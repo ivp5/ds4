@@ -39,6 +39,8 @@
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
 #endif
+#include "ds4_quant_blocks.h"
+#include "ds4_neon_i8mm.h"
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -120,39 +122,15 @@ static int g_ds4_lock_fd = -1;
  * GGUF Quant Block Formats.
  * =========================================================================
  *
- * These layouts and IQ2 tables match the GGUF quantized tensor format,
- * reduced to only the formats ds4.c currently reads:
+ * Block layouts (block_q2_K, block_q4_K, block_q8_K, block_iq2_xxs) and
+ * QK_K live in ds4_quant_blocks.h so the NEON i8mm dot kernels in
+ * ds4_neon_i8mm.c can reuse the same types.  Only ds4 reads/produces
+ * these formats:
  *   - Q2_K routed down experts
  *   - Q4_K routed experts in the high-memory variant
  *   - IQ2_XXS routed gate/up experts
  *   - Q8_K temporary activation blocks for dot products
  */
-#define QK_K 256
-
-typedef struct {
-    uint8_t  scales[QK_K / 16];
-    uint8_t  qs[QK_K / 4];
-    uint16_t d;
-    uint16_t dmin;
-} block_q2_K;
-
-typedef struct {
-    uint16_t d;
-    uint16_t dmin;
-    uint8_t  scales[12];
-    uint8_t  qs[QK_K / 2];
-} block_q4_K;
-
-typedef struct {
-    float   d;
-    int8_t  qs[QK_K];
-    int16_t bsums[QK_K / 16];
-} block_q8_K;
-
-typedef struct {
-    uint16_t d;
-    uint16_t qs[QK_K / 8];
-} block_iq2_xxs;
 
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
@@ -4180,6 +4158,11 @@ typedef struct {
 static void matvec_q4_k_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
     matvec_q4_k_mid_ctx *ctx = vctx;
 
+    /* Decode path (n_tok=1).  i8mm SMMLA cannot batch usefully here -- a
+     * single activation forces us to pass xq as both 2x2 columns, which
+     * wastes 50% of the SMMLA outputs and erases the per-instruction
+     * advantage over NEON DOTPROD.  NEON dot is already efficient for
+     * GEMV-shaped work, so we just call it twice per row. */
     for (uint64_t idx = row0; idx < row1; idx++) {
         const int slot = (int)(idx / ctx->out_dim);
         const uint64_t row = idx - (uint64_t)slot * ctx->out_dim;
@@ -4261,6 +4244,10 @@ typedef struct {
 static void matvec_q4_k_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
     matvec_q4_k_accum_ctx *ctx = vctx;
 
+    /* Decode down accum.  i8mm only buys us off-diagonal SMMLA lanes that
+     * we have to discard (cross-expert products are not part of the
+     * accumulator), so the diagonal-only path matched NEON within noise
+     * in benchmarks.  Stick with plain NEON dot here. */
     for (uint64_t row = row0; row < row1; row++) {
         float acc = 0.0f;
         for (int i = 0; i < ctx->n_expert; i++) {
@@ -4515,7 +4502,46 @@ static void matvec_q4_k_batch_mid_worker(void *vctx, uint64_t task0, uint64_t ta
         const block_q4_K *gate_row = (const block_q4_K *)(ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert]);
         const block_q4_K *up_row = (const block_q4_K *)(ctx->up_base[expert] + row * ctx->up_row_bytes[expert]);
 
-        for (uint32_t i = begin; i < end; i++) {
+        uint32_t i = begin;
+
+        /* Prefill path: for each pair we want (gate · xq, up · xq).  With
+         * two consecutive pairs that's four distinct dots = a genuine 2x2
+         * SMMLA (different "rows" gate/up x different "cols" xq[t0]/xq[t1]). */
+        if (ds4_has_i8mm()) {
+            while (i + 1 < end) {
+                const uint32_t pair_id_0 = ctx->pair_ids[i];
+                const uint32_t pair_id_1 = ctx->pair_ids[i + 1];
+                const uint32_t token_0 = pair_id_0 / DS4_N_EXPERT_USED;
+                const uint32_t token_1 = pair_id_1 / DS4_N_EXPERT_USED;
+                const block_q8_K *xq_0 = ctx->xq + (uint64_t)token_0 * ctx->xq_blocks;
+                const block_q8_K *xq_1 = ctx->xq + (uint64_t)token_1 * ctx->xq_blocks;
+
+                float buf[4];
+                ds4_neon_i8mm_q4_K_q8_K_2x2((int)ctx->in_dim, buf,
+                                             gate_row, up_row, xq_0, xq_1);
+                /* buf = [gate·xq_0, gate·xq_1, up·xq_0, up·xq_1]. */
+                float gate_0 = buf[0], gate_1 = buf[1];
+                float up_0   = buf[2], up_1   = buf[3];
+
+                if (ctx->clamp > 1.0e-6f) {
+                    if (gate_0 > ctx->clamp) gate_0 = ctx->clamp;
+                    if (gate_1 > ctx->clamp) gate_1 = ctx->clamp;
+                    if (up_0 > ctx->clamp) up_0 = ctx->clamp;
+                    if (up_1 > ctx->clamp) up_1 = ctx->clamp;
+                    if (up_0 < -ctx->clamp) up_0 = -ctx->clamp;
+                    if (up_1 < -ctx->clamp) up_1 = -ctx->clamp;
+                }
+                ctx->mid[(uint64_t)pair_id_0 * ctx->out_dim + row] =
+                    silu(gate_0) * up_0 * ctx->pair_weight[pair_id_0];
+                ctx->mid[(uint64_t)pair_id_1 * ctx->out_dim + row] =
+                    silu(gate_1) * up_1 * ctx->pair_weight[pair_id_1];
+
+                i += 2;
+            }
+        }
+
+        /* Tail (odd remainder, or the whole loop when i8mm is unavailable). */
+        for (; i < end; i++) {
             const uint32_t pair_id = ctx->pair_ids[i];
             const uint32_t token = pair_id / DS4_N_EXPERT_USED;
             const block_q8_K *xq = ctx->xq + (uint64_t)token * ctx->xq_blocks;
@@ -4553,6 +4579,80 @@ typedef struct {
 
 static void matvec_q4_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
     matvec_q4_k_batch_accum_rows_ctx *ctx = vctx;
+
+    /* Prefill down accum: for each (row pair) x (pair pair) we get a clean
+     * 2x2 = 4 useful dots.  Outer loop pairs rows (so we step row by 2),
+     * inner loop pairs pairs.  The two rows belong to the same down
+     * tensor for the same expert, just at consecutive output positions. */
+    if (ds4_has_i8mm()) {
+        uint64_t row = row0;
+        while (row + 1 < row1) {
+            for (uint32_t t = 0; t < ctx->n_tok; t++) {
+                ctx->moe[(uint64_t)t * ctx->out_dim + row]     = 0.0f;
+                ctx->moe[(uint64_t)t * ctx->out_dim + row + 1] = 0.0f;
+            }
+            for (uint32_t ai = 0; ai < ctx->n_active; ai++) {
+                const uint32_t expert = ctx->active_expert[ai];
+                const uint32_t begin = ctx->expert_offset[expert];
+                const uint32_t end = ctx->expert_offset[expert + 1];
+                const block_q4_K *br0 = (const block_q4_K *)(ctx->base[expert] +  row      * ctx->row_bytes[expert]);
+                const block_q4_K *br1 = (const block_q4_K *)(ctx->base[expert] + (row + 1) * ctx->row_bytes[expert]);
+
+                uint32_t i = begin;
+                while (i + 1 < end) {
+                    const uint32_t pair_id_0 = ctx->pair_ids[i];
+                    const uint32_t pair_id_1 = ctx->pair_ids[i + 1];
+                    const uint32_t token_0 = pair_id_0 / DS4_N_EXPERT_USED;
+                    const uint32_t token_1 = pair_id_1 / DS4_N_EXPERT_USED;
+                    const block_q8_K *xq_0 = ctx->midq + (uint64_t)pair_id_0 * ctx->midq_blocks;
+                    const block_q8_K *xq_1 = ctx->midq + (uint64_t)pair_id_1 * ctx->midq_blocks;
+
+                    float buf[4];
+                    ds4_neon_i8mm_q4_K_q8_K_2x2((int)ctx->in_dim, buf,
+                                                 br0, br1, xq_0, xq_1);
+                    /* buf = [br0·xq_0, br0·xq_1, br1·xq_0, br1·xq_1]. */
+                    ctx->moe[(uint64_t)token_0 * ctx->out_dim + row]     += buf[0];
+                    ctx->moe[(uint64_t)token_1 * ctx->out_dim + row]     += buf[1];
+                    ctx->moe[(uint64_t)token_0 * ctx->out_dim + row + 1] += buf[2];
+                    ctx->moe[(uint64_t)token_1 * ctx->out_dim + row + 1] += buf[3];
+                    i += 2;
+                }
+                /* Tail: odd pair remainder for this expert. */
+                for (; i < end; i++) {
+                    const uint32_t pair_id = ctx->pair_ids[i];
+                    const uint32_t token = pair_id / DS4_N_EXPERT_USED;
+                    const block_q8_K *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
+                    float v0 = 0.0f, v1 = 0.0f;
+                    ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &v0, br0, xq);
+                    ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &v1, br1, xq);
+                    ctx->moe[(uint64_t)token * ctx->out_dim + row]     += v0;
+                    ctx->moe[(uint64_t)token * ctx->out_dim + row + 1] += v1;
+                }
+            }
+            row += 2;
+        }
+        /* Tail: last row when row1 - row0 is odd. */
+        if (row < row1) {
+            for (uint32_t t = 0; t < ctx->n_tok; t++) {
+                ctx->moe[(uint64_t)t * ctx->out_dim + row] = 0.0f;
+            }
+            for (uint32_t ai = 0; ai < ctx->n_active; ai++) {
+                const uint32_t expert = ctx->active_expert[ai];
+                const uint32_t begin = ctx->expert_offset[expert];
+                const uint32_t end = ctx->expert_offset[expert + 1];
+                const block_q4_K *br = (const block_q4_K *)(ctx->base[expert] + row * ctx->row_bytes[expert]);
+                for (uint32_t i = begin; i < end; i++) {
+                    const uint32_t pair_id = ctx->pair_ids[i];
+                    const uint32_t token = pair_id / DS4_N_EXPERT_USED;
+                    const block_q8_K *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
+                    float v = 0.0f;
+                    ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &v, br, xq);
+                    ctx->moe[(uint64_t)token * ctx->out_dim + row] += v;
+                }
+            }
+        }
+        return;
+    }
 
     for (uint64_t row = row0; row < row1; row++) {
         for (uint32_t t = 0; t < ctx->n_tok; t++) {
@@ -17932,6 +18032,7 @@ static bool engine_map_metal_views_with_routed_holes(ds4_engine *e) {
 #endif
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+    ds4_neon_i8mm_init();
     if (opt->n_cpu_moe_layers < 0 || opt->n_cpu_moe_layers > DS4_N_LAYER) {
         fprintf(stderr, "ds4: n_cpu_moe_layers must be between 0 and %d\n", DS4_N_LAYER);
         *out = NULL;
