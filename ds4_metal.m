@@ -352,20 +352,35 @@ static int ds4_gpu_model_views_cover_range(
     return 0;
 }
 
+/* One-shot flag set by ds4_gpu_set_skip_next_warmup().  Cleared
+ * unconditionally inside ds4_gpu_finalize_model_views() so subsequent
+ * calls warmup normally unless re-armed. */
+static int g_skip_next_warmup = 0;
+
+int ds4_gpu_set_skip_next_warmup(int skip) {
+    const int prev = g_skip_next_warmup;
+    g_skip_next_warmup = skip ? 1 : 0;
+    return prev;
+}
+
 static int ds4_gpu_finalize_model_views(void) {
     const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
     const double t0 = ds4_gpu_now_ms();
     if (request_residency) ds4_gpu_progress_begin("requesting Metal residency (may take tens of seconds)");
     if (!ds4_gpu_model_residency_request_views()) {
         if (request_residency) ds4_gpu_progress_failed();
+        g_skip_next_warmup = 0;
         return 0;
     }
     if (request_residency) ds4_gpu_progress_done();
     const double t_resident = ds4_gpu_now_ms();
 
     int warmed = 1;
+    const int skip_once = g_skip_next_warmup;
+    g_skip_next_warmup = 0;
     const int warm_model_views = getenv("DS4_METAL_NO_RESIDENCY") == NULL &&
-                                 getenv("DS4_METAL_NO_MODEL_WARMUP") == NULL;
+                                 getenv("DS4_METAL_NO_MODEL_WARMUP") == NULL &&
+                                 !skip_once;
     if (warm_model_views) {
         ds4_gpu_progress_begin("warming Metal model views");
         warmed = ds4_gpu_warm_model_views();

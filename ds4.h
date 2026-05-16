@@ -73,6 +73,16 @@ typedef struct {
     bool quality;
     bool cpu_moe;
     int  n_cpu_moe_layers;
+    /* Prefill the model in N phases, each Metal-resident.  Mutually
+     * exclusive with --cpu-moe / --n-cpu-moe.  When != 0 the prefill path
+     * splits layers evenly across N phases, swapping Metal residency
+     * between phases.  Generation always falls back to cpu-moe so the
+     * routed expert pages stay in the OS page cache for decode.  Range:
+     *   -1  = auto (engine sizes N from sysctl iogpu.wired_limit_mb so
+     *          each phase fits the Metal wired-memory cap)
+     *    0  = disabled
+     *  1..DS4_N_LAYER = explicit phase count */
+    int  prefill_metal_phases;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);

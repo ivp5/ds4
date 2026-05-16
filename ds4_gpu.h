@@ -42,6 +42,12 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
 int ds4_gpu_set_model_map_ranges(const void *model_map, uint64_t model_size,
                                  const uint64_t *map_offsets, const uint64_t *map_sizes,
                                  uint32_t n_ranges);
+/* Set a one-shot flag that suppresses the warmup touch-loop in the NEXT
+ * call to a residency-establishing API.  Used by --prefill-metal-phases
+ * so phase swaps avoid the 20-30s synchronous page-touch pass; the
+ * initial residency at engine_open and any explicit user warmup still
+ * pay the page-in cost.  Returns the previous flag value. */
+int ds4_gpu_set_skip_next_warmup(int skip);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);

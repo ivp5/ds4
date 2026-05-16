@@ -19,6 +19,7 @@
 #include <float.h>
 #include <inttypes.h>
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -30,6 +31,9 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
@@ -4678,6 +4682,84 @@ static void matvec_q4_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint6
     }
 }
 
+/* Prefill profile state.  Enabled per-process by DS4_PREFILL_PROFILE=1
+ * and reset at every chunk boundary.  Lives at file scope rather than on
+ * ds4_gpu_graph so the deep CPU-MoE helpers (which take no graph handle)
+ * can accumulate into it without churning every signature.  Single-session
+ * assumption -- one prefill in flight at a time, which matches all current
+ * call sites. */
+typedef struct {
+    bool      enabled;            /* sampled once per chunk from getenv */
+    double    chunk_t0;
+    double    encode_s;
+    double    execute_s;
+    double    cpu_moe_wait_s;     /* main thread waited inside async_join */
+    uint64_t  cpu_moe_compute_ns; /* worker-thread compute, atomic add */
+    uint32_t  n_cpu_moe_layers;   /* layers whose worker the main thread joined */
+    uint64_t  active_expert_sum;  /* sum across MoE layers of #active experts */
+    uint64_t  pair_sum;           /* sum across MoE layers of total pairs (n_tok*6) */
+    uint32_t  hist_layers;        /* layers contributing to the two sums above */
+    /* Per-stage breakdown of the worker-thread compute time.  Written from
+     * the async worker via __atomic; mid covers gate/up matvecs, down
+     * covers the accum/down matvec, quant covers ds4_quantize_row_q8_K. */
+    uint64_t  cpu_moe_mid_ns;
+    uint64_t  cpu_moe_down_ns;
+    uint64_t  cpu_moe_quant_ns;
+} ds4_prefill_profile_state;
+
+static ds4_prefill_profile_state g_prefill_profile = {0};
+
+static void ds4_prefill_profile_reset(bool enabled) {
+    g_prefill_profile.enabled = enabled;
+    g_prefill_profile.chunk_t0 = enabled ? now_sec() : 0.0;
+    g_prefill_profile.encode_s = 0.0;
+    g_prefill_profile.execute_s = 0.0;
+    g_prefill_profile.cpu_moe_wait_s = 0.0;
+    __atomic_store_n(&g_prefill_profile.cpu_moe_compute_ns, (uint64_t)0, __ATOMIC_RELAXED);
+    g_prefill_profile.n_cpu_moe_layers = 0;
+    g_prefill_profile.active_expert_sum = 0;
+    g_prefill_profile.pair_sum = 0;
+    g_prefill_profile.hist_layers = 0;
+    __atomic_store_n(&g_prefill_profile.cpu_moe_mid_ns, (uint64_t)0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_prefill_profile.cpu_moe_down_ns, (uint64_t)0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_prefill_profile.cpu_moe_quant_ns, (uint64_t)0, __ATOMIC_RELAXED);
+}
+
+static void ds4_prefill_profile_emit(uint32_t pos, uint32_t n_tokens,
+                                     double chunk_encode_s, double chunk_execute_s) {
+    if (!g_prefill_profile.enabled) return;
+    const double chunk_total_s = now_sec() - g_prefill_profile.chunk_t0;
+    const uint64_t cpu_compute_ns =
+        __atomic_load_n(&g_prefill_profile.cpu_moe_compute_ns, __ATOMIC_RELAXED);
+    const uint32_t hist_layers =
+        __atomic_load_n(&g_prefill_profile.hist_layers, __ATOMIC_RELAXED);
+    const uint64_t active_sum =
+        __atomic_load_n(&g_prefill_profile.active_expert_sum, __ATOMIC_RELAXED);
+    const uint64_t pair_sum =
+        __atomic_load_n(&g_prefill_profile.pair_sum, __ATOMIC_RELAXED);
+    const double mean_active = hist_layers ? (double)active_sum / hist_layers : 0.0;
+    const double mean_pair_per_expert =
+        (hist_layers && active_sum) ? (double)pair_sum / (double)active_sum : 0.0;
+    const uint64_t mid_ns  = __atomic_load_n(&g_prefill_profile.cpu_moe_mid_ns,  __ATOMIC_RELAXED);
+    const uint64_t down_ns = __atomic_load_n(&g_prefill_profile.cpu_moe_down_ns, __ATOMIC_RELAXED);
+    const uint64_t quant_ns = __atomic_load_n(&g_prefill_profile.cpu_moe_quant_ns, __ATOMIC_RELAXED);
+    fprintf(stderr,
+            "ds4: prefill_profile chunk pos=%u n=%u total=%.1fms enc=%.1f exec=%.1f "
+            "cpu_moe_wait=%.1f cpu_moe_compute=%.1f (mid=%.1f down=%.1f quant=%.1f) "
+            "cpu_layers=%u moe_layers=%u active_mean=%.1f pair/expert_mean=%.1f\n",
+            pos, n_tokens,
+            chunk_total_s * 1000.0,
+            chunk_encode_s * 1000.0,
+            chunk_execute_s * 1000.0,
+            g_prefill_profile.cpu_moe_wait_s * 1000.0,
+            (double)cpu_compute_ns / 1.0e6,
+            (double)mid_ns / 1.0e6,
+            (double)down_ns / 1.0e6,
+            (double)quant_ns / 1.0e6,
+            g_prefill_profile.n_cpu_moe_layers,
+            hist_layers, mean_active, mean_pair_per_expert);
+}
+
 /* CPU-MoE handoff gets router selections and weights from GPU buffers, then
  * runs the expert projections on reusable host scratch. Prefill keeps the
  * efficient expert-grouped batch layout; decode reuses the same scratch path
@@ -4723,6 +4805,8 @@ static void layer_routed_moe_selected_batch_prealloc(
     uint32_t active_expert[DS4_N_EXPERT];
     uint32_t n_active = 0;
 
+    const bool prof = __atomic_load_n(&g_prefill_profile.enabled, __ATOMIC_RELAXED);
+    const double t_quant0 = prof ? now_sec() : 0.0;
     const uint64_t xq_blocks = expert_in_dim / QK_K;
     for (uint32_t t = 0; t < n_tok; t++) {
         ds4_quantize_row_q8_K(norm + (uint64_t)t * expert_in_dim,
@@ -4736,6 +4820,11 @@ static void layer_routed_moe_selected_batch_prealloc(
             counts[(uint32_t)expert + 1]++;
         }
     }
+    if (prof) {
+        const double dt = now_sec() - t_quant0;
+        __atomic_fetch_add(&g_prefill_profile.cpu_moe_quant_ns,
+                           (uint64_t)(dt * 1e9), __ATOMIC_RELAXED);
+    }
 
     for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
         counts[e + 1] += counts[e];
@@ -4746,6 +4835,16 @@ static void layer_routed_moe_selected_batch_prealloc(
     for (uint32_t pair_id = 0; pair_id < total_pairs; pair_id++) {
         const uint32_t expert = (uint32_t)selected_rows[pair_id];
         pair_ids[cursor[expert]++] = pair_id;
+    }
+
+    /* Prefill profile: log per-expert pair distribution.  Atomic because
+     * this helper runs on the async worker thread while the main thread
+     * may also enter through the sync-fallback path within the same
+     * chunk.  Snapshotting enabled once avoids racing against reset. */
+    if (__atomic_load_n(&g_prefill_profile.enabled, __ATOMIC_RELAXED)) {
+        __atomic_fetch_add(&g_prefill_profile.active_expert_sum, (uint64_t)n_active, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_prefill_profile.pair_sum, (uint64_t)total_pairs, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_prefill_profile.hist_layers, (uint32_t)1, __ATOMIC_RELAXED);
     }
 
     if (is_q4) {
@@ -4776,7 +4875,13 @@ static void layer_routed_moe_selected_batch_prealloc(
             }
         }
 
+        const double t_mid0 = prof ? now_sec() : 0.0;
         ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q4_k_batch_mid_worker, &mid_ctx);
+        if (prof) {
+            const double dt = now_sec() - t_mid0;
+            __atomic_fetch_add(&g_prefill_profile.cpu_moe_mid_ns,
+                               (uint64_t)(dt * 1e9), __ATOMIC_RELAXED);
+        }
     } else {
         matvec_iq2_xxs_batch_mid_ctx mid_ctx = {
             .mid = mid,
@@ -4805,7 +4910,13 @@ static void layer_routed_moe_selected_batch_prealloc(
             }
         }
 
+        const double t_mid0 = prof ? now_sec() : 0.0;
         ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
+        if (prof) {
+            const double dt = now_sec() - t_mid0;
+            __atomic_fetch_add(&g_prefill_profile.cpu_moe_mid_ns,
+                               (uint64_t)(dt * 1e9), __ATOMIC_RELAXED);
+        }
     }
 
     const uint64_t midq_blocks = down_in_dim / QK_K;
@@ -4815,7 +4926,13 @@ static void layer_routed_moe_selected_batch_prealloc(
         .down_in_dim = down_in_dim,
         .down_blocks = midq_blocks,
     };
+    const double t_mq0 = prof ? now_sec() : 0.0;
     ds4_parallel_for(total_pairs, quantize_mid_pairs_worker, &quant_ctx);
+    if (prof) {
+        const double dt = now_sec() - t_mq0;
+        __atomic_fetch_add(&g_prefill_profile.cpu_moe_quant_ns,
+                           (uint64_t)(dt * 1e9), __ATOMIC_RELAXED);
+    }
 
     if (is_q4) {
         matvec_q4_k_batch_accum_rows_ctx down_ctx = {
@@ -4841,7 +4958,13 @@ static void layer_routed_moe_selected_batch_prealloc(
             }
         }
 
+        const double t_down0 = prof ? now_sec() : 0.0;
         ds4_parallel_for(down_out_dim, matvec_q4_k_batch_accum_rows_worker, &down_ctx);
+        if (prof) {
+            const double dt = now_sec() - t_down0;
+            __atomic_fetch_add(&g_prefill_profile.cpu_moe_down_ns,
+                               (uint64_t)(dt * 1e9), __ATOMIC_RELAXED);
+        }
     } else {
         matvec_q2_k_batch_accum_rows_ctx down_ctx = {
             .moe = moe,
@@ -4866,7 +4989,13 @@ static void layer_routed_moe_selected_batch_prealloc(
             }
         }
 
+        const double t_down0 = prof ? now_sec() : 0.0;
         ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
+        if (prof) {
+            const double dt = now_sec() - t_down0;
+            __atomic_fetch_add(&g_prefill_profile.cpu_moe_down_ns,
+                               (uint64_t)(dt * 1e9), __ATOMIC_RELAXED);
+        }
     }
 }
 
@@ -9046,6 +9175,37 @@ typedef struct {
     block_q8_K *cpu_moe_xq;
     block_q8_K *cpu_moe_midq;
     uint32_t *cpu_moe_pair_ids;
+
+    /* async cpu-moe handoff: layer N's CPU expert runs on a worker thread
+     * while layer N's GPU shared expert + the next layer's pre-MoE encode
+     * keep the main thread busy.  The worker is joined just before the next
+     * end_commands so the encoded ffn_out add reads a fully-written
+     * batch_routed_out.  Only one expert thread is in flight at a time. */
+    pthread_t cpu_moe_async_thread;
+    bool cpu_moe_async_active;
+    const ds4_layer_weights *cpu_moe_async_layer;
+    const float   *cpu_moe_async_xs;
+    const int32_t *cpu_moe_async_sel;
+    const float   *cpu_moe_async_w;
+    float         *cpu_moe_async_out;
+    uint32_t       cpu_moe_async_n_tokens;
+
+    /* Non-owning back-pointer to the engine that hosts this graph.  Used
+     * by --prefill-metal-phases to remap the Metal residency between
+     * phases.  Set in ds4_session_create() right after metal_graph_init
+     * and cleared on free.  Stays NULL when no session owns the graph. */
+    ds4_engine *engine;
+    /* Mirror of engine->prefill_metal_phases set via
+     * metal_graph_apply_engine_runtime().  0 disables phase splitting. */
+    uint32_t prefill_metal_phases;
+
+    /* HC stream snapshot used by --prefill-metal-phases.  Each chunk's
+     * batch_cur_hc state at the end of a phase is copied here so the next
+     * phase can resume from layer K1's output.  Dynamically grown via
+     * realloc when a longer prompt arrives; lifecycle bound to the graph. */
+    float    *phase_hc_snapshot_host;
+    size_t    phase_hc_snapshot_per_chunk_bytes;
+    uint32_t  phase_hc_snapshot_chunks_cap;
 } ds4_gpu_graph;
 
 static void metal_graph_free_cpu_moe_scratch(ds4_gpu_graph *g) {
@@ -9089,6 +9249,58 @@ static bool metal_graph_ensure_cpu_moe_scratch(ds4_gpu_graph *g, uint32_t n_toke
     return true;
 }
 
+/* Grow the host-side HC-stream snapshot buffer used by
+ * --prefill-metal-phases.  Each entry holds the batch_cur_hc state of one
+ * chunk at the boundary between two phases.  Layout: contiguous
+ * `chunks_cap × per_chunk_bytes`, where per_chunk_bytes captures the
+ * tensor's element count for the configured chunk_cap.  Returns false on
+ * allocation failure; caller should fall back to disabling the phase
+ * split and emit a warning. */
+static bool metal_graph_ensure_phase_hc_snapshot(ds4_gpu_graph *g,
+                                                  uint32_t chunk_cap,
+                                                  uint32_t need_chunks) {
+    if (!g || need_chunks == 0) return true;
+    const size_t per_chunk =
+        (size_t)chunk_cap * DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    if (per_chunk == 0) return false;
+    if (g->phase_hc_snapshot_per_chunk_bytes != per_chunk) {
+        /* chunk_cap changed since last allocation -- reset everything. */
+        free(g->phase_hc_snapshot_host);
+        g->phase_hc_snapshot_host = NULL;
+        g->phase_hc_snapshot_per_chunk_bytes = per_chunk;
+        g->phase_hc_snapshot_chunks_cap = 0;
+    }
+    if (need_chunks <= g->phase_hc_snapshot_chunks_cap) return true;
+    uint32_t cap = g->phase_hc_snapshot_chunks_cap ? g->phase_hc_snapshot_chunks_cap : 1u;
+    while (cap < need_chunks) {
+        if (cap > UINT32_MAX / 2u) { cap = need_chunks; break; }
+        cap *= 2u;
+    }
+    void *p = realloc(g->phase_hc_snapshot_host, (size_t)cap * per_chunk);
+    if (!p) {
+        fprintf(stderr,
+                "ds4: --prefill-metal-phases: failed to grow HC snapshot to "
+                "%u chunks (%.2f GiB)\n",
+                cap, (double)((size_t)cap * per_chunk) / (1024.0 * 1024.0 * 1024.0));
+        return false;
+    }
+    g->phase_hc_snapshot_host = (float *)p;
+    g->phase_hc_snapshot_chunks_cap = cap;
+    return true;
+}
+
+static void cpu_moe_async_join(ds4_gpu_graph *g);
+
+/* Forward declarations used by metal_graph_prefill_chunked_range so the
+ * --prefill-metal-phases helpers (defined later, alongside the engine
+ * residency code) are visible.  Implementations live near
+ * engine_map_metal_views_with_routed_holes. */
+static void ds4_phase_layer_range(uint32_t phases, uint32_t phase_idx,
+                                  uint32_t *start, uint32_t *end);
+static bool engine_activate_prefill_phase(ds4_engine *e, ds4_gpu_graph *g,
+                                          uint32_t phase_idx);
+static bool engine_restore_gen_routing(ds4_engine *e, ds4_gpu_graph *g);
+
 /* Release the prefill-sized CPU-MoE scratch so it stops competing with the OS
  * page cache during decode. Under --cpu-moe with model > RAM, the scratch
  * (sized for the prefill batch) can hold hundreds of MiB of anon pages and
@@ -9096,13 +9308,87 @@ static bool metal_graph_ensure_cpu_moe_scratch(ds4_gpu_graph *g, uint32_t n_toke
  * Decode's first CPU-MoE layer re-allocates a 1-token scratch via the
  * existing ensure path. */
 static void metal_graph_shrink_cpu_moe_scratch(ds4_gpu_graph *g) {
-    if (!g || g->cpu_moe_tok_cap == 0) return;
+    if (!g) return;
+    cpu_moe_async_join(g);
+    if (g->cpu_moe_tok_cap == 0) return;
     metal_graph_free_cpu_moe_scratch(g);
+}
+
+/* async cpu-moe handoff worker thread entry.  Calls the synchronous handoff
+ * (which itself uses the global ds4_thread_pool internally); the outer
+ * pthread just lets the main thread move on to GPU shared-expert encoding
+ * while CPU experts churn through their routed-MoE work. */
+static void *cpu_moe_async_worker_fn(void *arg) {
+    ds4_gpu_graph *g = (ds4_gpu_graph *)arg;
+    const bool prof = g_prefill_profile.enabled;
+    const double t0 = prof ? now_sec() : 0.0;
+    cpu_routed_moe_batch_handoff_prealloc(
+            g->cpu_model,
+            g->cpu_moe_async_layer,
+            g->cpu_moe_async_xs,
+            g->cpu_moe_async_sel,
+            g->cpu_moe_async_w,
+            g->cpu_moe_async_out,
+            g->cpu_moe_async_n_tokens,
+            DS4_SWIGLU_CLAMP_EXP,
+            g->cpu_moe_mid,
+            g->cpu_moe_xq,
+            g->cpu_moe_midq,
+            g->cpu_moe_pair_ids);
+    if (prof) {
+        const double dt = now_sec() - t0;
+        const uint64_t dt_ns = dt > 0.0 ? (uint64_t)(dt * 1e9) : 0;
+        __atomic_fetch_add(&g_prefill_profile.cpu_moe_compute_ns, dt_ns, __ATOMIC_RELAXED);
+    }
+    return NULL;
+}
+
+/* Spawn the worker that runs `cpu_routed_moe_batch_handoff_prealloc` for the
+ * current layer.  Returns true on success.  Main thread must call
+ * `cpu_moe_async_join` before encoding any GPU op that reads
+ * `batch_routed_out`, and before any end_commands that would commit such an
+ * op to the GPU. */
+static bool cpu_moe_async_kick(ds4_gpu_graph *g,
+                                const ds4_layer_weights *layer,
+                                const float   *xs,
+                                const int32_t *sel,
+                                const float   *w,
+                                float         *out,
+                                uint32_t       n_tokens) {
+    g->cpu_moe_async_layer    = layer;
+    g->cpu_moe_async_xs       = xs;
+    g->cpu_moe_async_sel      = sel;
+    g->cpu_moe_async_w        = w;
+    g->cpu_moe_async_out      = out;
+    g->cpu_moe_async_n_tokens = n_tokens;
+    if (pthread_create(&g->cpu_moe_async_thread, NULL, cpu_moe_async_worker_fn, g) != 0) {
+        return false;
+    }
+    g->cpu_moe_async_active = true;
+    return true;
+}
+
+/* Wait for an in-flight async cpu-moe handoff to complete.  Idempotent. */
+static void cpu_moe_async_join(ds4_gpu_graph *g) {
+    if (!g || !g->cpu_moe_async_active) return;
+    const bool prof = g_prefill_profile.enabled;
+    const double t0 = prof ? now_sec() : 0.0;
+    pthread_join(g->cpu_moe_async_thread, NULL);
+    if (prof) {
+        g_prefill_profile.cpu_moe_wait_s += now_sec() - t0;
+        g_prefill_profile.n_cpu_moe_layers++;
+    }
+    g->cpu_moe_async_active = false;
 }
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    cpu_moe_async_join(g);
     metal_graph_free_cpu_moe_scratch(g);
+    free(g->phase_hc_snapshot_host);
+    g->phase_hc_snapshot_host = NULL;
+    g->phase_hc_snapshot_per_chunk_bytes = 0;
+    g->phase_hc_snapshot_chunks_cap = 0;
     ds4_gpu_tensor_free(g->directional_steering_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
     ds4_gpu_tensor_free(g->batch_routed_out);
@@ -13337,10 +13623,14 @@ static bool metal_graph_encode_layer_ffn_batch(
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
     if (ok && g->cpu_moe_layer[il]) {
-        /* Drain GPU work so the router selection in storageModeShared buffers
-         * is visible to the CPU MoE handoff. The next GPU command buffer is
-         * issued only after the CPU finishes writing batch_routed_out, so the
-         * subsequent encode acts as the implicit reverse barrier. */
+        /* Async cpu-moe handoff.  The previous layer's CPU expert worker (if
+         * any) must be joined before we drain the GPU command buffer here,
+         * because the ffn_out add encoded after that earlier layer reads
+         * batch_routed_out, and the current end_commands is what commits
+         * that read to the GPU.  After draining we kick this layer's CPU
+         * expert worker, then restart g_batch_cb so the shared expert can
+         * encode in parallel with the worker. */
+        cpu_moe_async_join(g);
         ok = metal_graph_ensure_cpu_moe_scratch(g, n_tokens) && (ds4_gpu_end_commands() != 0);
         if (ok) {
             const float   *xs  = (const float *)  ds4_gpu_tensor_contents(g->batch_ffn_norm);
@@ -13349,13 +13639,16 @@ static bool metal_graph_encode_layer_ffn_batch(
             float         *out = (float *)        ds4_gpu_tensor_contents(g->batch_routed_out);
             ok = xs && sel && w && out;
             if (ok) {
-                cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer,
-                                                      xs, sel, w, out,
-                                                      n_tokens, DS4_SWIGLU_CLAMP_EXP,
-                                                      g->cpu_moe_mid,
-                                                      g->cpu_moe_xq,
-                                                      g->cpu_moe_midq,
-                                                      g->cpu_moe_pair_ids);
+                if (!cpu_moe_async_kick(g, layer, xs, sel, w, out, n_tokens)) {
+                    /* pthread_create failed -- fall back to synchronous handoff. */
+                    cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer,
+                                                          xs, sel, w, out,
+                                                          n_tokens, DS4_SWIGLU_CLAMP_EXP,
+                                                          g->cpu_moe_mid,
+                                                          g->cpu_moe_xq,
+                                                          g->cpu_moe_midq,
+                                                          g->cpu_moe_pair_ids);
+                }
             }
         }
         if (ok) ok = (ds4_gpu_begin_commands() != 0);
@@ -13441,6 +13734,18 @@ static bool metal_graph_encode_layer_ffn_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp", g->batch_shared_out,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
+    }
+
+    /* Bridge between async cpu-moe and the routed-out consumers below.  The
+     * shared-expert chain just encoded does NOT depend on batch_routed_out
+     * so we flush it (async commit, GPU starts running) and then wait for
+     * the CPU expert worker to finish.  That way GPU shared-expert compute
+     * and CPU routed-MoE compute overlap up to min(T_cpu, T_gpu_shared).
+     * The next encode (ffn_out add / hc_expand_add_split) reads
+     * batch_routed_out, so it must wait for the join. */
+    if (ok && g->cpu_moe_async_active) {
+        if (!ds4_gpu_flush_commands()) ok = false;
+        cpu_moe_async_join(g);
     }
 
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos0);
@@ -13971,6 +14276,9 @@ static bool metal_graph_prefill_layer_major(
 
     if (!metal_graph_warmup_prefill_kernels(g, model, weights, (uint32_t)n_tokens)) return false;
 
+    const bool dprofile = getenv("DS4_PREFILL_PROFILE") != NULL;
+    if (dprofile) ds4_prefill_profile_reset(true);
+
     const bool split_profile = getenv("DS4_METAL_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
     /*
      * A full long-prompt prefill can keep the GPU busy long enough for macOS
@@ -13979,7 +14287,7 @@ static bool metal_graph_prefill_layer_major(
      * server gets regular scheduling points.
      */
     const bool split_commands = split_profile || n_tokens > 2048 || imatrix != NULL;
-    const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
+    const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || split_profile || dprofile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
     double execute_s = 0.0;
@@ -14054,6 +14362,11 @@ static bool metal_graph_prefill_layer_major(
                     (t_done - t_encoded) * 1000.0,
                     (t_read - t_before_read) * 1000.0,
                     (t_read - t0) * 1000.0);
+        }
+        if (dprofile) {
+            ds4_prefill_profile_emit(0, (uint32_t)n_tokens,
+                                     (t_encoded - t0), (t_done - t_encoded));
+            ds4_prefill_profile_reset(false);
         }
         return ok;
     }
@@ -14211,6 +14524,10 @@ static bool metal_graph_prefill_layer_major(
                 (t_read - t_before_read) * 1000.0,
                 (t_read - t0) * 1000.0);
     }
+    if (dprofile) {
+        ds4_prefill_profile_emit(0, (uint32_t)n_tokens, encode_s, execute_s);
+        ds4_prefill_profile_reset(false);
+    }
     return ok;
 }
 
@@ -14291,16 +14608,39 @@ static bool metal_graph_prefill_chunked_range(
     if (!metal_graph_warmup_prefill_kernels(g, model, weights, first_chunk)) return false;
 
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
-    const double t0 = profile ? now_sec() : 0.0;
+    const bool dprofile = getenv("DS4_PREFILL_PROFILE") != NULL;
+    const bool need_timer = profile || dprofile;
+    const double t0 = need_timer ? now_sec() : 0.0;
     double encode_s = 0.0;
     double execute_s = 0.0;
     uint32_t last_chunk_tokens = 0;
     const uint32_t end = start + n_tokens;
 
+    /* --prefill-metal-phases: prepare HC snapshot scratch sized to the
+     * number of chunks we are about to run.  Snapshot is only consumed
+     * when phases > 1; on phases == 1 we keep the existing fast path. */
+    const uint32_t phases = (g->prefill_metal_phases > 1) ? g->prefill_metal_phases : 1;
+    if (phases > 1) {
+        const uint32_t need_chunks = (n_tokens + chunk_cap - 1) / chunk_cap;
+        if (!metal_graph_ensure_phase_hc_snapshot(g, chunk_cap, need_chunks)) {
+            return false;
+        }
+    }
+
     if (progress) {
         progress(progress_ud, "prefill_chunk", (int)start, prompt->len);
     }
 
+  for (uint32_t phase_idx = 0; phase_idx < phases; phase_idx++) {
+    uint32_t phase_start_layer = 0;
+    uint32_t phase_end_layer = DS4_N_LAYER;
+    if (phases > 1) {
+        ds4_phase_layer_range(phases, phase_idx, &phase_start_layer, &phase_end_layer);
+        if (!engine_activate_prefill_phase(g->engine, g, phase_idx)) {
+            return false;
+        }
+    }
+    uint32_t chunk_idx = 0;
     for (uint32_t pos0 = start; pos0 < end; ) {
         const uint32_t remaining = end - pos0;
         uint32_t local_cap = chunk_cap;
@@ -14314,18 +14654,38 @@ static bool metal_graph_prefill_chunked_range(
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         last_chunk_tokens = chunk;
 
-        bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, pos0, chunk);
-        if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                             g->prefill_tokens,
-                                                             model,
-                                                             weights,
-                                                             prompt,
-                                                             pos0,
-                                                             chunk);
-        if (!ok) return false;
+        if (dprofile) ds4_prefill_profile_reset(true);
 
-        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-            const double t_layer0 = profile ? now_sec() : 0.0;
+        bool ok = true;
+        if (phase_idx == 0) {
+            ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, pos0, chunk);
+            if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                                 g->prefill_tokens,
+                                                                 model,
+                                                                 weights,
+                                                                 prompt,
+                                                                 pos0,
+                                                                 chunk);
+        } else {
+            /* Restore the layer-K1 output HC stream from this chunk's
+             * slot in the host snapshot.  The destination is the same
+             * batch_cur_hc the next phase will read as layer input. */
+            const size_t off = (size_t)chunk_idx * g->phase_hc_snapshot_per_chunk_bytes;
+            const size_t bytes = (size_t)chunk * DS4_N_HC * DS4_N_EMBD * sizeof(float);
+            ok = ds4_gpu_tensor_write(g->batch_cur_hc, 0,
+                                      (uint8_t *)g->phase_hc_snapshot_host + off,
+                                      bytes) != 0;
+        }
+        if (!ok) {
+            if (dprofile) ds4_prefill_profile_reset(false);
+            return false;
+        }
+
+        double chunk_encode_s = 0.0;
+        double chunk_execute_s = 0.0;
+
+        for (uint32_t il = phase_start_layer; ok && il < phase_end_layer; il++) {
+            const double t_layer0 = need_timer ? now_sec() : 0.0;
             ok = ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_batch(g,
                                                         model,
@@ -14333,13 +14693,19 @@ static bool metal_graph_prefill_chunked_range(
                                                         il,
                                                         pos0,
                                                         chunk);
-            const double t_encoded = profile ? now_sec() : 0.0;
+            const double t_encoded = need_timer ? now_sec() : 0.0;
             if (ok) ok = ds4_gpu_end_commands() != 0;
-            const double t_done = profile ? now_sec() : 0.0;
+            const double t_done = need_timer ? now_sec() : 0.0;
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, chunk);
+            if (need_timer) {
+                const double enc_dt = t_encoded - t_layer0;
+                const double exec_dt = t_done - t_encoded;
+                encode_s += enc_dt;
+                execute_s += exec_dt;
+                chunk_encode_s += enc_dt;
+                chunk_execute_s += exec_dt;
+            }
             if (profile) {
-                encode_s += t_encoded - t_layer0;
-                execute_s += t_done - t_encoded;
                 fprintf(stderr,
                         "ds4: gpu chunked prefill pos=%u tokens=%u layer %u encode=%.3f ms execute=%.3f ms\n",
                         pos0,
@@ -14362,19 +14728,39 @@ static bool metal_graph_prefill_chunked_range(
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
             }
+            if (dprofile) ds4_prefill_profile_reset(false);
             return false;
         }
         if (progress && !metal_graph_prefill_batch_row_logits(g, model, weights,
                                                               chunk - 1u,
                                                               logits))
         {
+            if (dprofile) ds4_prefill_profile_reset(false);
             return false;
         }
         if (progress) {
             progress(progress_ud, "prefill_chunk", (int)(pos0 + chunk), prompt->len);
         }
+        /* phase boundary: save layer K1 output HC to host snapshot so
+         * the next phase can resume from it. */
+        if (phases > 1 && phase_idx < phases - 1) {
+            const size_t off = (size_t)chunk_idx * g->phase_hc_snapshot_per_chunk_bytes;
+            const size_t bytes = (size_t)chunk * DS4_N_HC * DS4_N_EMBD * sizeof(float);
+            if (ds4_gpu_tensor_read(g->batch_cur_hc, 0,
+                                    (uint8_t *)g->phase_hc_snapshot_host + off,
+                                    bytes) == 0) {
+                if (dprofile) ds4_prefill_profile_reset(false);
+                return false;
+            }
+        }
+        if (dprofile) {
+            ds4_prefill_profile_emit(pos0, chunk, chunk_encode_s, chunk_execute_s);
+            ds4_prefill_profile_reset(false);
+        }
+        chunk_idx++;
         pos0 += chunk;
     }
+  } /* end of phase loop */
     if (show_progress) fputc('\n', stderr);
     if (last_chunk_tokens == 0) return false;
 
@@ -14968,12 +15354,20 @@ struct ds4_engine {
     bool cpu_moe;
     bool cpu_model_ready;
     bool cpu_moe_layer[DS4_N_LAYER];
+    /* Prefill-only Metal phase split.  0 = disabled.  When >0, prefill
+     * loops over N phases, swapping the routed-expert Metal residency
+     * between them; generation always uses the cpu_moe path (cpu_model
+     * mmap).  The per-phase layer range is recomputed in
+     * engine_activate_prefill_phase() since N <= DS4_N_LAYER and the
+     * split is deterministic. */
+    uint32_t prefill_metal_phases;
 };
 
 static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine *e) {
     g->quality = e->quality;
     g->cpu_moe = e->cpu_moe;
     g->cpu_model = e->cpu_moe ? &e->cpu_model : NULL;
+    g->prefill_metal_phases = e->prefill_metal_phases;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->cpu_moe_layer[il] = e->cpu_moe_layer[il];
     }
@@ -17913,6 +18307,163 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
  * non-overlapping, and shrunk inward to page boundaries so adjacent small
  * tensors stay in the GPU-side mapping. Returns the number of entries
  * written into `out` (caller-allocated, capacity DS4_N_LAYER * 3). */
+/* Return the physical RAM in bytes, or 0 if it cannot be determined.  Used
+ * for sanity-checking --prefill-metal-phases at engine_open time so a too
+ * small N fails early with a clear message instead of mid-prefill. */
+static uint64_t ds4_physical_ram_bytes(void) {
+#if defined(__APPLE__)
+    uint64_t mem = 0;
+    size_t size = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &size, NULL, 0) == 0) return mem;
+    return 0;
+#else
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_size > 0) return (uint64_t)pages * (uint64_t)page_size;
+    return 0;
+#endif
+}
+
+/* Read `iogpu.wired_limit_mb` (macOS Metal wired-memory cap) and return it
+ * in bytes.  Returns 0 when the sysctl is unavailable or its value is 0
+ * (the latter is macOS's "auto, ~75% of RAM" default and is not a usable
+ * hard limit for our budgeting).  Linux always returns 0. */
+static uint64_t ds4_metal_wired_limit_bytes(void) {
+#if defined(__APPLE__)
+    /* iogpu.wired_limit_mb is exposed as a 32-bit int on macOS. */
+    int mb = 0;
+    size_t size = sizeof(mb);
+    if (sysctlbyname("iogpu.wired_limit_mb", &mb, &size, NULL, 0) != 0) return 0;
+    if (mb <= 0) return 0;
+    return (uint64_t)mb * 1024ull * 1024ull;
+#else
+    return 0;
+#endif
+}
+
+/* Parse a uint64_t MiB value from `env_name`.  Returns true and writes
+ * bytes to *out when the env var is present and parses cleanly.  Leaves
+ * *out untouched and returns false otherwise. */
+static bool ds4_env_mib_to_bytes(const char *env_name, uint64_t *out) {
+    const char *v = getenv(env_name);
+    if (!v || !v[0]) return false;
+    char *endp = NULL;
+    const long long parsed = strtoll(v, &endp, 10);
+    if (endp == v || parsed < 0) return false;
+    *out = (uint64_t)parsed * 1024ull * 1024ull;
+    return true;
+}
+
+/* Forward declaration: defined alongside the other phase helpers below.
+ * Needed here because engine_resolve_auto_phases consults the all-layers
+ * total via phases=1. */
+static uint64_t engine_compute_phase_max_routed_bytes(const ds4_engine *e,
+                                                       uint32_t phases);
+
+/* Resolve `--prefill-metal-phases auto` into a concrete N in [1, DS4_N_LAYER].
+ *
+ * Budget model:
+ *   cap     = min(iogpu.wired_limit_mb, hw.memsize)    (both non-zero)
+ *           = hw.memsize * 3 / 4                       (wired_limit unset)
+ *   budget  = cap - headroom                           (headroom = 14 GiB)
+ *   N       = ceil(total_routed_bytes / budget),  clamped to [1, DS4_N_LAYER]
+ *
+ * Env overrides (all in MiB):
+ *   DS4_PREFILL_METAL_PHASES_WIRED_LIMIT_MIB  -- replace `cap` directly
+ *   DS4_PREFILL_METAL_PHASES_HEADROOM_MIB     -- replace the 14 GiB headroom
+ *
+ * Returns 0 on unrecoverable error (sysctl unavailable, budget <= 0) after
+ * logging a diagnostic; caller must treat that as engine_open failure. */
+static uint32_t engine_resolve_auto_phases(const ds4_engine *e) {
+    const uint64_t total = engine_compute_phase_max_routed_bytes(e, 1);
+    if (total == 0) {
+        fprintf(stderr,
+                "ds4: --prefill-metal-phases auto: routed expert bytes are zero, "
+                "cannot auto-size; specify an explicit N\n");
+        return 0;
+    }
+
+    uint64_t cap;
+    if (!ds4_env_mib_to_bytes("DS4_PREFILL_METAL_PHASES_WIRED_LIMIT_MIB", &cap)) {
+        const uint64_t wired = ds4_metal_wired_limit_bytes();
+        const uint64_t phys  = ds4_physical_ram_bytes();
+        if (wired > 0 && phys > 0) {
+            cap = wired < phys ? wired : phys;
+        } else if (phys > 0) {
+            cap = phys * 3ull / 4ull;
+        } else {
+            cap = 0;
+        }
+    }
+    if (cap == 0) {
+        fprintf(stderr,
+                "ds4: --prefill-metal-phases auto: failed to determine Metal "
+                "wired-limit budget (sysctl iogpu.wired_limit_mb and hw.memsize "
+                "both unavailable); specify an explicit N or set "
+                "DS4_PREFILL_METAL_PHASES_WIRED_LIMIT_MIB\n");
+        return 0;
+    }
+
+    uint64_t headroom = (uint64_t)14 * 1024ull * 1024ull * 1024ull;
+    (void)ds4_env_mib_to_bytes("DS4_PREFILL_METAL_PHASES_HEADROOM_MIB", &headroom);
+    if (cap <= headroom) {
+        fprintf(stderr,
+                "ds4: --prefill-metal-phases auto: wired-limit cap %.2f GiB <= "
+                "headroom %.2f GiB; raise iogpu.wired_limit_mb or lower "
+                "DS4_PREFILL_METAL_PHASES_HEADROOM_MIB\n",
+                (double)cap / (1024.0 * 1024.0 * 1024.0),
+                (double)headroom / (1024.0 * 1024.0 * 1024.0));
+        return 0;
+    }
+    const uint64_t budget = cap - headroom;
+    uint64_t n = (total + budget - 1) / budget;
+    if (n == 0) n = 1;
+    if (n > (uint64_t)DS4_N_LAYER) n = DS4_N_LAYER;
+
+    fprintf(stderr,
+            "ds4: --prefill-metal-phases auto: resolved N=%u "
+            "(total=%.2f GiB, cap=%.2f GiB, headroom=%.2f GiB, "
+            "per-phase budget=%.2f GiB)\n",
+            (uint32_t)n,
+            (double)total    / (1024.0 * 1024.0 * 1024.0),
+            (double)cap      / (1024.0 * 1024.0 * 1024.0),
+            (double)headroom / (1024.0 * 1024.0 * 1024.0),
+            (double)budget   / (1024.0 * 1024.0 * 1024.0));
+    return (uint32_t)n;
+}
+
+/* Layer range covered by phase `phase_idx` when the prefill is split into
+ * `phases` evenly-sized buckets.  The last phase absorbs the remainder if
+ * DS4_N_LAYER is not divisible by `phases`. */
+static void ds4_phase_layer_range(uint32_t phases, uint32_t phase_idx,
+                                  uint32_t *start, uint32_t *end) {
+    const uint32_t per_phase = DS4_N_LAYER / phases;
+    *start = phase_idx * per_phase;
+    *end   = (phase_idx == phases - 1) ? DS4_N_LAYER : (phase_idx + 1) * per_phase;
+}
+
+/* Sum of routed-expert tensor bytes (gate + up + down) in the largest
+ * phase under an N-way split.  Used to bound the Metal residency that the
+ * prefill phase will request. */
+static uint64_t engine_compute_phase_max_routed_bytes(const ds4_engine *e,
+                                                       uint32_t phases) {
+    if (phases == 0) return 0;
+    uint64_t max_bytes = 0;
+    for (uint32_t p = 0; p < phases; p++) {
+        uint32_t start = 0, end = 0;
+        ds4_phase_layer_range(phases, p, &start, &end);
+        uint64_t phase_bytes = 0;
+        for (uint32_t il = start; il < end; il++) {
+            const ds4_layer_weights *L = &e->weights.layer[il];
+            phase_bytes += L->ffn_gate_exps->bytes;
+            phase_bytes += L->ffn_up_exps->bytes;
+            phase_bytes += L->ffn_down_exps->bytes;
+        }
+        if (phase_bytes > max_bytes) max_bytes = phase_bytes;
+    }
+    return max_bytes;
+}
+
 static size_t engine_collect_cpu_moe_routed_ranges(const ds4_engine *e,
                                                     ds4_byte_range  *out) {
     size_t nr = 0;
@@ -18029,6 +18580,75 @@ static bool engine_map_metal_views_with_routed_holes(ds4_engine *e) {
     free(routed);
     return ok;
 }
+
+/* Apply the prefill-phase routing mask to the engine + graph state and
+ * remap the Metal residency to host only this phase's routed experts.
+ * Layers inside [pstart, pend) are computed on Metal (cpu_moe_layer=false);
+ * all other layers have their routed-expert byte ranges excluded from the
+ * Metal residency set so the per-phase resident footprint stays under
+ * physical RAM.  Idempotent: re-calling with the same phase reapplies the
+ * same state. */
+static bool engine_activate_prefill_phase(ds4_engine *e, ds4_gpu_graph *g,
+                                          uint32_t phase_idx) {
+    if (!e || e->prefill_metal_phases == 0) return true;
+    if (phase_idx >= e->prefill_metal_phases) return false;
+
+    uint32_t pstart = 0, pend = 0;
+    ds4_phase_layer_range(e->prefill_metal_phases, phase_idx, &pstart, &pend);
+
+    /* Defensive: a stale cpu-moe worker must not hold readers to expert
+     * pages while we tell Metal to drop them from residency. */
+    if (g) cpu_moe_async_join(g);
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        e->cpu_moe_layer[il] = !(il >= pstart && il < pend);
+    }
+    if (g) metal_graph_apply_engine_runtime(g, e);
+
+    /* Phase swaps skip the synchronous touch-loop warmup so the 20-30 s
+     * fixed cost per swap drops out.  The first Metal kernel that reads a
+     * newly-resident page will pay an on-demand page fault, but that cost
+     * overlaps with subsequent kernel encoding and amortises across the
+     * phase's chunks.  Only the initial residency (engine_open) keeps the
+     * warmup so the very first prefill chunk doesn't stall the GPU. */
+    (void)ds4_gpu_set_skip_next_warmup(1);
+    if (!engine_map_metal_views_with_routed_holes(e)) {
+        fprintf(stderr,
+                "ds4: --prefill-metal-phases: failed to activate phase %u/%u\n",
+                phase_idx, e->prefill_metal_phases);
+        return false;
+    }
+    fprintf(stderr,
+            "ds4: --prefill-metal-phases: activated phase %u/%u (layers %u..%u)\n",
+            phase_idx, e->prefill_metal_phases, pstart, pend - 1);
+    return true;
+}
+
+/* Restore the gen-time routing state after prefill completes: all routed
+ * MoE flows through the CPU path so the OS page cache is free to hold as
+ * many routed expert pages as fit, supporting decode latency. */
+static bool engine_restore_gen_routing(ds4_engine *e, ds4_gpu_graph *g) {
+    if (!e || e->prefill_metal_phases == 0) return true;
+
+    if (g) cpu_moe_async_join(g);
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        e->cpu_moe_layer[il] = true;
+    }
+    if (g) metal_graph_apply_engine_runtime(g, e);
+
+    /* Gen-time mapping excludes the entire routed expert range from Metal
+     * residency, so the Metal side has nothing to warm.  Skip the touch
+     * loop to avoid the ~20-30 s pause before decode starts. */
+    (void)ds4_gpu_set_skip_next_warmup(1);
+    if (!engine_map_metal_views_with_routed_holes(e)) {
+        fprintf(stderr, "ds4: --prefill-metal-phases: failed to restore gen routing\n");
+        return false;
+    }
+    fprintf(stderr,
+            "ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)\n");
+    return true;
+}
 #endif
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
@@ -18040,6 +18660,25 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
     if ((opt->cpu_moe || opt->n_cpu_moe_layers > 0) && opt->backend != DS4_BACKEND_METAL) {
         fprintf(stderr, "ds4: CPU MoE is only supported on the Metal backend\n");
+        *out = NULL;
+        return 1;
+    }
+    if (opt->prefill_metal_phases < -1 || opt->prefill_metal_phases > DS4_N_LAYER) {
+        fprintf(stderr,
+                "ds4: --prefill-metal-phases must be \"auto\" (-1), 0 (disabled) or "
+                "1..%d\n", DS4_N_LAYER);
+        *out = NULL;
+        return 1;
+    }
+    if (opt->prefill_metal_phases != 0 && opt->backend != DS4_BACKEND_METAL) {
+        fprintf(stderr, "ds4: --prefill-metal-phases requires the Metal backend\n");
+        *out = NULL;
+        return 1;
+    }
+    if (opt->prefill_metal_phases != 0 &&
+        (opt->cpu_moe || opt->n_cpu_moe_layers > 0)) {
+        fprintf(stderr,
+                "ds4: --prefill-metal-phases is mutually exclusive with --cpu-moe / --n-cpu-moe\n");
         *out = NULL;
         return 1;
     }
@@ -18080,13 +18719,78 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     /* Resolve how many leading layers run their routed MoE on the CPU. Matches
      * llama.cpp's --n-cpu-moe semantics: the first N layers are offloaded.
      * The legacy --cpu-moe flag means "all layers". Either flag enables the
-     * CPU-side mmap. Range is validated at the top of this function. */
+     * CPU-side mmap. Range is validated at the top of this function.
+     *
+     * --prefill-metal-phases N implies "cpu-moe for all layers during gen",
+     * because the routed expert pages only need to be in the OS page cache
+     * for decode; the prefill path itself does its own Metal residency
+     * management per phase. */
     int n_cpu = opt->n_cpu_moe_layers;
     if (opt->cpu_moe && n_cpu == 0) n_cpu = DS4_N_LAYER;
+    if (opt->prefill_metal_phases != 0) n_cpu = DS4_N_LAYER;
 
     e->cpu_moe = (n_cpu > 0) && (opt->backend == DS4_BACKEND_METAL);
+    /* Resolve --prefill-metal-phases.  -1 means "auto": compute N from the
+     * Metal wired-limit so each phase's routed residency fits within the
+     * iogpu.wired_limit_mb cap.  Explicit N > 0 is taken as-is and verified
+     * by the sanity check below. */
+    if (opt->prefill_metal_phases == -1) {
+        const uint32_t auto_n = engine_resolve_auto_phases(e);
+        if (auto_n == 0) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        e->prefill_metal_phases = auto_n;
+    } else {
+        e->prefill_metal_phases =
+            (uint32_t)(opt->prefill_metal_phases > 0 ? opt->prefill_metal_phases : 0);
+    }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         e->cpu_moe_layer[il] = e->cpu_moe && (il < (uint32_t)n_cpu);
+    }
+
+    /* Sanity-check the per-phase Metal residency footprint up front so a
+     * too-small N fails at engine_open instead of mid-prefill.  The cap is
+     * the Metal wired-memory limit (iogpu.wired_limit_mb), bounded by the
+     * physical RAM; the headroom covers dense/attn weights, batch scratch,
+     * and the OS reserve.  Same env overrides as the auto resolver.  auto-
+     * computed N is expected to pass; the check is primarily for explicit
+     * N (where the user may have under-counted). */
+    if (e->prefill_metal_phases > 0) {
+        const uint64_t phase_max =
+            engine_compute_phase_max_routed_bytes(e, e->prefill_metal_phases);
+        uint64_t cap;
+        if (!ds4_env_mib_to_bytes("DS4_PREFILL_METAL_PHASES_WIRED_LIMIT_MIB", &cap)) {
+            const uint64_t wired = ds4_metal_wired_limit_bytes();
+            const uint64_t phys  = ds4_physical_ram_bytes();
+            if (wired > 0 && phys > 0) {
+                cap = wired < phys ? wired : phys;
+            } else if (phys > 0) {
+                cap = phys * 3ull / 4ull;
+            } else {
+                cap = 0;
+            }
+        }
+        uint64_t headroom = (uint64_t)14 * 1024ull * 1024ull * 1024ull;
+        (void)ds4_env_mib_to_bytes("DS4_PREFILL_METAL_PHASES_HEADROOM_MIB", &headroom);
+        if (cap > 0 && (phase_max + headroom) > cap) {
+            fprintf(stderr,
+                    "ds4: --prefill-metal-phases N=%u: largest phase needs "
+                    "%.2f GiB routed + %.2f GiB headroom = %.2f GiB > "
+                    "%.2f GiB Metal wired-limit cap. "
+                    "Raise iogpu.wired_limit_mb (sudo sysctl "
+                    "iogpu.wired_limit_mb=...), use a larger N, or set "
+                    "DS4_PREFILL_METAL_PHASES_WIRED_LIMIT_MIB.\n",
+                    e->prefill_metal_phases,
+                    (double)phase_max / (1024.0 * 1024.0 * 1024.0),
+                    (double)headroom  / (1024.0 * 1024.0 * 1024.0),
+                    (double)(phase_max + headroom) / (1024.0 * 1024.0 * 1024.0),
+                    (double)cap       / (1024.0 * 1024.0 * 1024.0));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
     }
     if (e->cpu_moe) {
         /* Routed expert weights are read from a second, MAP_PRIVATE mapping to
@@ -18117,6 +18821,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         model_warm_weights(&e->model, skip, n_skip);
         free(skip);
     }
+
     if (opt->mtp_path && opt->mtp_path[0]) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
@@ -18260,6 +18965,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         free(s);
         return 1;
     }
+    s->graph.engine = e;
     metal_graph_apply_engine_runtime(&s->graph, e);
     if (!metal_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
@@ -18445,7 +19151,46 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
 
     bool ok;
-    if (s->prefill_cap < (uint32_t)prompt->len) {
+    /* --prefill-metal-phases has a non-trivial fixed cost (~70-100 s for
+     * the routed residency swap plus on-demand page-in on the first
+     * chunk of each phase).  For short prompts that overhead dwarfs the
+     * Metal compute savings, so auto-disable the phase split below a
+     * tuned threshold and fall back to plain --cpu-moe for prefill.
+     * Measured crossover on M4 Max 128 GB with Q4 ds4flash (2026-05):
+     *   tokens   cpu-moe tps    phases=auto tps
+     *    1024        --              13.97
+     *    1536      23.06             19.45
+     *    2048      20.12             43.72
+     * so the threshold is set just below 1536 tok; phases pulls ahead by
+     * 2x at 2048 tok.  DS4_PREFILL_METAL_PHASES_MIN_TOKENS overrides. */
+    bool use_phases = e->prefill_metal_phases > 0;
+    if (use_phases) {
+        uint32_t min_tokens = 1500u;
+        const char *env = getenv("DS4_PREFILL_METAL_PHASES_MIN_TOKENS");
+        if (env && env[0]) {
+            char *endp = NULL;
+            const long v = strtol(env, &endp, 10);
+            if (endp != env && v >= 0 && v <= INT_MAX) {
+                min_tokens = (uint32_t)v;
+            }
+        }
+        if ((uint32_t)prompt->len < min_tokens) {
+            s->graph.prefill_metal_phases = 0;
+            use_phases = false;
+            fprintf(stderr,
+                    "ds4: --prefill-metal-phases: prompt has %d tokens < %u, "
+                    "falling back to cpu-moe for prefill (set "
+                    "DS4_PREFILL_METAL_PHASES_MIN_TOKENS to override)\n",
+                    prompt->len, min_tokens);
+        }
+    }
+    /* --prefill-metal-phases is only wired into the chunked path so far;
+     * force-route to it whenever phase splitting is requested, even for
+     * short prompts that would otherwise go through the layer-major
+     * shortcut.  The chunked path treats a single-chunk prompt
+     * identically to the raw_swa path when phases <= 1. */
+    const bool force_chunked = use_phases;
+    if (force_chunked || s->prefill_cap < (uint32_t)prompt->len) {
         ds4_sync_progress progress = {
             .session = s,
             .prompt = prompt,
@@ -18467,6 +19212,14 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         return 1;
     }
     metal_graph_shrink_cpu_moe_scratch(&s->graph);
+    /* Restore the gen-time routing (all routed MoE on CPU) and reconfigure
+     * Metal residency so the OS page cache can hold expert pages for the
+     * decode loop.  Only needed when the phase-split prefill path actually
+     * ran (use_phases above); the auto-disable fallback already left the
+     * engine in the gen-ready state. */
+    if (use_phases) {
+        (void)engine_restore_gen_routing(e, &s->graph);
+    }
     ds4_tokens_copy(&s->checkpoint, prompt);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;

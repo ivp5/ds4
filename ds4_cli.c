@@ -122,6 +122,15 @@ static void usage(FILE *fp) {
         "      remaining layers stay on the GPU. Matches llama.cpp's --n-cpu-moe\n"
         "      semantics. Tune N to trade VRAM for speed: N=10..20 is a typical\n"
         "      sweet spot for q4 on 128 GB. N=0 disables CPU MoE entirely.\n"
+        "  --prefill-metal-phases auto|N\n"
+        "      Run prefill on Metal in N evenly-split phases, swapping the routed\n"
+        "      expert residency between phases. Generation falls back to cpu-moe.\n"
+        "      \"auto\" sizes N from sysctl iogpu.wired_limit_mb (bounded by\n"
+        "      hw.memsize) so each phase fits the Metal wired-memory cap.\n"
+        "      Mutually exclusive with --cpu-moe / --n-cpu-moe. Metal backend only.\n"
+        "      Env overrides: DS4_PREFILL_METAL_PHASES_WIRED_LIMIT_MIB,\n"
+        "      DS4_PREFILL_METAL_PHASES_HEADROOM_MIB (default 14336),\n"
+        "      DS4_PREFILL_METAL_PHASES_MIN_TOKENS (default 1500).\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -1283,6 +1292,13 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.cpu_moe = true;
         } else if (!strcmp(arg, "--n-cpu-moe")) {
             c.engine.n_cpu_moe_layers = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--prefill-metal-phases")) {
+            const char *s = need_arg(&i, argc, argv, arg);
+            if (!strcmp(s, "auto")) {
+                c.engine.prefill_metal_phases = -1;
+            } else {
+                c.engine.prefill_metal_phases = parse_int(s, arg);
+            }
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {

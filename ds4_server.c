@@ -11808,6 +11808,15 @@ static void usage(FILE *fp) {
         "      Compute the routed MoE on the CPU only for the first N layers; the\n"
         "      remaining layers stay on the GPU. Matches llama.cpp's --n-cpu-moe\n"
         "      semantics. Tune N to trade VRAM for speed.\n"
+        "  --prefill-metal-phases auto|N\n"
+        "      Run prefill on Metal in N evenly-split phases, swapping the routed\n"
+        "      expert residency between phases. Generation falls back to cpu-moe.\n"
+        "      \"auto\" sizes N from sysctl iogpu.wired_limit_mb (bounded by\n"
+        "      hw.memsize) so each phase fits the Metal wired-memory cap.\n"
+        "      Mutually exclusive with --cpu-moe / --n-cpu-moe. Metal backend only.\n"
+        "      Env overrides: DS4_PREFILL_METAL_PHASES_WIRED_LIMIT_MIB,\n"
+        "      DS4_PREFILL_METAL_PHASES_HEADROOM_MIB (default 14336),\n"
+        "      DS4_PREFILL_METAL_PHASES_MIN_TOKENS (default 1500).\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
         "\n"
@@ -11978,6 +11987,13 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.cpu_moe = true;
         } else if (!strcmp(arg, "--n-cpu-moe")) {
             c.engine.n_cpu_moe_layers = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--prefill-metal-phases")) {
+            const char *s = need_arg(&i, argc, argv, arg);
+            if (!strcmp(s, "auto")) {
+                c.engine.prefill_metal_phases = -1;
+            } else {
+                c.engine.prefill_metal_phases = parse_int_arg(s, arg);
+            }
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr);
