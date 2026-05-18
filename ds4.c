@@ -19154,18 +19154,19 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     /* --prefill-metal-phases has a non-trivial fixed cost (~70-100 s for
      * the routed residency swap plus on-demand page-in on the first
      * chunk of each phase).  For short prompts that overhead dwarfs the
-     * Metal compute savings, so auto-disable the phase split below a
-     * tuned threshold and fall back to plain --cpu-moe for prefill.
-     * Measured crossover on M4 Max 128 GB with Q4 ds4flash (2026-05):
-     *   tokens   cpu-moe tps    phases=auto tps
-     *    1024        --              13.97
-     *    1536      23.06             19.45
-     *    2048      20.12             43.72
-     * so the threshold is set just below 1536 tok; phases pulls ahead by
-     * 2x at 2048 tok.  DS4_PREFILL_METAL_PHASES_MIN_TOKENS overrides. */
+     * Metal compute savings; on M4 Max 128 GB with Q4 ds4flash phases
+     * only pulls ahead of cpu-moe at ~2048 tok (measured 2026-05).
+     *
+     * Single-shot chat benefits from auto-falling-back to cpu-moe below a
+     * threshold, but agent flows (request -> prefill -> gen -> prefill -> ...)
+     * see only the first prompt's size, and a small bootstrap prompt will
+     * leave the engine in cpu-moe state so that subsequent 8k+ tool prompts
+     * never get the phase-split benefit.  Default the threshold to 0 (always
+     * use phases when --prefill-metal-phases is set); chat-style runs can
+     * opt back in with DS4_PREFILL_METAL_PHASES_MIN_TOKENS=1500. */
     bool use_phases = e->prefill_metal_phases > 0;
     if (use_phases) {
-        uint32_t min_tokens = 1500u;
+        uint32_t min_tokens = 0u;
         const char *env = getenv("DS4_PREFILL_METAL_PHASES_MIN_TOKENS");
         if (env && env[0]) {
             char *endp = NULL;
