@@ -4452,13 +4452,21 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
     if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) return 0;
 
     @autoreleasepool {
+        /* Drain any in-flight command buffer that may still reference old
+         * model views before we release them. Without this, releasing the
+         * old MTLBuffer would be deferred until the command buffer drops
+         * its reference, leaving us with the old views and the new views
+         * overlapping the same mmap range — exactly the accumulation that
+         * pushed cpt_mapcnt past 2048 on the 145 GiB GGUF and panicked the
+         * kernel. */
+        (void)ds4_gpu_wait_pending_command_buffers("set_model_map_range");
         ds4_gpu_model_residency_clear();
+        ds4_gpu_model_views_clear();
         g_model_map_ptr = model_map;
         g_model_map_size = model_size;
         g_model_mapped_offset = map_offset;
         g_model_mapped_size = map_size;
-        if (!ds4_gpu_model_views_cover_range(model_map, model_size, map_offset, map_size) &&
-            !ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size)) {
+        if (!ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size)) {
             ds4_gpu_model_residency_clear();
             return 0;
         }
@@ -4483,7 +4491,13 @@ int ds4_gpu_set_model_map_ranges(
     if (!model_map || model_size == 0 || !map_offsets || !map_sizes || n_ranges == 0) return 0;
 
     @autoreleasepool {
+        /* Same rationale as set_model_map_range: drain in-flight command
+         * buffers and drop the old MTLBuffer views before remapping so we
+         * never have two generations of overlapping views referencing the
+         * same mmap range at once. */
+        (void)ds4_gpu_wait_pending_command_buffers("set_model_map_ranges");
         ds4_gpu_model_residency_clear();
+        ds4_gpu_model_views_clear();
         g_model_map_ptr = model_map;
         g_model_map_size = model_size;
 
