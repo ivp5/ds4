@@ -19132,6 +19132,13 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             }
             ds4_tokens_copy(&s->checkpoint, prompt);
             s->checkpoint_valid = true;
+            /* Match the full-prefill branch below: release the Metal residency
+             * that engine_activate_prefill_phase() built inside the chunked
+             * range so gen falls back to the all-routed-on-CPU layout and the
+             * OS page cache regains room for expert pages. */
+            if (e->prefill_metal_phases > 0) {
+                (void)engine_restore_gen_routing(e, &s->graph);
+            }
             return 0;
         }
 
