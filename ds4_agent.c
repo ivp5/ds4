@@ -67,6 +67,7 @@ typedef enum {
     AGENT_WORKER_PREFILL,
     AGENT_WORKER_GENERATING,
     AGENT_WORKER_COMPACTING,
+    AGENT_WORKER_SAVING,
     AGENT_WORKER_ERROR,
     AGENT_WORKER_STOPPED,
 } agent_worker_state;
@@ -103,6 +104,7 @@ typedef struct {
     bool stop;
     bool interrupt;
     bool queued_user_pending;
+    bool save_requested;
     int progress_base;
     char *cmd_text;
     agent_status status;
@@ -2550,14 +2552,12 @@ static bool agent_worker_needs_save(agent_worker *w) {
     return yes;
 }
 
-/* Save the current session under its rendered-text SHA.  Before saving, sync the
- * live KV to the transcript so the file contains both the exact text and a
- * resumable checkpoint. */
-static bool agent_worker_save_session(agent_worker *w, char *err, size_t err_len) {
-    if (!worker_is_idle(w)) {
-        snprintf(err, err_len, "model is busy");
-        return false;
-    }
+/* Save the current session under its rendered-text SHA.  The worker owns the
+ * live KV, so busy /save requests are deferred until a stable append-only point
+ * and then executed by the worker thread. */
+static bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
+                                          int *tokens_out,
+                                          char *err, size_t err_len) {
     if (!agent_worker_has_user_session(w)) {
         snprintf(err, err_len, "nothing to save");
         return false;
@@ -2582,17 +2582,29 @@ static bool agent_worker_save_session(agent_worker *w, char *err, size_t err_len
     char *path = agent_kv_path_for_sha(w->cache_dir, sha);
 
     bool ok = agent_kv_save_path(w, path, &w->transcript,
-                                 "agent-session", NULL, err, err_len);
+                                 "agent-session", sha_out, err, err_len);
     if (ok) {
         agent_kv_delete_prefix_sessions(w, sha, text, text_len);
         pthread_mutex_lock(&w->mu);
         w->session_dirty = false;
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
-        printf("saved session %.8s (%d tokens)\n", sha, w->transcript.len);
+        if (tokens_out) *tokens_out = w->transcript.len;
     }
     free(path);
     free(text);
+    return ok;
+}
+
+static bool agent_worker_save_session(agent_worker *w, char *err, size_t err_len) {
+    if (!worker_is_idle(w)) {
+        snprintf(err, err_len, "model is busy");
+        return false;
+    }
+    char sha[41];
+    int tokens = 0;
+    bool ok = agent_worker_save_session_now(w, sha, &tokens, err, err_len);
+    if (ok) printf("saved session %.8s (%d tokens)\n", sha, tokens);
     return ok;
 }
 
@@ -5523,6 +5535,35 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
     }
 }
 
+static void worker_request_save(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    w->save_requested = true;
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
+static bool worker_take_save_requested(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    bool requested = w->save_requested;
+    w->save_requested = false;
+    pthread_mutex_unlock(&w->mu);
+    return requested;
+}
+
+static void worker_run_deferred_save(agent_worker *w) {
+    if (!worker_take_save_requested(w)) return;
+    agent_set_status(w, AGENT_WORKER_SAVING);
+    char err[160] = {0};
+    char sha[41];
+    int tokens = 0;
+    if (agent_worker_save_session_now(w, sha, &tokens, err, sizeof(err)))
+        agent_publishf(w, "\nsaved session %.8s (%d tokens)\n", sha, tokens);
+    else
+        agent_publishf(w, "\nsave failed: %s\n", err[0] ? err : "unknown error");
+    agent_set_status(w, AGENT_WORKER_IDLE);
+}
+
 /* Worker thread entry point.  The UI thread submits plain user text; this
  * thread owns all DS4 session mutation, tool execution, and compaction. */
 static void *worker_main(void *arg) {
@@ -5540,10 +5581,16 @@ static void *worker_main(void *arg) {
 
     while (true) {
         pthread_mutex_lock(&w->mu);
-        while (!w->stop && !w->cmd_text) pthread_cond_wait(&w->cond, &w->mu);
+        while (!w->stop && !w->cmd_text && !w->save_requested)
+            pthread_cond_wait(&w->cond, &w->mu);
         if (w->stop) {
             pthread_mutex_unlock(&w->mu);
             break;
+        }
+        if (!w->cmd_text && w->save_requested) {
+            pthread_mutex_unlock(&w->mu);
+            worker_run_deferred_save(w);
+            continue;
         }
         char *cmd = w->cmd_text;
         w->cmd_text = NULL;
@@ -5551,6 +5598,7 @@ static void *worker_main(void *arg) {
 
         worker_run_turn(w, cmd);
         free(cmd);
+        worker_run_deferred_save(w);
     }
 
     agent_set_status(w, AGENT_WORKER_STOPPED);
@@ -5760,6 +5808,9 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
     case AGENT_WORKER_COMPACTING:
         snprintf(buf, len, "ctx %s/%s | COMPACTING summary %d tokens %.1f t/s",
                  used, total_ctx, st->generated, st->gen_tps);
+        break;
+    case AGENT_WORKER_SAVING:
+        snprintf(buf, len, "ctx %s/%s | saving session", used, total_ctx);
         break;
     case AGENT_WORKER_ERROR:
         snprintf(buf, len, "ctx %s/%s | error: %s", used, total_ctx,
@@ -6906,25 +6957,30 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 bool had_output_line_open = editor.output_line_open;
                 int saved_output_col = editor.output_col;
                 editor_stop(&editor);
+                bool busy = !worker_is_idle(&worker);
                 if (!cmd[0]) {
                     /* Empty input: just reopen the editor. */
-                } else if (!worker_is_idle(&worker)) {
-                    agent_prompt_queue_push(&queue, cmd);
-                    worker_set_queued_user_pending(&worker, true);
+                } else if (!strcmp(cmd, "/help")) {
+                    runtime_help();
+                } else if (!strcmp(cmd, "/save")) {
+                    if (busy) {
+                        worker_request_save(&worker);
+                        printf("save scheduled at next safe point\n");
+                    } else {
+                        char err[160] = {0};
+                        if (!agent_worker_save_session(&worker, err, sizeof(err)))
+                            printf("save failed: %s\n", err);
+                    }
+                } else if (!strcmp(cmd, "/list")) {
+                    agent_worker_list_sessions(&worker);
+                } else if (cmd[0] == '/' && busy) {
+                    printf("command requires the model to be idle: %s\n", cmd);
                 } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
                     editor_restore_terminal_layout(&editor);
                     if (agent_maybe_save_before_leaving_session(&worker)) {
                         exit_save_handled = true;
                         running = false;
                     }
-                } else if (!strcmp(cmd, "/help")) {
-                    runtime_help();
-                } else if (!strcmp(cmd, "/save")) {
-                    char err[160] = {0};
-                    if (!agent_worker_save_session(&worker, err, sizeof(err)))
-                        printf("save failed: %s\n", err);
-                } else if (!strcmp(cmd, "/list")) {
-                    agent_worker_list_sessions(&worker);
                 } else if (!strcmp(cmd, "/new")) {
                     editor_restore_terminal_layout(&editor);
                     if (agent_maybe_save_before_leaving_session(&worker)) {
@@ -6968,6 +7024,9 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         printf("history failed: %s\n", err);
                 } else if (cmd[0] == '/') {
                     printf("unknown command: %s\n", cmd);
+                } else if (busy) {
+                    agent_prompt_queue_push(&queue, cmd);
+                    worker_set_queued_user_pending(&worker, true);
                 } else {
                     linenoiseHistoryAdd(cmd);
                     linenoiseHistorySave(hist);
