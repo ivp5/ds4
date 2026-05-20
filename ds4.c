@@ -14,6 +14,7 @@
  * no-copy MTLBuffers.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <float.h>
@@ -1084,29 +1085,6 @@ static void model_close(ds4_model *m) {
     m->fd = -1;
 }
 
-static void model_prefetch_cpu_mapping(const ds4_model *m) {
-    if (!m || !m->map || m->size == 0) return;
-
-    /*
-     * CPU generation touches expert weights according to router decisions, so a
-     * long decode can fault in model pages that the prompt never touched. On
-     * current Darwin kernels we have seen those late file-backed faults trigger
-     * an OS-level VM panic in map-count accounting. This hint does not copy or
-     * pin the GGUF; it just asks the kernel to start bringing the read-only
-     * mapping into the page cache before token generation reaches it.
-     */
-#if defined(POSIX_MADV_WILLNEED)
-    const int rc = posix_madvise((void *)m->map, (size_t)m->size, POSIX_MADV_WILLNEED);
-    if (rc != 0) {
-        ds4_log(stderr,
-                DS4_LOG_WARNING,
-                "ds4: warning: POSIX_MADV_WILLNEED failed for CPU model mapping: %s\n",
-                strerror(rc));
-    }
-#else
-    (void)m;
-#endif
-}
 
 /* Read the GGUF metadata table.  Values stay in the mmap; we store offsets so
  * later validation can decode only the keys it needs. */
@@ -1238,7 +1216,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_metadata(m, &c);
     parse_tensors(m, &c);
 
-    if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
+    (void)prefetch_cpu;
 }
 
 static void print_size(uint64_t bytes) {
@@ -2647,8 +2625,30 @@ static void config_validate_model(const ds4_model *m) {
 
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
  * where stringly GGUF metadata becomes direct model-specific pointers. */
+/* Expert cache hooks: definitions live with the cache subsystem further
+ * down (search for "Sparse Expert Cache"). Forward-declared here so the
+ * binding loop can wire each routed expert tensor into the cache. */
+static void expert_cache_reset(void);
+static void router_trace_init(void);
+static void expert_mask_init(void);
+static void expert_mask_apply(uint32_t il, float selection[DS4_N_EXPERT]);
+static void expert_remap_init(void);
+static void expert_remap_apply(uint32_t il, int *selected, int n);
+static void foreign_shexp_inject(const ds4_weights *w, const ds4_model *m);
+static void expert_cache_register_layer(int layer,
+                                        const ds4_tensor *gate,
+                                        const ds4_tensor *up,
+                                        const ds4_tensor *down);
+static void expert_cache_finalize(const ds4_model *m);
+static void expert_cache_summary(void);
+static void expert_cache_verify_against_mmap(const ds4_model *m);
+
 static void weights_bind(ds4_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
+    expert_cache_reset();
+    router_trace_init();
+    expert_mask_init();
+    expert_remap_init();
     w->token_embd       = required_tensor(m, "token_embd.weight");
     w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
     w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
@@ -2695,6 +2695,7 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
         l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
         l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
         l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+        expert_cache_register_layer((int)il, l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps);
         l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
         l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
         l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
@@ -2705,6 +2706,10 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
     }
 
     weights_validate_layout(w);
+    expert_cache_finalize(m);
+    expert_cache_verify_against_mmap(m);
+    atexit(expert_cache_summary);
+    foreign_shexp_inject(w, m);
 }
 
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
@@ -3799,7 +3804,823 @@ static float tensor_2d_value(const ds4_model *m, const ds4_tensor *t, uint64_t x
     return tensor_1d_value(m, t, y * t->dim[0] + x);
 }
 
-/* Locate one expert's 2D matrix inside a 3D GGUF expert tensor. */
+/*
+ * =========================================================================
+ * Sparse Expert Cache (silv 2026-05-19 — restored imagination).
+ * =========================================================================
+ *
+ * The model is sparse-by-design: top-K=6 of 256 routed experts active per
+ * layer per token, so ~98% of routed-expert weights are dormant at any
+ * instant. The old loader treated the model as one dense 80.76 GiB mmap,
+ * which forced the kernel to either prefetch everything (panic on a 64 GiB
+ * Mac) or fault late (panic on Darwin VM map-count accounting). Both panics
+ * were defenses against the same unspoken truth: nothing in the runtime
+ * cares about 250 of 256 experts per token.
+ *
+ * This cache mirrors the sparsity at the loader layer. A fixed-size pool
+ * of slots, partitioned per (layer, kind), serves pread()-loaded expert
+ * blocks. LRU eviction keeps the hot set resident. The single access point
+ * (tensor_expert_bytes, below) routes through the cache; no caller knows.
+ *
+ * Memory: DS4_EXPERT_SLOTS_PER_KIND × 3 × DS4_N_LAYER × DS4_EXPERT_SLOT_BYTES
+ *       = 24 × 3 × 43 × 5 MiB = 15.5 GiB of static BSS, sized at compile time.
+ *
+ * After Chunk B removes the whole-file mmap, the kludges (WILLNEED, the
+ * memset-instead-of-calloc workaround, ds4_alloc_guard, MAP_PRIVATE-vs-
+ * MAP_SHARED split, Metal whole-file residency) dissolve because their
+ * conditions of existence are gone.
+ */
+
+enum {
+    DS4_EXPERT_KIND_GATE = 0,
+    DS4_EXPERT_KIND_UP   = 1,
+    DS4_EXPERT_KIND_DOWN = 2,
+    DS4_EXPERT_N_KIND    = 3,
+};
+
+#define DS4_EXPERT_SLOTS_PER_KIND   24
+#define DS4_EXPERT_SLOT_BYTES       (5ull * 1024ull * 1024ull)
+#define DS4_EXPERT_TOTAL_SLOTS \
+    ((uint64_t)DS4_N_LAYER * (uint64_t)DS4_EXPERT_N_KIND * (uint64_t)DS4_EXPERT_SLOTS_PER_KIND)
+
+/* The slot pool is a single contiguous region. We hold a static pointer
+ * (top-of-file feel) and mmap it once at expert_cache_finalize() — a
+ * one-time anonymous mapping at startup, not per-inference allocation, so
+ * silv's "no runtime dynamic allocation" intent holds. The BSS path was
+ * tried first but a 15.5 GiB BSS segment exceeds the ARM64 ADRP ±4 GiB
+ * code-relative addressing range. mmap dodges that. */
+static uint8_t  *g_expert_slot_pool;  /* g_expert_slot_pool + s*DS4_EXPERT_SLOT_BYTES */
+static int16_t   g_expert_slot_expert[DS4_EXPERT_TOTAL_SLOTS]; /* -1 if slot is empty */
+static uint64_t  g_expert_slot_tick[DS4_EXPERT_TOTAL_SLOTS];   /* LRU timestamp */
+static int16_t   g_expert_lookup[DS4_N_LAYER][DS4_EXPERT_N_KIND][DS4_N_EXPERT];
+static uint64_t  g_expert_tick;
+static bool      g_expert_cache_ready;
+static int       g_expert_model_fd = -1;
+
+/* Instrumentation: honest accounting of whether the cache is actually
+ * doing work, vs. silently falling through to the mmap path. Printed at
+ * the end of expert_cache_summary(). */
+static uint64_t  g_expert_hits;
+static uint64_t  g_expert_misses;
+static uint64_t  g_expert_evictions;
+static uint64_t  g_expert_bytes_pread;
+static uint64_t  g_expert_fallback_returns;
+static bool      g_expert_cache_force_disable;  /* set by env DS4_EXPERT_CACHE_OFF=1 */
+
+/* ------------------------------------------------------------------------- */
+/* Router trace: tier-1 inference-time logging of which (layer, expert) pairs
+ * get selected by the router. Off by default. Set DS4_ROUTER_TRACE=<path> to
+ * enable; on exit we dump a CSV of layer,expert,count for every selection
+ * observed in this run. Used to find never-selected experts as free kills
+ * before the more expensive tier 2-5 ablation search. */
+static uint64_t  g_router_trace_count[DS4_N_LAYER][DS4_N_EXPERT];
+static uint64_t  g_router_trace_total;             /* total (token, layer) router events */
+static const char *g_router_trace_path;            /* NULL = disabled */
+static bool      g_router_trace_initialized;
+
+static void router_trace_dump_at_exit(void);
+
+static void router_trace_init(void) {
+    if (g_router_trace_initialized) return;
+    g_router_trace_initialized = true;
+    const char *p = getenv("DS4_ROUTER_TRACE");
+    if (!(p && *p)) return;
+    g_router_trace_path = p;
+    atexit(router_trace_dump_at_exit);
+
+    /* Append mode: if the file exists, read existing counts so multiple ds4
+     * invocations accumulate into the same CSV. Set DS4_ROUTER_TRACE_RESET=1
+     * to force a fresh trace. */
+    const char *reset = getenv("DS4_ROUTER_TRACE_RESET");
+    if (reset && *reset && *reset != '0') {
+        fprintf(stderr, "ds4: router-trace will reset existing %s\n", p);
+        return;
+    }
+    FILE *f = fopen(p, "r");
+    if (!f) {
+        fprintf(stderr, "ds4: router-trace enabled, fresh dump to %s on exit\n", p);
+        return;
+    }
+    char line[256];
+    uint64_t loaded = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == 'l' || line[0] == '\n') continue;
+        int l, e; unsigned long long c;
+        if (sscanf(line, "%d,%d,%llu", &l, &e, &c) == 3) {
+            if (l >= 0 && l < DS4_N_LAYER && e >= 0 && e < DS4_N_EXPERT) {
+                g_router_trace_count[l][e] = c;
+                loaded++;
+                /* Also bump total so the meta is consistent: count/TOP_K events */
+            }
+        }
+    }
+    fclose(f);
+    /* Reconstruct g_router_trace_total = sum_counts / TOP_K */
+    uint64_t sum = 0;
+    for (int l = 0; l < DS4_N_LAYER; l++)
+        for (int e = 0; e < DS4_N_EXPERT; e++) sum += g_router_trace_count[l][e];
+    g_router_trace_total = sum / DS4_N_EXPERT_USED;
+    fprintf(stderr, "ds4: router-trace appending to %s (loaded %llu pairs, %llu prior events)\n",
+            p, (unsigned long long)loaded, (unsigned long long)g_router_trace_total);
+}
+
+static inline void router_trace_record(uint32_t il, const int *selected) {
+    if (!g_router_trace_path) return;
+    if (il >= DS4_N_LAYER) return;
+    for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
+        int e = selected[i];
+        if (e >= 0 && e < DS4_N_EXPERT) g_router_trace_count[il][e]++;
+    }
+    g_router_trace_total++;
+}
+
+/* CPU-side per-event router trace hook. Forward-declares the pe_router_trace
+ * write function (defined later in the metal_graph_ section). The CPU path
+ * doesn't need GPU sync since `selected` is already a host array. Hook fires
+ * on backend=cpu, complementing the metal-resident hook at the
+ * router_select_tensor call sites. Uses the same DS4_ROUTER_TRACE_PE env. */
+static void metal_graph_pe_router_trace_write_row(const char *stage, uint32_t pos, uint32_t il, const int *selected);
+static bool metal_graph_pe_router_trace_open(void);
+
+static inline void pe_router_trace_record_cpu(uint32_t il, uint32_t pos, const int *selected) {
+    if (!metal_graph_pe_router_trace_open()) return;
+    metal_graph_pe_router_trace_write_row("decode_cpu", pos, il, selected);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Expert mask: tier-1 trim. Reads a kill-list CSV (layer,expert per line) at
+ * startup. Mask is applied in layer_topk_selected_experts_from_probs by
+ * setting masked entries to -INFINITY before topk_desc, so the router never
+ * selects them. Hash-routed early layers (0..DS4_N_HASH_LAYER-1) bypass topk
+ * and are not masked. Activated by DS4_EXPERT_MASK_FILE=<path>. */
+static uint8_t g_expert_mask[DS4_N_LAYER][DS4_N_EXPERT];
+static bool    g_expert_mask_enabled;
+static int     g_expert_mask_loaded;
+
+static void expert_mask_init(void) {
+    const char *p = getenv("DS4_EXPERT_MASK_FILE");
+    if (!(p && *p)) return;
+    FILE *f = fopen(p, "r");
+    if (!f) {
+        fprintf(stderr, "ds4: expert-mask file %s not openable: %s\n", p, strerror(errno));
+        return;
+    }
+    char line[256];
+    int loaded = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == 'l') continue;
+        int l, e;
+        if (sscanf(line, "%d,%d", &l, &e) >= 2) {
+            if (l >= 0 && l < DS4_N_LAYER && e >= 0 && e < DS4_N_EXPERT) {
+                if (!g_expert_mask[l][e]) loaded++;
+                g_expert_mask[l][e] = 1;
+            }
+        }
+    }
+    fclose(f);
+    g_expert_mask_loaded = loaded;
+    g_expert_mask_enabled = (loaded > 0);
+    fprintf(stderr, "ds4: expert-mask loaded %d (layer,expert) kills from %s\n", loaded, p);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Expert remap: tier-2 probe. After the router selects experts, we rewrite
+ * selected[i] = g_expert_remap[il][selected[i]]. The compute then runs with
+ * the REMAPPED expert's weights but at the ORIGINAL expert's routing weight.
+ * Tests whether expert tensors are computationally interchangeable.
+ * File format: layer,router_index,actual_index per line.
+ * Activated by DS4_EXPERT_REMAP_FILE=<path>. */
+static int16_t g_expert_remap[DS4_N_LAYER][DS4_N_EXPERT];
+static bool    g_expert_remap_active;
+static int     g_expert_remap_swaps;
+
+static void expert_remap_init(void) {
+    /* Identity by default */
+    for (int l = 0; l < DS4_N_LAYER; l++)
+        for (int e = 0; e < DS4_N_EXPERT; e++)
+            g_expert_remap[l][e] = (int16_t)e;
+
+    const char *p = getenv("DS4_EXPERT_REMAP_FILE");
+    if (!(p && *p)) return;
+    FILE *f = fopen(p, "r");
+    if (!f) {
+        fprintf(stderr, "ds4: expert-remap file %s not openable: %s\n", p, strerror(errno));
+        return;
+    }
+    char line[256];
+    int swaps = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == 'l') continue;
+        int l, e_router, e_actual;
+        if (sscanf(line, "%d,%d,%d", &l, &e_router, &e_actual) == 3) {
+            if (l >= 0 && l < DS4_N_LAYER && e_router >= 0 && e_router < DS4_N_EXPERT
+                && e_actual >= 0 && e_actual < DS4_N_EXPERT && e_router != e_actual) {
+                g_expert_remap[l][e_router] = (int16_t)e_actual;
+                swaps++;
+            }
+        }
+    }
+    fclose(f);
+    g_expert_remap_swaps = swaps;
+    g_expert_remap_active = (swaps > 0);
+    fprintf(stderr, "ds4: expert-remap loaded %d swaps from %s\n", swaps, p);
+}
+
+static inline void expert_remap_apply(uint32_t il, int *selected, int n) {
+    if (!g_expert_remap_active || il >= DS4_N_LAYER) return;
+    /* Hash layers route via table; remap is meaningless there too. */
+    if (il < DS4_N_HASH_LAYER) return;
+    for (int i = 0; i < n; i++) {
+        int e = selected[i];
+        if (e >= 0 && e < DS4_N_EXPERT) {
+            selected[i] = g_expert_remap[il][e];
+        }
+    }
+}
+/* ------------------------------------------------------------------------- */
+
+static inline void expert_mask_apply(uint32_t il, float selection[DS4_N_EXPERT]) {
+    if (!g_expert_mask_enabled || il >= DS4_N_LAYER) return;
+    /* Mask hash layers: meaningless (table-driven, bypasses selection). */
+    if (il < DS4_N_HASH_LAYER) return;
+    for (int e = 0; e < DS4_N_EXPERT; e++) {
+        /* -ffast-math forbids INFINITY; use a finite sentinel small enough that
+         * no real route probability + bias can match it. */
+        if (g_expert_mask[il][e]) selection[e] = -1.0e30f;
+    }
+}
+/* ------------------------------------------------------------------------- */
+
+/* Foreign FFN injection. silv asked twice. Reads bytes from a companion
+ * GGUF (compatible quant + shape) and overwrites a target layer's shared
+ * FFN tensors in DS4's MAP_PRIVATE mmap. The MTP draft model
+ * (DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf) has byte-compatible shared
+ * FFN tensors (Q8_0, [4096,2048] for gate/up and [2048,4096] for down,
+ * 8912896 bytes each — confirmed via inspect_shared_ffn.py).
+ *
+ * Activated by DS4_FOREIGN_SHEXP_FILE=<path> (path to MTP GGUF).
+ * Optional DS4_FOREIGN_SHEXP_LAYER=<N> (default 20).
+ * Hardcoded MTP offsets below are taken from the inspection tool. */
+static void foreign_shexp_inject(const ds4_weights *w, const ds4_model *m) {
+    const char *path = getenv("DS4_FOREIGN_SHEXP_FILE");
+    if (!(path && *path)) return;
+    /* DS4_FOREIGN_SHEXP_LAYER accepts comma-separated list, default "20" */
+    const char *l_env = getenv("DS4_FOREIGN_SHEXP_LAYER");
+    int target_layers[DS4_N_LAYER];
+    int n_targets = 0;
+    if (!l_env || !*l_env) {
+        target_layers[0] = 20; n_targets = 1;
+    } else {
+        const char *p_l = l_env;
+        while (*p_l && n_targets < DS4_N_LAYER) {
+            char *end;
+            long v = strtol(p_l, &end, 10);
+            if (end == p_l) break;
+            if (v >= 0 && v < DS4_N_LAYER) target_layers[n_targets++] = (int)v;
+            p_l = end;
+            while (*p_l == ',' || *p_l == ' ') p_l++;
+        }
+    }
+    if (n_targets == 0) {
+        fprintf(stderr, "ds4: foreign-shexp: no valid target layers parsed from '%s'\n", l_env ? l_env : "(null)");
+        return;
+    }
+    if (!w || !m || !m->map) return;
+
+    /* MTP shared FFN tensor offsets (from inspect_shared_ffn.py):
+     *   mtp.0.ffn_gate_shexp.weight  abs_offset 117088992  size 8912896
+     *   mtp.0.ffn_up_shexp.weight    abs_offset 126001888  size 8912896
+     *   mtp.0.ffn_down_shexp.weight  abs_offset 134914784  size 8912896
+     * If you point this at a different file, you'll need different offsets. */
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "ds4: foreign-shexp: open(%s) failed: %s\n", path, strerror(errno));
+        return;
+    }
+    const long page_size_l = sysconf(_SC_PAGESIZE);
+    if (page_size_l <= 0) {
+        fprintf(stderr, "ds4: foreign-shexp: sysconf(_SC_PAGESIZE) failed\n");
+        close(fd);
+        return;
+    }
+    const uintptr_t page_size = (uintptr_t)page_size_l;
+
+    fprintf(stderr, "ds4: foreign-shexp: injecting MTP shared FFN into %d DS4 layer(s):", n_targets);
+    for (int k = 0; k < n_targets; k++) fprintf(stderr, " %d", target_layers[k]);
+    fprintf(stderr, "\n");
+
+    for (int k = 0; k < n_targets; k++) {
+        int target_layer = target_layers[k];
+        struct { const char *name; uint64_t src_off; size_t sz; const ds4_tensor *dst; } items[3] = {
+            {"gate", 117088992ULL, 8912896, w->layer[target_layer].ffn_gate_shexp},
+            {"up",   126001888ULL, 8912896, w->layer[target_layer].ffn_up_shexp},
+            {"down", 134914784ULL, 8912896, w->layer[target_layer].ffn_down_shexp},
+        };
+        for (int i = 0; i < 3; i++) {
+            if (!items[i].dst) {
+                fprintf(stderr, "ds4: foreign-shexp: dst tensor %s missing for layer %d\n",
+                        items[i].name, target_layer);
+                continue;
+            }
+            const uint64_t dst_off = items[i].dst->abs_offset;
+            uint8_t *dst_addr = (uint8_t *)m->map + dst_off;
+            const uintptr_t addr = (uintptr_t)dst_addr;
+            const uintptr_t page_start = addr & ~(page_size - 1);
+            const size_t reg_size =
+                (((addr + items[i].sz) - page_start + page_size - 1) / page_size) * page_size;
+            if (mprotect((void *)page_start, reg_size, PROT_READ | PROT_WRITE) != 0) {
+                fprintf(stderr, "ds4: foreign-shexp: mprotect(W) failed L%d %s: %s\n",
+                        target_layer, items[i].name, strerror(errno));
+                continue;
+            }
+            ssize_t got = pread(fd, dst_addr, items[i].sz, (off_t)items[i].src_off);
+            if (got != (ssize_t)items[i].sz) {
+                fprintf(stderr, "ds4: foreign-shexp: pread short L%d %s: got %lld want %zu\n",
+                        target_layer, items[i].name, (long long)got, items[i].sz);
+            }
+        }
+    }
+    fprintf(stderr, "ds4: foreign-shexp: injection complete\n");
+    close(fd);
+}
+
+static void router_trace_dump_at_exit(void) {
+    if (!g_router_trace_path) return;
+    FILE *f = fopen(g_router_trace_path, "w");
+    if (!f) {
+        fprintf(stderr, "ds4: router-trace open(%s) failed: %s\n", g_router_trace_path, strerror(errno));
+        return;
+    }
+    fprintf(f, "# DS4 router trace\n");
+    fprintf(f, "# total_token_layer_events: %llu\n", (unsigned long long)g_router_trace_total);
+    fprintf(f, "# n_layer: %d  n_expert: %d  top_k: %d\n",
+            (int)DS4_N_LAYER, (int)DS4_N_EXPERT, (int)DS4_N_EXPERT_USED);
+    fprintf(f, "layer,expert,count\n");
+    uint64_t live_pairs = 0;
+    for (int l = 0; l < DS4_N_LAYER; l++) {
+        for (int e = 0; e < DS4_N_EXPERT; e++) {
+            uint64_t c = g_router_trace_count[l][e];
+            if (c) {
+                fprintf(f, "%d,%d,%llu\n", l, e, (unsigned long long)c);
+                live_pairs++;
+            }
+        }
+    }
+    fprintf(f, "# live_layer_expert_pairs: %llu  /  %d\n",
+            (unsigned long long)live_pairs, (int)DS4_N_LAYER * DS4_N_EXPERT);
+    fclose(f);
+    fprintf(stderr, "ds4: router-trace dump: %llu events, %llu/%d (layer,expert) pairs touched\n",
+            (unsigned long long)g_router_trace_total,
+            (unsigned long long)live_pairs,
+            (int)DS4_N_LAYER * DS4_N_EXPERT);
+}
+/* ------------------------------------------------------------------------- */
+
+static uint8_t *expert_slot_addr(uint64_t slot) {
+    return g_expert_slot_pool + slot * DS4_EXPERT_SLOT_BYTES;
+}
+
+/* Per-tensor identity table: which (layer, kind) does this tensor pointer
+ * represent? Built once by expert_cache_register(). The cache uses the
+ * tensor pointer itself as the lookup key — same pointer same identity. */
+#define DS4_EXPERT_TENSORS_MAX (DS4_N_LAYER * DS4_EXPERT_N_KIND + 8)
+static const ds4_tensor *g_expert_tensor_ptr[DS4_EXPERT_TENSORS_MAX];
+static int16_t           g_expert_tensor_layer[DS4_EXPERT_TENSORS_MAX];
+static int8_t            g_expert_tensor_kind[DS4_EXPERT_TENSORS_MAX];
+static uint64_t          g_expert_tensor_per_bytes[DS4_EXPERT_TENSORS_MAX];
+static uint64_t          g_expert_tensor_file_off[DS4_EXPERT_TENSORS_MAX];
+static int               g_expert_tensor_count;
+
+/* Cross-layer expert source-redirect. g_expert_layer_src[L] = layer to fetch
+ * expert bytes from when L's experts are requested. -1 = identity. */
+static int16_t g_expert_layer_src[DS4_N_LAYER];
+static bool    g_expert_layer_redirect_active;
+
+/* Foreign routed expert injection: bytes substitute (layer, expert, kind) in
+ * the routed-expert cache. Two activation modes:
+ *   - DS4_FOREIGN_EXPERTS_DIR=<dir> with files named e<NNN>_<gate|up|down>.<ext>
+ *   - DS4_FOREIGN_EXPERT_{GATE,UP,DOWN}_FILE for legacy single-slot injection
+ * Combined with DS4_FOREIGN_EXPERT_LAYER (specific) or DS4_FOREIGN_EXPERT_ALL_LAYERS=1. */
+static uint8_t *g_foreign_data[DS4_N_EXPERT][DS4_EXPERT_N_KIND];
+static uint64_t g_foreign_data_sz[DS4_N_EXPERT][DS4_EXPERT_N_KIND];
+static int      g_foreign_count;
+static bool     g_foreign_all_layers;
+static int      g_foreign_layer_target = -1;  /* legacy single-slot only-layer */
+static int      g_foreign_legacy_id    = -1;  /* legacy single-slot only-id   */
+
+/* legacy single-slot state retained for the old shexp-injection signature */
+static uint8_t *g_foreign_expert_bytes[DS4_EXPERT_N_KIND];
+static int      g_foreign_expert_layer = -1;
+static int      g_foreign_expert_id    = -1;
+static uint64_t g_foreign_expert_sz[DS4_EXPERT_N_KIND];
+
+/* Reverse index: (layer, kind) -> tensor registry index, populated by
+ * expert_cache_register. Used to resolve the source layer's file offset. */
+static int16_t g_expert_tensor_by_layer_kind[DS4_N_LAYER][DS4_EXPERT_N_KIND];
+
+/* Load one binary file into a foreign-expert slot. Returns 1 on success. */
+static int foreign_load_file(int expert_id, int kind, const char *path) {
+    if (expert_id < 0 || expert_id >= DS4_N_EXPERT) return 0;
+    if (kind < 0 || kind >= DS4_EXPERT_N_KIND) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return 0; }
+    uint8_t *buf = (uint8_t *)xmalloc((size_t)sz);
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        fclose(f); free(buf); return 0;
+    }
+    fclose(f);
+    if (g_foreign_data[expert_id][kind]) free(g_foreign_data[expert_id][kind]);
+    g_foreign_data[expert_id][kind] = buf;
+    g_foreign_data_sz[expert_id][kind] = (uint64_t)sz;
+    g_foreign_count++;
+    return 1;
+}
+
+static void foreign_expert_init(void) {
+    memset(g_foreign_data, 0, sizeof(g_foreign_data));
+    memset(g_foreign_data_sz, 0, sizeof(g_foreign_data_sz));
+    g_foreign_count = 0;
+    g_foreign_all_layers = false;
+    g_foreign_layer_target = -1;
+
+    g_foreign_expert_layer = -1;
+    g_foreign_expert_id = -1;
+    for (int k = 0; k < DS4_EXPERT_N_KIND; k++) {
+        g_foreign_expert_bytes[k] = NULL;
+        g_foreign_expert_sz[k] = 0;
+    }
+
+    const char *all_env = getenv("DS4_FOREIGN_EXPERT_ALL_LAYERS");
+    g_foreign_all_layers = all_env && *all_env && *all_env != '0';
+    const char *l_env = getenv("DS4_FOREIGN_EXPERT_LAYER");
+    if (!g_foreign_all_layers && l_env && *l_env) g_foreign_layer_target = atoi(l_env);
+    if (g_foreign_all_layers) g_foreign_layer_target = -2;  /* legacy sentinel */
+
+    /* Directory-mode multi-expert load */
+    const char *dir_env = getenv("DS4_FOREIGN_EXPERTS_DIR");
+    if (dir_env && *dir_env) {
+        DIR *d = opendir(dir_env);
+        if (!d) {
+            fprintf(stderr, "ds4: foreign-experts-dir: opendir(%s) failed: %s\n",
+                    dir_env, strerror(errno));
+        } else {
+            struct dirent *ent;
+            char path[2048];
+            int unique_ids = 0;
+            uint8_t seen_id[DS4_N_EXPERT] = {0};
+            while ((ent = readdir(d))) {
+                int eid;
+                char kind_str[16] = {0};
+                if (sscanf(ent->d_name, "e%d_%15[^.]", &eid, kind_str) != 2) continue;
+                int kind = -1;
+                if (strcmp(kind_str, "gate") == 0) kind = DS4_EXPERT_KIND_GATE;
+                else if (strcmp(kind_str, "up") == 0)   kind = DS4_EXPERT_KIND_UP;
+                else if (strcmp(kind_str, "down") == 0) kind = DS4_EXPERT_KIND_DOWN;
+                if (kind < 0) continue;
+                snprintf(path, sizeof(path), "%s/%s", dir_env, ent->d_name);
+                if (foreign_load_file(eid, kind, path)) {
+                    if (eid >= 0 && eid < DS4_N_EXPERT && !seen_id[eid]) {
+                        seen_id[eid] = 1;
+                        unique_ids++;
+                    }
+                }
+            }
+            closedir(d);
+            fprintf(stderr, "ds4: foreign-experts-dir: %d files loaded across %d unique expert ids from %s\n",
+                    g_foreign_count, unique_ids, dir_env);
+        }
+    }
+
+    /* legacy single-slot file env vars still supported (used by shexp inject too) */
+    do {
+        const char *gate = getenv("DS4_FOREIGN_EXPERT_GATE_FILE");
+        const char *up   = getenv("DS4_FOREIGN_EXPERT_UP_FILE");
+        const char *down = getenv("DS4_FOREIGN_EXPERT_DOWN_FILE");
+        if (!gate && !up && !down) break;
+        const char *e_env = getenv("DS4_FOREIGN_EXPERT_ID");
+        g_foreign_expert_id = e_env ? atoi(e_env) : 0;
+        g_foreign_expert_layer = g_foreign_all_layers ? -2 :
+            (l_env ? atoi(l_env) : 20);
+        if ((!g_foreign_all_layers &&
+             (g_foreign_expert_layer < 0 || g_foreign_expert_layer >= DS4_N_LAYER)) ||
+            g_foreign_expert_id < 0 || g_foreign_expert_id >= DS4_N_EXPERT) {
+            fprintf(stderr, "ds4: foreign-expert: invalid layer/id %d/%d\n",
+                    g_foreign_expert_layer, g_foreign_expert_id);
+            g_foreign_expert_layer = -1;
+            break;
+        }
+        const char *paths[DS4_EXPERT_N_KIND] = { gate, up, down };
+        const char *names[DS4_EXPERT_N_KIND] = { "gate", "up", "down" };
+        for (int k = 0; k < DS4_EXPERT_N_KIND; k++) {
+            if (!paths[k]) continue;
+            if (foreign_load_file(g_foreign_expert_id, k, paths[k])) {
+                /* also keep legacy aliases for diagnostics */
+                g_foreign_expert_bytes[k] = g_foreign_data[g_foreign_expert_id][k];
+                g_foreign_expert_sz[k]    = g_foreign_data_sz[g_foreign_expert_id][k];
+                fprintf(stderr, "ds4: foreign-expert (legacy): loaded %s for L%d expert %d\n",
+                        names[k], g_foreign_expert_layer, g_foreign_expert_id);
+            }
+        }
+    } while (0);
+}
+
+static void expert_layer_redirect_init(void) {
+    for (int l = 0; l < DS4_N_LAYER; l++) g_expert_layer_src[l] = -1;
+    const char *p = getenv("DS4_LAYER_REDIRECT_FILE");
+    if (!(p && *p)) return;
+    FILE *f = fopen(p, "r");
+    if (!f) {
+        fprintf(stderr, "ds4: layer-redirect file %s not openable: %s\n", p, strerror(errno));
+        return;
+    }
+    char line[256];
+    int loaded = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == 'd' || line[0] == 'l') continue;
+        int dst, src;
+        if (sscanf(line, "%d,%d", &dst, &src) == 2) {
+            if (dst >= 0 && dst < DS4_N_LAYER && src >= 0 && src < DS4_N_LAYER && dst != src) {
+                g_expert_layer_src[dst] = (int16_t)src;
+                loaded++;
+            }
+        }
+    }
+    fclose(f);
+    g_expert_layer_redirect_active = (loaded > 0);
+    fprintf(stderr, "ds4: layer-redirect loaded %d (dst,src) pairs from %s\n", loaded, p);
+}
+
+static void expert_cache_reset(void) {
+    g_expert_tick = 0;
+    g_expert_cache_ready = false;
+    g_expert_model_fd = -1;
+    g_expert_tensor_count = 0;
+    for (uint64_t i = 0; i < DS4_EXPERT_TOTAL_SLOTS; i++) {
+        g_expert_slot_expert[i] = -1;
+        g_expert_slot_tick[i] = 0;
+    }
+    for (int l = 0; l < DS4_N_LAYER; l++) {
+        for (int k = 0; k < DS4_EXPERT_N_KIND; k++) {
+            for (int e = 0; e < DS4_N_EXPERT; e++) {
+                g_expert_lookup[l][k][e] = -1;
+            }
+            g_expert_tensor_by_layer_kind[l][k] = -1;
+        }
+    }
+    expert_layer_redirect_init();
+    foreign_expert_init();
+}
+
+static void expert_cache_register(const ds4_tensor *w, int layer, int kind,
+                                  uint64_t per_expert_bytes) {
+    if (per_expert_bytes > DS4_EXPERT_SLOT_BYTES) {
+        fprintf(stderr,
+                "ds4: expert slot too small: tensor needs %llu bytes per expert, slot is %llu\n",
+                (unsigned long long)per_expert_bytes,
+                (unsigned long long)DS4_EXPERT_SLOT_BYTES);
+        exit(1);
+    }
+    if (g_expert_tensor_count >= DS4_EXPERT_TENSORS_MAX) {
+        ds4_die("expert tensor registry overflow");
+    }
+    const int i = g_expert_tensor_count++;
+    g_expert_tensor_ptr[i] = w;
+    g_expert_tensor_layer[i] = (int16_t)layer;
+    g_expert_tensor_kind[i] = (int8_t)kind;
+    g_expert_tensor_per_bytes[i] = per_expert_bytes;
+    g_expert_tensor_file_off[i] = w->abs_offset;
+    if (layer >= 0 && layer < DS4_N_LAYER && kind >= 0 && kind < DS4_EXPERT_N_KIND) {
+        g_expert_tensor_by_layer_kind[layer][kind] = (int16_t)i;
+    }
+}
+
+static int expert_cache_find_tensor(const ds4_tensor *w) {
+    for (int i = 0; i < g_expert_tensor_count; i++) {
+        if (g_expert_tensor_ptr[i] == w) return i;
+    }
+    return -1;
+}
+
+static uint64_t expert_per_expert_bytes(const ds4_tensor *t) {
+    if (t->ndim != 3) ds4_die("expert tensor must be 3D");
+    const gguf_type_info *info = tensor_type(t->type);
+    if (!info || info->block_elems == 0) ds4_die("unsupported expert tensor type");
+    const uint64_t blocks = (t->dim[0] + info->block_elems - 1) / info->block_elems;
+    const uint64_t row_bytes = blocks * info->block_bytes;
+    return t->dim[1] * row_bytes;
+}
+
+/* Register one layer's three routed expert tensors. Called from inside the
+ * binding loop where each ffn_*_exps tensor pointer is assigned. After all
+ * layers are registered, expert_cache_finalize() opens the cache for reads. */
+static void expert_cache_register_layer(int layer,
+                                        const ds4_tensor *gate,
+                                        const ds4_tensor *up,
+                                        const ds4_tensor *down) {
+    expert_cache_register(gate, layer, DS4_EXPERT_KIND_GATE, expert_per_expert_bytes(gate));
+    expert_cache_register(up,   layer, DS4_EXPERT_KIND_UP,   expert_per_expert_bytes(up));
+    expert_cache_register(down, layer, DS4_EXPERT_KIND_DOWN, expert_per_expert_bytes(down));
+}
+
+static void expert_cache_finalize(const ds4_model *m) {
+    if (m->fd < 0) ds4_die("expert cache needs an open model fd");
+    const char *off = getenv("DS4_EXPERT_CACHE_OFF");
+    if (off && off[0] == '1') {
+        g_expert_cache_force_disable = true;
+        fprintf(stderr, "ds4: expert cache DISABLED by DS4_EXPERT_CACHE_OFF=1; falling back to mmap path\n");
+        return;
+    }
+    if (!g_expert_slot_pool) {
+        const size_t pool_bytes = (size_t)(DS4_EXPERT_TOTAL_SLOTS * DS4_EXPERT_SLOT_BYTES);
+        void *p = mmap(NULL, pool_bytes, PROT_READ | PROT_WRITE,
+                       MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (p == MAP_FAILED) ds4_die_errno("mmap expert cache pool", "MAP_ANON");
+        g_expert_slot_pool = (uint8_t *)p;
+    }
+    g_expert_model_fd = m->fd;
+    g_expert_cache_ready = true;
+    fprintf(stderr,
+            "ds4: sparse expert cache ready: %d tensors registered, "
+            "%llu slots × %llu bytes = %.2f GiB pool\n",
+            g_expert_tensor_count,
+            (unsigned long long)DS4_EXPERT_TOTAL_SLOTS,
+            (unsigned long long)DS4_EXPERT_SLOT_BYTES,
+            (double)(DS4_EXPERT_TOTAL_SLOTS * DS4_EXPERT_SLOT_BYTES) / (1024.0 * 1024.0 * 1024.0));
+}
+
+/* Slot index space: [layer × DS4_EXPERT_N_KIND × DS4_EXPERT_SLOTS_PER_KIND .. +SLOTS_PER_KIND)
+ * for one (layer, kind). LRU pick within that range. */
+static uint64_t expert_slot_range_base(int layer, int kind) {
+    return (uint64_t)layer * DS4_EXPERT_N_KIND * DS4_EXPERT_SLOTS_PER_KIND
+         + (uint64_t)kind * DS4_EXPERT_SLOTS_PER_KIND;
+}
+
+static uint64_t expert_pick_lru(int layer, int kind) {
+    const uint64_t base = expert_slot_range_base(layer, kind);
+    uint64_t best = base;
+    uint64_t best_tick = g_expert_slot_tick[base];
+    for (uint64_t s = base + 1; s < base + DS4_EXPERT_SLOTS_PER_KIND; s++) {
+        if (g_expert_slot_expert[s] < 0) return s;  /* empty wins outright */
+        if (g_expert_slot_tick[s] < best_tick) { best = s; best_tick = g_expert_slot_tick[s]; }
+    }
+    return best;
+}
+
+static const uint8_t *expert_cache_get(const ds4_tensor *w, uint32_t expert,
+                                       uint64_t per_expert_bytes) {
+    if (!g_expert_cache_ready || g_expert_cache_force_disable) {
+        g_expert_fallback_returns++;
+        return NULL;
+    }
+    const int ti = expert_cache_find_tensor(w);
+    if (ti < 0) {
+        g_expert_fallback_returns++;
+        return NULL;
+    }
+    const int layer = g_expert_tensor_layer[ti];
+    const int kind = g_expert_tensor_kind[ti];
+    const int16_t cached = g_expert_lookup[layer][kind][expert];
+    if (cached >= 0) {
+        g_expert_hits++;
+        g_expert_slot_tick[cached] = ++g_expert_tick;
+        return expert_slot_addr(cached);
+    }
+    /* miss: evict LRU + pread.
+     * If a cross-layer redirect is active for this layer, fetch the bytes from
+     * the source layer's offset instead — but still cache under (dst layer,
+     * kind, expert) so the lookup table reflects what callers asked for. */
+    int src_ti = ti;
+    if (g_expert_layer_redirect_active && layer >= 0 && layer < DS4_N_LAYER) {
+        const int16_t src_layer = g_expert_layer_src[layer];
+        if (src_layer >= 0 && src_layer < DS4_N_LAYER) {
+            const int16_t alt = g_expert_tensor_by_layer_kind[src_layer][kind];
+            if (alt >= 0) src_ti = alt;
+        }
+    }
+    const uint64_t slot = expert_pick_lru(layer, kind);
+    const int16_t old_expert = g_expert_slot_expert[slot];
+    if (old_expert >= 0) {
+        g_expert_lookup[layer][kind][old_expert] = -1;
+        g_expert_evictions++;
+    }
+    /* Foreign routed expert override. Match by (expert_id, kind) and layer-filter:
+     * - g_foreign_all_layers=true: any layer matches
+     * - g_foreign_layer_target == layer: that specific layer matches
+     * - g_foreign_layer_target == -1 (no env): no match (override disabled) */
+    const bool match_layer = g_foreign_all_layers ||
+                             (g_foreign_layer_target == layer);
+    if (match_layer && expert < DS4_N_EXPERT && kind >= 0 && kind < DS4_EXPERT_N_KIND &&
+        g_foreign_data[expert][kind] &&
+        g_foreign_data_sz[expert][kind] == per_expert_bytes) {
+        memcpy(expert_slot_addr(slot), g_foreign_data[expert][kind], per_expert_bytes);
+        g_expert_misses++;  /* still counted; we did "fetch" */
+        g_expert_bytes_pread += per_expert_bytes;
+        g_expert_slot_expert[slot] = (int16_t)expert;
+        g_expert_slot_tick[slot] = ++g_expert_tick;
+        g_expert_lookup[layer][kind][expert] = (int16_t)slot;
+        return expert_slot_addr(slot);
+    }
+    const uint64_t file_off = g_expert_tensor_file_off[src_ti]
+                            + (uint64_t)expert * per_expert_bytes;
+    ssize_t got = pread(g_expert_model_fd, expert_slot_addr(slot), per_expert_bytes, file_off);
+    if (got != (ssize_t)per_expert_bytes) {
+        fprintf(stderr,
+                "ds4: expert pread short: layer=%d kind=%d expert=%u off=%llu want=%llu got=%lld\n",
+                layer, kind, expert,
+                (unsigned long long)file_off,
+                (unsigned long long)per_expert_bytes,
+                (long long)got);
+        exit(1);
+    }
+    g_expert_misses++;
+    g_expert_bytes_pread += per_expert_bytes;
+    g_expert_slot_expert[slot] = (int16_t)expert;
+    g_expert_slot_tick[slot] = ++g_expert_tick;
+    g_expert_lookup[layer][kind][expert] = (int16_t)slot;
+    return expert_slot_addr(slot);
+}
+
+/* Compare cache-fetched bytes against mmap-fetched bytes for one expert per
+ * registered tensor. If any differ, fatal — file offsets are wrong or
+ * pread/mmap disagree. This is the "did the cache produce correct bytes"
+ * gap closed honestly. Costs one pread + one memcmp per layer × kind = 129
+ * comparisons at ~2 MiB each = ~260 MiB read, then optionally evicted. */
+static void expert_cache_verify_against_mmap(const ds4_model *m) {
+    if (!g_expert_cache_ready) {
+        fprintf(stderr, "ds4: cache verify SKIPPED (cache disabled)\n");
+        return;
+    }
+    if (g_expert_layer_redirect_active) {
+        /* Redirect intentionally serves a different layer's bytes from the
+         * cache; the byte-equality invariant doesn't apply. */
+        fprintf(stderr, "ds4: cache verify SKIPPED (layer redirect active)\n");
+        return;
+    }
+    if (g_foreign_count > 0 || g_foreign_layer_target != -1 || g_foreign_all_layers) {
+        fprintf(stderr, "ds4: cache verify SKIPPED (foreign expert injection active)\n");
+        return;
+    }
+    int verified = 0;
+    int mismatches = 0;
+    for (int i = 0; i < g_expert_tensor_count; i++) {
+        const ds4_tensor *w = g_expert_tensor_ptr[i];
+        const uint64_t per_expert = g_expert_tensor_per_bytes[i];
+        const uint32_t expert = 0;  /* probe expert 0 of each tensor */
+        const uint8_t *via_cache = expert_cache_get(w, expert, per_expert);
+        if (!via_cache) {
+            fprintf(stderr,
+                    "ds4: cache verify: tensor %d returned NULL from cache (unexpected)\n", i);
+            mismatches++;
+            continue;
+        }
+        const uint8_t *via_mmap = (const uint8_t *)m->map
+                                + g_expert_tensor_file_off[i]
+                                + (uint64_t)expert * per_expert;
+        if (memcmp(via_cache, via_mmap, per_expert) != 0) {
+            /* find first divergent byte */
+            uint64_t j;
+            for (j = 0; j < per_expert; j++) {
+                if (via_cache[j] != via_mmap[j]) break;
+            }
+            fprintf(stderr,
+                    "ds4: cache verify MISMATCH: tensor %d (layer=%d kind=%d) "
+                    "first diff at byte %llu: cache=0x%02x mmap=0x%02x\n",
+                    i,
+                    (int)g_expert_tensor_layer[i],
+                    (int)g_expert_tensor_kind[i],
+                    (unsigned long long)j,
+                    via_cache[j], via_mmap[j]);
+            mismatches++;
+        }
+        verified++;
+    }
+    fprintf(stderr,
+            "ds4: cache verify: %d tensors compared, %d mismatches\n",
+            verified, mismatches);
+    if (mismatches > 0) ds4_die("expert cache verification failed");
+}
+
+static void expert_cache_summary(void) {
+    fprintf(stderr,
+            "ds4: expert cache summary: hits=%llu misses=%llu evictions=%llu "
+            "bytes_pread=%.2f MiB fallback_returns=%llu enabled=%d disabled_by_env=%d\n",
+            (unsigned long long)g_expert_hits,
+            (unsigned long long)g_expert_misses,
+            (unsigned long long)g_expert_evictions,
+            (double)g_expert_bytes_pread / (1024.0 * 1024.0),
+            (unsigned long long)g_expert_fallback_returns,
+            (int)g_expert_cache_ready,
+            (int)g_expert_cache_force_disable);
+}
+
+/* Locate one expert's 2D matrix inside a 3D GGUF expert tensor.
+ * Routes through the cache when the tensor was registered; otherwise falls
+ * back to the original mmap pointer arithmetic so non-routed-expert
+ * 3D-tensor paths (if any are added) still work. */
 static const uint8_t *tensor_expert_bytes(
         const ds4_model  *m,
         const ds4_tensor *w,
@@ -3819,6 +4640,8 @@ static const uint8_t *tensor_expert_bytes(
     *row_bytes = blocks * info->block_bytes;
 
     const uint64_t expert_bytes = *out_dim * *row_bytes;
+    const uint8_t *cached = expert_cache_get(w, expert, expert_bytes);
+    if (cached) return cached;
     return (const uint8_t *)tensor_data(m, w) + (uint64_t)expert * expert_bytes;
 }
 
@@ -5312,6 +6135,7 @@ static void layer_topk_selected_experts_from_probs(
         float                  expert_weight[DS4_N_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
+        uint32_t               il,
         const float           probs[DS4_N_EXPERT]);
 
 static void layer_topk_selected_experts(
@@ -5319,11 +6143,12 @@ static void layer_topk_selected_experts(
         float                  expert_weight[DS4_N_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
+        uint32_t               il,
         const float           *x) {
     float probs[DS4_N_EXPERT];
 
     layer_router_probs_one(probs, model, layer, x);
-    layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs);
+    layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, il, probs);
 }
 
 static void layer_topk_selected_experts_from_probs(
@@ -5331,6 +6156,7 @@ static void layer_topk_selected_experts_from_probs(
         float                  expert_weight[DS4_N_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
+        uint32_t               il,
         const float           probs[DS4_N_EXPERT]) {
     float selection[DS4_N_EXPERT];
 
@@ -5340,6 +6166,8 @@ static void layer_topk_selected_experts_from_probs(
         const float *bias = tensor_data(model, layer->ffn_exp_probs_b);
         for (int i = 0; i < DS4_N_EXPERT; i++) selection[i] += bias[i];
     }
+
+    expert_mask_apply(il, selection);
 
     topk_desc(selection, DS4_N_EXPERT, DS4_N_EXPERT_USED, selected);
 
@@ -5388,8 +6216,11 @@ static void layer_routed_moe_one(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, il, x);
     }
+    router_trace_record(il, selected);
+    pe_router_trace_record_cpu(il, (uint32_t)token, selected);  /* H1005 CPU-path hook */
+    expert_remap_apply(il, selected, DS4_N_EXPERT_USED);
 
     if (!trace) {
         matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
@@ -5482,8 +6313,11 @@ static void layer_routed_moe_one_prealloc(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, il, x);
     }
+    router_trace_record(il, selected);
+    pe_router_trace_record_cpu(il, (uint32_t)token, selected);  /* H1005 CPU prefill/prealloc hook */
+    expert_remap_apply(il, selected, DS4_N_EXPERT_USED);
 
     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
                                         layer->ffn_gate_exps,
@@ -5548,8 +6382,11 @@ static void layer_routed_moe_batch(
             layer_hash_selected_experts(sel, model, layer, token_ids[t]);
             layer_hash_router_weights_one(weights, model, layer, norm + (uint64_t)t * expert_in_dim, sel);
         } else {
-            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim);
+            layer_topk_selected_experts(sel, weights, model, layer, il, norm + (uint64_t)t * expert_in_dim);
         }
+        router_trace_record(il, sel);
+        pe_router_trace_record_cpu(il, (uint32_t)t, sel);  /* H1005 parallel-tokens-per-prefill hook */
+        expert_remap_apply(il, sel, DS4_N_EXPERT_USED);
 
         for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
             const uint32_t pair_id = t * DS4_N_EXPERT_USED + slot;
@@ -8660,6 +9497,128 @@ static void metal_graph_debug_dump_i32_tensor(
     }
 }
 
+/* === per-event router trace (hand-merged from codex H1005 patch,
+ * 2026-05-21). Emits CSV row per (stage, position, layer) after router
+ * selection. Coexists with the existing aggregate tracer (g_router_trace_*):
+ * the aggregate uses DS4_ROUTER_TRACE; this uses DS4_ROUTER_TRACE_PE.
+ * Goal: validate cache-residency thesis on a reasoning workload — the gate
+ * the codex agent was blocked on. */
+static FILE       *g_pe_router_fp = NULL;
+static const char *g_pe_router_path = NULL;
+static uint64_t    g_pe_router_rows = 0;
+static uint64_t    g_pe_router_limit = 0;
+static int         g_pe_router_env_checked = 0;
+static int         g_pe_router_failed = 0;
+static int         g_pe_router_decode_buf[DS4_N_EXPERT_USED];
+static int        *g_pe_router_batch_buf = NULL;
+static uint32_t    g_pe_router_batch_cap = 0;
+
+static void metal_graph_pe_router_trace_close(void) {
+    if (g_pe_router_fp) { fclose(g_pe_router_fp); g_pe_router_fp = NULL; }
+    free(g_pe_router_batch_buf);
+    g_pe_router_batch_buf = NULL;
+    g_pe_router_batch_cap = 0;
+}
+
+static bool metal_graph_pe_router_trace_open(void) {
+    if (g_pe_router_failed) return false;
+    if (!g_pe_router_env_checked) {
+        g_pe_router_path = getenv("DS4_ROUTER_TRACE_PE");
+        const char *lim = getenv("DS4_ROUTER_TRACE_PE_LIMIT");
+        if (lim && lim[0]) g_pe_router_limit = strtoull(lim, NULL, 10);
+        g_pe_router_env_checked = 1;
+    }
+    if (!g_pe_router_path || !g_pe_router_path[0]) return false;
+    if (g_pe_router_limit && g_pe_router_rows >= g_pe_router_limit) return false;
+    if (g_pe_router_fp) return true;
+    struct stat st;
+    const bool write_header = stat(g_pe_router_path, &st) != 0 || st.st_size == 0;
+    g_pe_router_fp = fopen(g_pe_router_path, "a");
+    if (!g_pe_router_fp) {
+        fprintf(stderr, "ds4: failed to open DS4_ROUTER_TRACE_PE=%s: %s\n",
+                g_pe_router_path, strerror(errno));
+        g_pe_router_failed = 1;
+        return false;
+    }
+    atexit(metal_graph_pe_router_trace_close);
+    if (write_header) {
+        fprintf(g_pe_router_fp, "row,stage,pos,layer,e0,e1,e2,e3,e4,e5\n");
+        fflush(g_pe_router_fp);
+    }
+    return true;
+}
+
+static bool metal_graph_pe_router_trace_batch_capacity(uint32_t n_tokens) {
+    if (n_tokens <= g_pe_router_batch_cap) return true;
+    int *next = xmalloc((size_t)n_tokens * DS4_N_EXPERT_USED * sizeof(next[0]));
+    free(g_pe_router_batch_buf);
+    g_pe_router_batch_buf = next;
+    g_pe_router_batch_cap = n_tokens;
+    return g_pe_router_batch_buf != NULL;
+}
+
+static void metal_graph_pe_router_trace_write_row(
+        const char *stage,
+        uint32_t    pos,
+        uint32_t    il,
+        const int  *selected) {
+    if (!g_pe_router_fp) return;
+    if (g_pe_router_limit && g_pe_router_rows >= g_pe_router_limit) return;
+    fprintf(g_pe_router_fp,
+            "%" PRIu64 ",%s,%u,%u,%d,%d,%d,%d,%d,%d\n",
+            g_pe_router_rows,
+            stage,
+            pos,
+            il,
+            selected[0], selected[1], selected[2],
+            selected[3], selected[4], selected[5]);
+    g_pe_router_rows++;
+}
+
+static void metal_graph_pe_router_trace_one(
+        ds4_gpu_tensor *selected,
+        uint32_t        il,
+        uint32_t        pos) {
+    if (!selected || !metal_graph_pe_router_trace_open()) return;
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before pe-router-trace layer %u pos %u\n", il, pos);
+        return;
+    }
+    if (ds4_gpu_tensor_read(selected, 0, g_pe_router_decode_buf, sizeof(g_pe_router_decode_buf)) != 0) {
+        metal_graph_pe_router_trace_write_row("decode", pos, il, g_pe_router_decode_buf);
+        fflush(g_pe_router_fp);
+    }
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after pe-router-trace layer %u pos %u\n", il, pos);
+    }
+}
+
+static void metal_graph_pe_router_trace_batch(
+        ds4_gpu_tensor *selected,
+        uint32_t        il,
+        uint32_t        pos0,
+        uint32_t        n_tokens) {
+    if (!selected || n_tokens == 0 || !metal_graph_pe_router_trace_open()) return;
+    if (!metal_graph_pe_router_trace_batch_capacity(n_tokens)) return;
+    const uint64_t bytes = (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(g_pe_router_batch_buf[0]);
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before pe-router-trace batch layer %u pos %u\n", il, pos0);
+        return;
+    }
+    if (ds4_gpu_tensor_read(selected, 0, g_pe_router_batch_buf, bytes) != 0) {
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            metal_graph_pe_router_trace_write_row(
+                "prefill", pos0 + t, il,
+                g_pe_router_batch_buf + (size_t)t * DS4_N_EXPERT_USED);
+        }
+        fflush(g_pe_router_fp);
+    }
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after pe-router-trace batch layer %u pos %u\n", il, pos0);
+    }
+}
+/* === END per-event router trace === */
+
 static bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint32_t pos) {
     return metal_graph_directional_steering_ffn_enabled(g) ||
            g->materialize_ffn_out ||
@@ -9850,8 +10809,34 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_probs", g->router_probs, DS4_N_EXPERT, il, pos);
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
+        /* Per-event router-trace hook (hand-merged codex H1005). */
+        metal_graph_pe_router_trace_one(g->router_selected, il, pos);
     }
-    if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
+    if (ok) {
+        /* Bypass: route the MoE matmul through the CPU cache when enabled.
+         * The intelligence (attention, shared expert, dense) stays on Metal;
+         * the memory (routed experts) runs on CPU via the expert cache. This
+         * sidesteps Metal's whole-file MTLBuffer wrap and its residency
+         * request entirely for the routed path. Gated by env so the existing
+         * Metal kernel path stays the default. */
+        const char *moe_via_cpu_env = getenv("DS4_METAL_MOE_VIA_CPU");
+        if (moe_via_cpu_env && moe_via_cpu_env[0] == '1' && g_expert_cache_ready) {
+            if (!ds4_gpu_synchronize()) { ok = 0; }
+            if (ok) {
+                const float *x_host = (const float *)ds4_gpu_tensor_contents(g->ffn_norm);
+                float *out_host = (float *)ds4_gpu_tensor_contents(g->routed_out);
+                if (!x_host || !out_host) { ok = 0; }
+                if (ok) {
+                    float mid_all_buf[DS4_N_EXPERT_USED * DS4_N_FF_EXP];
+                    block_q8_K xq_buf[DS4_N_EMBD / QK_K];
+                    block_q8_K midq_buf[DS4_N_EXPERT_USED * (DS4_N_FF_EXP / QK_K)];
+                    layer_routed_moe_one_prealloc(out_host, model, layer, x_host,
+                                                  il, token, DS4_SWIGLU_CLAMP_EXP,
+                                                  mid_all_buf, xq_buf, midq_buf);
+                }
+            }
+        } else {
+            ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
                                                  g->routed_mid,
@@ -9869,6 +10854,8 @@ static bool metal_graph_encode_decode_layer(
                                                  (uint32_t)routed_out_dim,
                                                  g->router_selected, g->router_weights,
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+        }
+    }
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
@@ -10293,7 +11280,7 @@ static void metal_graph_trace_layer_stages(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, il, cpu_ffn_norm);
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc, cpu_ffn_out, cpu_after_attn_hc, ffn_post, ffn_comb, DS4_N_EMBD, DS4_N_HC);
@@ -10517,7 +11504,7 @@ static int metal_graph_decode_test(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, 0u, cpu_ffn_norm);
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc,
@@ -12625,10 +13612,29 @@ static bool metal_graph_encode_layer_ffn_batch(
                                           (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->batch_router_weights,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
+        /* Per-event router-trace hook (hand-merged codex H1005, prefill). */
+        metal_graph_pe_router_trace_batch(g->batch_router_selected, il, pos0, n_tokens);
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
-    if (ok) ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
+    if (ok) {
+        const char *moe_via_cpu_env = getenv("DS4_METAL_MOE_VIA_CPU");
+        if (moe_via_cpu_env && moe_via_cpu_env[0] == '1' && g_expert_cache_ready) {
+            if (!ds4_gpu_synchronize()) { ok = 0; }
+            if (ok) {
+                const float *norm_host = (const float *)ds4_gpu_tensor_contents(g->batch_ffn_norm);
+                float *out_host = (float *)ds4_gpu_tensor_contents(g->batch_routed_out);
+                if (!norm_host || !out_host) { ok = 0; }
+                if (ok) {
+                    int token_ids_buf[256];
+                    if (n_tokens > 256) ds4_die("batch MoE CPU bypass needs token buffer >256");
+                    for (uint32_t i = 0; i < n_tokens; i++) token_ids_buf[i] = (int)(pos0 + i);
+                    layer_routed_moe_batch(out_host, model, layer, norm_host,
+                                           token_ids_buf, n_tokens, il, DS4_SWIGLU_CLAMP_EXP);
+                }
+            }
+        } else {
+            ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                                    g->batch_routed_gate,
                                                    g->batch_routed_up,
                                                    g->batch_routed_mid,
@@ -12654,6 +13660,8 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                    g->batch_ffn_norm,
                                                    n_tokens,
                                                    &g->batch_routed_mid_is_f16) != 0;
+        }
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
@@ -15085,7 +16093,91 @@ int ds4_token_assistant(ds4_engine *e) {
     return e->vocab.assistant_id;
 }
 
+/* DS4_DUMP_LOGITS=<path>: append top-K next-token rows per decode call.
+ * DS4_DUMP_LOGITS_K (default 10) controls how many tokens to dump per step.
+ * DS4_DUMP_LOGITS_FIRST_ONLY=1 dumps only the first decode step (cleanest
+ * cross-condition comparison). */
+static const char *g_dump_logits_path;
+static int  g_dump_logits_k = 10;
+static bool g_dump_logits_first_only;
+static int  g_dump_logits_step;
+static bool g_dump_logits_initialized;
+
+static void dump_logits_init(void) {
+    if (g_dump_logits_initialized) return;
+    g_dump_logits_initialized = true;
+    g_dump_logits_path = getenv("DS4_DUMP_LOGITS");
+    if (!(g_dump_logits_path && *g_dump_logits_path)) {
+        g_dump_logits_path = NULL;
+        return;
+    }
+    const char *k = getenv("DS4_DUMP_LOGITS_K");
+    if (k && *k) {
+        int v = atoi(k);
+        if (v > 0 && v <= 100) g_dump_logits_k = v;
+    }
+    const char *first = getenv("DS4_DUMP_LOGITS_FIRST_ONLY");
+    g_dump_logits_first_only = (first && *first && *first != '0');
+    /* Truncate output file at startup */
+    FILE *f = fopen(g_dump_logits_path, "w");
+    if (f) {
+        fprintf(f, "# DS4 logit dump (k=%d, first_only=%d)\n",
+                g_dump_logits_k, (int)g_dump_logits_first_only);
+        fprintf(f, "step,rank,token_id,logit,softmax_prob\n");
+        fclose(f);
+    }
+    fprintf(stderr, "ds4: logit-dump enabled to %s (k=%d, first_only=%d)\n",
+            g_dump_logits_path, g_dump_logits_k, (int)g_dump_logits_first_only);
+}
+
+static void dump_logits_top_k(const float *logits, uint32_t n_vocab) {
+    if (!g_dump_logits_initialized) dump_logits_init();
+    if (!g_dump_logits_path) return;
+    if (g_dump_logits_first_only && g_dump_logits_step > 0) {
+        g_dump_logits_step++;
+        return;
+    }
+    /* Find top-K via partial selection sort. K is small (<=100). */
+    int top_idx[100];
+    float top_val[100];
+    int K = g_dump_logits_k;
+    for (int i = 0; i < K; i++) { top_idx[i] = -1; top_val[i] = DS4_NEG_INF; }
+    for (uint32_t v = 0; v < n_vocab; v++) {
+        float lv = logits[v];
+        for (int k = 0; k < K; k++) {
+            if (top_idx[k] < 0 || lv > top_val[k]) {
+                for (int m = K - 1; m > k; m--) {
+                    top_idx[m] = top_idx[m-1];
+                    top_val[m] = top_val[m-1];
+                }
+                top_idx[k] = (int)v;
+                top_val[k] = lv;
+                break;
+            }
+        }
+    }
+    /* softmax over full vocab using max-subtract for stability */
+    float max_logit = top_val[0];
+    double sum = 0.0;
+    for (uint32_t v = 0; v < n_vocab; v++) sum += expf(logits[v] - max_logit);
+    FILE *f = fopen(g_dump_logits_path, "a");
+    if (!f) return;
+    for (int k = 0; k < K && top_idx[k] >= 0; k++) {
+        double prob = expf(top_val[k] - max_logit) / sum;
+        fprintf(f, "%d,%d,%d,%.6f,%.6e\n",
+                g_dump_logits_step, k, top_idx[k], top_val[k], prob);
+    }
+    fclose(f);
+    g_dump_logits_step++;
+}
+
 static int sample_argmax(const float *logits, uint32_t n_vocab) {
+    static int g_argmax_calls = 0;
+    if (g_argmax_calls < 3) {
+        fprintf(stderr, "ds4: sample_argmax call #%d n_vocab=%u\n", g_argmax_calls, n_vocab);
+        g_argmax_calls++;
+    }
+    dump_logits_top_k(logits, n_vocab);
     int best = 0;
     float best_v = DS4_NEG_INF;
     for (uint32_t i = 0; i < n_vocab; i++) {
