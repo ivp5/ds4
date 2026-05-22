@@ -22,6 +22,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *mtp_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -33,6 +34,8 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
+    int mtp_draft_tokens;
+    float mtp_margin;
     double step_mul;
     bool warm_weights;
     bool quality;
@@ -190,6 +193,8 @@ static bench_config parse_options(int argc, char **argv) {
         .step_incr = 2048,
         .gen_tokens = 128,
         .step_mul = 1.0,
+        .mtp_draft_tokens = 1,
+        .mtp_margin = 3.0f,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -257,6 +262,26 @@ static bench_config parse_options(int argc, char **argv) {
                 }
                 c.prefill_metal_phases = (int)v;
             }
+        } else if (!strcmp(arg, "--mtp")) {
+            c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-draft")) {
+            const char *s = need_arg(&i, argc, argv, arg);
+            char *end = NULL;
+            long v = strtol(s, &end, 10);
+            if (s[0] == '\0' || *end != '\0' || v < 1 || v > 16) {
+                fprintf(stderr, "ds4-bench: --mtp-draft expects 1..16, got %s\n", s);
+                exit(2);
+            }
+            c.mtp_draft_tokens = (int)v;
+        } else if (!strcmp(arg, "--mtp-margin")) {
+            const char *s = need_arg(&i, argc, argv, arg);
+            char *end = NULL;
+            double v = strtod(s, &end);
+            if (s[0] == '\0' || *end != '\0' || v < 0.0) {
+                fprintf(stderr, "ds4-bench: --mtp-margin expects non-negative float, got %s\n", s);
+                exit(2);
+            }
+            c.mtp_margin = (float)v;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr);
@@ -325,8 +350,11 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
+        .mtp_draft_tokens = cfg.mtp_draft_tokens,
+        .mtp_margin = cfg.mtp_margin,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .cpu_moe = cfg.cpu_moe,
@@ -390,6 +418,10 @@ int main(int argc, char **argv) {
             .cap = frontier,
         };
 
+        const int prefill_tokens_planned = frontier - previous;
+        fprintf(stderr, "ds4-bench: prefill[%d] start tokens=%d (cumulative ctx=%d)\n",
+                frontier, prefill_tokens_planned, frontier);
+        fflush(stderr);
         const double prefill_t0 = bench_now_sec();
         if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", frontier, err);
@@ -399,6 +431,10 @@ int main(int argc, char **argv) {
         const double prefill_t1 = bench_now_sec();
         const double prefill_sec = prefill_t1 - prefill_t0;
         const int prefill_tokens = frontier - previous;
+        fprintf(stderr, "ds4-bench: prefill[%d] done tokens=%d %.2fs %.2f t/s\n",
+                frontier, prefill_tokens, prefill_sec,
+                prefill_sec > 0 ? prefill_tokens / prefill_sec : 0.0);
+        fflush(stderr);
 
         if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
@@ -407,7 +443,22 @@ int main(int argc, char **argv) {
         }
 
         const double gen_t0 = bench_now_sec();
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        int total_accepted = 0;
+        int total_calls = 0;
+        const bool use_spec = (cfg.mtp_path != NULL && cfg.mtp_draft_tokens > 1);
+        int spec_buf[16];
+        const int spec_cap = (int)(sizeof(spec_buf)/sizeof(spec_buf[0]));
+        /* Live progress: emit a status line every ~2 sec OR every 16 tokens,
+         * whichever first. The line carries current rate + accept stats so
+         * an observer (or the next AI inference) can monitor in realtime. */
+        double last_report_t = gen_t0;
+        int last_report_tok = 0;
+        const double report_interval_s = 2.0;
+        const int report_interval_tok = 16;
+        fprintf(stderr, "ds4-bench: gen[%d] start ctx=%d gen_target=%d %s\n",
+                frontier, frontier, cfg.gen_tokens,
+                use_spec ? "[spec-decode]" : "[seq]");
+        while (total_accepted < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -419,13 +470,64 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+            if (use_spec) {
+                const int remaining = cfg.gen_tokens - total_accepted;
+                const int cap = remaining < spec_cap ? remaining : spec_cap;
+                const int n = ds4_session_eval_speculative_argmax(session, token,
+                                                                   cap, eos,
+                                                                   spec_buf, cap,
+                                                                   err, sizeof(err));
+                if (n < 0) {
+                    fprintf(stderr, "ds4-bench: spec decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                if (n == 0) break;
+                total_accepted += n;
+                total_calls += 1;
+            } else {
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                total_accepted += 1;
+                total_calls += 1;
+            }
+            /* live-progress probe */
+            const double now = bench_now_sec();
+            const int tok_delta = total_accepted - last_report_tok;
+            if (now - last_report_t >= report_interval_s || tok_delta >= report_interval_tok) {
+                const double window = now - last_report_t;
+                const double inst_tps = window > 0 ? tok_delta / window : 0.0;
+                const double avg_tps = (now - gen_t0) > 0 ? total_accepted / (now - gen_t0) : 0.0;
+                if (use_spec) {
+                    fprintf(stderr, "ds4-bench: gen[%d] @%d/%d (%.0f%%) inst=%.2f t/s avg=%.2f t/s "
+                                    "spec_calls=%d spec_avg=%.2f elapsed=%.1fs\n",
+                            frontier, total_accepted, cfg.gen_tokens,
+                            100.0 * total_accepted / cfg.gen_tokens,
+                            inst_tps, avg_tps,
+                            total_calls,
+                            total_calls > 0 ? (double)total_accepted / total_calls : 0.0,
+                            now - gen_t0);
+                } else {
+                    fprintf(stderr, "ds4-bench: gen[%d] @%d/%d (%.0f%%) inst=%.2f t/s avg=%.2f t/s elapsed=%.1fs\n",
+                            frontier, total_accepted, cfg.gen_tokens,
+                            100.0 * total_accepted / cfg.gen_tokens,
+                            inst_tps, avg_tps,
+                            now - gen_t0);
+                }
+                fflush(stderr);
+                last_report_t = now;
+                last_report_tok = total_accepted;
             }
         }
         const double gen_t1 = bench_now_sec();
+        if (use_spec && rc == 0) {
+            fprintf(stderr, "ds4-bench: mtp spec=%d total_accepted=%d total_calls=%d avg_per_call=%.2f\n",
+                    cfg.mtp_draft_tokens, total_accepted, total_calls,
+                    total_calls > 0 ? (double)total_accepted/total_calls : 0.0);
+        }
         if (rc != 0) break;
 
         if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
@@ -435,13 +537,14 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
+        const int gen_actual = total_accepted > 0 ? total_accepted : cfg.gen_tokens;
         fprintf(out,
                 "%d,%d,%.2f,%d,%.2f,%llu\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
-                cfg.gen_tokens,
-                gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
+                gen_actual,
+                gen_sec > 0.0 ? (double)gen_actual / gen_sec : 0.0,
                 (unsigned long long)snap.len);
         fflush(out);
 

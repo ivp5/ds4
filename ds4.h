@@ -14,6 +14,9 @@
  * ds4_session_sync() reuse, extend, or rebuild the graph state.  Keep this
  * header narrow so HTTP/CLI code does not depend on tensor internals. */
 
+/* Public model dimensions for callers that need to size buffers. */
+#define DS4_VOCAB_SIZE  129280
+
 typedef enum {
     DS4_BACKEND_METAL,
     DS4_BACKEND_CUDA,
@@ -186,6 +189,22 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
+
+/* Substrate inspection: dump the raw KV state at (layer, position) from the
+ * Metal cache. out_n must equal DS4_N_HEAD_DIM (512). If inverse_rope is true,
+ * the rotated tail is unrotated using the layer's frequency base + position.
+ * Returns 1 on success, 0 on failure (bad layer/pos, GPU unavailable). */
+int ds4_session_dump_kv_raw(ds4_session *s, uint32_t layer, uint32_t position,
+                             float *out, size_t out_n, int inverse_rope);
+
+/* Dump the full next-token logits array. out_n must equal DS4_N_VOCAB.
+ * Returns 1 on success, 0 on failure. */
+int ds4_session_dump_logits(ds4_session *s, float *out, size_t out_n);
+
+/* Override DS4_LAYER_SKIP_LIST at runtime. csv = comma-separated layer indices,
+ * NULL or empty string clears any previous setting. Subsequent prefill/decode
+ * calls honor the new mask. */
+void ds4_set_skip_list(const char *csv);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,

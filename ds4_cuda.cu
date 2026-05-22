@@ -1500,6 +1500,21 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     return 1;
 }
 
+/* CUDA equivalent of the Metal add-without-clear path. CUDA doesn't track a
+ * Metal-style view registry, so adding a secondary mmap just means recording
+ * its base pointer for prefetch / lookup. For now this delegates to the
+ * existing set_model_map_range path, which on CUDA is effectively additive
+ * (set_model_map remembers the latest, prefetch_range works on the passed
+ * mmap). If multi-model CUDA support needs separate base tracking later,
+ * extend this stub. */
+extern "C" int ds4_gpu_add_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+    if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
+        !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
+        (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_set_skip_next_warmup(int skip) {
     (void)skip;
     return 0;

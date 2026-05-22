@@ -434,6 +434,34 @@ static void ds4_gpu_model_views_clear(void) {
     g_model_view_count = 0;
 }
 
+/* Compact-and-clear: drop views matching (model_map, model_size); keep all
+ * others in place. Used when re-mapping a specific mmap (main model phase
+ * swap) without disturbing views of a different mmap (the MTP draft). */
+static void ds4_gpu_model_views_clear_for_mmap(const void *model_map, uint64_t model_size) {
+    uint32_t write = 0;
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (g_model_views[i].model_map == model_map &&
+            g_model_views[i].model_size == model_size) {
+            g_model_views[i].buffer = nil;
+            g_model_views[i].model_map = NULL;
+            g_model_views[i].model_size = 0;
+            g_model_views[i].model_offset = 0;
+            g_model_views[i].bytes = 0;
+            continue;
+        }
+        if (write != i) {
+            g_model_views[write] = g_model_views[i];
+            g_model_views[i].buffer = nil;
+            g_model_views[i].model_map = NULL;
+            g_model_views[i].model_size = 0;
+            g_model_views[i].model_offset = 0;
+            g_model_views[i].bytes = 0;
+        }
+        write++;
+    }
+    g_model_view_count = write;
+}
+
 static void ds4_gpu_model_residency_clear(void) {
 #if TARGET_OS_OSX
     if (@available(macOS 15.0, *)) {
@@ -4461,7 +4489,9 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
          * kernel. */
         (void)ds4_gpu_wait_pending_command_buffers("set_model_map_range");
         ds4_gpu_model_residency_clear();
-        ds4_gpu_model_views_clear();
+        /* Only drop views of THIS mmap; preserve views of other mmaps such
+         * as the MTP draft module that was previously add-mapped. */
+        ds4_gpu_model_views_clear_for_mmap(model_map, model_size);
         g_model_map_ptr = model_map;
         g_model_map_size = model_size;
         g_model_mapped_offset = map_offset;
@@ -4497,7 +4527,9 @@ int ds4_gpu_set_model_map_ranges(
          * same mmap range at once. */
         (void)ds4_gpu_wait_pending_command_buffers("set_model_map_ranges");
         ds4_gpu_model_residency_clear();
-        ds4_gpu_model_views_clear();
+        /* Preserve views of other mmaps (e.g. add-mapped MTP draft module);
+         * only drop views matching this specific (model_map, model_size). */
+        ds4_gpu_model_views_clear_for_mmap(model_map, model_size);
         g_model_map_ptr = model_map;
         g_model_map_size = model_size;
 
@@ -4533,6 +4565,39 @@ int ds4_gpu_set_model_map_ranges(
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size);
+}
+
+/* ADD a model-view range without clearing existing views. Used to register
+ * a second mmap (e.g. the MTP draft module's tensor region) alongside the
+ * main model. The wrap-by-range lookup discriminates by model_map pointer +
+ * model_size so multi-model views coexist safely. */
+int ds4_gpu_add_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || model_size == 0) return 0;
+    if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) return 0;
+
+    @autoreleasepool {
+        /* Drain in-flight command buffers that may reference current views
+         * before we extend the residency set. */
+        (void)ds4_gpu_wait_pending_command_buffers("add_model_map_range");
+        /* Skip if the requested range is already covered by an existing view
+         * for the same mmap. Idempotent re-add. */
+        if (ds4_gpu_model_views_cover_range(model_map, model_size, map_offset, map_size)) {
+            return 1;
+        }
+        if (!ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size)) {
+            return 0;
+        }
+        if (!ds4_gpu_finalize_model_views()) {
+            return 0;
+        }
+        fprintf(stderr,
+                "ds4: Metal added auxiliary model views (mmap=%p offset=%llu size=%llu); "
+                "total views=%u\n",
+                model_map, (unsigned long long)map_offset,
+                (unsigned long long)map_size, g_model_view_count);
+        return 1;
+    }
 }
 
 int ds4_gpu_set_model_fd(int fd) {

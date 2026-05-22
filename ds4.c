@@ -59,6 +59,11 @@
 #define DS4_HC_EPS  ( 1.0e-6f)
 #define DS4_EXPERT_WEIGHT_SCALE (1.5f)
 #define DS4_SWIGLU_CLAMP_EXP    (10.0f)
+
+/* Forward declaration for the per-event router-trace CPU hook (codex H1005).
+ * Schema v2 (2026-05-21) captures gating weights alongside selected expert IDs
+ * to support the codex H1209-1213 selector/admission/actuator decomposition. */
+static inline void pe_router_trace_record_cpu(uint32_t il, uint32_t pos, const int *selected, const float *weights);
 #define DS4_ROPE_FREQ_BASE      (10000.0f)
 #define DS4_ROPE_SCALE_FACTOR   (16.0f)
 #define DS4_ROPE_YARN_BETA_FAST (32.0f)
@@ -2047,6 +2052,104 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
 #endif
 }
 
+/* TBL-kernel variant: uses vqtbl4q_s8 to apply sign patterns via in-register
+ * table lookup instead of vld1_s8 + vmulq_s8. Theoretically saves the multiply
+ * step and may improve ILP by interleaving table loads.
+ *
+ * Note (silv 2026-05-22): K_REDUCE diagnostic (DS4_K_REDUCE=1 → 18% speedup vs
+ * default K=6) suggests routed-MoE compute is NOT the per-token bottleneck, so
+ * even a 2x kernel improvement caps at ~10% total decode speedup. Built for
+ * empirical comparison per silv directive. */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static void ds4_vec_dot_iq2_xxs_pair_q8_K_tbl(
+        int n,
+        float *s0,
+        float *s1,
+        const block_iq2_xxs *x0,
+        const block_iq2_xxs *x1,
+        const block_q8_K *y) {
+    const int nb = n / QK_K;
+    float total0 = 0.0f;
+    float total1 = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = f16_to_f32(x0[i].d) * y[i].d;
+        const float d1 = f16_to_f32(x1[i].d) * y[i].d;
+        const uint16_t *q20 = x0[i].qs;
+        const uint16_t *q21 = x1[i].qs;
+        const int8_t *q8 = y[i].qs;
+        float sum01 = 0.0f, sum02 = 0.0f, sum11 = 0.0f, sum12 = 0.0f;
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const int8x16x4_t q8b = vld1q_s8_x4(q8);
+            q8 += 64;
+
+            uint32_t aux0[4], aux1[4];
+            memcpy(aux0, q20, sizeof(aux0));
+            memcpy(aux1, q21, sizeof(aux1));
+            q20 += 8; q21 += 8;
+            const uint8_t *a0 = (const uint8_t *)aux0;
+            const uint8_t *a1 = (const uint8_t *)aux1;
+
+            /* TBL-style sign application: pack the 4 sign patterns for the
+             * group into a 32-byte 2-register table, then use vqtbl2q_u8 with
+             * low (0..15) and high (16..31) indices to extract sgn0 and sgn1
+             * (or sgn2 and sgn3). Bug fix: must use DIFFERENT index sets to
+             * get the second 16-byte half of the table. */
+            #define DS4_IQ2_TBL_DOT(aux, aux8, acc_a, acc_b) do {                                       \
+                int8x16_t g0 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[0])),           \
+                                            vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[1])));         \
+                int8x16_t g1 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[2])),           \
+                                            vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[3])));         \
+                int8x16_t g2 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[8])),           \
+                                            vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[9])));         \
+                int8x16_t g3 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[10])),          \
+                                            vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[11])));        \
+                /* Build 2-register sign tables. uint8x16x2_t is the required type for vqtbl2q_u8. */    \
+                uint8x16x2_t sgn01 = {{                                                                  \
+                    vreinterpretq_u8_s8(vcombine_s8(vld1_s8(iq2xxs_signs[((aux)[1] >>  0) & 127]),       \
+                                                     vld1_s8(iq2xxs_signs[((aux)[1] >>  7) & 127]))),    \
+                    vreinterpretq_u8_s8(vcombine_s8(vld1_s8(iq2xxs_signs[((aux)[1] >> 14) & 127]),       \
+                                                     vld1_s8(iq2xxs_signs[((aux)[1] >> 21) & 127])))     \
+                }};                                                                                      \
+                uint8x16x2_t sgn23 = {{                                                                  \
+                    vreinterpretq_u8_s8(vcombine_s8(vld1_s8(iq2xxs_signs[((aux)[3] >>  0) & 127]),       \
+                                                     vld1_s8(iq2xxs_signs[((aux)[3] >>  7) & 127]))),    \
+                    vreinterpretq_u8_s8(vcombine_s8(vld1_s8(iq2xxs_signs[((aux)[3] >> 14) & 127]),       \
+                                                     vld1_s8(iq2xxs_signs[((aux)[3] >> 21) & 127])))     \
+                }};                                                                                      \
+                static const uint8_t idx_lo_data[16] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};         \
+                static const uint8_t idx_hi_data[16] = {16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31}; \
+                const uint8x16_t idx_lo = vld1q_u8(idx_lo_data);                                         \
+                const uint8x16_t idx_hi = vld1q_u8(idx_hi_data);                                         \
+                int8x16_t s0v = vreinterpretq_s8_u8(vqtbl2q_u8(sgn01, idx_lo));                          \
+                int8x16_t s1v = vreinterpretq_s8_u8(vqtbl2q_u8(sgn01, idx_hi));                          \
+                int8x16_t s2v = vreinterpretq_s8_u8(vqtbl2q_u8(sgn23, idx_lo));                          \
+                int8x16_t s3v = vreinterpretq_s8_u8(vqtbl2q_u8(sgn23, idx_hi));                          \
+                g0 = vmulq_s8(g0, s0v);                                                                  \
+                g1 = vmulq_s8(g1, s1v);                                                                  \
+                g2 = vmulq_s8(g2, s2v);                                                                  \
+                g3 = vmulq_s8(g3, s3v);                                                                  \
+                const int32x4_t p1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), g0, q8b.val[0]), g1, q8b.val[1]); \
+                const int32x4_t p2 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), g2, q8b.val[2]), g3, q8b.val[3]); \
+                (acc_a) += (float)vaddvq_s32(p1) * (0.5f + (float)((aux)[1] >> 28));                     \
+                (acc_b) += (float)vaddvq_s32(p2) * (0.5f + (float)((aux)[3] >> 28));                     \
+            } while (0)
+
+            DS4_IQ2_TBL_DOT(aux0, a0, sum01, sum02);
+            DS4_IQ2_TBL_DOT(aux1, a1, sum11, sum12);
+            #undef DS4_IQ2_TBL_DOT
+        }
+
+        total0 += d0 * (sum01 + sum02);
+        total1 += d1 * (sum11 + sum12);
+    }
+
+    *s0 = 0.25f * total0;
+    *s1 = 0.25f * total1;
+}
+#endif
+
 static void ds4_vec_dot_iq2_xxs_pair_q8_K(
         int n,
         float *s0,
@@ -2055,6 +2158,18 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
         const block_iq2_xxs *x1,
         const block_q8_K *y) {
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    /* Optional TBL-kernel route, switchable via DS4_USE_TBL_KERNEL env var */
+    {
+        static int cached = -1;
+        if (cached < 0) {
+            const char *e = getenv("DS4_USE_TBL_KERNEL");
+            cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (cached) {
+            ds4_vec_dot_iq2_xxs_pair_q8_K_tbl(n, s0, s1, x0, x1, y);
+            return;
+        }
+    }
     const int nb = n / QK_K;
     float total0 = 0.0f;
     float total1 = 0.0f;
@@ -5151,14 +5266,15 @@ static void hc_pre_from_state_one(
         float             * out,
         float             * post,
         float             * comb) {
-    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
-    float *flat = xmalloc((size_t)hc_dim * sizeof(flat[0]));
+    /* H1 lift: 64KB scratch was per-call xmalloc+free, now thread-local static.
+     * Purely scratch (overwritten by rms_norm_no_weight inside _scratch), size
+     * is compile-time constant, concurrent callers handled by _Thread_local. */
+    static _Thread_local float flat[(size_t)DS4_N_EMBD * DS4_N_HC];
 
     hc_pre_from_state_one_scratch(model,
                                   fn, scale_tensor, base_tensor,
                                   residual_hc, out, post, comb,
                                   flat, false);
-    free(flat);
 }
 
 static void layer_attn_pre_one(
@@ -5337,7 +5453,11 @@ typedef struct {
 static void hc_pre_norm_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
     hc_pre_norm_batch_ctx *ctx = vctx;
     const float *norm_w = tensor_data(ctx->model, ctx->norm_w);
-    float *flat = xmalloc((size_t)ctx->hc_dim * sizeof(flat[0]));
+    /* H2 lift: per-worker xmalloc replaced by thread-local static. Each parallel-for
+     * thread keeps its own 64KB scratch across all hc_pre_norm_batch invocations
+     * for its lifetime. Buffer is overwritten by rms_norm_no_weight inside the
+     * scratch fn before any read. */
+    static _Thread_local float flat[(size_t)DS4_N_EMBD * DS4_N_HC];
 
     for (uint64_t t = t0; t < t1; t++) {
         const float *residual = ctx->inp_hc + t * ctx->hc_dim;
@@ -5363,8 +5483,6 @@ static void hc_pre_norm_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
                         DS4_N_EMBD,
                         DS4_RMS_EPS);
     }
-
-    free(flat);
 }
 
 /* Batched HC pre plus RMSNorm.  Prefill uses this to keep the layer-major
@@ -6103,6 +6221,18 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n);
 
 /* Single-token routed MoE.  It selects six experts, runs IQ2_XXS gate/up,
  * applies SwiGLU and router weights, then accumulates Q2_K down projections. */
+static void layer_routed_moe_one_prealloc(
+        float             * out,
+        const ds4_model   * model,
+        const ds4_layer_weights * layer,
+        const float       * x,
+        uint32_t            il,
+        int                 token,
+        float               clamp,
+        float              * mid_all,
+        block_q8_K         * xq,
+        block_q8_K         * midq);
+
 static void layer_routed_moe_one(
         float             * out,
         const ds4_model   * model,
@@ -6112,19 +6242,32 @@ static void layer_routed_moe_one(
         int                 token,
         float               clamp,
         bool                trace) {
-    int selected[DS4_N_EXPERT_USED];
-    float expert_weight[DS4_N_EXPERT_USED];
-    float *gate = trace ? xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0])) : NULL;
-    float *up = trace ? xmalloc((size_t)DS4_N_FF_EXP * sizeof(up[0])) : NULL;
-    float *mid = trace ? xmalloc((size_t)DS4_N_FF_EXP * sizeof(mid[0])) : NULL;
-    float *mid_all = trace ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(mid_all[0]));
-    float *down = trace ? xmalloc((size_t)DS4_N_EMBD * sizeof(down[0])) : NULL;
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     if (expert_in_dim % QK_K != 0) ds4_die("IQ2_XXS expert input is not QK_K aligned");
+    if (expert_in_dim > DS4_N_EMBD) ds4_die("expert_in_dim exceeds DS4_N_EMBD static-scratch ceiling");
     if (down_in_dim != DS4_N_FF_EXP || down_in_dim % QK_K != 0) ds4_die("Q2_K expert input has an unexpected layout");
-    block_q8_K *xq = xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(xq[0]));
-    block_q8_K *midq = trace ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(midq[0]));
+    /* H4 lift: xq sized to maximum expert_in_dim/QK_K = DS4_N_EMBD/QK_K = 16 blocks.
+     * Asserted ≤ at runtime; tensor_expect_routed_expert pins to DS4_N_EMBD at model load. */
+    static _Thread_local block_q8_K xq[DS4_N_EMBD / QK_K];
+
+    if (!trace) {
+        /* Fast path: H4 lift — mid_all + midq lifted to thread-local statics.
+         * Sizes are compile-time constants (DS4_N_EXPERT_USED=6, DS4_N_FF_EXP=2048,
+         * down_in_dim==DS4_N_FF_EXP asserted above). */
+        static _Thread_local float mid_all[DS4_N_EXPERT_USED * DS4_N_FF_EXP];
+        static _Thread_local block_q8_K midq[DS4_N_EXPERT_USED * DS4_N_FF_EXP / QK_K];
+        layer_routed_moe_one_prealloc(out, model, layer, x, il, token, clamp, mid_all, xq, midq);
+        return;
+    }
+
+    /* Trace path: per-expert stats dump for diagnostic inspection. */
+    int selected[DS4_N_EXPERT_USED];
+    float expert_weight[DS4_N_EXPERT_USED];
+    float *gate = xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0]));
+    float *up = xmalloc((size_t)DS4_N_FF_EXP * sizeof(up[0]));
+    float *mid = xmalloc((size_t)DS4_N_FF_EXP * sizeof(mid[0]));
+    float *down = xmalloc((size_t)DS4_N_EMBD * sizeof(down[0]));
 
     memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
     ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
@@ -6135,68 +6278,29 @@ static void layer_routed_moe_one(
     } else {
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
     }
+    pe_router_trace_record_cpu(il, (uint32_t)token, selected, expert_weight);
 
-    if (!trace) {
-        matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
-                                            layer->ffn_gate_exps,
-                                            layer->ffn_up_exps,
-                                            xq,
-                                            selected,
-                                            expert_weight,
-                                            DS4_N_EXPERT_USED,
-                                            clamp);
-        for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
-            ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
-                                  midq + (uint64_t)i * (down_in_dim / QK_K),
-                                  (int64_t)down_in_dim);
-        }
-        matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
-    } else {
-        for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
-            const uint32_t expert = (uint32_t)selected[i];
-
-            matvec_iq2_xxs_expert_pair_prequant(gate, up, model,
-                                                 layer->ffn_gate_exps,
-                                                 layer->ffn_up_exps,
-                                                 xq,
-                                                 expert);
-            char name[64];
-            snprintf(name, sizeof(name), "blk.%u expert %u gate", il, expert);
-            print_vec_stats(name, gate, DS4_N_FF_EXP);
-            snprintf(name, sizeof(name), "blk.%u expert %u up", il, expert);
-            print_vec_stats(name, up, DS4_N_FF_EXP);
-
-            /*
-             * DeepSeek V4 clamps routed expert gate/up values before SwiGLU and
-             * applies the router weight before the down projection.
-             */
-            const float limit = clamp;
-            for (int j = 0; j < DS4_N_FF_EXP; j++) {
-                if (limit > 1.0e-6f) {
-                    if (gate[j] > limit) gate[j] = limit;
-                    if (up[j] > limit) up[j] = limit;
-                    if (up[j] < -limit) up[j] = -limit;
-                }
-                mid[j] = silu(gate[j]) * up[j] * expert_weight[i];
+    for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
+        const uint32_t expert = (uint32_t)selected[i];
+        matvec_iq2_xxs_expert_pair_prequant(gate, up, model, layer->ffn_gate_exps, layer->ffn_up_exps, xq, expert);
+        char name[64];
+        snprintf(name, sizeof(name), "blk.%u expert %u gate", il, expert); print_vec_stats(name, gate, DS4_N_FF_EXP);
+        snprintf(name, sizeof(name), "blk.%u expert %u up",   il, expert); print_vec_stats(name, up,   DS4_N_FF_EXP);
+        for (int j = 0; j < DS4_N_FF_EXP; j++) {
+            if (clamp > 1.0e-6f) {
+                if (gate[j] > clamp)  gate[j] = clamp;
+                if (up[j]   > clamp)  up[j]   = clamp;
+                if (up[j]   < -clamp) up[j]   = -clamp;
             }
-
-            snprintf(name, sizeof(name), "blk.%u expert %u mid", il, expert);
-            print_vec_stats(name, mid, DS4_N_FF_EXP);
-
-            matvec_q2_k_expert(down, model, layer->ffn_down_exps, mid, expert);
-            snprintf(name, sizeof(name), "blk.%u expert %u down", il, expert);
-            print_vec_stats(name, down, DS4_N_EMBD);
-            for (int j = 0; j < DS4_N_EMBD; j++) out[j] += down[j];
+            mid[j] = silu(gate[j]) * up[j] * expert_weight[i];
         }
+        snprintf(name, sizeof(name), "blk.%u expert %u mid", il, expert); print_vec_stats(name, mid, DS4_N_FF_EXP);
+        matvec_q2_k_expert(down, model, layer->ffn_down_exps, mid, expert);
+        snprintf(name, sizeof(name), "blk.%u expert %u down", il, expert); print_vec_stats(name, down, DS4_N_EMBD);
+        for (int j = 0; j < DS4_N_EMBD; j++) out[j] += down[j];
     }
 
-    free(midq);
-    free(xq);
-    free(down);
-    free(mid_all);
-    free(mid);
-    free(up);
-    free(gate);
+    free(down); free(mid); free(up); free(gate); /* H4: xq is thread-local-static, no free */
 }
 
 /* Decode version of routed MoE: same math as layer_routed_moe_one(), but all
@@ -6229,6 +6333,34 @@ static void layer_routed_moe_one_prealloc(
     } else {
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
     }
+    pe_router_trace_record_cpu(il, (uint32_t)token, selected, expert_weight);
+
+    /* K_REDUCE diagnostic: env DS4_K_REDUCE=N (1..6) keeps only top-N experts
+     * after gating. Renormalize weights so total magnitude doesn't shrink.
+     * Quality degradation is the cost; speed gain is the diagnostic signal. */
+    int effective_k = DS4_N_EXPERT_USED;
+    {
+        static int cached_k = -1;
+        if (cached_k < 0) {
+            const char *e = getenv("DS4_K_REDUCE");
+            if (e && e[0]) {
+                int v = atoi(e);
+                cached_k = (v >= 1 && v <= DS4_N_EXPERT_USED) ? v : DS4_N_EXPERT_USED;
+            } else {
+                cached_k = DS4_N_EXPERT_USED;
+            }
+        }
+        effective_k = cached_k;
+    }
+    if (effective_k < DS4_N_EXPERT_USED) {
+        /* Renormalize top-effective_k weights to sum to DS4_EXPERT_WEIGHT_SCALE */
+        float sum = 0.0f;
+        for (int i = 0; i < effective_k; i++) sum += expert_weight[i];
+        if (sum > 1e-6f) {
+            const float scale = DS4_EXPERT_WEIGHT_SCALE / sum;
+            for (int i = 0; i < effective_k; i++) expert_weight[i] *= scale;
+        }
+    }
 
     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
                                         layer->ffn_gate_exps,
@@ -6236,15 +6368,15 @@ static void layer_routed_moe_one_prealloc(
                                         xq,
                                         selected,
                                         expert_weight,
-                                        DS4_N_EXPERT_USED,
+                                        effective_k,
                                         clamp);
 
-    for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
+    for (int i = 0; i < effective_k; i++) {
         ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
                               midq + (uint64_t)i * (down_in_dim / QK_K),
                               (int64_t)down_in_dim);
     }
-    matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
+    matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, effective_k);
 
     (void)il;
 }
@@ -6423,6 +6555,7 @@ static void layer_routed_moe_batch(
         } else {
             layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim);
         }
+        pe_router_trace_record_cpu(il, (uint32_t)t, sel, weights);
 
         for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
             const uint32_t pair_id = t * DS4_N_EXPERT_USED + slot;
@@ -6543,11 +6676,16 @@ static void layer_ffn_one(
     double t_routed = 0.0;
     double t_shared = 0.0;
     double t_post = 0.0;
-    float *ffn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(ffn_cur[0]));
-    float *norm = xmalloc((size_t)DS4_N_EMBD * sizeof(norm[0]));
-    float *moe = xmalloc((size_t)DS4_N_EMBD * sizeof(moe[0]));
-    float *shared = xmalloc((size_t)DS4_N_EMBD * sizeof(shared[0]));
-    float *ffn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(ffn_out[0]));
+    /* H3 lift: five per-call xmallocs (5 × 16KB = 80KB) replaced by thread-local
+     * statics. Each parallel-for worker keeps its own scratch across all FFN calls
+     * for its lifetime. All five buffers are fully overwritten by the layer
+     * subcalls below (hc_pre_from_state_one, rms_norm_weight, layer_routed_moe_one,
+     * layer_shared_ffn_one, the moe+shared sum loop) before any read. */
+    static _Thread_local float ffn_cur[DS4_N_EMBD];
+    static _Thread_local float norm[DS4_N_EMBD];
+    static _Thread_local float moe[DS4_N_EMBD];
+    static _Thread_local float shared[DS4_N_EMBD];
+    static _Thread_local float ffn_out[DS4_N_EMBD];
     float post[4];
     float comb[16];
 
@@ -6622,11 +6760,7 @@ static void layer_ffn_one(
                 (now_sec() - t_start) * 1000.0);
     }
 
-    free(ffn_out);
-    free(shared);
-    free(moe);
-    free(norm);
-    free(ffn_cur);
+    /* H3 lift: no frees — scratch is thread-local-static */
 }
 
 /* Allocation-free decode FFN using the persistent CPU scratch buffers. */
@@ -9700,6 +9834,138 @@ static void metal_graph_debug_dump_i32_tensor(
     }
 }
 
+/* === per-event router trace (codex H1005, hand-merged 2026-05-21) ===
+ * Emits CSV per (stage, position, layer) after router selection. Gated by
+ * DS4_ROUTER_TRACE_PE env. Validates cache-residency thesis on real workloads. */
+static FILE       *g_pe_router_fp = NULL;
+static const char *g_pe_router_path = NULL;
+static uint64_t    g_pe_router_rows = 0;
+static uint64_t    g_pe_router_limit = 0;
+static int         g_pe_router_env_checked = 0;
+static int         g_pe_router_failed = 0;
+static int         g_pe_router_decode_buf[DS4_N_EXPERT_USED];
+static float       g_pe_router_decode_w[DS4_N_EXPERT_USED];
+static int        *g_pe_router_batch_buf = NULL;
+static float      *g_pe_router_batch_w_buf = NULL;
+static uint32_t    g_pe_router_batch_cap = 0;
+
+static void metal_graph_pe_router_trace_close(void) {
+    if (g_pe_router_fp) { fclose(g_pe_router_fp); g_pe_router_fp = NULL; }
+    free(g_pe_router_batch_buf);
+    free(g_pe_router_batch_w_buf);
+    g_pe_router_batch_buf = NULL; g_pe_router_batch_w_buf = NULL;
+    g_pe_router_batch_cap = 0;
+}
+
+static bool metal_graph_pe_router_trace_open(void) {
+    if (g_pe_router_failed) return false;
+    if (!g_pe_router_env_checked) {
+        g_pe_router_path = getenv("DS4_ROUTER_TRACE_PE");
+        const char *lim = getenv("DS4_ROUTER_TRACE_PE_LIMIT");
+        if (lim && lim[0]) g_pe_router_limit = strtoull(lim, NULL, 10);
+        g_pe_router_env_checked = 1;
+    }
+    if (!g_pe_router_path || !g_pe_router_path[0]) return false;
+    if (g_pe_router_limit && g_pe_router_rows >= g_pe_router_limit) return false;
+    if (g_pe_router_fp) return true;
+    struct stat st;
+    const bool write_header = stat(g_pe_router_path, &st) != 0 || st.st_size == 0;
+    g_pe_router_fp = fopen(g_pe_router_path, "a");
+    if (!g_pe_router_fp) { g_pe_router_failed = 1; return false; }
+    atexit(metal_graph_pe_router_trace_close);
+    if (write_header) {
+        /* Schema v2: per-event router trace with gating weights.
+         * Captures the admission scores per the codex H1209-1213 selector/admission/actuator
+         * decomposition. Backward-compat readers that only know e0..e5 will ignore w0..w5. */
+        fprintf(g_pe_router_fp, "row,stage,pos,layer,e0,e1,e2,e3,e4,e5,w0,w1,w2,w3,w4,w5\n");
+        fflush(g_pe_router_fp);
+    }
+    return true;
+}
+
+static void metal_graph_pe_router_trace_write_row(const char *stage, uint32_t pos, uint32_t il, const int *selected, const float *weights) {
+    if (!g_pe_router_fp) return;
+    if (g_pe_router_limit && g_pe_router_rows >= g_pe_router_limit) return;
+    if (weights) {
+        fprintf(g_pe_router_fp, "%" PRIu64 ",%s,%u,%u,%d,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                g_pe_router_rows, stage, pos, il,
+                selected[0], selected[1], selected[2],
+                selected[3], selected[4], selected[5],
+                weights[0], weights[1], weights[2],
+                weights[3], weights[4], weights[5]);
+    } else {
+        /* Weights not available at this call site; emit empty floats so schema stays uniform. */
+        fprintf(g_pe_router_fp, "%" PRIu64 ",%s,%u,%u,%d,%d,%d,%d,%d,%d,nan,nan,nan,nan,nan,nan\n",
+                g_pe_router_rows, stage, pos, il,
+                selected[0], selected[1], selected[2],
+                selected[3], selected[4], selected[5]);
+    }
+    g_pe_router_rows++;
+    /* Live-monitor heartbeat: print every 1000 rows so an external observer
+     * sees the trace advancing without tailing the CSV. */
+    if ((g_pe_router_rows % 1000) == 0) {
+        fprintf(stderr, "ds4: router-trace rows=%" PRIu64 " stage=%s last_layer=%u\n",
+                g_pe_router_rows, stage, il);
+        fflush(stderr);
+    }
+}
+
+static bool metal_graph_pe_router_trace_batch_capacity(uint32_t n_tokens) {
+    if (n_tokens <= g_pe_router_batch_cap) return true;
+    int   *next   = xmalloc((size_t)n_tokens * DS4_N_EXPERT_USED * sizeof(next[0]));
+    float *next_w = xmalloc((size_t)n_tokens * DS4_N_EXPERT_USED * sizeof(next_w[0]));
+    free(g_pe_router_batch_buf);
+    free(g_pe_router_batch_w_buf);
+    g_pe_router_batch_buf   = next;
+    g_pe_router_batch_w_buf = next_w;
+    g_pe_router_batch_cap   = n_tokens;
+    return g_pe_router_batch_buf != NULL && g_pe_router_batch_w_buf != NULL;
+}
+
+static void metal_graph_pe_router_trace_one(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, uint32_t il, uint32_t pos) {
+    if (!selected || !metal_graph_pe_router_trace_open()) return;
+    if (ds4_gpu_synchronize() == 0) return;
+    bool have_w = false;
+    if (weights && ds4_gpu_tensor_read(weights, 0, g_pe_router_decode_w, sizeof(g_pe_router_decode_w)) != 0) {
+        have_w = true;
+    }
+    if (ds4_gpu_tensor_read(selected, 0, g_pe_router_decode_buf, sizeof(g_pe_router_decode_buf)) != 0) {
+        metal_graph_pe_router_trace_write_row("decode", pos, il, g_pe_router_decode_buf,
+                                              have_w ? g_pe_router_decode_w : NULL);
+        fflush(g_pe_router_fp);
+    }
+    if (ds4_gpu_begin_commands() == 0) return;
+}
+
+static void metal_graph_pe_router_trace_batch(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, uint32_t il, uint32_t pos0, uint32_t n_tokens) {
+    if (!selected || n_tokens == 0 || !metal_graph_pe_router_trace_open()) return;
+    if (!metal_graph_pe_router_trace_batch_capacity(n_tokens)) return;
+    const uint64_t bytes   = (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(g_pe_router_batch_buf[0]);
+    const uint64_t w_bytes = (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(g_pe_router_batch_w_buf[0]);
+    if (ds4_gpu_synchronize() == 0) return;
+    bool have_w = false;
+    if (weights && ds4_gpu_tensor_read(weights, 0, g_pe_router_batch_w_buf, w_bytes) != 0) {
+        have_w = true;
+    }
+    if (ds4_gpu_tensor_read(selected, 0, g_pe_router_batch_buf, bytes) != 0) {
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            metal_graph_pe_router_trace_write_row("prefill", pos0 + t, il,
+                g_pe_router_batch_buf + (size_t)t * DS4_N_EXPERT_USED,
+                have_w ? g_pe_router_batch_w_buf + (size_t)t * DS4_N_EXPERT_USED : NULL);
+        }
+        fflush(g_pe_router_fp);
+    }
+    if (ds4_gpu_begin_commands() == 0) return;
+}
+
+/* CPU-path hook: weights are computed alongside selected experts in
+ * layer_topk_selected_experts. Callers pass both. */
+static inline void pe_router_trace_record_cpu(uint32_t il, uint32_t pos, const int *selected, const float *weights) {
+    if (!metal_graph_pe_router_trace_open()) return;
+    metal_graph_pe_router_trace_write_row("decode_cpu", pos, il, selected, weights);
+}
+/* === END per-event router trace === */
+
 static bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint32_t pos) {
     return metal_graph_directional_steering_ffn_enabled(g) ||
            g->materialize_ffn_out ||
@@ -10082,7 +10348,20 @@ static bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t i
 
 static uint32_t metal_graph_decode_indexer_top_k(const ds4_gpu_graph *g) {
     (void)g;
-    return DS4_N_INDEXER_TOP_K;
+    /* Env-var override DS4_INDEXER_TOP_K=N caps the indexer's top-k at N
+     * (must be 1..DS4_N_INDEXER_TOP_K). Smaller K cuts attention compute on
+     * even (ratio-4 indexer) layers linearly with K. Quality may degrade. */
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_INDEXER_TOP_K");
+        if (e && e[0]) {
+            int v = atoi(e);
+            cached = (v > 0 && v <= (int)DS4_N_INDEXER_TOP_K) ? v : (int)DS4_N_INDEXER_TOP_K;
+        } else {
+            cached = (int)DS4_N_INDEXER_TOP_K;
+        }
+    }
+    return (uint32_t)cached;
 }
 
 /* =========================================================================
@@ -10848,6 +11127,7 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_probs", g->router_probs, DS4_N_EXPERT, il, pos);
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
+        metal_graph_pe_router_trace_one(g->router_selected, g->router_weights, il, pos);
     }
     if (ok && !force_metal_moe && g->cpu_moe_layer[il]) {
         ok = metal_graph_ensure_cpu_moe_scratch(g, 1) && (ds4_gpu_end_commands() != 0);
@@ -10919,7 +11199,8 @@ static bool metal_graph_encode_decode_layer(
                                                          layer->ffn_up_shexp->abs_offset,
                                                          DS4_N_EMBD,
                                                          shared_dim,
-                                                         g->ffn_norm) != 0;
+                                                         g->ffn_norm,
+                                                         DS4_SWIGLU_CLAMP_EXP) != 0;
     } else {
         if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
                                                   layer->ffn_gate_shexp->abs_offset,
@@ -11866,21 +12147,82 @@ static bool metal_graph_encode_token_raw_swa(
         if (end != split_env && v <= DS4_N_LAYER) split_after_layers = (uint32_t)v;
     }
 
+    /* Terminal-case experiment: multiple layer-skip policies via env vars.
+     * DS4_LAYER_SKIP_MOD=N: skip where il%N != 0 (e.g., MOD=2 keeps evens).
+     * DS4_LAYER_KEEP_FIRST=N: keep only il < N (skip the rest).
+     * DS4_LAYER_KEEP_LAST=N: keep only il >= DS4_N_LAYER-N.
+     * DS4_LAYER_SKIP_RANGE="lo-hi": skip layers in inclusive range. */
+    static int cached_skip_mod = -1;
+    static int cached_keep_first = -1;
+    static int cached_keep_last = -1;
+    static int cached_skip_lo = -1, cached_skip_hi = -1;
+    if (cached_skip_mod < 0) {
+        const char *e = getenv("DS4_LAYER_SKIP_MOD");
+        cached_skip_mod = (e && e[0]) ? atoi(e) : 0;
+        if (cached_skip_mod < 0) cached_skip_mod = 0;
+    }
+    if (cached_keep_first < 0) {
+        const char *e = getenv("DS4_LAYER_KEEP_FIRST");
+        cached_keep_first = (e && e[0]) ? atoi(e) : 0;
+        if (cached_keep_first < 0) cached_keep_first = 0;
+    }
+    if (cached_keep_last < 0) {
+        const char *e = getenv("DS4_LAYER_KEEP_LAST");
+        cached_keep_last = (e && e[0]) ? atoi(e) : 0;
+        if (cached_keep_last < 0) cached_keep_last = 0;
+    }
+    if (cached_skip_lo < 0) {
+        const char *e = getenv("DS4_LAYER_SKIP_RANGE");
+        if (e && e[0]) {
+            char *dash = strchr((char*)e, '-');
+            if (dash) {
+                cached_skip_lo = atoi(e);
+                cached_skip_hi = atoi(dash + 1);
+            }
+        }
+        if (cached_skip_lo < 0) { cached_skip_lo = 0; cached_skip_hi = -1; }
+    }
+    /* DS4_LAYER_SKIP_LIST="a,b,c": comma-separated layer indices to skip */
+    static int skip_list_initialized = 0;
+    static bool skip_layer_mask[DS4_N_LAYER];
+    if (!skip_list_initialized) {
+        for (uint32_t k = 0; k < DS4_N_LAYER; k++) skip_layer_mask[k] = false;
+        const char *e = getenv("DS4_LAYER_SKIP_LIST");
+        if (e && e[0]) {
+            char buf[1024];
+            strncpy(buf, e, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            char *tok = strtok(buf, ",");
+            while (tok) {
+                int v = atoi(tok);
+                if (v >= 0 && v < (int)DS4_N_LAYER) skip_layer_mask[v] = true;
+                tok = strtok(NULL, ",");
+            }
+        }
+        skip_list_initialized = 1;
+    }
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        ok = metal_graph_encode_decode_layer(g,
-                                             model,
-                                             &weights->layer[il],
-                                             il,
-                                             pos,
-                                             g->layer_raw_cache[il],
-                                             g->raw_cap,
-                                             raw_row,
-                                             n_raw,
-                                             token,
-                                             false);
-        ds4_gpu_tensor *tmp = g->cur_hc;
-        g->cur_hc = g->after_ffn_hc;
-        g->after_ffn_hc = tmp;
+        bool skip = (cached_skip_mod > 1) && ((il % cached_skip_mod) != 0);
+        if (cached_keep_first > 0 && (int)il >= cached_keep_first) skip = true;
+        if (cached_keep_last > 0 && (int)il < (int)(DS4_N_LAYER - cached_keep_last)) skip = true;
+        if (cached_skip_hi >= 0 && (int)il >= cached_skip_lo && (int)il <= cached_skip_hi) skip = true;
+        if (skip_layer_mask[il]) skip = true;
+        if (!skip) {
+            ok = metal_graph_encode_decode_layer(g,
+                                                 model,
+                                                 &weights->layer[il],
+                                                 il,
+                                                 pos,
+                                                 g->layer_raw_cache[il],
+                                                 g->raw_cap,
+                                                 raw_row,
+                                                 n_raw,
+                                                 token,
+                                                 false);
+            ds4_gpu_tensor *tmp = g->cur_hc;
+            g->cur_hc = g->after_ffn_hc;
+            g->after_ffn_hc = tmp;
+        }
         if (ok && allow_split_flush && split_after_layers != 0 && il + 1u == split_after_layers) {
             ok = ds4_gpu_flush_commands() != 0;
         }
@@ -13619,6 +13961,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                           (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->batch_router_weights,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
+        metal_graph_pe_router_trace_batch(g->batch_router_selected, g->batch_router_weights, il, pos0, n_tokens);
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
@@ -14260,6 +14603,69 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
 
 /* Execute Metal prefill in layer-major order so intermediate activations stay
  * on the GPU and cache state is built exactly once. */
+/* File-scope skip state, settable at runtime via ds4_set_skip_list() or
+ * initialized from DS4_LAYER_SKIP_LIST etc. env vars on first use. */
+static int ds4_skip_init = 0;
+static bool ds4_skip_mask[DS4_N_LAYER];
+static int ds4_skip_mod = 0, ds4_skip_keep_first = 0, ds4_skip_keep_last = 0;
+static int ds4_skip_lo = 0, ds4_skip_hi = -1;
+
+static void ds4_skip_init_from_env(void) {
+    for (uint32_t k = 0; k < DS4_N_LAYER; k++) ds4_skip_mask[k] = false;
+    ds4_skip_mod = 0; ds4_skip_keep_first = 0; ds4_skip_keep_last = 0;
+    ds4_skip_lo = 0; ds4_skip_hi = -1;
+    const char *e = getenv("DS4_LAYER_SKIP_LIST");
+    if (e && e[0]) {
+        char buf[1024];
+        strncpy(buf, e, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        char *tok = strtok(buf, ",");
+        while (tok) {
+            int v = atoi(tok);
+            if (v >= 0 && v < (int)DS4_N_LAYER) ds4_skip_mask[v] = true;
+            tok = strtok(NULL, ",");
+        }
+    }
+    e = getenv("DS4_LAYER_SKIP_MOD");      if (e && e[0]) { ds4_skip_mod = atoi(e); if (ds4_skip_mod < 0) ds4_skip_mod = 0; }
+    e = getenv("DS4_LAYER_KEEP_FIRST");    if (e && e[0]) { ds4_skip_keep_first = atoi(e); if (ds4_skip_keep_first < 0) ds4_skip_keep_first = 0; }
+    e = getenv("DS4_LAYER_KEEP_LAST");     if (e && e[0]) { ds4_skip_keep_last = atoi(e); if (ds4_skip_keep_last < 0) ds4_skip_keep_last = 0; }
+    e = getenv("DS4_LAYER_SKIP_RANGE");
+    if (e && e[0]) {
+        char *dash = strchr((char*)e, '-');
+        if (dash) { ds4_skip_lo = atoi(e); ds4_skip_hi = atoi(dash + 1); }
+    }
+    ds4_skip_init = 1;
+}
+
+/* Public: override skip-list at runtime. csv=NULL or empty clears mask. */
+void ds4_set_skip_list(const char *csv) {
+    for (uint32_t k = 0; k < DS4_N_LAYER; k++) ds4_skip_mask[k] = false;
+    if (csv && csv[0]) {
+        char buf[1024];
+        strncpy(buf, csv, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        char *tok = strtok(buf, ",");
+        while (tok) {
+            int v = atoi(tok);
+            if (v >= 0 && v < (int)DS4_N_LAYER) ds4_skip_mask[v] = true;
+            tok = strtok(NULL, ",");
+        }
+    }
+    ds4_skip_init = 1;
+}
+
+/* Read skip state, return true iff this layer should be elided.
+ * Used by both decode (metal_graph_encode_decode) and prefill paths. */
+static bool ds4_layer_should_skip(uint32_t il) {
+    if (!ds4_skip_init) ds4_skip_init_from_env();
+    if (ds4_skip_mask[il]) return true;
+    if (ds4_skip_mod > 1 && ((int)il % ds4_skip_mod) != 0) return true;
+    if (ds4_skip_keep_first > 0 && (int)il >= ds4_skip_keep_first) return true;
+    if (ds4_skip_keep_last > 0 && (int)il < (int)(DS4_N_LAYER - ds4_skip_keep_last)) return true;
+    if (ds4_skip_hi >= 0 && (int)il >= ds4_skip_lo && (int)il <= ds4_skip_hi) return true;
+    return false;
+}
+
 static bool metal_graph_prefill_layer_major(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -14302,6 +14708,13 @@ static bool metal_graph_prefill_layer_major(
                                                      (uint32_t)n_tokens);
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            if (ds4_layer_should_skip(il)) {
+                if (show_progress) {
+                    fprintf(stderr, "ds4: gpu prefill layer %u/%u (SKIPPED)\r", il + 1, (uint32_t)DS4_N_LAYER);
+                    fflush(stderr);
+                }
+                continue;
+            }
             ok = metal_graph_encode_layer_batch(g,
                                                 model,
                                                 &weights->layer[il],
@@ -14399,6 +14812,13 @@ static bool metal_graph_prefill_layer_major(
     }
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (ds4_layer_should_skip(il)) {
+            if (show_progress) {
+                fprintf(stderr, "ds4: gpu prefill layer %u/%u (SKIPPED)\r", il + 1, (uint32_t)DS4_N_LAYER);
+                fflush(stderr);
+            }
+            continue;
+        }
         if (split_profile) {
             const double t_attn0 = now_sec();
             ok = ds4_gpu_begin_commands() != 0;
@@ -14685,6 +15105,14 @@ static bool metal_graph_prefill_chunked_range(
         double chunk_execute_s = 0.0;
 
         for (uint32_t il = phase_start_layer; ok && il < phase_end_layer; il++) {
+            if (ds4_layer_should_skip(il)) {
+                if (show_progress) {
+                    fprintf(stderr, "ds4: gpu chunked prefill layer %u/%u (SKIPPED)\r",
+                            il + 1, (uint32_t)DS4_N_LAYER);
+                    fflush(stderr);
+                }
+                continue;
+            }
             const double t_layer0 = need_timer ? now_sec() : 0.0;
             ok = ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_batch(g,
@@ -16228,6 +16656,16 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
 
 int ds4_token_eos(ds4_engine *e) {
     return e->vocab.eos_id;
+}
+
+/* Re-added: ds4.h declares these and ds4-server uses ds4_token_user.
+ * Got dropped in the prior session's H1005 hand-graft. */
+int ds4_token_user(ds4_engine *e) {
+    return e->vocab.user_id;
+}
+
+int ds4_token_assistant(ds4_engine *e) {
+    return e->vocab.assistant_id;
 }
 
 static int sample_argmax(const float *logits, uint32_t n_vocab) {
@@ -18604,6 +19042,16 @@ static bool engine_activate_prefill_phase(ds4_engine *e, ds4_gpu_graph *g,
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         e->cpu_moe_layer[il] = !(il >= pstart && il < pend);
     }
+    /* Note (2026-05-21): a per-layer DS4_LAYER_PIN_FILE override applied
+     * HERE fragments the Metal mapping into many non-contiguous routed-
+     * expert ranges, which exceeds the per-buffer Metal residency budget
+     * and OOMs warmup. The phase machinery's invariant — each phase covers
+     * a single contiguous [pstart, pend) layer range — is load-bearing for
+     * the Metal-side mmap layout. Workload-specialization at the layer
+     * granularity is incompatible with this design without re-architecting
+     * the per-phase mmap path. Keeping the engine_open-level pin reader
+     * (which sets initial cpu_moe_layer[] before any phase runs) as a
+     * harmless no-op surface for future-when-redesigned integration. */
     if (g) metal_graph_apply_engine_runtime(g, e);
 
     /* Phase swaps skip the synchronous touch-loop warmup so the 20-30 s
@@ -18751,6 +19199,56 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->cpu_moe_layer[il] = e->cpu_moe && (il < (uint32_t)n_cpu);
     }
 
+    /* Workload-specialized layer-pin override (2026-05-21).
+     *
+     * DS4_LAYER_PIN_FILE=<path> reads a CSV of "layer,cpu_moe" lines where
+     * cpu_moe is 0 (keep this layer Metal-resident) or 1 (offload to CPU).
+     * Lines for missing layers leave the prior assignment untouched.
+     *
+     * Why this is an organ, not a unit: the assignment loop above uses a
+     * fixed first-N policy that has no workload knowledge. The trace
+     * machinery emits per-(layer, expert) routing data via DS4_ROUTER_TRACE
+     * and DS4_ROUTER_TRACE_PE; a downstream tool can derive per-layer
+     * concentration (Gini or LRU-hit) and decide which layers benefit
+     * most from staying GPU-resident. This hook is the runtime end of
+     * that chain. Removing it severs the trace -> manifest -> runtime
+     * connection: the manifests become CSV files no code consumes. */
+    const char *pin_path = getenv("DS4_LAYER_PIN_FILE");
+    if (pin_path && pin_path[0] && e->backend == DS4_BACKEND_METAL) {
+        FILE *pf = fopen(pin_path, "r");
+        if (!pf) {
+            fprintf(stderr,
+                    "ds4: warning: DS4_LAYER_PIN_FILE='%s' not readable: %s\n",
+                    pin_path, strerror(errno));
+        } else {
+            char line[64];
+            int updated = 0;
+            int cpu_count = 0, metal_count = 0;
+            while (fgets(line, sizeof line, pf)) {
+                if (line[0] == '#' || line[0] == '\n') continue;
+                int il, cpu_flag;
+                if (sscanf(line, "%d,%d", &il, &cpu_flag) != 2) continue;
+                if (il < 0 || il >= DS4_N_LAYER) continue;
+                e->cpu_moe_layer[il] = (cpu_flag != 0);
+                updated++;
+            }
+            fclose(pf);
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                if (e->cpu_moe_layer[il]) cpu_count++;
+                else metal_count++;
+            }
+            /* The pin file may only mention a subset of layers; the rest
+             * retain their first-N assignment from the loop above. If the
+             * pin file activates ANY layer for CPU MoE, we need the CPU
+             * MoE plumbing on. */
+            if (cpu_count > 0) e->cpu_moe = true;
+            fprintf(stderr,
+                    "ds4: DS4_LAYER_PIN_FILE='%s': %d entries applied; "
+                    "%d layers CPU-MoE, %d layers Metal-resident\n",
+                    pin_path, updated, cpu_count, metal_count);
+        }
+    }
+
     /* Sanity-check the per-phase Metal residency footprint up front so a
      * too-small N fails at engine_open instead of mid-prefill.  The cap is
      * the Metal wired-memory limit (iogpu.wired_limit_mb), bounded by the
@@ -18879,7 +19377,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         if (e->mtp_ready &&
-            !ds4_gpu_set_model_map_range(e->mtp_model.map,
+            !ds4_gpu_add_model_map_range(e->mtp_model.map,
                                            e->mtp_model.size,
                                            e->mtp_model.tensor_data_pos,
                                            e->mtp_model.size - e->mtp_model.tensor_data_pos))
@@ -19326,6 +19824,49 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
+}
+
+/* Substrate inspection: extract raw KV state at (layer, position) from the
+ * Metal cache. Optionally undo position rotation via inverse RoPE. */
+int ds4_session_dump_kv_raw(ds4_session *s, uint32_t layer, uint32_t position,
+                             float *out, size_t out_n, int inverse_rope) {
+    if (!s || !out || out_n != (size_t)DS4_N_HEAD_DIM) return 0;
+    if (layer >= DS4_N_LAYER) return 0;
+#ifdef DS4_NO_GPU
+    (void)position; (void)inverse_rope;
+    return 0;
+#else
+    ds4_gpu_tensor *cache = s->graph.layer_raw_cache[layer];
+    if (!cache) return 0;
+    const uint32_t raw_cap = s->graph.raw_cap;
+    if (position >= raw_cap) return 0;
+    const uint64_t row_offset = (uint64_t)position * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    if (ds4_gpu_tensor_read(cache, row_offset, out, row_bytes) == 0) return 0;
+    if (inverse_rope) {
+        const float freq_base = layer_rope_freq_base(layer);
+        const float freq_scale = layer_rope_freq_scale(layer);
+        const bool compressed = ds4_layer_compress_ratio(layer) != 0;
+        const float ext_factor = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+        float attn_factor = 1.0f;
+        if (ext_factor != 0.0f && freq_scale > 0.0f) {
+            attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        rope_tail_ext_inplace(out, /*n_head=*/1, DS4_N_HEAD_DIM, DS4_N_ROT,
+                              position, DS4_ROPE_ORIG_CTX, freq_base, freq_scale,
+                              ext_factor, attn_factor,
+                              DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                              /*inverse=*/true);
+    }
+    return 1;
+#endif
+}
+
+int ds4_session_dump_logits(ds4_session *s, float *out, size_t out_n) {
+    if (!s || !out || !s->logits) return 0;
+    if (out_n != (size_t)DS4_N_VOCAB) return 0;
+    memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    return 1;
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
