@@ -15272,6 +15272,159 @@ static int ds4_polar_tile_pipeline_init(void) {
     return 1;
 }
 
+/* Same kernel as ds4_gpu_mtl4_polar_tile_canary, but loads buffers from
+ * pre-encoded binary files produced by analyzers/polar_encode_safetensors.py.
+ * Validates end-to-end against the Python reference in <prefix>.expected_polar.bin.
+ *
+ * Files read (sizes are tiles*rows*pairs for mag/phase, tiles*rows*4 for levels,
+ * tiles*pairs*2 for hidden when batches=1):
+ *   <prefix>.mag.bin        uint8
+ *   <prefix>.phase.bin      uint8
+ *   <prefix>.levels.bin     float32
+ *   <prefix>.cos_lut.bin    9 float32
+ *   <prefix>.sin_lut.bin    9 float32
+ *   <prefix>.hidden.bin     float32 (size = batches * tiles * pairs * 2;
+ *                                   encoder emits batches=n_tiles by default)
+ *   <prefix>.expected_polar.bin  rows*tiles float32 (Python-computed reference)
+ *
+ * Returns 1 on success, 0 on failure. Reports max|GPU-Python_ref| difference. */
+static long ds4_polar_read_file(const char *path, void *dst, size_t expected_bytes) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { fprintf(stderr, "ds4: polar_tile_real: open %s failed\n", path); return -1; }
+    long got = (long)fread(dst, 1, expected_bytes, fp);
+    fclose(fp);
+    if (got != (long)expected_bytes) {
+        fprintf(stderr, "ds4: polar_tile_real: short read %s (%ld / %zu bytes)\n",
+                path, got, expected_bytes);
+        return -1;
+    }
+    return got;
+}
+
+int ds4_gpu_mtl4_polar_tile_real(const char *prefix,
+                                  uint32_t tiles, uint32_t rows,
+                                  uint32_t batches, uint32_t pairs) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_polar_tile_pipeline_init()) return 0;
+    if (!prefix || tiles == 0 || rows == 0 || batches == 0 || pairs == 0) return 0;
+
+    @autoreleasepool {
+        NSError *err = nil;
+        const NSUInteger row_packets = (NSUInteger)tiles * rows;
+        const NSUInteger pair_count = row_packets * pairs;
+        const NSUInteger hidden_count = (NSUInteger)batches * tiles * pairs * 2;
+        const NSUInteger out_count = (NSUInteger)batches * row_packets;
+
+        id<MTLBuffer> mag      = [g_device newBufferWithLength:pair_count                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> phase    = [g_device newBufferWithLength:pair_count                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> levels   = [g_device newBufferWithLength:row_packets * 4 * sizeof(float)   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> hidden   = [g_device newBufferWithLength:hidden_count * sizeof(float)      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cosLut   = [g_device newBufferWithLength:9 * sizeof(float)                 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> sinLut   = [g_device newBufferWithLength:9 * sizeof(float)                 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf   = [g_device newBufferWithLength:out_count * sizeof(float)         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> paramsBuf= [g_device newBufferWithLength:3 * sizeof(uint32_t)              options:MTLResourceStorageModeShared];
+        if (!mag || !phase || !levels || !hidden || !cosLut || !sinLut || !outBuf || !paramsBuf) return 0;
+
+        char path[1024];
+        snprintf(path, sizeof(path), "%s.mag.bin",   prefix); if (ds4_polar_read_file(path, mag.contents,    pair_count) < 0) return 0;
+        snprintf(path, sizeof(path), "%s.phase.bin", prefix); if (ds4_polar_read_file(path, phase.contents,  pair_count) < 0) return 0;
+        snprintf(path, sizeof(path), "%s.levels.bin",prefix); if (ds4_polar_read_file(path, levels.contents, row_packets * 4 * sizeof(float)) < 0) return 0;
+        snprintf(path, sizeof(path), "%s.hidden.bin",prefix); if (ds4_polar_read_file(path, hidden.contents, hidden_count * sizeof(float)) < 0) return 0;
+        snprintf(path, sizeof(path), "%s.cos_lut.bin", prefix); if (ds4_polar_read_file(path, cosLut.contents, 9 * sizeof(float)) < 0) return 0;
+        snprintf(path, sizeof(path), "%s.sin_lut.bin", prefix); if (ds4_polar_read_file(path, sinLut.contents, 9 * sizeof(float)) < 0) return 0;
+
+        uint32_t *params = (uint32_t *)paramsBuf.contents;
+        params[0] = pairs; params[1] = rows; params[2] = tiles;
+
+        /* Standard MTL4 dispatch — copied from the synthetic canary. */
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (!residency) return 0;
+        id<MTLAllocation> allocs[8] = {
+            (id<MTLAllocation>)mag, (id<MTLAllocation>)phase,
+            (id<MTLAllocation>)levels, (id<MTLAllocation>)hidden,
+            (id<MTLAllocation>)cosLut, (id<MTLAllocation>)sinLut,
+            (id<MTLAllocation>)outBuf, (id<MTLAllocation>)paramsBuf,
+        };
+        [residency addAllocations:allocs count:8];
+        [residency commit];
+        [residency requestResidency];
+
+        MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+        atDesc.maxBufferBindCount = 8;
+        atDesc.initializeBindings = YES;
+        id<MTL4ArgumentTable> argTable = [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+        if (!argTable) return 0;
+        [argTable setAddress:mag.gpuAddress       atIndex:0];
+        [argTable setAddress:phase.gpuAddress     atIndex:1];
+        [argTable setAddress:levels.gpuAddress    atIndex:2];
+        [argTable setAddress:hidden.gpuAddress    atIndex:3];
+        [argTable setAddress:cosLut.gpuAddress    atIndex:4];
+        [argTable setAddress:sinLut.gpuAddress    atIndex:5];
+        [argTable setAddress:outBuf.gpuAddress    atIndex:6];
+        [argTable setAddress:paramsBuf.gpuAddress atIndex:7];
+
+        id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+        [cb beginCommandBufferWithAllocator:g_polar_allocator];
+        [cb useResidencySet:residency];
+        id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) return 0;
+        [enc setComputePipelineState:g_polar_tile_pipeline];
+        [enc setArgumentTable:argTable];
+        [enc dispatchThreadgroups:MTLSizeMake(tiles, rows, batches)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb endCommandBuffer];
+
+        [g_polar_queue addResidencySet:residency];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block CFTimeInterval gpuStart = 0.0, gpuEnd = 0.0;
+        __block NSError *fbErr = nil;
+        MTL4CommitOptions *opts = [MTL4CommitOptions new];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            fbErr = feedback.error;
+            gpuStart = feedback.GPUStartTime; gpuEnd = feedback.GPUEndTime;
+            dispatch_semaphore_signal(sem);
+        }];
+        id<MTL4CommandBuffer> bufs[1] = { cb };
+        [g_polar_queue commit:bufs count:1 options:opts];
+        long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+        [residency endResidency];
+        if (waitRes != 0) { fprintf(stderr, "ds4: polar_tile_real timeout\n"); return 0; }
+        if (fbErr) { fprintf(stderr, "ds4: polar_tile_real feedback err: %s\n", fbErr.localizedDescription.UTF8String); return 0; }
+
+        /* Compare GPU output to Python reference. */
+        float *expected_polar = malloc(out_count * sizeof(float));
+        snprintf(path, sizeof(path), "%s.expected_polar.bin", prefix);
+        if (ds4_polar_read_file(path, expected_polar, out_count * sizeof(float)) < 0) {
+            free(expected_polar);
+            return 0;
+        }
+
+        float *outPtr = (float *)outBuf.contents;
+        float maxAbsErr = 0.0f;
+        double sumAbsErr = 0.0;
+        for (NSUInteger i = 0; i < out_count; i++) {
+            float diff = fabsf(outPtr[i] - expected_polar[i]);
+            sumAbsErr += diff;
+            if (diff > maxAbsErr) maxAbsErr = diff;
+        }
+        const double gpuMs = (gpuEnd - gpuStart) * 1000.0;
+        fprintf(stderr,
+                "ds4: polar TILE REAL prefix=%s tiles=%u rows=%u batches=%u pairs=%u\n"
+                "  GPU out[0]=%.4f  Python ref[0]=%.4f  max|diff|=%.3e  mean|diff|=%.3e\n"
+                "  gpu_elapsed=%.6f ms  (%.0f ns/output, resident=%.1f MB)\n",
+                prefix, tiles, rows, batches, pairs,
+                (double)outPtr[0], (double)expected_polar[0],
+                (double)maxAbsErr, sumAbsErr / out_count,
+                gpuMs, gpuMs * 1e6 / (double)out_count,
+                (double)(pair_count * 2 + row_packets * 4 * 4 + hidden_count * 4 + out_count * 4) / 1e6);
+        free(expected_polar);
+        return maxAbsErr < 1e-2f ? 1 : 0; /* fp32-vs-Python tolerance — codex H1729 hit 7e-9 */
+    }
+}
+
 int ds4_gpu_mtl4_polar_tile_canary(uint32_t tiles, uint32_t rows, uint32_t batches, uint32_t pairs) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!ds4_polar_tile_pipeline_init()) return 0;

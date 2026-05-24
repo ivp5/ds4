@@ -1634,6 +1634,17 @@ int main(int argc, char **argv) {
         uint32_t pairs   = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2048;
         return ds4_gpu_mtl4_polar_tile_canary(tiles, rows, batches, pairs) ? 0 : 1;
     }
+    /* --polar-tile-real <prefix> [tiles [rows [batches [pairs]]]] : load real
+     * polar binaries from <prefix>.{mag,phase,levels,hidden,cos_lut,sin_lut}.bin
+     * and validate GPU output against <prefix>.expected_polar.bin. */
+    if (argc >= 3 && !strcmp(argv[1], "--polar-tile-real")) {
+        const char *prefix = argv[2];
+        uint32_t tiles   = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 2;
+        uint32_t rows    = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 32;
+        uint32_t batches = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
+        uint32_t pairs   = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
+        return ds4_gpu_mtl4_polar_tile_real(prefix, tiles, rows, batches, pairs) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {

@@ -39,21 +39,37 @@ FP4_TABLE = np.array([
 FP4_BLOCK_SIZE = 32
 
 
-def unpack_fp4_row(packed_int8: np.ndarray, scale_row: np.ndarray) -> np.ndarray:
-    """Unpack one weight row from FP4-packed int8 + per-block fp32 scale.
-    packed_int8: shape (in_dim/2,) uint8
-    scale_row:   shape (in_dim/32,) float32
+def decode_e8m0_to_fp32(scale_u8: np.ndarray) -> np.ndarray:
+    """F8_E8M0 (8 exponent bits, 0 mantissa, no sign) → fp32.
+    Value = 2^(byte - 127). Byte 255 = NaN per IEEE 754. Byte 0 = 2^-127 (denorm).
+    Used by DS4 V4 as block-scale for FP4 expert weights.
+    """
+    # Use IEEE-754 fp32 bit reinterpret: set exponent field directly.
+    scale_u8 = scale_u8.astype(np.uint32)
+    # Treat byte as exponent field of fp32 (bits 23..30), mantissa zero, sign zero.
+    # bits = byte << 23 — gives 2^(byte - 127)
+    bits = scale_u8 << 23
+    out = bits.view(np.uint32).astype(np.uint32).tobytes()
+    return np.frombuffer(out, dtype=np.float32).reshape(scale_u8.shape)
+
+
+def unpack_fp4_row(packed_int8: np.ndarray, scale_row_u8: np.ndarray) -> np.ndarray:
+    """Unpack one weight row from FP4-packed int8 + per-block F8_E8M0 scale.
+    packed_int8: shape (in_dim/2,) int8/uint8 (two FP4 codes per byte)
+    scale_row_u8: shape (in_dim/32,) uint8 (F8_E8M0 codes)
     Returns: shape (in_dim,) float32
     """
-    in_dim_half = packed_int8.shape[0]
+    # Treat packed as uint8 for nibble extraction
+    packed_u8 = packed_int8.view(np.uint8) if packed_int8.dtype != np.uint8 else packed_int8
+    in_dim_half = packed_u8.shape[0]
     in_dim = in_dim_half * 2
-    # unpack low + high nibble (low FIRST per convert.py)
-    low = packed_int8 & 0x0F
-    high = (packed_int8 >> 4) & 0x0F
+    low = packed_u8 & 0x0F
+    high = (packed_u8 >> 4) & 0x0F
     pairs = np.stack([FP4_TABLE[low.astype(np.int64)],
                        FP4_TABLE[high.astype(np.int64)]], axis=-1).reshape(in_dim)
-    # scale: one fp32 per 32 in-axis elements → broadcast
-    scale_expanded = np.repeat(scale_row, FP4_BLOCK_SIZE)
+    # F8_E8M0 → fp32 then broadcast over 32 elements
+    scale_fp32 = decode_e8m0_to_fp32(scale_row_u8.view(np.uint8))
+    scale_expanded = np.repeat(scale_fp32, FP4_BLOCK_SIZE)
     return (pairs * scale_expanded).astype(np.float32)
 
 
@@ -141,28 +157,56 @@ def main():
     args = ap.parse_args()
 
     model_dir = Path(args.model_dir)
-    # DS4 V4 expert naming convention: layers.{L}.mlp.experts.{E}.{w1,w2,w3}.weight
-    # gate = w1, up = w3, down = w2 (per inference/convert.py mapping)
+    # DS4 V4 expert naming convention (confirmed via real safetensors inspection):
+    #   layers.{L}.ffn.experts.{E}.{w1,w2,w3}.weight  (FP4-packed int8)
+    #   layers.{L}.ffn.experts.{E}.{w1,w2,w3}.scale   (F8_E8M0)
+    # gate = w1, up = w3, down = w2 (per inference/convert.py mapping).
     kind_to_w = {"gate": "w1", "up": "w3", "down": "w2"}
     w = kind_to_w[args.kind]
-    # Try multiple naming conventions
+
+    # If model.safetensors.index.json hasn't landed yet, fall back to scanning shards.
     candidates = [
+        f"layers.{args.layer}.ffn.experts.{args.expert}.{w}.weight",
         f"layers.{args.layer}.mlp.experts.{args.expert}.{w}.weight",
-        f"model.layers.{args.layer}.mlp.experts.{args.expert}.{w}.weight",
-        f"layers.{args.layer}.mlp.experts.{args.expert}.{w}",
+        f"model.layers.{args.layer}.ffn.experts.{args.expert}.{w}.weight",
     ]
     weight_path = scale_path = None
     weight_key = scale_key = None
     for c in candidates:
         sp, key = find_tensor_shard(model_dir, c)
+        if sp is None:
+            # Manual scan if index missing
+            for shard in sorted(model_dir.glob("model-*.safetensors")):
+                if shard.stat().st_size < 3.5e9:
+                    continue  # skip incomplete
+                from safetensors import safe_open
+                try:
+                    with safe_open(str(shard), framework="numpy", device="cpu") as f:
+                        if c in f.keys():
+                            sp = shard
+                            key = c
+                            break
+                except Exception:
+                    continue
         if sp is not None:
             weight_path, weight_key = sp, key
-            # Scale name convention: same as weight + ".scale_inv" OR "_scale"
-            for s_suffix in (".scale_inv", "_scale_inv", ".scale", "_scale"):
-                sp2, key2 = find_tensor_shard(model_dir, c.replace(".weight", s_suffix))
-                if sp2 is not None:
-                    scale_path, scale_key = sp2, key2
-                    break
+            scale_name = c.replace(".weight", ".scale")
+            sp2, key2 = find_tensor_shard(model_dir, scale_name)
+            if sp2 is None:
+                # Manual scan for scale too
+                from safetensors import safe_open
+                for shard in sorted(model_dir.glob("model-*.safetensors")):
+                    if shard.stat().st_size < 3.5e9:
+                        continue
+                    try:
+                        with safe_open(str(shard), framework="numpy", device="cpu") as f:
+                            if scale_name in f.keys():
+                                sp2, key2 = shard, scale_name
+                                break
+                    except Exception:
+                        continue
+            if sp2 is not None:
+                scale_path, scale_key = sp2, key2
             break
     if weight_path is None:
         print(f"polar_encode: weight not found. Tried: {candidates}", file=sys.stderr)
@@ -178,12 +222,23 @@ def main():
             print("polar_encode: int8 weight requires a scale tensor; couldn't find one", file=sys.stderr)
             sys.exit(3)
         w_packed = load_tensor(weight_path, weight_key)
-        scale = load_tensor(scale_path, scale_key)
+        # Scale dtype is F8_E8M0 — load as raw uint8 via safetensors framework=numpy
+        # safetensors may not directly support F8_E8M0 numpy view, so manual byte read
+        from safetensors import safe_open
+        with safe_open(str(scale_path), framework="numpy", device="cpu") as f:
+            try:
+                scale_u8 = f.get_tensor(scale_key)
+            except Exception:
+                # Fallback: torch view as uint8
+                import torch
+                from safetensors.torch import safe_open as st
+                with st(str(scale_path), framework="pt", device="cpu") as tf:
+                    scale_u8 = tf.get_tensor(scale_key).view(torch.uint8).numpy()
         out_dim, in_dim_half = w_packed.shape
         in_dim = in_dim_half * 2
-        print(f"polar_encode: FP4-packed; out_dim={out_dim} in_dim={in_dim} scale_shape={scale.shape}", file=sys.stderr)
+        print(f"polar_encode: FP4-packed; out_dim={out_dim} in_dim={in_dim} scale_shape={scale_u8.shape} scale_dtype={scale_u8.dtype}", file=sys.stderr)
         def get_row(r):
-            return unpack_fp4_row(w_packed[r], scale[r])
+            return unpack_fp4_row(w_packed[r], scale_u8[r])
     elif w_dtype in ("BF16", "F32", "FLOAT32"):
         # Non-experts (bf16) — already non-quantized
         weight_full = load_tensor(weight_path, weight_key).astype(np.float32)

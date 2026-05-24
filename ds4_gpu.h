@@ -912,3 +912,16 @@ int ds4_gpu_mtl4_polar_dot_canary(uint32_t packets, uint32_t pairs);
  * Returns 1 on success, 0 on failure. */
 int ds4_gpu_mtl4_polar_tile_canary(uint32_t tiles, uint32_t rows,
                                     uint32_t batches, uint32_t pairs);
+
+/* Real-data variant: load mag/phase/levels/hidden/cos_lut/sin_lut from
+ * <prefix>.{mag,phase,levels,hidden,cos_lut,sin_lut}.bin files emitted by
+ * analyzers/polar_encode_safetensors.py, then dispatch the H1729 tile×row×batch
+ * kernel and compare GPU output to <prefix>.expected_polar.bin.
+ *
+ * Closes the loop on the polar p8_m2 path: real DS4 V4 Flash BF16/FP4 weights
+ * → Python polar encoder → MTL4 GPU dot → numerical match against Python ref.
+ *
+ * Returns 1 on success, 0 on failure. */
+int ds4_gpu_mtl4_polar_tile_real(const char *prefix,
+                                  uint32_t tiles, uint32_t rows,
+                                  uint32_t batches, uint32_t pairs);
