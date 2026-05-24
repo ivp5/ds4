@@ -258,3 +258,110 @@ mmaps PLR2 files and attaches their data buffers via MTLResidencySet,
 HOLDING them alongside the existing FP4 weight tensors. No dispatch
 change yet. This lets us measure load-time + memory cost separately
 from compute-time gain.
+
+## Addendum: H1742 / H1743 / H1744 (read 2026-05-25, after H1741)
+
+### H1742 — Route `topk` is a boundary certificate, not a hard set
+
+Quantized DS4 router perturbations can be rescued by expanding perturbed
+candidates until they contain the clean top-6 set. Width sweep tested
+on widths {6, 7, 8, 10, 12, 16, 24, 32, 48, 64} per the artifact
+`h1742_ds4_router_candidate_expansion_rescue_20260525.py`. Pressure
+buckets: high (small kth-margin / high entropy), medium, low.
+
+| Profile     | Width policy (high/med/low) | Mean | Multiple of top-6 | Savings vs uniform |
+|-------------|------------------------------|------|-------------------|--------------------|
+| q6 row      | 9 / 8 / 6                   | 7.236 | 1.206×           | 19.6% vs width 9   |
+| q6 tensor   | 11 / 12 / 7                 | 9.264 | 1.544×           | 22.8% vs width 12  |
+| q4 row      | 32 / 14 / 11                | —    | large            | (cold path)        |
+| q4 tensor   | 91 / 47 / 14                | —    | very large       | (cold path)        |
+| q3          | rejected for hot path       | —    | —                | —                  |
+
+**Shift**: expert IDs alone are an over-compressed route trace. Keep
+selected experts + boundary pressure + optional extra candidates;
+rerank/verify at higher precision only when the boundary is fragile.
+
+### H1743 — M1 Max Metal4 surface is compute-first, not ML-encoder-first
+
+Re-mapped on macOS 26.5 / SDK 26.4. Five separate probe binaries
+narrow the boundary:
+
+**Runtime-proven productive (compute path):**
+- `MTL4CommandQueue`, `MTL4CommandAllocator`, `MTL4CommandBuffer`
+- `MTL4Compiler` (compiled an `add_one` kernel end-to-end, `bad=0`)
+- `MTL4ComputePipelineDescriptor`, `MTL4ComputeCommandEncoder`
+- `MTL4ArgumentTable` (raw `gpuAddress` binding works)
+- `MTL4CommitFeedback`, `MTL4CounterHeap`
+- `MTLResidencySet` (already known critical per H1724)
+- Placement sparse buffers: `supportsPlacementSparse=yes`,
+  tile sizes 16/64/256 KiB pages verified; allocation returns a
+  valid `gpuAddress`.
+
+**Not productive (ML encoder path):**
+- `MTL4MachineLearningCommandEncoder` exists, but a no-pipeline /
+  noop probe CRASHES at `end_ml_encoder`.
+- `MTLTensor` selectors exist, but direct tensor canary CRASHES at
+  `tensorSizeAndAlignWithDescriptor:`.
+- Plus H1728 already established normal `kernel void` MSL functions
+  are NOT valid ML pipeline inputs.
+
+**Selectors enumerated** (h1743 selector probe): 10 of 10 respond on
+the device class, but "responds" ≠ "executes without crashing." The
+selector_probe binary is the cheap-existence check; the canary
+binaries are the actual functional probes.
+
+**Shift**: stay on raw `MTLBuffer` + arg tables + residency + counters
++ placement sparse + transparent compute. Don't block on opaque ML/ANE
+packaging while the inspectable compute path is already proven.
+
+### H1744 — Compression policy follows route boundary geometry
+
+H1742's measurement turned into an executable C policy table:
+`h1744_ds4_route_pressure_policy_table_20260525.inc`. The struct
+`ds4_route_policy_t` carries `{profile, bits, axis_tensor, target_pct,
+width_high, width_medium, width_low}` for 8 quant profiles
+(q3/q4/q6/q8 × row/tensor). For DS4 V4 Flash inference, the deployable
+target is **q6 row** with widths `{9, 8, 6}` per pressure bucket.
+
+The `.inc` file is pre-shipped (codex side) and pulled into our repo
+this turn at `analyzers/ds4_route_policy.inc` for direct C inclusion.
+Per-token flow at inference time:
+
+  1. Router emits topk(k+1) packet per H1739 (selected + kth-margin
+     + entropy + weights).
+  2. Compute pressure bucket from kth-margin/entropy (thresholds TBD).
+  3. Look up `width_{high,medium,low}` from policy table.
+  4. Run approximate q6-row router → extract `width` candidates.
+  5. Rerank top-`width` at higher precision (the rerank cost is the
+     1.206× top-6 multiplier).
+  6. Emit route certificate = (selected_6, rerank_logits, pressure).
+
+**Shift**: a global quantization setting is the wrong abstraction.
+Low-pressure attractor tokens stay narrow (width 6 = exact top-6);
+fragile boundary tokens buy a small candidate halo (width 9).
+Row-wise router quant much safer than tensor-wise at same nominal
+bits (H1741 corroboration).
+
+### Composite integration implications
+
+The polar (#563 / #565) work is for **expert MLP weights** (gate / up /
+down). The H1742-1744 work is for the **router** (the layer that
+decides which experts fire). They compose:
+
+  pressure-aware router (q6-row + width 9/8/6) →
+    selected experts (per token) →
+      polar gate / up / down (per expert) →
+        decoded activations →
+          high-precision rerank ONLY if pressure says fragile
+
+When pressure says LOW (router_attractor case from H1738: 65/72 cases),
+we run narrow router AND can also skip the rerank — fastest path.
+When pressure says HIGH (gaussian case from H1738: 48/72), we widen
+both the router and the rerank — slower but boundary-correct path.
+
+The next end-to-end deliverable is therefore: read PLR2 polar weights
+(Phase A ✓ shipped commit aad0608) + dispatch H1735 tiled kernel
+(Phase B pending) + emit topk(k+1) at the router (#566 prereq) +
+gate the rerank by pressure (post-#566 win). Per-token cost moves
+from "constant" to "load-bearing on actual ambiguity," which is what
+H1738 first measured and H1744 turned into a policy table.
