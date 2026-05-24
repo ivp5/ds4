@@ -15067,6 +15067,15 @@ static bool metal_graph_prefill_layer_major(
                                                      n_tokens);
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            if (ds4_layer_should_skip(il)) {
+                if (show_progress) {
+                    fprintf(stderr,
+                            "ds4: gpu layer-major prefill layer %u/%u (SKIPPED)\r",
+                            il + 1, (uint32_t)DS4_N_LAYER);
+                    fflush(stderr);
+                }
+                continue;
+            }
             ok = metal_graph_encode_layer_batch(g,
                                                 model,
                                                 &weights->layer[il],
@@ -15162,6 +15171,21 @@ static bool metal_graph_prefill_layer_major(
     }
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (ds4_layer_should_skip(il)) {
+            if (show_progress) {
+                fprintf(stderr,
+                        "ds4: gpu layer-major prefill layer %u/%u (SKIPPED)\r",
+                        il + 1, (uint32_t)DS4_N_LAYER);
+                fflush(stderr);
+            }
+            metal_graph_report_prefill_display_progress(display_progress,
+                                                        display_progress_ud,
+                                                        start,
+                                                        n_tokens,
+                                                        il + 1,
+                                                        prompt->len);
+            continue;
+        }
         double layer_elapsed = 0.0;
         if (split_profile) {
             const double t_attn0 = now_sec();
