@@ -46,6 +46,7 @@
 #include "ds4_quant_blocks.h"
 #include "ds4_neon_i8mm.h"
 #include "ds4_moe_route_log.h"
+#include "ds4_polar_reader.h"
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -16219,6 +16220,7 @@ struct ds4_engine {
  float directional_steering_attn_scale;
  float directional_steering_ffn_scale;
  uint32_t power_percent;     /* 1..100; 0 means uninitialized → treated as 100 */
+ ds4_polar_pool polar_pool;  /* #563 Phase B: per-(layer, kind) PLR2 mmap pool */
  bool quality;
  bool metal_ready;
  bool mtp_ready;
@@ -19708,6 +19710,19 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  } else {
  e->power_percent = 100;
  }
+ /* #563 Phase B-1.5: load PLR2 polar files if DS4_POLAR_DIR is set.
+  * Held alongside FP4 weights; no dispatch substitution yet (Phase B-2). */
+ ds4_polar_pool_init(&e->polar_pool);
+ const char *polar_dir = getenv("DS4_POLAR_DIR");
+ if (polar_dir && polar_dir[0]) {
+ uint32_t opened = ds4_polar_pool_load_dir(&e->polar_pool, polar_dir);
+ if (opened > 0) {
+ ds4_polar_pool_print_summary(&e->polar_pool, polar_dir);
+ } else {
+ fprintf(stderr, "ds4: DS4_POLAR_DIR=%s opened 0 files (Phase B-1 disabled)\n",
+ polar_dir);
+ }
+ }
  if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
  ds4_acquire_instance_lock();
 
@@ -19976,6 +19991,7 @@ void ds4_engine_summary(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
  if (!e) return;
+ ds4_polar_pool_close(&e->polar_pool);  /* #563 Phase B-1: release mmap'd PLR2 */
  weights_free(&e->weights);
  vocab_free(&e->vocab);
  ds4_threads_shutdown();
