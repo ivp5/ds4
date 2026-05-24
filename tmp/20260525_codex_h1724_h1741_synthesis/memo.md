@@ -515,3 +515,133 @@ routing to it. The DS4 V4 page cache + my mmap-based reader
 (commit aad0608) gets this for free on the disk-paging side.
 
 **Memo scope now H1724 → H1747.**
+
+### H1748–H1752 — Exact-row cache coding sweep (router-side memory frontier)
+
+Codex shifts text in CODEX_SHIFTS.md stops at H1747; artifacts H1748-H1752
+exist as Python probes + summary JSONs in
+`research/llm_fallacy_deconstruction/framework_deconstruction/` and
+`research/llm_fallacy_deconstruction/logs/20260525/h17{48..52}*.summary.json`.
+
+The series explores **how to code the exact-row cache** introduced by H1747:
+once we know we need an exact-row cache (vs naive per-token slicing), what's
+the smallest representation that preserves 100% set+order exactness on the
+clean top-6 set?
+
+Reference axis: full fp32 router = **25,165,824 bytes** = 1.000×.
+
+#### H1748 — Plain quant sweep on the cache
+
+Tested: fp16, q8 (per-row + per-tensor), q6 (per-row + per-tensor),
+q4 (per-row + per-tensor). Best full-correct (100% set + order across
+high/medium/low pressure buckets):
+
+  **fp16_cache**: 8,085,504 bytes = **0.321× full fp32 router**, 0.5×
+  fp32_cache reference. Bucket widths 9/8/6 matched H1744 policy exactly.
+
+q8 row alone is "small but not exact by itself" — perturbs the boundary
+on enough cases to drop order exactness below 100%.
+
+#### H1749 — q8 + fp16-fallback policy
+
+Tried: keep q8 cache by default, fall back to fp16 only when an online
+heuristic (top-6 order gap) says the boundary is fragile.
+
+Best exact mixed policy: `q8_min_top6_order_gap_le_0.00299988` —
+triggers fp16 fallback on **113 of 216 cases (52.3%)**, 640 unique
+fallback rows. Total bytes: 15.6 MB = **0.619× fp32 router** but
+**1.08× fp16-all-cache** — i.e., **worse** than just using fp16
+everywhere.
+
+The shift codex documents: "if no exact mixed policy beats fp16-all-cache,
+the exact-cache values are globally fragile rather than locally fragile."
+Translation: q8's perturbation isn't concentrated on boundary-fragile
+rows; it spreads across many rows that don't have a cheap-to-detect
+gap. Online detection isn't recoverable.
+
+#### H1750 — Basis-aware rerank cache sweep
+
+Brought in alternative bases (polar magnitude coding via H1719, polar
+self-projection via H1720). Best exact profile still **fp16_cache** at
+0.321× fp32 router. Polar bases tested but didn't beat fp16 at this
+sweep's resolution.
+
+#### H1751 — Phase resolution rerank cache sweep ⭐ NEW FRONTIER
+
+Swept polar phase bins {64, 128, 256, 512, 1024, 2048, 4096, 8192,
+16384, 32768, 65536} × magnitude bits {keepmag8, keepmag16}.
+
+**Best exact profile**: `polar_p4096_keepmag16` — **14 bits nominal**:
+
+  cache_bytes:                7,074,816 (was 8,085,504 for fp16)
+  cache_vs_fp16_cache:        0.875× (12.5% smaller)
+  cache_vs_full_fp32_router:  0.281× (vs fp16's 0.321×)
+  q6_router + cache_vs_fp32_router: 0.531× (vs q6+fp16's 0.572×)
+  dot_abs_error max:          8.17e-5
+  dot_rel_error max:          9.76e-3
+  order_exact_rate:           1.0
+  set_exact_rate:             1.0
+
+**At 100% set + order exact on 216 cases, polar p4096+m16 is 12.5%
+smaller than fp16.** This is the new memory frontier for the
+router-side exact-row cache.
+
+#### H1752 — Cross-seed stress test
+
+Scaled probe count from 216 to 4320 cases (20× more) to verify robustness.
+Best exact profile in this enlarged sweep: still **fp16_cache** —
+suggesting H1751's polar profile may need further verification at
+larger scales OR the polar profile's win is sensitive to the specific
+seed used in H1751.
+
+The cross-seed result doesn't refute polar; it flags that H1751's
+0.281× win is from a single sweep at the canonical scale. Codex's own
+interpretation: "this isolates rerank-cache coding by giving every
+profile the clean top9 candidate set; failure here means the coding
+cannot be considered robust even before approximate q6 candidate
+discovery is reintroduced."
+
+**Per-profile reads in H1752 are not in the summary JSON's `rows`
+field captured here**, so the question "did polar_p4096_keepmag16
+survive scale?" is open. Codex hasn't yet written a definitive
+H1752-name-only shift line. The next codex turn likely lands this as
+the verdict.
+
+#### Composite picture across H1740 → H1752
+
+The router-side memory + correctness sweep arc:
+
+  H1738: tile policy is measured dispatch — pressure splits buckets
+  H1739: topk(k+1) = boundary certificate, NOT hard set
+  H1740: pressure doesn't change tile winner — splitting hurts occupancy
+  H1741: pressure predicts router quant fragility (AUC 0.85+)
+  H1742: width policy 9/8/6 per pressure bucket rescues q6 router
+  H1743: M1 Metal4 surface is compute-first (ML encoder not viable)
+  H1744: H1742 policy as executable .inc (deployable)
+  H1745: q6-approximate pressure self-selects width — no clean oracle needed
+  H1746: q6 route certificate runs as real MTL4 compute kernel
+  H1747: candidate rows are NOT auto-small; reuse-conditioned cache
+         (16.17 MB = 0.643× fp32) beats naive per-token (31.85 MB = 1.266×)
+  H1748: exact-row cache quant sweep — fp16 wins at 8.09 MB (0.321×)
+  H1749: q8 + fallback hybrid is worse than fp16-everywhere (1.08×)
+  H1750: basis-aware sweep — fp16 still wins on exact 100%
+  H1751: polar_p4096_keepmag16 — 7.07 MB (0.281×, 0.875× fp16) ⭐
+  H1752: cross-seed at 4320 cases — fp16 robust; polar verification open
+
+**Strategic implication for #563 polar inference work**: my expert-side
+polar codec (PLR2 with p8_m2) is in the SAME family as H1751's
+router-side polar_p4096_keepmag16. The codex sequence is converging
+on polar coding as the unified compression strategy across DS4. If
+H1751 holds at H1752 scale, then the DS4 inference stack ships with
+TWO polar coders:
+
+  - Expert MLPs (gate/up/down):  PLR2 p8_m2 (mine, commits 8402a5e/aad0608/4b59348)
+  - Router exact-row cache:       polar_p4096_keepmag16 (codex H1751)
+
+Both use the same shared infrastructure: MTL4 compute, MTLResidencySet
+for buffer residency, raw MTLBuffer + ArgumentTable for binding,
+phase + magnitude codebooks with cos_lut/sin_lut decode tables. The
+PLR2 file format I shipped can be parameterized to encode the higher-
+resolution variant if/when the H1751 numbers stabilize.
+
+**Memo scope now H1724 → H1752.**
