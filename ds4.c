@@ -45,6 +45,7 @@
 #endif
 #include "ds4_quant_blocks.h"
 #include "ds4_neon_i8mm.h"
+#include "ds4_moe_route_log.h"
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -2539,6 +2540,35 @@ static void tensor_expect_routed_expert(
     }
 }
 
+/* Per-layer trimmed expert count populated from ds4.expert_remap.<il> metadata
+ * at model load. If the GGUF was produced by trim_experts_gguf.py, each layer's
+ * remap array gives the kept original-expert-IDs; its LENGTH is the layer's
+ * post-trim expert count. Default to DS4_N_EXPERT (256) when no metadata.
+ *
+ * NOTE (silv 2026-05-25): this validator-only relaxation lets the binary LOAD
+ * a trim50 file. Inference codepaths still assume DS4_N_EXPERT=256 in many
+ * places; full expert_remap inference plumbing is silv-side WIP not ported
+ * here. For shape-capture + route-logger work, validator-only is sufficient. */
+static uint32_t g_ds4_n_expert_trim[DS4_N_LAYER] = {0};
+static bool g_ds4_n_expert_trim_loaded = false;
+
+static void ds4_load_expert_trim_metadata(const ds4_model *m) {
+    if (g_ds4_n_expert_trim_loaded) return;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        char key[64];
+        snprintf(key, sizeof(key), "ds4.expert_remap.%u", il);
+        ds4_array_ref arr;
+        if (model_get_array(m, key, &arr) &&
+            (arr.type == GGUF_VALUE_UINT32 || arr.type == GGUF_VALUE_INT32) &&
+            arr.len > 0 && arr.len <= DS4_N_EXPERT) {
+            g_ds4_n_expert_trim[il] = (uint32_t)arr.len;
+        } else {
+            g_ds4_n_expert_trim[il] = DS4_N_EXPERT;
+        }
+    }
+    g_ds4_n_expert_trim_loaded = true;
+}
+
 /* Verify every tensor type and dimension used by the specialized pipeline.
  * After this succeeds, inference code can rely on fixed DS4 constants. */
 static void weights_validate_layout(const ds4_weights *w) {
@@ -2594,11 +2624,14 @@ static void weights_validate_layout(const ds4_weights *w) {
         tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->ffn_gate_inp,   DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-        tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        /* trim50: per-layer expert count from ds4.expert_remap.<il> metadata. */
+        const uint64_t n_exp_layer = g_ds4_n_expert_trim_loaded
+            ? (uint64_t)g_ds4_n_expert_trim[il] : (uint64_t)DS4_N_EXPERT;
+        tensor_expect_layout(l->ffn_gate_inp,   DS4_TENSOR_F16,  2, DS4_N_EMBD, n_exp_layer, 0);
+        tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, n_exp_layer, 0, 0);
+        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, n_exp_layer);
+        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, n_exp_layer);
+        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, n_exp_layer);
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
@@ -2891,6 +2924,9 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
         }
     }
 
+    /* Load ds4.expert_remap.<L> metadata so the validator can accept trim50
+     * files where per-layer expert count < DS4_N_EXPERT. */
+    ds4_load_expert_trim_metadata(m);
     weights_validate_layout(w);
 }
 
@@ -9805,10 +9841,6 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
            attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
 }
 
-static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
-    return managed ? ds4_gpu_tensor_alloc_managed(bytes) : ds4_gpu_tensor_alloc(bytes);
-}
-
 /* =========================================================================
  * Metal Diagnostic Dump Hooks.
  * =========================================================================
@@ -13972,6 +14004,11 @@ static bool metal_graph_encode_layer_ffn_batch(
     const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+
+    /* H1681-analog: env-gated route-key emit, no tensor materialization.
+     * See ds4_moe_route_log.h. Cost is ~1 atomic load when disabled. */
+    ds4_moe_route_log_emit(il, n_tokens, expert_in_dim, expert_mid_dim, down_in_dim);
+
     const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);

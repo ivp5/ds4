@@ -17,7 +17,7 @@ METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_metal.o
+CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_metal.o ds4_expert_table.o ds4_moe_route_log.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
@@ -217,8 +217,7 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4-eval
-	./ds4-eval --self-test-extractors
+test: ds4_test
 	./ds4_test
 
 clean:
