@@ -16502,14 +16502,30 @@ int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
         id<MTLBuffer> gateCode  = [g_device newBufferWithLength:route_pairs * sizeof(uint32_t)   options:MTLResourceStorageModeShared];
         id<MTLBuffer> upCode    = [g_device newBufferWithLength:route_pairs * sizeof(uint32_t)   options:MTLResourceStorageModeShared];
         id<MTLBuffer> routeW    = [g_device newBufferWithLength:route_pairs * sizeof(float)      options:MTLResourceStorageModeShared];
+        /* LUT sizes depend on file's phase_levels (legacy=8 → 9 entries; new
+         * p16 → 17 entries; ... up to p+1). H1735 kernel reads
+         * cos_lut[phase_code] where phase_code ∈ [0, phase_levels], so
+         * buffer must be at least (phase_levels + 1) floats. */
+        const uint32_t phase_levels = gate_file->phase_levels;
+        const uint32_t mag_levels   = gate_file->mag_levels;
+        const NSUInteger lut_entries = (NSUInteger)phase_levels + 1u;
+        const NSUInteger levels_bytes_per_expert = (NSUInteger)rows * mag_levels * sizeof(float);
         id<MTLBuffer> hidden    = [g_device newBufferWithLength:hidden_count * sizeof(float)     options:MTLResourceStorageModeShared];
         id<MTLBuffer> downBuf   = [g_device newBufferWithLength:down_count * sizeof(float)       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cosLut    = [g_device newBufferWithLength:9 * sizeof(float)                options:MTLResourceStorageModeShared];
-        id<MTLBuffer> sinLut    = [g_device newBufferWithLength:9 * sizeof(float)                options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cosLut    = [g_device newBufferWithLength:lut_entries * sizeof(float)      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> sinLut    = [g_device newBufferWithLength:lut_entries * sizeof(float)      options:MTLResourceStorageModeShared];
         id<MTLBuffer> outBuf    = [g_device newBufferWithLength:out_count * sizeof(float)        options:MTLResourceStorageModeShared];
         id<MTLBuffer> paramsBuf = [g_device newBufferWithLength:5 * sizeof(uint32_t)             options:MTLResourceStorageModeShared];
         if (!mag || !phase || !levels || !gateCode || !upCode || !routeW || !hidden ||
             !downBuf || !cosLut || !sinLut || !outBuf || !paramsBuf) {
+            ds4_polar_pool_close(&pool); return 0;
+        }
+
+        /* `levels` buffer was allocated above as code_rows * 4 * sizeof(float).
+         * That hardcoded 4 must match mag_levels for correctness. Reject if not. */
+        if (mag_levels != 4) {
+            fprintf(stderr, "ds4: polar real canary — mag_levels=%u not 4; "
+                            "kernel + canary support 4 only at this time\n", mag_levels);
             ds4_polar_pool_close(&pool); return 0;
         }
 
@@ -16522,7 +16538,7 @@ int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
         ds4_polar_expert_view(gate_file, expert, &gate_mag_src, &gate_phase_src, &gate_levels_src);
         memcpy(mag.contents,    gate_mag_src,    (NSUInteger)rows * pairs);
         memcpy(phase.contents,  gate_phase_src,  (NSUInteger)rows * pairs);
-        memcpy(levels.contents, gate_levels_src, (NSUInteger)rows * 4 * sizeof(float));
+        memcpy(levels.contents, gate_levels_src, levels_bytes_per_expert);
 
         /* Route metadata: single route_pair points at code tile 0 (our copied expert). */
         ((uint32_t *)gateCode.contents)[0] = 0;
@@ -16535,7 +16551,17 @@ int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
         for (NSUInteger i = 0; i < down_count; i++) dwn[i] = down_val;
         float *cosP = (float *)cosLut.contents;
         float *sinP = (float *)sinLut.contents;
-        for (int code = -4; code <= 4; code++) {
+        /* Populate LUT for phase_codes ∈ [0, phase_levels]:
+         * decoded angle for code c is (c - phase_levels/2) × 2π/phase_levels. */
+        const double phase_step_d = (2.0 * M_PI) / (double)phase_levels;
+        const int half_P = (int)(phase_levels / 2u);
+        for (NSUInteger c = 0; c < lut_entries; c++) {
+            double angle = ((double)c - (double)half_P) * phase_step_d;
+            cosP[c] = (float)cos(angle);
+            sinP[c] = (float)sin(angle);
+        }
+        (void)0;  /* satisfy old loop tail; replaced by parameterized loop above */
+        if (0) for (int code = -4; code <= 4; code++) {
             float angle = (float)code * 0.78539816339744830962f;
             cosP[code + 4] = cosf(angle);
             sinP[code + 4] = sinf(angle);

@@ -147,16 +147,49 @@ def _dequant_fp4_batch_mlx(packed_u8: mx.array, scale_u8: mx.array,
     return interleaved * scale_expanded
 
 
+def _polar_encode_core_generic(rows_f32: mx.array, phase_levels: int, mag_levels: int):
+    """Parameterized polar encoder. phase_levels ∈ {4, 8, 16, 32, ...} powers
+    of 2; mag_levels ∈ {2, 4, 8, 16}.
+
+    phase_step = 2π / phase_levels.  signed phase code in [-P/2+1, P/2],
+    LUT-shifted code = signed + P/2 ∈ [1, P].  For decoded angle use
+    angle = (code - P/2) * 2π/P.
+
+    Returns (mag_codes uint8, phase_codes uint8, levels fp32 [..., mag_levels]).
+    """
+    re = rows_f32[..., 0::2]
+    im = rows_f32[..., 1::2]
+    mag = mx.sqrt(re * re + im * im)
+    angle = mx.arctan2(im, re)
+    phase_step = 2.0 * math.pi / float(phase_levels)
+    P = phase_levels
+    signed = mx.round(angle / phase_step).astype(mx.int32)
+    signed = mx.clip(signed, -(P // 2) + 1, P // 2)
+    phase_codes = (signed + (P // 2)).astype(mx.uint8)
+    n = mag.shape[-1]
+    s = mx.argsort(mag, axis=-1)
+    sm = mx.take_along_axis(mag, s, axis=-1)
+    M = mag_levels
+    q = n // M
+    # Generalize: for M boundaries, compare against M-1 quantile cuts.
+    # mag_codes[p] = (sum_k (mag[p] > sm[k*q - 1])) for k ∈ 1..M-1.
+    mag_codes_acc = mx.zeros(mag.shape, dtype=mx.uint8)
+    for k in range(1, M):
+        cut = sm[..., k * q - 1 : k * q]
+        mag_codes_acc = mag_codes_acc + (mag > cut).astype(mx.uint8)
+    mag_codes = mag_codes_acc
+    # Quartile/M-tile means as the codebook
+    sm2 = sm[..., : q * M].reshape(*sm.shape[:-1], M, q)
+    levels = sm2.mean(axis=-1).astype(mx.float32)
+    return mag_codes, phase_codes, levels
+
+
 @mx.compile
 def _polar_encode_core(rows_f32: mx.array):
-    """Polar p8_m2 encoder, fused via mx.compile. Single argsort + 3 comparisons
+    """Polar p8_m4 encoder, fused via mx.compile. Single argsort + 3 comparisons
     replaces the argsort² rank trick — ~2× faster on the hot path.
-
-    NB: rank-based binning ranks ties by sort-stability; comparison-based
-    binning bins ties by value comparison. For fp32 dequantized FP4 these are
-    identical up to numerical noise (verified bytewise against numpy for the
-    16-expert sanity batch).
-    """
+    LEGACY entry point for the default (P=8, M=4) config; for arbitrary
+    (P, M) call _polar_encode_core_generic. """
     re = rows_f32[..., 0::2]
     im = rows_f32[..., 1::2]
     mag = mx.sqrt(re * re + im * im)
@@ -182,18 +215,25 @@ def _polar_encode_core(rows_f32: mx.array):
     return mag_codes, phase_codes, levels
 
 
-def _polar_encode_p8_m2_mlx(rows_f32: mx.array):
-    mag_codes, phase_codes, levels = _polar_encode_core(rows_f32)
+def _polar_encode_p8_m2_mlx(rows_f32: mx.array, phase_levels: int = 8, mag_levels: int = 4):
+    """Dispatches to compiled p8_m4 path when (P, M) == (8, 4), else generic. """
+    if phase_levels == 8 and mag_levels == 4:
+        mag_codes, phase_codes, levels = _polar_encode_core(rows_f32)
+    else:
+        mag_codes, phase_codes, levels = _polar_encode_core_generic(
+            rows_f32, phase_levels, mag_levels)
     return mag_codes, phase_codes, levels, None, None
 
 
 def _reconstruct_mlx(mag_codes: mx.array, phase_codes: mx.array,
-                     levels: mx.array, rows_f32: mx.array):
-    """For diagnostics: reconstruct qrows + cos_sim + rel_L2 on GPU."""
+                     levels: mx.array, rows_f32: mx.array,
+                     phase_levels: int = 8):
+    """For diagnostics: reconstruct qrows + cos_sim + rel_L2 on GPU.
+    phase_levels MUST match what the encoder used; else angles are wrong."""
     # qmag = levels[mag_codes]
     qmag = mx.take_along_axis(levels, mag_codes.astype(mx.int32), axis=-1)
-    phase_step = 2.0 * math.pi / 8.0
-    qangle = (phase_codes.astype(mx.int32) - 4).astype(mx.float32) * phase_step
+    phase_step = 2.0 * math.pi / float(phase_levels)
+    qangle = (phase_codes.astype(mx.int32) - (phase_levels // 2)).astype(mx.float32) * phase_step
     qre = qmag * mx.cos(qangle)
     qim = qmag * mx.sin(qangle)
     # Interleave back to [B, n_rows, in]
@@ -229,7 +269,8 @@ def _group_jobs_by_shard(jobs, weight_map):
 
 def encode_shard_gpu(model_dir: Path, shard_jobs, fp4_lut: mx.array,
                      rows_per_tile: int, n_tiles: int,
-                     gpu_batch: int, diag_every: int):
+                     gpu_batch: int, diag_every: int,
+                     phase_levels: int = 8, mag_levels: int = 4):
     """One shard → one open → many GPU dispatches of size gpu_batch.
 
     shard_jobs: ((wshard, sshard), [(job, wname, sname), ...])
@@ -272,10 +313,12 @@ def encode_shard_gpu(model_dir: Path, shard_jobs, fp4_lut: mx.array,
             packed_mx = mx.array(packed_np)
             scale_mx = mx.array(scale_np)
             rows_f32 = _dequant_fp4_batch_mlx(packed_mx, scale_mx, fp4_lut)
-            mag_codes, phase_codes, levels, _, _ = _polar_encode_p8_m2_mlx(rows_f32)
+            mag_codes, phase_codes, levels, _, _ = _polar_encode_p8_m2_mlx(
+                rows_f32, phase_levels=phase_levels, mag_levels=mag_levels)
             run_diag = (diag_every > 0 and (s_idx // gpu_batch) % diag_every == 0)
             if run_diag:
-                _, rel_l2, cos = _reconstruct_mlx(mag_codes, phase_codes, levels, rows_f32)
+                _, rel_l2, cos = _reconstruct_mlx(mag_codes, phase_codes, levels, rows_f32,
+                                                  phase_levels=phase_levels)
                 mx.eval(mag_codes, phase_codes, levels, rel_l2, cos)
                 rl_np = np.array(rel_l2)
                 cs_np = np.array(cos)
@@ -294,6 +337,7 @@ def encode_shard_gpu(model_dir: Path, shard_jobs, fp4_lut: mx.array,
                 metas.append({
                     "layer": layer, "expert": expert, "kind": kind,
                     "rows_encoded": rows_eff, "pairs": in_dim // 2, "in_dim": in_dim,
+                    "phase_levels": phase_levels, "mag_levels": mag_levels,
                     "rel_l2": float(rl_np[i]) if not np.isnan(rl_np[i]) else None,
                     "cos_sim": float(cs_np[i]) if not np.isnan(cs_np[i]) else None,
                     "mag_arr": mc_np[i], "phase_arr": pc_np[i], "levels_arr": lv_np[i],
@@ -344,12 +388,15 @@ def write_combined(out_dir: Path, layer: int, kind: str, metas):
         return None
     n_rows = metas_sorted[0]["rows_encoded"]
     n_pairs = metas_sorted[0]["pairs"]
+    # Codec params recorded in header (default to legacy 8/4 when absent).
+    phase_levels = int(metas_sorted[0].get("phase_levels", 8))
+    mag_levels   = int(metas_sorted[0].get("mag_levels", 4))
     mag = np.stack([m["mag_arr"] for m in metas_sorted], axis=0)
     phase = np.stack([m["phase_arr"] for m in metas_sorted], axis=0)
     levels = np.stack([m["levels_arr"] for m in metas_sorted], axis=0)
     assert mag.shape == (n, n_rows, n_pairs)
     assert phase.shape == (n, n_rows, n_pairs)
-    assert levels.shape == (n, n_rows, 4)
+    assert levels.shape == (n, n_rows, mag_levels)
 
     path = out_dir / f"L{layer:02d}_{kind}.polar"
     header = bytearray(COMBINED_HEADER_BYTES)
@@ -360,6 +407,11 @@ def write_combined(out_dir: Path, layer: int, kind: str, metas):
     header[16:20] = struct.pack("<I", n_pairs)
     header[20:24] = struct.pack("<I", layer)
     header[24:28] = struct.pack("<I", KIND_ID[kind])
+    # Backwards-compatible: bytes 28..31 = phase_levels, 32..35 = mag_levels.
+    # Legacy readers see version=1 + zeros in reserved → treat as p8_m4 default.
+    # New readers explicitly read these fields.
+    header[28:32] = struct.pack("<I", phase_levels)
+    header[32:36] = struct.pack("<I", mag_levels)
     with open(path, "wb") as f:
         f.write(bytes(header))
         f.write(mag.tobytes())
@@ -368,6 +420,7 @@ def write_combined(out_dir: Path, layer: int, kind: str, metas):
     return {
         "layer": layer, "kind": kind, "file": path.name, "n_experts": n,
         "n_rows": n_rows, "n_pairs": n_pairs,
+        "phase_levels": phase_levels, "mag_levels": mag_levels,
         "bytes": COMBINED_HEADER_BYTES + mag.nbytes + phase.nbytes + levels.nbytes,
         "experts": [m["expert"] for m in metas_sorted],
     }
@@ -391,6 +444,10 @@ def main():
                     help="cap on queued writes; backpressures GPU when disk-bound")
     ap.add_argument("--diag-every", type=int, default=8,
                     help="run cos_sim/rel_L2 on every Nth gpu-batch (0 = never, 1 = always)")
+    ap.add_argument("--phase-levels", type=int, default=8,
+                    help="polar phase resolution; power of 2. 8 = legacy, 16 = Test A recommended (+26%% acc, +20%% storage)")
+    ap.add_argument("--mag-levels", type=int, default=4,
+                    help="polar magnitude codebook size. 4 = Test A near-Pareto-optimal; more = diminishing returns")
     ap.add_argument("--format", choices=("combined", "per_expert"), default="combined",
                     help="combined = 1 .polar file per (layer,kind); per_expert = 4 files per expert (legacy)")
     ap.add_argument("--out-dir", required=True)
@@ -449,7 +506,9 @@ def main():
                 prefetch = None
             metas = encode_shard_gpu(model_dir, item, fp4_lut,
                                       args.rows_per_tile, args.n_tiles,
-                                      args.gpu_batch, args.diag_every)
+                                      args.gpu_batch, args.diag_every,
+                                      phase_levels=args.phase_levels,
+                                      mag_levels=args.mag_levels)
             if args.format == "per_expert":
                 for m in metas:
                     write_futures.append(write_pool.submit(write_meta, out_dir, m))

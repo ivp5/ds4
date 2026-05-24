@@ -35,7 +35,12 @@ extern "C" {
 #endif
 
 /* PLR2 file handle.  Opaque; do not access fields directly except as
- * documented below.  Fields are read-only after ds4_polar_open(). */
+ * documented below.  Fields are read-only after ds4_polar_open().
+ *
+ * Codec parameters: phase_levels / mag_levels.
+ *   Legacy PLR2 files (encoder pre-2026-05-25 cross-layer Test A) have
+ *   bytes 28-35 = zeros; reader interprets that as p8_m4 default (the
+ *   only legacy config). New PLR2 files record explicit values. */
 typedef struct {
     void    *mmap_base;     /* base of mmap region, do not free */
     size_t   mmap_bytes;    /* total mmap length passed to munmap()  */
@@ -46,14 +51,16 @@ typedef struct {
     uint32_t n_pairs;
     uint32_t layer;
     uint32_t kind_id;       /* 0=gate, 1=up, 2=down */
+    uint32_t phase_levels;  /* 8 = legacy default; 16/32/... = new */
+    uint32_t mag_levels;    /* 4 = legacy default; 8/16 = new */
     /* Cached pointer arithmetic — recomputed on open() so callers don't
      * have to walk the header layout. */
     const uint8_t *mag_base;     /* [n_experts × n_rows × n_pairs] u8 */
     const uint8_t *phase_base;   /* [n_experts × n_rows × n_pairs] u8 */
-    const float   *levels_base;  /* [n_experts × n_rows × 4]      f32 */
+    const float   *levels_base;  /* [n_experts × n_rows × mag_levels] f32 */
     size_t    expert_mag_stride;     /* n_rows × n_pairs   */
     size_t    expert_phase_stride;   /* n_rows × n_pairs   */
-    size_t    expert_levels_stride;  /* n_rows × 4         */
+    size_t    expert_levels_stride;  /* n_rows × mag_levels */
 } ds4_polar_file;
 
 /* Kind ID mapping (matches the Python encoder). */

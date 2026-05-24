@@ -18,11 +18,12 @@
 #define DS4_POLAR_VERSION 1u
 #define DS4_POLAR_HEADER_BYTES 64u
 
-/* Match the encoder's quartile-mean / 8-level phase codec. */
-#define DS4_POLAR_PHASE_LEVELS 8
-#define DS4_POLAR_MAG_LEVELS   4
-
-static const double TWO_PI_OVER_8 = (2.0 * M_PI) / 8.0;
+/* Legacy defaults when PLR2 header reserved bytes are zero (encoder
+ * pre-cross-layer-Test-A used to hardcode 8 phase × 4 mag). New encoder
+ * (post-cross-layer Test A 2026-05-25) records explicit values in
+ * bytes 28-35. */
+#define DS4_POLAR_LEGACY_PHASE_LEVELS 8u
+#define DS4_POLAR_LEGACY_MAG_LEVELS   4u
 
 static uint32_t le32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -72,6 +73,11 @@ bool ds4_polar_open(const char *path, ds4_polar_file *out) {
     uint32_t n_pairs   = le32(base + 16);
     uint32_t layer     = le32(base + 20);
     uint32_t kind_id   = le32(base + 24);
+    /* Bytes 28-31, 32-35: phase_levels and mag_levels (legacy=0 → defaults). */
+    uint32_t phase_levels = le32(base + 28);
+    uint32_t mag_levels   = le32(base + 32);
+    if (phase_levels == 0) phase_levels = DS4_POLAR_LEGACY_PHASE_LEVELS;
+    if (mag_levels   == 0) mag_levels   = DS4_POLAR_LEGACY_MAG_LEVELS;
 
     if (version != DS4_POLAR_VERSION) {
         fprintf(stderr, "ds4_polar_open: %s version=%u, want %u\n",
@@ -87,8 +93,22 @@ bool ds4_polar_open(const char *path, ds4_polar_file *out) {
         close(fd);
         return false;
     }
+    if (phase_levels < 4 || phase_levels > 65536 || (phase_levels & (phase_levels - 1)) != 0) {
+        fprintf(stderr, "ds4_polar_open: %s phase_levels=%u not a power of 2 in [4, 65536]\n",
+                path, phase_levels);
+        munmap(mm, (size_t)st.st_size);
+        close(fd);
+        return false;
+    }
+    if (mag_levels < 1 || mag_levels > 256) {
+        fprintf(stderr, "ds4_polar_open: %s mag_levels=%u out of range\n",
+                path, mag_levels);
+        munmap(mm, (size_t)st.st_size);
+        close(fd);
+        return false;
+    }
     const size_t per_expert_codes = (size_t)n_rows * (size_t)n_pairs;
-    const size_t per_expert_levels = (size_t)n_rows * (size_t)DS4_POLAR_MAG_LEVELS;
+    const size_t per_expert_levels = (size_t)n_rows * (size_t)mag_levels;
     const size_t mag_bytes = (size_t)n_experts * per_expert_codes;
     const size_t phase_bytes = mag_bytes;
     const size_t levels_bytes = (size_t)n_experts * per_expert_levels * sizeof(float);
@@ -111,6 +131,8 @@ bool ds4_polar_open(const char *path, ds4_polar_file *out) {
     out->n_pairs = n_pairs;
     out->layer = layer;
     out->kind_id = kind_id;
+    out->phase_levels = phase_levels;
+    out->mag_levels = mag_levels;
     out->mag_base = base + DS4_POLAR_HEADER_BYTES;
     out->phase_base = out->mag_base + mag_bytes;
     out->levels_base = (const float *)(out->phase_base + phase_bytes);
@@ -145,18 +167,26 @@ bool ds4_polar_expert_view(const ds4_polar_file *p, uint32_t expert_idx,
 }
 
 /* Decode (mag_code, phase_code, levels_row) → complex pair in fp32.
- * Mirror of polar_encode_mlx.py:
- *   qmag = levels[row, mag_code]
- *   qangle = (phase_code - 4) * 2π/8
+ * Mirror of polar_encode_mlx.py (parameterized for arbitrary phase_levels
+ * P and mag_levels M):
+ *   qmag = levels[row, mag_code]   (mag_code ∈ [0, M))
+ *   qangle = (phase_code - P/2) * 2π/P   (phase_code ∈ [0, P])
  *   re = qmag * cos(qangle)
  *   im = qmag * sin(qangle)
+ *
+ * Pre-cross-layer-Test-A PLR2 files have phase_levels=0/mag_levels=0
+ * in reserved header bytes; reader populates these as 8/4 at open time
+ * to maintain legacy behavior.  Decoders operating on the handle always
+ * read p->phase_levels / p->mag_levels.
  */
 static void decode_pair_internal(uint8_t mag_code, uint8_t phase_code,
                                   const float *levels_row,
+                                  uint32_t phase_levels, uint32_t mag_levels,
                                   float *re_out, float *im_out) {
-    if (mag_code > 3u) mag_code = 3u;     /* defense, should not happen */
+    if ((uint32_t)mag_code >= mag_levels) mag_code = (uint8_t)(mag_levels - 1);
     const float qmag = levels_row[mag_code];
-    const double qangle = ((int)phase_code - 4) * TWO_PI_OVER_8;
+    const double phase_step = (2.0 * M_PI) / (double)phase_levels;
+    const double qangle = ((int)phase_code - (int)(phase_levels / 2u)) * phase_step;
     if (re_out) *re_out = (float)(qmag * cos(qangle));
     if (im_out) *im_out = (float)(qmag * sin(qangle));
 }
@@ -171,9 +201,9 @@ float ds4_polar_decode_pair_re(const ds4_polar_file *p, uint32_t expert_idx,
                          + (size_t)row * p->n_pairs;
     const float *levels = p->levels_base
                         + (size_t)expert_idx * p->expert_levels_stride
-                        + (size_t)row * DS4_POLAR_MAG_LEVELS;
+                        + (size_t)row * p->mag_levels;
     float re;
-    decode_pair_internal(mag[pair], phase[pair], levels, &re, NULL);
+    decode_pair_internal(mag[pair], phase[pair], levels, p->phase_levels, p->mag_levels, &re, NULL);
     return re;
 }
 
@@ -187,9 +217,9 @@ float ds4_polar_decode_pair_im(const ds4_polar_file *p, uint32_t expert_idx,
                          + (size_t)row * p->n_pairs;
     const float *levels = p->levels_base
                         + (size_t)expert_idx * p->expert_levels_stride
-                        + (size_t)row * DS4_POLAR_MAG_LEVELS;
+                        + (size_t)row * p->mag_levels;
     float im;
-    decode_pair_internal(mag[pair], phase[pair], levels, NULL, &im);
+    decode_pair_internal(mag[pair], phase[pair], levels, p->phase_levels, p->mag_levels, NULL, &im);
     return im;
 }
 
@@ -209,46 +239,58 @@ void ds4_polar_print_summary(const ds4_polar_file *p, const char *label) {
         return;
     }
     const size_t total_codes = (size_t)p->n_experts * (size_t)p->n_rows * (size_t)p->n_pairs;
-    const size_t total_levels = (size_t)p->n_experts * (size_t)p->n_rows * 4u;
+    const size_t total_levels = (size_t)p->n_experts * (size_t)p->n_rows * (size_t)p->mag_levels;
 
     /* Quick histogram on the first expert's first row. */
-    uint64_t mag_hist[4] = {0,0,0,0};
-    uint64_t phase_hist[DS4_POLAR_PHASE_LEVELS + 1] = {0};  /* 0..8 */
+    /* phase_levels can be up to 65536; cap histogram displayable size at 17 for legible printing.
+     * Bins up to MIN(phase_levels+1, 17) are tallied + shown. */
+    enum { MAX_PHASE_BUCKETS = 17 };
+    const uint32_t hist_buckets = (p->phase_levels + 1u < MAX_PHASE_BUCKETS)
+                                    ? (p->phase_levels + 1u) : MAX_PHASE_BUCKETS;
+    /* mag_hist sized to mag_levels (≤256). */
+    uint64_t mag_hist[256] = {0};
+    uint64_t phase_hist[MAX_PHASE_BUCKETS] = {0};
     const uint8_t *m0, *p0;
     const float   *l0;
     if (ds4_polar_expert_view(p, 0, &m0, &p0, &l0)) {
         for (uint32_t k = 0; k < p->n_pairs; k++) {
-            mag_hist[m0[k] & 3u]++;
-            if (p0[k] <= DS4_POLAR_PHASE_LEVELS) phase_hist[p0[k]]++;
+            if (m0[k] < p->mag_levels) mag_hist[m0[k]]++;
+            if (p0[k] < hist_buckets) phase_hist[p0[k]]++;
         }
     }
 
     fprintf(stderr, "ds4_polar: %s\n", label ? label : "summary");
     fprintf(stderr, "  layer=%u kind=%s (id=%u) version=%u\n",
             p->layer, kind_name(p->kind_id), p->kind_id, p->version);
-    fprintf(stderr, "  n_experts=%u n_rows=%u n_pairs=%u\n",
-            p->n_experts, p->n_rows, p->n_pairs);
+    fprintf(stderr, "  n_experts=%u n_rows=%u n_pairs=%u  codec=p%u_m%u\n",
+            p->n_experts, p->n_rows, p->n_pairs, p->phase_levels, p->mag_levels);
     fprintf(stderr,
             "  bytes mmap=%zu  codes=%zu (mag+phase=%zu)  levels=%zu (%.1f MB total)\n",
             p->mmap_bytes, total_codes, total_codes * 2u, total_levels,
             (double)p->mmap_bytes / (1024.0 * 1024.0));
-    fprintf(stderr,
-            "  E0,R0 mag hist: [%llu,%llu,%llu,%llu]   ",
-            (unsigned long long)mag_hist[0],
-            (unsigned long long)mag_hist[1],
-            (unsigned long long)mag_hist[2],
-            (unsigned long long)mag_hist[3]);
-    fprintf(stderr, "phase hist: [");
-    for (int k = 0; k <= DS4_POLAR_PHASE_LEVELS; k++) {
+    fprintf(stderr, "  E0,R0 mag hist (first %u of %u): [",
+            p->mag_levels < 8 ? p->mag_levels : 8, p->mag_levels);
+    uint32_t mag_show = p->mag_levels < 8 ? p->mag_levels : 8;
+    for (uint32_t k = 0; k < mag_show; k++) {
+        fprintf(stderr, "%llu%s", (unsigned long long)mag_hist[k],
+                k == mag_show - 1 ? "" : ",");
+    }
+    fprintf(stderr, "]   ");
+    fprintf(stderr, "phase hist (first %u of %u): [", hist_buckets, p->phase_levels + 1);
+    for (uint32_t k = 0; k < hist_buckets; k++) {
         fprintf(stderr, "%llu%s",
                 (unsigned long long)phase_hist[k],
-                k == DS4_POLAR_PHASE_LEVELS ? "" : ",");
+                k == hist_buckets - 1 ? "" : ",");
     }
     fprintf(stderr, "]\n");
     if (l0) {
-        fprintf(stderr,
-                "  E0,R0 levels: [%.6f, %.6f, %.6f, %.6f]\n",
-                l0[0], l0[1], l0[2], l0[3]);
+        fprintf(stderr, "  E0,R0 levels (first %u of %u): [",
+                p->mag_levels < 8 ? p->mag_levels : 8, p->mag_levels);
+        uint32_t lvl_show = p->mag_levels < 8 ? p->mag_levels : 8;
+        for (uint32_t k = 0; k < lvl_show; k++) {
+            fprintf(stderr, "%.6f%s", l0[k], k == lvl_show - 1 ? "" : ", ");
+        }
+        fprintf(stderr, "]\n");
         float re0 = ds4_polar_decode_pair_re(p, 0, 0, 0);
         float im0 = ds4_polar_decode_pair_im(p, 0, 0, 0);
         fprintf(stderr,
