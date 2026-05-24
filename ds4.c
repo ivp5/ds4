@@ -9508,6 +9508,13 @@ typedef struct {
  uint32_t power_percent;
  double prefill_layer_avg_sec[DS4_N_LAYER];
  double decode_token_avg_sec;
+ /* #563 Phase B-2: pointers into engine state (engine owns the lifecycle).
+  * NULL when polar dispatch is disabled. When non-NULL, ffn-batch entry
+  * checks polar_layer_enabled[il] AND polar_pool has GUD for il before
+  * deciding whether to dispatch the H1735 kernel (Phase B-2 dispatch
+  * substitution lives downstream of this gate). */
+ const ds4_polar_pool *polar_pool_ref;
+ const uint8_t *polar_layer_enabled_ref;
  bool cpu_moe;
  bool cpu_moe_layer[DS4_N_LAYER];
  const ds4_model *cpu_model;
@@ -14158,6 +14165,33 @@ static bool metal_graph_encode_layer_ffn_batch(
  uint32_t n_tokens) {
  if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
 
+ /* #563 Phase B-2.1 instrumentation: report when this layer would have been
+  * polar-dispatched. Counts as a structural gate but does not yet substitute
+  * the FP4 path. The Phase B-2.2 dispatch substitution lands as a separate
+  * commit that uses the same gate condition. */
+ if (g->polar_pool_ref && g->polar_layer_enabled_ref &&
+     il < DS4_POLAR_MAX_LAYERS && g->polar_layer_enabled_ref[il]) {
+     const ds4_polar_file *gate = ds4_polar_pool_get(g->polar_pool_ref, il, DS4_POLAR_KIND_GATE);
+     const ds4_polar_file *up   = ds4_polar_pool_get(g->polar_pool_ref, il, DS4_POLAR_KIND_UP);
+     const ds4_polar_file *down = ds4_polar_pool_get(g->polar_pool_ref, il, DS4_POLAR_KIND_DOWN);
+     static int s_warned[DS4_POLAR_MAX_LAYERS] = {0};
+     if (!s_warned[il]) {
+         s_warned[il] = 1;
+         if (gate && up && down) {
+             fprintf(stderr,
+                     "ds4: polar layer %u armed (gate=%u×%u up=%u×%u down=%u×%u) — Phase B-2.2 dispatch pending\n",
+                     il, gate->n_experts, gate->n_rows,
+                     up->n_experts, up->n_rows, down->n_experts, down->n_rows);
+         } else {
+             fprintf(stderr,
+                     "ds4: polar layer %u NOT armed — missing %s%s%s in pool\n",
+                     il, gate ? "" : "[gate]",
+                     up ? "" : "[up]",
+                     down ? "" : "[down]");
+         }
+     }
+ }
+
  const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
  const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
  const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
@@ -16243,6 +16277,9 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
  g->cpu_model = e->cpu_moe ? &e->cpu_model : NULL;
  g->prefill_metal_phases = e->prefill_metal_phases;
  g->power_percent = e->power_percent;   /* propagate throttle to graph */
+ /* #563 Phase B-2: thread polar pool + layer mask refs into graph. */
+ g->polar_pool_ref = (e->polar_pool.opened_count > 0) ? &e->polar_pool : NULL;
+ g->polar_layer_enabled_ref = e->polar_layer_enabled;
  for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
  g->cpu_moe_layer[il] = e->cpu_moe_layer[il];
  }
