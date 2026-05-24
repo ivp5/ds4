@@ -139,7 +139,10 @@ def load_layer_gate(model_dir, layer, n_experts, rows):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", default="/Users/silv/cl/tlp/montyneg/ds4/gguf/DeepSeek-V4-Flash")
-    ap.add_argument("--layer", type=int, default=0)
+    ap.add_argument("--layer", type=int, default=0,
+                    help="single layer (legacy; ignored if --layers is set)")
+    ap.add_argument("--layers", default=None,
+                    help="comma-separated layer indices, or 'all' for 0..42")
     ap.add_argument("--n-experts", type=int, default=32)
     ap.add_argument("--rows", type=int, default=128)
     ap.add_argument("--out-json", required=True)
@@ -149,70 +152,112 @@ def main():
 
     Ps = [int(x) for x in args.phase_levels.split(",")]
     Ms = [int(x) for x in args.mag_levels.split(",")]
+    if args.layers is not None:
+        if args.layers == "all":
+            layers = list(range(43))
+        else:
+            layers = [int(x) for x in args.layers.split(",")]
+    else:
+        layers = [args.layer]
 
-    print(f"polar_sweep: loading L{args.layer} gate, {args.n_experts} experts × {args.rows} rows",
+    all_results = []   # one entry per (layer, P, M)
+    per_layer_pareto = {}
+    grand_t0 = time.time()
+    for layer_idx in layers:
+        print(f"polar_sweep: L{layer_idx} gate, {args.n_experts} experts × {args.rows} rows",
+              file=sys.stderr)
+        t0 = time.time()
+        weights = load_layer_gate(args.model_dir, layer_idx, args.n_experts, args.rows)
+        print(f"  loaded in {time.time()-t0:.1f}s  shape={weights.shape}", file=sys.stderr)
+
+        layer_results = []
+        for P in Ps:
+            for M in Ms:
+                t1 = time.time()
+                cos_acc = []
+                rel_acc = []
+                for e in range(args.n_experts):
+                    qrows, bpp = encode_polar_pN_mM(weights[e], P, M)
+                    cos, rel = measure(weights[e], qrows)
+                    cos_acc.append(cos)
+                    rel_acc.append(rel)
+                cos_all = np.concatenate(cos_acc)
+                rel_all = np.concatenate(rel_acc)
+                elapsed = time.time() - t1
+                entry = {
+                    "layer": layer_idx,
+                    "phase_levels": P,
+                    "mag_levels": M,
+                    "bits_per_pair": bpp,
+                    "cos_sim_mean": float(cos_all.mean()),
+                    "cos_sim_min": float(cos_all.min()),
+                    "rel_l2_mean": float(rel_all.mean()),
+                    "rel_l2_p95": float(np.percentile(rel_all, 95)),
+                    "n_rows_sampled": int(cos_all.shape[0]),
+                    "elapsed_s": float(elapsed),
+                }
+                layer_results.append(entry)
+                all_results.append(entry)
+
+        # Build per-layer Pareto
+        points = [(r["bits_per_pair"], r["rel_l2_mean"], r) for r in layer_results]
+        points.sort()
+        pareto = []
+        best_rel = float("inf")
+        for bpp, rel, r in points:
+            if rel < best_rel:
+                pareto.append(r)
+                best_rel = rel
+        per_layer_pareto[layer_idx] = pareto
+
+        # Compact per-layer print: just the Pareto frontier
+        pareto_str = " → ".join(
+            f"p{r['phase_levels']}_m{r['mag_levels']}({r['rel_l2_mean']:.3f})"
+            for r in pareto[:6]
+        )
+        print(f"  L{layer_idx} Pareto: {pareto_str}", file=sys.stderr)
+
+    grand_elapsed = time.time() - grand_t0
+    print(f"\npolar_sweep: {len(layers)} layers × {len(Ps)*len(Ms)} combos in {grand_elapsed:.1f}s",
           file=sys.stderr)
-    t0 = time.time()
-    weights = load_layer_gate(args.model_dir, args.layer, args.n_experts, args.rows)
-    print(f"  loaded in {time.time()-t0:.1f}s  shape={weights.shape}", file=sys.stderr)
 
-    results = []
-    for P in Ps:
-        for M in Ms:
-            t1 = time.time()
-            cos_acc = []
-            rel_acc = []
-            for e in range(args.n_experts):
-                qrows, bpp = encode_polar_pN_mM(weights[e], P, M)
-                cos, rel = measure(weights[e], qrows)
-                cos_acc.append(cos)
-                rel_acc.append(rel)
-            cos_all = np.concatenate(cos_acc)
-            rel_all = np.concatenate(rel_acc)
-            elapsed = time.time() - t1
-            entry = {
-                "phase_levels": P,
-                "mag_levels": M,
-                "bits_per_pair": bpp,
-                "cos_sim_mean": float(cos_all.mean()),
-                "cos_sim_min": float(cos_all.min()),
-                "cos_sim_p05": float(np.percentile(cos_all, 5)),
-                "rel_l2_mean": float(rel_all.mean()),
-                "rel_l2_max": float(rel_all.max()),
-                "rel_l2_p95": float(np.percentile(rel_all, 95)),
-                "n_rows_sampled": int(cos_all.shape[0]),
-                "elapsed_s": elapsed,
-            }
-            results.append(entry)
-            print(f"  p{P:>3}_m{M:>2}  bits={bpp:>4.1f}  cos_mean={entry['cos_sim_mean']:.4f}  "
-                  f"rel_L2_mean={entry['rel_l2_mean']:.4f}  ({elapsed:.1f}s)",
+    # Cross-layer summary at p8_m4 (baseline) and p16_m4 (recommended upgrade)
+    def at(P, M):
+        rows = [r for r in all_results if r["phase_levels"] == P and r["mag_levels"] == M]
+        return [r["rel_l2_mean"] for r in rows]
+
+    if 8 in Ps and 4 in Ms:
+        rel_p8m4 = at(8, 4)
+        print(f"\nCross-layer p8_m4 baseline (current PLR2): "
+              f"mean={np.mean(rel_p8m4):.4f}  min={min(rel_p8m4):.4f}  max={max(rel_p8m4):.4f}",
+              file=sys.stderr)
+    if 16 in Ps and 4 in Ms:
+        rel_p16m4 = at(16, 4)
+        print(f"Cross-layer p16_m4 (+1 bit, Test A elbow):  "
+              f"mean={np.mean(rel_p16m4):.4f}  min={min(rel_p16m4):.4f}  max={max(rel_p16m4):.4f}",
+              file=sys.stderr)
+        if 8 in Ps and 4 in Ms:
+            improvements = [(a - b) / a * 100 for a, b in zip(rel_p8m4, rel_p16m4)]
+            print(f"p8_m4→p16_m4 per-layer improvement %: "
+                  f"mean={np.mean(improvements):.1f}%  min={min(improvements):.1f}%  max={max(improvements):.1f}%",
                   file=sys.stderr)
-
-    # Build Pareto: (bits_per_pair, rel_l2_mean) — minimize both
-    points = [(r["bits_per_pair"], r["rel_l2_mean"], r) for r in results]
-    points.sort()
-    pareto = []
-    best_rel = float("inf")
-    for bpp, rel, r in points:
-        if rel < best_rel:
-            pareto.append(r)
-            best_rel = rel
-    print(f"\npolar_sweep: Pareto frontier ({len(pareto)} points):", file=sys.stderr)
-    for r in pareto:
-        print(f"  p{r['phase_levels']:>3}_m{r['mag_levels']:>2}  "
-              f"bits={r['bits_per_pair']:>4.1f}  "
-              f"rel_L2_mean={r['rel_l2_mean']:.4f}  "
-              f"cos_sim_mean={r['cos_sim_mean']:.4f}",
+    if 32 in Ps and 8 in Ms:
+        rel_p32m8 = at(32, 8)
+        print(f"Cross-layer p32_m8 (+3 bits, Test A best ratio): "
+              f"mean={np.mean(rel_p32m8):.4f}  min={min(rel_p32m8):.4f}  max={max(rel_p32m8):.4f}",
               file=sys.stderr)
 
     with open(args.out_json, "w") as f:
         json.dump({
             "model_dir": args.model_dir,
-            "layer": args.layer,
+            "layers": layers,
             "n_experts": args.n_experts,
             "rows": args.rows,
-            "results": results,
-            "pareto": pareto,
+            "phase_levels": Ps,
+            "mag_levels": Ms,
+            "results": all_results,
+            "per_layer_pareto": {str(k): v for k, v in per_layer_pareto.items()},
+            "elapsed_s": grand_elapsed,
         }, f, indent=2)
     print(f"\npolar_sweep: wrote {args.out_json}", file=sys.stderr)
 
