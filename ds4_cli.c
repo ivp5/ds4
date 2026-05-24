@@ -1668,6 +1668,24 @@ int main(int argc, char **argv) {
         ds4_polar_close(&pf);
         return 0;
     }
+    /* --polar-gud-canary [n_codes [route_pairs [rows [batches [pairs [down_rows [act_rows]]]]]]]:
+     * H1735 fused gate*silu*up*route_weight + down-projection in one
+     * dispatch. Synthetic input where expected output = pairs^2 for all
+     * cells (mag=0, phase=4, levels=1, hidden=1, down=1/act_rows, route_weight=1).
+     * Tile policy hint (H1736/H1738): try down_rows=8 act_rows=16 at small
+     * batches, down_rows=64 act_rows=32 at large batches. */
+    if (argc >= 2 && !strcmp(argv[1], "--polar-gud-canary")) {
+        uint32_t n_codes     = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        uint32_t route_pairs = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 8;
+        uint32_t rows        = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 32;
+        uint32_t batches     = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 1;
+        uint32_t pairs       = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
+        uint32_t down_rows   = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 8;
+        uint32_t act_rows    = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 16;
+        return ds4_gpu_mtl4_polar_gate_up_down_canary(n_codes, route_pairs, rows,
+                                                      batches, pairs,
+                                                      down_rows, act_rows) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {

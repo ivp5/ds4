@@ -943,3 +943,28 @@ int ds4_gpu_mtl4_polar_tile_real(const char *prefix,
 int ds4_gpu_mtl4_polar_fused_canary(uint32_t n_codes, uint32_t route_pairs,
                                      uint32_t rows, uint32_t batches,
                                      uint32_t pairs);
+
+/* H1735 down-projection extension of the H1733 fused gate*silu*up packet.
+ *
+ * Adds a Q2_K-style down slice multiply on top: for each (batch, route_pair),
+ * the threadgroup first computes act[r] = silu(gate)*up*route_weight for
+ * r ∈ [0, act_rows), then for tid < down_rows it computes
+ *   out[batch, route_pair, tid] = sum_k act[k] * down[route_pair, tid, k]
+ * in a single dispatch.
+ *
+ * H1736/H1738 tile policy: at b8, 16×8 (act × down) hits 22.31 ns/equiv
+ * row-dot; at b32, 32×64 hits 21.03 ns. H1737 refuted two-stage
+ * materialization; keep this monolithic tiled fusion as-is.
+ *
+ * Synthetic canary uses mag=0, phase=4 (angle 0), level[0]=1, hidden=1,
+ * down=1/act_rows uniform → expected output = pairs² for all out cells.
+ * Pass criterion: relative error vs expected < 1e-3.
+ *
+ * Constraints: act_rows ≤ 64 (MAX_ACT in shared-memory tile), act_rows ≤ rows,
+ * down_rows ≤ 256 (must fit in one threadgroup).
+ *
+ * Returns 1 on success, 0 on failure. */
+int ds4_gpu_mtl4_polar_gate_up_down_canary(uint32_t n_codes, uint32_t route_pairs,
+                                            uint32_t rows, uint32_t batches,
+                                            uint32_t pairs, uint32_t down_rows,
+                                            uint32_t act_rows);
