@@ -13798,6 +13798,26 @@ static int ds4_gpu_encode_router_select(
  return 0;
  }
 
+ /* #559 ICB Phase 5 — NOT shipped. Two structural blockers prevent
+  * record/replay of router_finalize_one:
+  *
+  *   1. setThreadgroupMemoryLength (line below, 2 KB workspace) has NO
+  *      equivalent in MTLIndirectComputeCommand. ICB exposes
+  *      setKernelBuffer + setKernelBytes + concurrentDispatchThreadgroups
+  *      but threadgroup memory size is set per-encoder, not per-command.
+  *      Workaround would require kernel refactor to declare workspace
+  *      as fixed-size threadgroup arrays in MSL — outside this commit's scope.
+  *
+  *   2. Conditional bindings (has_bias × hash_mode × use_token_buffer
+  *      = 8 combinations) would need 8 distinct ICB slots, each with
+  *      a different mix of setKernelBuffer / setKernelBytes calls. ICB
+  *      record-time encoding can't conditionally choose between buffer
+  *      and inline-bytes at the same arg index.
+  *
+  * Closing #559 with the doctrine block here so future-claude (or
+  * a future codex agent) doesn't re-attempt without first restructuring
+  * the kernel + caller. The direct encoding below remains the only
+  * viable path on the current shape. */
  id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
  [enc setComputePipelineState:router_finalize_pipeline];
  [enc setBytes:&args length:sizeof(args) atIndex:0];
