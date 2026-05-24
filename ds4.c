@@ -19922,6 +19922,15 @@ void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *
  s->progress_ud = ud;
 }
 
+/* No-op stub for the antirez "fine-grained prefill display progress" callback.
+ * Our ds4_session struct doesn't carry display_progress fields yet (they land
+ * with the antirez/main merge — see merge-deferred note 2026-05-25). ds4_agent
+ * already calls this API; without the stub, the linker fails. The callback
+ * silently doesn't fire until the proper merge lands. */
+void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
+ (void)s; (void)fn; (void)ud;
+}
+
 #ifndef DS4_NO_GPU
 typedef struct {
  ds4_session *session;
