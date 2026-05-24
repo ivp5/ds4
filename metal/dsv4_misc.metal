@@ -202,16 +202,22 @@ kernel void kernel_dsv4_indexer_score_one_direct(
 // per token, n_expert threads cooperating. Replaced the prior 2-kernel
 // (remap + separate renormalize) path 2026-05-25; the fused kernel saves
 // 1 dispatch per layer × n_tokens.
+// Args block at buffer(3): { layer_index, n_expert, n_tokens } per layer,
+// laid out as 43 contiguous slots of 3 uint32 each (12 bytes per layer).
+// Host indexes by setBuffer:offset:(layer_index * 12) so the kernel sees its
+// own slot as args[0..2]. The buffer-with-offset form is ICB-compatible;
+// the prior constant-uint setBytes form was not (per ds4_metal.m:4216 note).
 kernel void kernel_dsv4_router_weights_with_remap(
  device const int *inverse_remap_table, // flat 43*256 int32
  device int *selected_ids,
  device float *weights,
- constant uint &layer_index,
- constant uint &n_expert, // typically 6
- constant uint &n_tokens,
+ constant uint *args, // [0]=layer_index, [1]=n_expert, [2]=n_tokens
  threadgroup float *scratch [[threadgroup(0)]],
  uint2 tgpig [[threadgroup_position_in_grid]],
  ushort tid [[thread_index_in_threadgroup]]) {
+ const uint layer_index = args[0];
+ const uint n_expert = args[1];
+ const uint n_tokens = args[2];
  const uint token = tgpig.x;
  if (token >= n_tokens) return;
  if (tid >= n_expert) return;

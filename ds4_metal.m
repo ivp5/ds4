@@ -106,6 +106,35 @@ static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_with_remap_pipeline;
 static id<MTLBuffer> g_dsv4_expert_inverse_table_buffer; /* 43*256 int32, flat */
+/* Per-layer args slot buffer for kernel_dsv4_router_weights_with_remap.
+ * 43 layers × 3 uint32 (layer_index, n_expert, n_tokens) = 516 bytes.
+ * Host writes once per n_tokens change; dispatch indexes by
+ * setBuffer:offset:(layer * 12) so each layer reads its own slot. The
+ * buffer-with-offset form is ICB-compatible; the prior setBytes form
+ * crashed ICB record→replay (ds4_metal.m:4216). */
+static id<MTLBuffer> g_dsv4_route_remap_args_buf;
+static uint32_t g_dsv4_route_remap_args_n_tokens; /* last n_tokens loaded */
+/* ICB record→replay for kernel_dsv4_router_weights_with_remap. One ICB with
+ * 43 slots (one per layer). Per-slot signature tracks the buffer pointers +
+ * offsets + n_tokens that were recorded; if signature matches at execute
+ * time, replay; else re-record that slot. Env-gated by DS4_ICB_ACTIVE.
+ *
+ * Per H1716 (codex tinygrad route capture): graph capture removes per-dispatch
+ * host-encoding overhead. 6.43× at 1 layer, 16.33× at 16 in tinygrad. For
+ * DS4 this slot covers ~1/4 of the route chain (just the fused remap), so
+ * we expect modest 5-15% gen improvement from this slice alone. */
+static id<MTLIndirectCommandBuffer> g_route_remap_icb;
+typedef struct {
+    void *selected_ptr;  /* __unsafe_unretained id<MTLBuffer> as bare pointer for compare only */
+    uint64_t selected_off;
+    void *weights_ptr;
+    uint64_t weights_off;
+    uint32_t n_tokens;
+    int recorded;        /* 0 = empty slot, 1 = recorded with above signature */
+} ds4_route_remap_icb_slot;
+static ds4_route_remap_icb_slot g_route_remap_icb_slots[43];
+static int g_route_remap_icb_env_checked;
+static int g_route_remap_icb_env_active;
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_model_buffer_cache;
@@ -693,7 +722,18 @@ static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
  return nil;
  }
 
- id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+ /* Build with supportIndirectCommandBuffers=YES so the same pipeline can
+  * be used both via direct compute encoder AND via ICB. Apple docs note
+  * minimal perf impact for pipelines that don't get ICB-recorded. Needed
+  * for Phase 2 route ICB record→replay (task #555 / H1716 port). */
+ MTLComputePipelineDescriptor *pdesc = [MTLComputePipelineDescriptor new];
+ pdesc.computeFunction = fn;
+ pdesc.supportIndirectCommandBuffers = YES;
+ id<MTLComputePipelineState> pipeline =
+ [g_device newComputePipelineStateWithDescriptor:pdesc
+ options:MTLPipelineOptionNone
+ reflection:nil
+ error:&error];
  if (!pipeline) {
  fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
  function_name, [[error localizedDescription] UTF8String]);
@@ -4565,6 +4605,12 @@ void ds4_gpu_cleanup(void) {
  g_dsv4_router_weights_one_pipeline = nil;
  g_dsv4_router_weights_with_remap_pipeline = nil;
  g_dsv4_expert_inverse_table_buffer = nil;
+ g_dsv4_route_remap_args_buf = nil;
+ g_dsv4_route_remap_args_n_tokens = 0;
+ g_route_remap_icb = nil;
+ memset(g_route_remap_icb_slots, 0, sizeof(g_route_remap_icb_slots));
+ g_route_remap_icb_env_checked = 0;
+ g_route_remap_icb_env_active = 0;
  g_dsv4_hc_expand4_pipeline = nil;
  g_flash_attn_mask_buffer = nil;
  g_flash_attn_pad_buffer = nil;
@@ -14255,18 +14301,109 @@ int ds4_gpu_remap_routed_for_trim(
  "kernel_dsv4_router_weights_with_remap");
  if (!fused_pipeline) return 0;
 
+ /* Ensure per-layer args slots are populated for the current n_tokens. The
+  * args buffer is 43 contiguous (layer_index, n_expert, n_tokens) tuples.
+  * Refill triggers only when n_tokens changes (free between decode steps,
+  * one refill per prefill chunk-size change). 516 bytes total. */
+ if (!g_dsv4_route_remap_args_buf) {
+ g_dsv4_route_remap_args_buf =
+ [g_device newBufferWithLength:(43u * 3u * sizeof(uint32_t))
+ options:MTLResourceStorageModeShared];
+ g_dsv4_route_remap_args_n_tokens = 0;
+ }
+ if (g_dsv4_route_remap_args_n_tokens != n_tokens) {
+ uint32_t *slots = (uint32_t *)g_dsv4_route_remap_args_buf.contents;
+ for (uint32_t L = 0; L < 43u; L++) {
+ slots[L * 3u + 0u] = L;
+ slots[L * 3u + 1u] = n_expert;
+ slots[L * 3u + 2u] = n_tokens;
+ }
+ g_dsv4_route_remap_args_n_tokens = n_tokens;
+ }
+
+ /* ICB record→replay path: gated by DS4_ICB_ACTIVE. Each layer slot caches
+  * the recorded command with (selectedbuf, weightsbuf, n_tokens) signature.
+  * Signature match → just execute. Mismatch → re-record at that slot. The
+  * args buffer offset is part of the recorded command (per-layer), so layer
+  * id is implicit. Per H1716 codex tinygrad: this slice is ~1/4 of the
+  * route chain. Expected gain: 5-15% of route encoding cost reclaimed. */
+ if (!g_route_remap_icb_env_checked) {
+ g_route_remap_icb_env_active = getenv("DS4_ICB_ACTIVE") != NULL ? 1 : 0;
+ g_route_remap_icb_env_checked = 1;
+ if (g_route_remap_icb_env_active) {
+ fprintf(stderr, "ds4: DS4_ICB_ACTIVE=1 — route_remap ICB record→replay engaged\n");
+ }
+ }
+
+ if (g_route_remap_icb_env_active && layer_index < 43u) {
+ if (!g_route_remap_icb) {
+ MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
+ desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+ desc.inheritBuffers = NO;
+ desc.inheritPipelineState = NO;
+ desc.maxKernelBufferBindCount = 4;
+ g_route_remap_icb =
+ [g_device newIndirectCommandBufferWithDescriptor:desc
+ maxCommandCount:43
+ options:MTLResourceStorageModeShared];
+ if (!g_route_remap_icb) {
+ fprintf(stderr, "ds4: ICB allocation failed — falling back to direct encoding\n");
+ g_route_remap_icb_env_active = 0;
+ }
+ }
+ }
+
+ if (g_route_remap_icb_env_active && g_route_remap_icb) {
+ ds4_route_remap_icb_slot *slot = &g_route_remap_icb_slots[layer_index];
+ const int sig_match = slot->recorded &&
+ slot->selected_ptr == (__bridge void *)selectedbuf &&
+ slot->selected_off == (uint64_t)selected_off &&
+ slot->weights_ptr == (__bridge void *)weightsbuf &&
+ slot->weights_off == (uint64_t)weights_off &&
+ slot->n_tokens == n_tokens;
+ if (!sig_match) {
+ id<MTLIndirectComputeCommand> cmd =
+ [g_route_remap_icb indirectComputeCommandAtIndex:layer_index];
+ [cmd setComputePipelineState:fused_pipeline];
+ [cmd setKernelBuffer:g_dsv4_expert_inverse_table_buffer offset:0 atIndex:0];
+ [cmd setKernelBuffer:selectedbuf offset:selected_off atIndex:1];
+ [cmd setKernelBuffer:weightsbuf offset:weights_off atIndex:2];
+ [cmd setKernelBuffer:g_dsv4_route_remap_args_buf
+ offset:(NSUInteger)(layer_index * 3u * sizeof(uint32_t))
+ atIndex:3];
+ [cmd setThreadgroupMemoryLength:(NSUInteger)n_expert * sizeof(float) atIndex:0];
+ [cmd concurrentDispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+ threadsPerThreadgroup:MTLSizeMake(n_expert, 1, 1)];
+ slot->selected_ptr = (__bridge void *)selectedbuf;
+ slot->selected_off = (uint64_t)selected_off;
+ slot->weights_ptr = (__bridge void *)weightsbuf;
+ slot->weights_off = (uint64_t)weights_off;
+ slot->n_tokens = n_tokens;
+ slot->recorded = 1;
+ }
+ id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+ [enc useResource:g_dsv4_expert_inverse_table_buffer usage:MTLResourceUsageRead];
+ [enc useResource:selectedbuf usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+ [enc useResource:weightsbuf usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+ [enc useResource:g_dsv4_route_remap_args_buf usage:MTLResourceUsageRead];
+ [enc executeCommandsInBuffer:g_route_remap_icb
+ withRange:NSMakeRange(layer_index, 1)];
+ ds4_gpu_end_compute_encoder(cb, enc);
+ } else {
  id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
  [enc setComputePipelineState:fused_pipeline];
  [enc setBuffer:g_dsv4_expert_inverse_table_buffer offset:0 atIndex:0];
  [enc setBuffer:selectedbuf offset:selected_off atIndex:1];
  [enc setBuffer:weightsbuf offset:weights_off atIndex:2];
- [enc setBytes:&layer_index length:sizeof(uint32_t) atIndex:3];
- [enc setBytes:&n_expert length:sizeof(uint32_t) atIndex:4];
- [enc setBytes:&n_tokens length:sizeof(uint32_t) atIndex:5];
+ /* Args at buffer(3) with per-layer offset. ICB-compatible (no setBytes). */
+ [enc setBuffer:g_dsv4_route_remap_args_buf
+ offset:(NSUInteger)(layer_index * 3u * sizeof(uint32_t))
+ atIndex:3];
  [enc setThreadgroupMemoryLength:(NSUInteger)n_expert * sizeof(float) atIndex:0];
  [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
  threadsPerThreadgroup:MTLSizeMake(n_expert, 1, 1)];
  ds4_gpu_end_compute_encoder(cb, enc);
+ }
  (void)renormalize; /* always renormalized inside the fused kernel */
 
  if (!ds4_gpu_finish_command_buffer(cb, owned, "trim remap")) return 0;

@@ -4,7 +4,7 @@
  * Pillar B — Hot-expert F16 cache with margin gate
  * Pillar C — Spec-decode propose+verify
  *
- * FROZEN-organ candidates for MTL4 ML packaging (post-ICB integration):
+ * FROZEN-organ candidates for ML-accelerator packaging:
  *   - Shared-expert MLP: ffn_gate_shexp / ffn_up_shexp / ffn_down_shexp,
  *     Q8_0, runs every token, fixed per-layer (ds4.c L2281-2283).
  *   - Output head: output_hc_base + output_hc_fn + output_hc_scale (L2288-2290).
@@ -13,8 +13,17 @@
  *   - HC split/expand kernels: kernel_dsv4_hc_split_sinkhorn,
  *     kernel_dsv4_hc_expand, kernel_dsv4_hc_split_weighted_sum
  *     (metal/dsv4_hc.metal). Fixed-structure dispatch every layer.
- * All non-dynamic (no per-token surgery), ideal MTL4 ML targets once
- * the boundary-deletion path (ICB) lands.
+ *
+ * Dispatch paths by hardware:
+ *   - M5/A19+ : MTL4MachineLearningCommandEncoder (Metal 4 native).
+ *               MTL4Device + MTLTensor classes available at runtime;
+ *               supportsFamily:MTLGPUFamilyMetal4 returns YES.
+ *   - M1-M4   : CoreML w/ computeUnits=.cpuAndNeuralEngine OR MPSGraph
+ *               (compiler-dispatched, may target ANE for supported ops).
+ *               MTL4 classes do NOT exist at runtime on Apple7/Apple8.
+ *
+ * All organs are non-dynamic (no per-token surgery), ideal accelerator
+ * targets once the boundary-deletion path (ICB) lands.
  *
  * Spaghetti consolidation: was 6 files (3 .c + 3 .h),
  * now 2 files. Single grep finds all pillar state at top of the .c file.
