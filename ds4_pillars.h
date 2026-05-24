@@ -14,22 +14,36 @@
  *     kernel_dsv4_hc_expand, kernel_dsv4_hc_split_weighted_sum
  *     (metal/dsv4_hc.metal). Fixed-structure dispatch every layer.
  *
- * Dispatch paths by hardware (corrected 2026-05-25 per codex H1722/H1723):
+ * Dispatch paths by hardware (corrected 2026-05-25 per codex H1722/H1723
+ * and SHARPENED per H1727/H1728):
  *   - M5/A19+ : Full MTL4MachineLearningCommandEncoder support.
- *   - M1-M4   : MTL4 compute + ML encoder IS usable when the correct
- *               lifecycle is followed: newCommandAllocator →
- *               newCommandBuffer (from device, not from queue) →
- *               beginCommandBufferWithAllocator → encoder →
- *               endCommandBuffer → MTL4 queue commit. Vector-add canary
- *               on M1 Max: maxerr=0, 0.0567 ms for 1024 floats. Apple8/9-
- *               only features (specific Tensor ops) remain unavailable,
- *               but the general MTL4 compute + ML packaging surface works.
- *               Earlier "MTL4 disabled on Apple7/Apple8" conclusion
- *               measured misuse of old command-buffer assumptions, not
- *               absence of API.
+ *   - M1-M4   : MTL4 COMPUTE path IS productive on M1 Max. Full lifecycle:
+ *               newCommandAllocator → newCommandBuffer (from device, not
+ *               from queue) → beginCommandBufferWithAllocator →
+ *               useResidencySet (H1724 critical: MTL4ArgumentTable buffers
+ *               silently read as zero without it) → MTL4ComputeCommandEncoder
+ *               → endCommandBuffer → MTL4 queue commit. Verified end-to-end
+ *               in DS4 build (commit ba4ed85, --polar-canary):
+ *               - 7776 packets × 2048 pairs: 0.647 ms (83 ns/packet)
+ *               - 82944 packets × 2048 pairs: 5.483 ms (66 ns/packet)
+ *               - max_abs_err = 0
+ *
+ *               MTL4 ML path (MTL4MachineLearningPipelineState) is NOT
+ *               productive for normal kernel void functions on M1 Max.
+ *               Per H1728: a normal MSL kernel raises NSInvalidArgumentException
+ *               (executableWithDeviceSelection: unrecognized) when fed to
+ *               newMachineLearningPipelineStateWithDescriptor:. The ML
+ *               pipeline path needs an ML-compatible executable shape
+ *               (probably a Core ML model or compiled .mlpackage); not
+ *               accessible from a custom compute kernel.
+ *               IMPLICATION: skip ML packaging on M1 Max. Use the COMPUTE
+ *               path for FROZEN organs too (the only difference would be
+ *               that the kernel runs the matmul + activation directly via
+ *               MTL4ComputeCommandEncoder, exactly like our polar_dot canary).
+ *
  *   - Fallback: classic Metal compute encoders + ICB record→replay (the
- *               currently-shipping pillar A path) when MTL4 ML packaging
- *               doesn't fit a given organ's shape constraints.
+ *               currently-shipping pillar A path) when porting an organ
+ *               to MTL4 isn't worth the rewrite cost.
  *
  * All organs are non-dynamic (no per-token surgery), ideal accelerator
  * targets once the boundary-deletion path (ICB) lands.
