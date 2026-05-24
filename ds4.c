@@ -16221,6 +16221,7 @@ struct ds4_engine {
  float directional_steering_ffn_scale;
  uint32_t power_percent;     /* 1..100; 0 means uninitialized → treated as 100 */
  ds4_polar_pool polar_pool;  /* #563 Phase B: per-(layer, kind) PLR2 mmap pool */
+ uint8_t polar_layer_enabled[DS4_POLAR_MAX_LAYERS]; /* #563 Phase B-2: DS4_POLAR_LAYERS mask */
  bool quality;
  bool metal_ready;
  bool mtp_ready;
@@ -19721,6 +19722,34 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  } else {
  fprintf(stderr, "ds4: DS4_POLAR_DIR=%s opened 0 files (Phase B-1 disabled)\n",
  polar_dir);
+ }
+ }
+ /* #563 Phase B-2: DS4_POLAR_LAYERS="l1,l2,..." selects which layers get
+  * polar dispatch (H1735 kernel) instead of FP4. Comma-separated layer
+  * indices; empty / unset = no polar dispatch (Phase B-1 only). Layer must
+  * also be present in the polar pool (GUD all loaded). Phase B-2 dispatch
+  * itself lives in metal_graph_encode_layer_batch; this just records the
+  * intent. */
+ memset(e->polar_layer_enabled, 0, sizeof(e->polar_layer_enabled));
+ const char *polar_layers = getenv("DS4_POLAR_LAYERS");
+ if (polar_layers && polar_layers[0]) {
+ const char *p = polar_layers;
+ uint32_t n_marked = 0;
+ while (*p) {
+ char *end = NULL;
+ long v = strtol(p, &end, 10);
+ if (end == p) break;
+ if (v >= 0 && v < (long)DS4_POLAR_MAX_LAYERS) {
+ e->polar_layer_enabled[v] = 1;
+ n_marked++;
+ }
+ p = end;
+ while (*p == ',' || *p == ' ') p++;
+ }
+ fprintf(stderr, "ds4: DS4_POLAR_LAYERS marked %u layers for polar dispatch (Phase B-2)\n",
+ n_marked);
+ if (n_marked > 0 && e->polar_pool.opened_count == 0) {
+ fprintf(stderr, "ds4: WARN — DS4_POLAR_LAYERS set but DS4_POLAR_DIR unset / empty; dispatch will fall back to FP4\n");
  }
  }
  if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
