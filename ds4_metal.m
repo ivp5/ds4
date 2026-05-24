@@ -14915,6 +14915,257 @@ int ds4_gpu_routed_moe_batch_tensor(
  * to a frozen organ once ICB integration lands. Env-gated DS4_MTL4_MOE_ENABLE;
  * current preflight: n_tokens ≤ 16, n_expert == 6, package + queue allocated. */
 
+/* ============================================================ */
+/* Polar p8_m2 MTL4 dot kernel (port of codex H1725)            */
+/* ============================================================ */
+/* H1722 lifecycle: newCommandAllocator → newCommandBuffer from device →
+ * beginCommandBufferWithAllocator → useResidencySet → encoder →
+ * endCommandBuffer → MTL4 queue commit.
+ *
+ * H1724 critical: MTL4ArgumentTable buffers silently read as zero unless
+ * their allocations are committed/requested through MTLResidencySet and
+ * attached to the command buffer/queue. The bind goes via .gpuAddress.
+ *
+ * H1725 measured: 7776 packets @ 0.605 ms via 256-thread threadgroup per
+ * packet (13.54× speedup over the H1724 serial-thread version).
+ *
+ * Self-test path: ds4_gpu_mtl4_polar_dot_canary(packets, pairs) — exposed
+ * for diagnostic dispatch. Real DS4 integration (consuming polar-encoded
+ * routed expert weights for actual inference) is task #563.
+ *
+ * Codex artifact source: research/llm_fallacy_deconstruction/
+ *   framework_deconstruction/h1725_mtl4_polar_dot_parallel_kernel_20260525.m
+ */
+
+static id<MTL4Compiler> g_polar_compiler;
+static id<MTLComputePipelineState> g_polar_pipeline;
+static id<MTL4CommandAllocator> g_polar_allocator;
+static id<MTL4CommandQueue> g_polar_queue;
+static int g_polar_init_attempted;
+static int g_polar_init_ok;
+
+static int ds4_polar_pipeline_init(void) {
+    if (g_polar_init_attempted) return g_polar_init_ok;
+    g_polar_init_attempted = 1;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "kernel void polar_dot(device const uchar* mag [[buffer(0)]],\n"
+         "                      device const uchar* phase [[buffer(1)]],\n"
+         "                      device const float* levels [[buffer(2)]],\n"
+         "                      device const float* hidden [[buffer(3)]],\n"
+         "                      device const float* cos_lut [[buffer(4)]],\n"
+         "                      device const float* sin_lut [[buffer(5)]],\n"
+         "                      device float* out [[buffer(6)]],\n"
+         "                      device const uint* pairs_ptr [[buffer(7)]],\n"
+         "                      uint3 tg [[threadgroup_position_in_grid]],\n"
+         "                      uint tid [[thread_index_in_threadgroup]]) {\n"
+         "  constexpr uint THREADS = 256;\n"
+         "  threadgroup float partial[THREADS];\n"
+         "  uint packet = tg.x;\n"
+         "  uint pairs = pairs_ptr[0];\n"
+         "  uint base = packet * pairs;\n"
+         "  uint hbase = packet * pairs * 2;\n"
+         "  float acc = 0.0f;\n"
+         "  for (uint j = tid; j < pairs; j += THREADS) {\n"
+         "    uint idx = base + j;\n"
+         "    uchar mcode = mag[idx];\n"
+         "    float qmag = levels[packet * 4 + uint(mcode)];\n"
+         "    uint lut = uint(phase[idx]);\n"
+         "    float x0 = qmag * cos_lut[lut];\n"
+         "    float x1 = qmag * sin_lut[lut];\n"
+         "    acc += x0 * hidden[hbase + 2*j] + x1 * hidden[hbase + 2*j + 1];\n"
+         "  }\n"
+         "  partial[tid] = acc;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (uint stride = THREADS >> 1; stride > 0; stride >>= 1) {\n"
+         "    if (tid < stride) partial[tid] += partial[tid + stride];\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  if (tid == 0) out[packet] = partial[0];\n"
+         "}\n";
+
+    MTL4CompilerDescriptor *compDesc = [MTL4CompilerDescriptor new];
+    g_polar_compiler = [g_device newCompilerWithDescriptor:compDesc error:&err];
+    if (!g_polar_compiler) {
+        fprintf(stderr, "ds4: polar MTL4 compiler init failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_polar_dot";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: polar MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"polar_dot";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_polar_pipeline = [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                                           compilerTaskOptions:nil
+                                                                         error:&err];
+    if (!g_polar_pipeline) {
+        fprintf(stderr, "ds4: polar MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    g_polar_allocator = [g_device newCommandAllocatorWithDescriptor:[MTL4CommandAllocatorDescriptor new] error:&err];
+    if (!g_polar_allocator) {
+        fprintf(stderr, "ds4: polar MTL4 allocator failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    g_polar_queue = [g_device newMTL4CommandQueueWithDescriptor:[MTL4CommandQueueDescriptor new] error:&err];
+    if (!g_polar_queue) {
+        fprintf(stderr, "ds4: polar MTL4 queue failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: polar MTL4 pipeline initialized "
+                    "(threadExecutionWidth=%lu maxThreadsPerTg=%lu)\n",
+            (unsigned long)g_polar_pipeline.threadExecutionWidth,
+            (unsigned long)g_polar_pipeline.maxTotalThreadsPerThreadgroup);
+    g_polar_init_ok = 1;
+    return 1;
+}
+
+/* Polar canary: dispatch the polar_dot kernel on deterministic synthetic inputs
+ * (all-ones hidden, level[0]=1.0, mag code 0, phase code 0 → angle 0 in 9-entry
+ * LUT). Expected output per packet = pairs × 1.0. Reports GPU elapsed via
+ * MTL4CommitFeedback. Returns 1 on success, 0 on failure. */
+int ds4_gpu_mtl4_polar_dot_canary(uint32_t packets, uint32_t pairs) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_polar_pipeline_init()) return 0;
+    if (packets == 0 || pairs == 0) return 0;
+
+    @autoreleasepool {
+        NSError *err = nil;
+        const NSUInteger pairCount = (NSUInteger)packets * pairs;
+        const NSUInteger scalarCount = pairCount * 2;
+
+        id<MTLBuffer> mag       = [g_device newBufferWithLength:pairCount options:MTLResourceStorageModeShared];
+        id<MTLBuffer> phase     = [g_device newBufferWithLength:pairCount options:MTLResourceStorageModeShared];
+        id<MTLBuffer> levels    = [g_device newBufferWithLength:packets * 4 * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> hidden    = [g_device newBufferWithLength:scalarCount * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cosLut    = [g_device newBufferWithLength:9 * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> sinLut    = [g_device newBufferWithLength:9 * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out       = [g_device newBufferWithLength:packets * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> pairsBuf  = [g_device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        if (!mag || !phase || !levels || !hidden || !cosLut || !sinLut || !out || !pairsBuf) return 0;
+
+        memset(mag.contents, 0, pairCount);
+        memset(phase.contents, 4, pairCount); /* phase code 4 → angle 0 in 9-entry LUT */
+        float *lvl = (float *)levels.contents;
+        for (uint32_t p = 0; p < packets; p++) {
+            lvl[p * 4 + 0] = 1.0f;
+            lvl[p * 4 + 1] = 0.5f;
+            lvl[p * 4 + 2] = 0.25f;
+            lvl[p * 4 + 3] = 0.125f;
+        }
+        float *hid = (float *)hidden.contents;
+        for (NSUInteger i = 0; i < scalarCount; i++) hid[i] = 1.0f;
+        float *cosP = (float *)cosLut.contents;
+        float *sinP = (float *)sinLut.contents;
+        for (int code = -4; code <= 4; code++) {
+            float angle = (float)code * 0.78539816339744830962f;
+            cosP[code + 4] = cosf(angle);
+            sinP[code + 4] = sinf(angle);
+        }
+        *((uint32_t *)pairsBuf.contents) = (uint32_t)pairs;
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (!residency) {
+            fprintf(stderr, "ds4: polar residency set: %s\n",
+                    err ? err.localizedDescription.UTF8String : "(no error)");
+            return 0;
+        }
+        id<MTLAllocation> allocs[8] = {
+            (id<MTLAllocation>)mag, (id<MTLAllocation>)phase,
+            (id<MTLAllocation>)levels, (id<MTLAllocation>)hidden,
+            (id<MTLAllocation>)cosLut, (id<MTLAllocation>)sinLut,
+            (id<MTLAllocation>)out, (id<MTLAllocation>)pairsBuf,
+        };
+        [residency addAllocations:allocs count:8];
+        [residency commit];
+        [residency requestResidency];
+
+        MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+        atDesc.maxBufferBindCount = 8;
+        atDesc.initializeBindings = YES;
+        id<MTL4ArgumentTable> argTable = [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+        if (!argTable) {
+            fprintf(stderr, "ds4: polar argument table: %s\n",
+                    err ? err.localizedDescription.UTF8String : "(no error)");
+            return 0;
+        }
+        [argTable setAddress:mag.gpuAddress atIndex:0];
+        [argTable setAddress:phase.gpuAddress atIndex:1];
+        [argTable setAddress:levels.gpuAddress atIndex:2];
+        [argTable setAddress:hidden.gpuAddress atIndex:3];
+        [argTable setAddress:cosLut.gpuAddress atIndex:4];
+        [argTable setAddress:sinLut.gpuAddress atIndex:5];
+        [argTable setAddress:out.gpuAddress atIndex:6];
+        [argTable setAddress:pairsBuf.gpuAddress atIndex:7];
+
+        id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+        [cb beginCommandBufferWithAllocator:g_polar_allocator];
+        [cb useResidencySet:residency];
+        id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) return 0;
+        [enc setComputePipelineState:g_polar_pipeline];
+        [enc setArgumentTable:argTable];
+        [enc dispatchThreadgroups:MTLSizeMake(packets, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb endCommandBuffer];
+
+        [g_polar_queue addResidencySet:residency];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block CFTimeInterval gpuStart = 0.0;
+        __block CFTimeInterval gpuEnd = 0.0;
+        __block NSError *fbErr = nil;
+        MTL4CommitOptions *opts = [MTL4CommitOptions new];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            fbErr = feedback.error;
+            gpuStart = feedback.GPUStartTime;
+            gpuEnd = feedback.GPUEndTime;
+            dispatch_semaphore_signal(sem);
+        }];
+        id<MTL4CommandBuffer> bufs[1] = { cb };
+        [g_polar_queue commit:bufs count:1 options:opts];
+        long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+        [residency endResidency];
+        if (waitRes != 0) { fprintf(stderr, "ds4: polar canary timeout\n"); return 0; }
+        if (fbErr) { fprintf(stderr, "ds4: polar canary feedback err: %s\n", fbErr.localizedDescription.UTF8String); return 0; }
+
+        float *outPtr = (float *)out.contents;
+        float expected = (float)pairs * 1.0f;
+        float maxAbsErr = 0.0f;
+        for (uint32_t p = 0; p < packets; p++) {
+            float diff = fabsf(outPtr[p] - expected);
+            if (diff > maxAbsErr) maxAbsErr = diff;
+        }
+        const double gpuMs = (gpuEnd - gpuStart) * 1000.0;
+        fprintf(stderr,
+                "ds4: polar MTL4 canary packets=%u pairs=%u expected=%.3f "
+                "out[0]=%.3f max_abs_err=%.3e gpu_elapsed=%.6f ms (%.0f ns/packet)\n",
+                packets, pairs, (double)expected, (double)outPtr[0],
+                (double)maxAbsErr, gpuMs, gpuMs * 1e6 / (double)packets);
+        return maxAbsErr < 1e-3f ? 1 : 0;
+    }
+}
+
 static int ds4_mtl4_moe_env_enabled(void) {
  static int cached = -1;
  if (cached < 0) {

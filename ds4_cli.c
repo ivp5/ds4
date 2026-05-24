@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_gpu.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -1613,6 +1614,15 @@ static cli_config parse_options(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    /* --polar-canary [packets [pairs]] : dispatch the MTL4 polar_dot kernel
+     * on synthetic deterministic inputs and report GPU elapsed + max error.
+     * Standalone diagnostic for task #563 (codex H1725 port). Bypasses
+     * engine init since no model is needed. */
+    if (argc >= 2 && !strcmp(argv[1], "--polar-canary")) {
+        uint32_t packets = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 7776;
+        uint32_t pairs   = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 2048;
+        return ds4_gpu_mtl4_polar_dot_canary(packets, pairs) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {

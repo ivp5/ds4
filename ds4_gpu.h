@@ -891,3 +891,14 @@ int ds4_gpu_set_model_map_ranges(const void *model_map, uint64_t model_size,
  uint32_t n_ranges);
 int ds4_gpu_add_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
 int ds4_gpu_set_skip_next_warmup(int skip);
+
+/* Polar p8_m2 MTL4 dot canary (port of codex H1725). Dispatches a synthetic
+ * polar-dot kernel through the M1 Max Metal 4 path: compile MSL via
+ * MTL4Compiler, bind buffers via MTL4ArgumentTable .gpuAddress, residency via
+ * MTLResidencySet attached to cb/queue, dispatch via MTL4ComputeCommandEncoder,
+ * complete via MTL4CommitFeedback. Reports GPU elapsed + max abs error vs the
+ * deterministic expected output (pairs × 1.0).
+ *
+ * Smoke-test surface for task #563 (polar MTL4 inference integration).
+ * Returns 1 on success, 0 on failure. */
+int ds4_gpu_mtl4_polar_dot_canary(uint32_t packets, uint32_t pairs);
