@@ -18,6 +18,7 @@
 
 #include "ds4.h"
 #include "ds4_gpu.h"
+#include "ds4_polar_reader.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -16421,6 +16422,231 @@ int ds4_gpu_mtl4_polar_gate_up_down_canary(uint32_t n_codes, uint32_t route_pair
                 gpuMs * 1e6 / (double)gate_up_dots,
                 bytes / 1e6);
         float relErr = maxAbsErr / fabsf(expected);
+        return relErr < 1e-3f ? 1 : 0;
+    }
+}
+
+/* ============================================================ */
+/* #563 Phase B-2.2 real-data H1735 canary                       */
+/* ============================================================ */
+/* Bridges the PLR2 polar file format to the H1735 GPU kernel. Loads real
+ * DS4 V4 expert weights from a directory of L{LL}_{kind}.polar files,
+ * copies expert <expert>'s rows into MTL buffers, dispatches the kernel
+ * with synthetic hidden=1, route_weight=1, down=1/act_rows, and compares
+ * the GPU output to a CPU reference derived from ds4_polar_decode_pair_re/im.
+ *
+ * Verifies that the PLR2 byte format matches what the kernel reads. If byte
+ * alignment, stride arithmetic, or LUT indexing diverged between encoder
+ * (polar_encode_mlx.py) and decoder (H1735 MSL kernel), this canary catches
+ * it BEFORE we touch the inference hot path in Phase B-2.3.
+ *
+ * Output cross-check: with hidden=h0=h1=1 the kernel's per-pair accumulator
+ * is `qmag*cos*1 + qmag*sin*1 = re_decoded + im_decoded`. Summing over all
+ * pairs of one row gives the dot product the kernel computes. We do this on
+ * CPU for the FIRST `act_rows` of the FIRST expert in the pool's code slot,
+ * apply silu, multiply, sum × (1/act_rows). Expected = act = silu(dot)*dot. */
+int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
+                                    uint32_t layer, uint32_t expert,
+                                    uint32_t down_rows, uint32_t act_rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_polar_gud_pipeline_init()) return 0;
+    if (!polar_dir || !polar_dir[0]) return 0;
+    if (down_rows == 0 || act_rows == 0 || down_rows > 256 || act_rows > 64) return 0;
+
+    ds4_polar_pool pool;
+    ds4_polar_pool_init(&pool);
+    uint32_t opened = ds4_polar_pool_load_dir(&pool, polar_dir);
+    if (opened == 0) {
+        fprintf(stderr, "ds4: polar real canary — no PLR2 files in %s\n", polar_dir);
+        ds4_polar_pool_close(&pool);
+        return 0;
+    }
+
+    const ds4_polar_file *gate_file = ds4_polar_pool_get(&pool, layer, DS4_POLAR_KIND_GATE);
+    const ds4_polar_file *up_file   = ds4_polar_pool_get(&pool, layer, DS4_POLAR_KIND_UP);
+    if (!gate_file || !up_file) {
+        fprintf(stderr, "ds4: polar real canary — layer %u missing gate/up in pool\n", layer);
+        ds4_polar_pool_close(&pool);
+        return 0;
+    }
+    if (expert >= gate_file->n_experts || expert >= up_file->n_experts) {
+        fprintf(stderr, "ds4: polar real canary — expert %u OOR (gate/up have %u experts)\n",
+                expert, gate_file->n_experts);
+        ds4_polar_pool_close(&pool);
+        return 0;
+    }
+    if (act_rows > gate_file->n_rows || act_rows > up_file->n_rows) {
+        fprintf(stderr, "ds4: polar real canary — act_rows %u > available rows %u\n",
+                act_rows, gate_file->n_rows);
+        ds4_polar_pool_close(&pool);
+        return 0;
+    }
+
+    const uint32_t rows   = gate_file->n_rows;
+    const uint32_t pairs  = gate_file->n_pairs;
+    const uint32_t n_codes = 1;        /* single tile pool: just this expert */
+    const uint32_t route_pairs = 1;    /* single route */
+    const uint32_t batches = 1;
+
+    @autoreleasepool {
+        NSError *err = nil;
+        const NSUInteger code_rows = (NSUInteger)n_codes * rows;
+        const NSUInteger pair_count = code_rows * pairs;
+        const NSUInteger hidden_count = (NSUInteger)batches * route_pairs * pairs * 2;
+        const NSUInteger down_count = (NSUInteger)route_pairs * down_rows * act_rows;
+        const NSUInteger out_count = (NSUInteger)batches * route_pairs * down_rows;
+
+        id<MTLBuffer> mag       = [g_device newBufferWithLength:pair_count                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> phase     = [g_device newBufferWithLength:pair_count                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> levels    = [g_device newBufferWithLength:code_rows * 4 * sizeof(float)    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gateCode  = [g_device newBufferWithLength:route_pairs * sizeof(uint32_t)   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> upCode    = [g_device newBufferWithLength:route_pairs * sizeof(uint32_t)   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> routeW    = [g_device newBufferWithLength:route_pairs * sizeof(float)      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> hidden    = [g_device newBufferWithLength:hidden_count * sizeof(float)     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> downBuf   = [g_device newBufferWithLength:down_count * sizeof(float)       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cosLut    = [g_device newBufferWithLength:9 * sizeof(float)                options:MTLResourceStorageModeShared];
+        id<MTLBuffer> sinLut    = [g_device newBufferWithLength:9 * sizeof(float)                options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf    = [g_device newBufferWithLength:out_count * sizeof(float)        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> paramsBuf = [g_device newBufferWithLength:5 * sizeof(uint32_t)             options:MTLResourceStorageModeShared];
+        if (!mag || !phase || !levels || !gateCode || !upCode || !routeW || !hidden ||
+            !downBuf || !cosLut || !sinLut || !outBuf || !paramsBuf) {
+            ds4_polar_pool_close(&pool); return 0;
+        }
+
+        /* Copy expert's real polar data from PLR2 (mmap-resident in pool).
+         * For this canary, we use the SAME expert for gate AND up to keep
+         * the CPU reference computation trivial. */
+        const uint8_t *gate_mag_src = NULL;
+        const uint8_t *gate_phase_src = NULL;
+        const float   *gate_levels_src = NULL;
+        ds4_polar_expert_view(gate_file, expert, &gate_mag_src, &gate_phase_src, &gate_levels_src);
+        memcpy(mag.contents,    gate_mag_src,    (NSUInteger)rows * pairs);
+        memcpy(phase.contents,  gate_phase_src,  (NSUInteger)rows * pairs);
+        memcpy(levels.contents, gate_levels_src, (NSUInteger)rows * 4 * sizeof(float));
+
+        /* Route metadata: single route_pair points at code tile 0 (our copied expert). */
+        ((uint32_t *)gateCode.contents)[0] = 0;
+        ((uint32_t *)upCode.contents)[0]   = 0;
+        ((float    *)routeW.contents)[0]   = 1.0f;
+        float *hid = (float *)hidden.contents;
+        for (NSUInteger i = 0; i < hidden_count; i++) hid[i] = 1.0f;
+        float *dwn = (float *)downBuf.contents;
+        const float down_val = 1.0f / (float)act_rows;
+        for (NSUInteger i = 0; i < down_count; i++) dwn[i] = down_val;
+        float *cosP = (float *)cosLut.contents;
+        float *sinP = (float *)sinLut.contents;
+        for (int code = -4; code <= 4; code++) {
+            float angle = (float)code * 0.78539816339744830962f;
+            cosP[code + 4] = cosf(angle);
+            sinP[code + 4] = sinf(angle);
+        }
+        uint32_t *params = (uint32_t *)paramsBuf.contents;
+        params[0] = pairs; params[1] = rows; params[2] = route_pairs;
+        params[3] = down_rows; params[4] = act_rows;
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 12;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (!residency) { ds4_polar_pool_close(&pool); return 0; }
+        id<MTLAllocation> allocs[12] = {
+            (id<MTLAllocation>)mag, (id<MTLAllocation>)phase, (id<MTLAllocation>)levels,
+            (id<MTLAllocation>)gateCode, (id<MTLAllocation>)upCode, (id<MTLAllocation>)routeW,
+            (id<MTLAllocation>)hidden, (id<MTLAllocation>)downBuf,
+            (id<MTLAllocation>)cosLut, (id<MTLAllocation>)sinLut,
+            (id<MTLAllocation>)outBuf, (id<MTLAllocation>)paramsBuf,
+        };
+        [residency addAllocations:allocs count:12];
+        [residency commit];
+        [residency requestResidency];
+
+        MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+        atDesc.maxBufferBindCount = 12;
+        atDesc.initializeBindings = YES;
+        id<MTL4ArgumentTable> argTable = [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+        if (!argTable) { ds4_polar_pool_close(&pool); return 0; }
+        [argTable setAddress:mag.gpuAddress       atIndex:0];
+        [argTable setAddress:phase.gpuAddress     atIndex:1];
+        [argTable setAddress:levels.gpuAddress    atIndex:2];
+        [argTable setAddress:gateCode.gpuAddress  atIndex:3];
+        [argTable setAddress:upCode.gpuAddress    atIndex:4];
+        [argTable setAddress:routeW.gpuAddress    atIndex:5];
+        [argTable setAddress:hidden.gpuAddress    atIndex:6];
+        [argTable setAddress:downBuf.gpuAddress   atIndex:7];
+        [argTable setAddress:cosLut.gpuAddress    atIndex:8];
+        [argTable setAddress:sinLut.gpuAddress    atIndex:9];
+        [argTable setAddress:outBuf.gpuAddress    atIndex:10];
+        [argTable setAddress:paramsBuf.gpuAddress atIndex:11];
+
+        id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+        [cb beginCommandBufferWithAllocator:g_polar_allocator];
+        [cb useResidencySet:residency];
+        id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) { ds4_polar_pool_close(&pool); return 0; }
+        [enc setComputePipelineState:g_polar_gud_pipeline];
+        [enc setArgumentTable:argTable];
+        [enc dispatchThreadgroups:MTLSizeMake(route_pairs, batches, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb endCommandBuffer];
+
+        [g_polar_queue addResidencySet:residency];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block CFTimeInterval gpuStart = 0.0, gpuEnd = 0.0;
+        __block NSError *fbErr = nil;
+        MTL4CommitOptions *opts = [MTL4CommitOptions new];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            fbErr = feedback.error;
+            gpuStart = feedback.GPUStartTime; gpuEnd = feedback.GPUEndTime;
+            dispatch_semaphore_signal(sem);
+        }];
+        id<MTL4CommandBuffer> bufs[1] = { cb };
+        [g_polar_queue commit:bufs count:1 options:opts];
+        long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+        [residency endResidency];
+        if (waitRes != 0) { fprintf(stderr, "ds4: polar real canary timeout\n"); ds4_polar_pool_close(&pool); return 0; }
+        if (fbErr) { fprintf(stderr, "ds4: polar real canary feedback err: %s\n", fbErr.localizedDescription.UTF8String); ds4_polar_pool_close(&pool); return 0; }
+
+        /* CPU reference computation. For each row r ∈ [0, act_rows):
+         *   gate_dot[r] = sum over p ∈ [0, pairs): re_decoded(r,p) + im_decoded(r,p)
+         * (same as up_dot since we copied gate into up's slot for this canary).
+         * act[r] = silu(gate_dot) * up_dot * 1.0
+         * out[d] = sum_r act[r] * (1/act_rows) for each down_rows entry d. */
+        float gate_dot_sum_rows[64] = {0};  /* MAX_ACT = 64 */
+        for (uint32_t r = 0; r < act_rows; r++) {
+            double sum_re_im = 0.0;
+            for (uint32_t p = 0; p < pairs; p++) {
+                sum_re_im += (double)ds4_polar_decode_pair_re(gate_file, expert, r, p);
+                sum_re_im += (double)ds4_polar_decode_pair_im(gate_file, expert, r, p);
+            }
+            gate_dot_sum_rows[r] = (float)sum_re_im;
+        }
+        double act_sum = 0.0;
+        for (uint32_t r = 0; r < act_rows; r++) {
+            const float g = gate_dot_sum_rows[r];
+            const float silu = g / (1.0f + expf(-g));
+            act_sum += (double)silu * (double)g * 1.0;
+        }
+        /* down is uniform 1.0/act_rows, so each output = sum_r act × (1/act_rows) */
+        const float expected = (float)(act_sum / (double)act_rows);
+
+        float *outPtr = (float *)outBuf.contents;
+        float maxAbsErr = 0.0f;
+        for (NSUInteger i = 0; i < out_count; i++) {
+            float diff = fabsf(outPtr[i] - expected);
+            if (diff > maxAbsErr) maxAbsErr = diff;
+        }
+        const double gpuMs = (gpuEnd - gpuStart) * 1000.0;
+        const float relErr = fabsf(expected) > 1e-6f ? maxAbsErr / fabsf(expected) : maxAbsErr;
+        fprintf(stderr,
+                "ds4: polar REAL canary layer=%u expert=%u rows=%u pairs=%u down_rows=%u act_rows=%u\n"
+                "  CPU expected=%.4f GPU out[0]=%.4f max_abs_err=%.4e rel_err=%.4e\n"
+                "  gpu_elapsed=%.4f ms  resident=%.1f MB\n",
+                layer, expert, rows, pairs, down_rows, act_rows,
+                (double)expected, (double)outPtr[0],
+                (double)maxAbsErr, (double)relErr,
+                gpuMs,
+                (double)(pair_count * 2 + code_rows * 16 + hidden_count * 4 + down_count * 4) / 1e6);
+        ds4_polar_pool_close(&pool);
         return relErr < 1e-3f ? 1 : 0;
     }
 }

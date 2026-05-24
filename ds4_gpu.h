@@ -968,3 +968,21 @@ int ds4_gpu_mtl4_polar_gate_up_down_canary(uint32_t n_codes, uint32_t route_pair
                                             uint32_t rows, uint32_t batches,
                                             uint32_t pairs, uint32_t down_rows,
                                             uint32_t act_rows);
+
+/* #563 Phase B-2.2 real-data canary. Loads PLR2 files from <polar_dir> for
+ * (layer) gate+up+down, copies expert <expert> rows into MTL buffers, runs
+ * the H1735 kernel with hidden=1, route_weight=1, down=1/act_rows.
+ *
+ * Validates the PLR2 byte format → MTL4 GPU binding pipeline end-to-end:
+ *   - byte alignment of mag/phase/levels arrays
+ *   - per-expert stride arithmetic
+ *   - cos_lut/sin_lut indexing consistency between encoder and kernel
+ *
+ * Computes the expected output on CPU via ds4_polar_decode_pair_re/im (the
+ * same decode formula the encoder uses) and reports max_abs_err vs GPU.
+ *
+ * Returns 1 if relative error < 1e-3, 0 on any failure (file open, dispatch,
+ * tolerance). */
+int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
+                                    uint32_t layer, uint32_t expert,
+                                    uint32_t down_rows, uint32_t act_rows);

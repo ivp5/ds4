@@ -1697,6 +1697,20 @@ int main(int argc, char **argv) {
                                                       batches, pairs,
                                                       down_rows, act_rows) ? 0 : 1;
     }
+    /* --polar-real-canary <polar_dir> [layer [expert [down_rows [act_rows]]]]:
+     * #563 Phase B-2.2 real-data validation — load PLR2 files from
+     * <polar_dir> for the given layer, copy expert <expert> rows into MTL
+     * buffers, dispatch H1735 with hidden=1, route_weight=1, down=1/act_rows.
+     * Compares GPU output to a CPU reference derived from polar decode.
+     * Validates the PLR2 byte format → MTL4 GPU pipeline end-to-end. */
+    if (argc >= 3 && !strcmp(argv[1], "--polar-real-canary")) {
+        const char *dir   = argv[2];
+        uint32_t layer    = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 0;
+        uint32_t expert   = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 0;
+        uint32_t down_rows = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 8;
+        uint32_t act_rows  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 16;
+        return ds4_gpu_mtl4_polar_real_canary(dir, layer, expert, down_rows, act_rows) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
