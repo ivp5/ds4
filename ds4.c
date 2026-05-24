@@ -2552,6 +2552,15 @@ static void tensor_expect_routed_expert(
 static uint32_t g_ds4_n_expert_trim[DS4_N_LAYER] = {0};
 static bool g_ds4_n_expert_trim_loaded = false;
 
+/* Public getter so ds4_metal.m can bounds-check selected_ids against the
+ * per-layer trimmed expert count. Returns DS4_N_EXPERT (256) when metadata
+ * was not loaded (i.e. full untrimmed file). */
+uint32_t ds4_get_layer_expert_count(uint32_t layer) {
+    if (!g_ds4_n_expert_trim_loaded || layer >= DS4_N_LAYER) return DS4_N_EXPERT;
+    const uint32_t v = g_ds4_n_expert_trim[layer];
+    return v ? v : DS4_N_EXPERT;
+}
+
 static void ds4_load_expert_trim_metadata(const ds4_model *m) {
     if (g_ds4_n_expert_trim_loaded) return;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {

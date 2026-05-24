@@ -15139,6 +15139,46 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
             layer_index, n_tokens, mid_is_f16);
     }
 
+    /* Bounds check: under trim50, router can output IDs in original 0..255
+     * space but the on-disk gate_exps tensor only stores N_kept < 256
+     * experts. Reading at expert_id × gate_expert_bytes for an out-of-range
+     * id reads past the tensor's allocated bytes → garbage F16 d scales
+     * → IQ2_XXS dequant produces NaN. The proper fix is to plumb the
+     * expert_remap translation through inference (silv's WIP — not ported
+     * to my merged binary). Until then: detect + fall back. */
+    extern uint32_t ds4_get_layer_expert_count(uint32_t layer);
+    const uint32_t layer_expert_count = ds4_get_layer_expert_count(layer_index);
+    int out_of_bounds = 0;
+    for (uint32_t e = 0; e < n_expert; e++) {
+        if (selected_ids[e] < 0 || (uint32_t)selected_ids[e] >= layer_expert_count) {
+            out_of_bounds++;
+        }
+    }
+    if (out_of_bounds > 0) {
+        static int warned[64] = {0};  /* DS4_N_LAYER = 43 but use a const here */
+        if (layer_index < 64 && !warned[layer_index]) {
+            warned[layer_index] = 1;
+            fprintf(stderr,
+                    "ds4_mtl4: L%u — %d/%d selected_ids out of trim_count=%u, "
+                    "falling back to legacy. Need expert_remap plumbing.\n",
+                    layer_index, out_of_bounds, n_expert, layer_expert_count);
+        }
+        free(tmp_dequant); free(packed_gate_B); free(x_data); free(gate_out);
+        if (mtl4_path_taken) *mtl4_path_taken = false;
+        return ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, experts, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_expert, clamp, x,
+            layer_index, n_tokens, mid_is_f16);
+    }
+
+    fprintf(stderr, "ds4_mtl4: L%u selected_ids: [%d %d %d %d %d %d] (trim=%u)\n",
+            layer_index,
+            selected_ids[0], selected_ids[1], selected_ids[2],
+            selected_ids[3], selected_ids[4], selected_ids[5], layer_expert_count);
+
     uint64_t t_dequant_ns_total = 0;
     for (int e = 0; e < (int)n_expert && e < 6; e++) {
         const int32_t expert_id = selected_ids[e];
@@ -15157,16 +15197,30 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         ds4_mtl4_dequant_iq2_xxs_expert(expert_bytes, expert_in_dim, expert_mid_dim, tmp_dequant);
         t_dequant_ns_total += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
-        /* Concat into packed_gate_B at column offset (e * expert_mid_dim).
-         * packed_gate_B is (expert_in_dim × 6·expert_mid_dim), row-major. */
-        for (uint64_t r = 0; r < expert_in_dim; r++) {
-            memcpy(&packed_gate_B[r * 6 * expert_mid_dim + e * expert_mid_dim],
-                   &tmp_dequant[r * expert_mid_dim],
-                   expert_mid_dim * sizeof(float));
+        /* GGUF quantized expert layout: stored as [output_col][input_row]
+         * row-major (output_col outer, input_row inner — natural quant
+         * blocking along the matmul inner-product axis). The dequant walks
+         * blocks sequentially, so tmp_dequant has the same [out_col][in_row]
+         * layout. Pack into packed_gate_B which is [input_row][packed_out]
+         * row-major where packed_out = e * expert_mid_dim + c. TRANSPOSE. */
+        for (uint64_t c = 0; c < expert_mid_dim; c++) {
+            for (uint64_t r = 0; r < expert_in_dim; r++) {
+                packed_gate_B[r * 6 * expert_mid_dim + e * expert_mid_dim + c] =
+                    tmp_dequant[c * expert_in_dim + r];
+            }
         }
     }
 
-    /* Read x activation from GPU tensor. */
+    /* Read x activation from GPU tensor. Force command buffer flush first
+     * so prior in-flight Metal work (layer pre-MoE compute) is committed
+     * before host read. Without this, layers immediately after cpu_moe
+     * layers can race-read uninitialized batch_ffn_norm tensor data
+     * (observed: NaN gate_abs_sum on first 2 Metal MoE layers after a
+     * cpu_moe sequence; the 3rd layer succeeds because by then the
+     * tensor has been populated by the prior Metal MoE dispatch). */
+    (void)ds4_gpu_end_commands();
+    (void)ds4_gpu_begin_commands();
+
     const size_t x_bytes = (size_t)n_tokens * (size_t)expert_in_dim * sizeof(float);
     if (ds4_gpu_tensor_read(x, 0, x_data, x_bytes) == 0) {
         fprintf(stderr, "ds4_mtl4: failed to read x activation\n");
@@ -15190,18 +15244,37 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
     }
     uint64_t t_dispatch_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t_dispatch0;
 
-    /* Compute output checksum so we can verify legacy parity later. */
-    double gate_abs_sum = 0.0;
+    /* Compute checksums to localize NaN source. */
+    double x_abs_sum = 0.0, B_abs_sum = 0.0, gate_abs_sum = 0.0;
+    int x_nan = 0, B_nan = 0, gate_nan = 0;
+    const size_t x_n = (size_t)n_tokens * (size_t)expert_in_dim;
+    for (size_t i = 0; i < x_n; i++) {
+        const float v = x_data[i];
+        if (isnan(v) || isinf(v)) x_nan++;
+        else x_abs_sum += fabs((double)v);
+    }
+    const size_t B_n = (size_t)expert_in_dim * 6 * (size_t)expert_mid_dim;
+    for (size_t i = 0; i < B_n; i++) {
+        const float v = packed_gate_B[i];
+        if (isnan(v) || isinf(v)) B_nan++;
+        else B_abs_sum += fabs((double)v);
+    }
     const size_t gate_out_n = (size_t)n_tokens * 6 * (size_t)expert_mid_dim;
     for (size_t i = 0; i < gate_out_n; i++) {
-        gate_abs_sum += fabs((double)gate_out[i]);
+        const float v = gate_out[i];
+        if (isnan(v) || isinf(v)) gate_nan++;
+        else gate_abs_sum += fabs((double)v);
     }
     fprintf(stderr,
-            "ds4_mtl4: layer=%u T=%u — dequant_total=%.2fms (6 experts), "
-            "dispatch=%.2fms, gate_abs_sum=%.6e, dispatch_ok=%d\n",
+            "ds4_mtl4: L%u T=%u dequant=%.1fms disp=%.1fms "
+            "| x: |sum|=%.3e nan=%d/%zu | B: |sum|=%.3e nan=%d/%zu "
+            "| gate: |sum|=%.3e nan=%d/%zu | ok=%d\n",
             layer_index, n_tokens,
             (double)t_dequant_ns_total / 1e6, (double)t_dispatch_ns / 1e6,
-            gate_abs_sum, dispatch_ok ? 1 : 0);
+            x_abs_sum, x_nan, x_n,
+            B_abs_sum, B_nan, B_n,
+            gate_abs_sum, gate_nan, gate_out_n,
+            dispatch_ok ? 1 : 0);
 
     free(tmp_dequant); free(packed_gate_B); free(x_data); free(gate_out);
 
