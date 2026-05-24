@@ -413,3 +413,67 @@ together they form the deployable inference kernel for DS4 V4 on M1
 Max with the polar + pressure-aware-router stack.
 
 Memo scope is now H1724 → H1745.
+
+### H1746 — Q6 route certificate runs as real MTL4 compute
+
+Moves H1745 from Python proof to executable M1 Max MTL4 compute kernel
+over raw buffers — the companion to H1735 on the router side. Source
+files: `h1746_mtl4_q6_route_certificate_kernel_20260525.m` (kernel +
+dispatch) and `h1746_ds4_mtl4_q6_route_certificate_20260525.py`
+(harness over 216 real DS4 route cases).
+
+**Kernel shape**: one threadgroup per route case computes q6 row-wise
+logits for all 256 experts, selects top-9 candidates, then exact-reranks
+only the pressure-width subset (high=9, medium=8, low=6 per the H1744
+policy table that codex shipped earlier this batch).
+
+**Verification on 216 real DS4 route cases**:
+
+  - Approximate top-N containment: **100%**
+  - Rerank set exactness:           **100%**
+  - Rerank order exactness:         **100%**
+  - Misses:                         **0**
+
+**MTL4 commit feedback**: 6.356 ms GPU time for all 216 cases. Width
+distribution: 6 → 110 cases, 8 → 61, 9 → 45 (matches the H1738 pressure
+split — most tokens are in a low-pressure attractor).
+
+**Compute-path doctrine corroborated**: the transparent compute path
+is sufficient. No opaque `MTL4MachineLearningCommandEncoder` / `MTLTensor`
+needed for the route certificate. H1727 / H1734 / H1743 picture survives.
+
+**Remaining memory residency frontier**:
+  - Current canary: full fp32 router resident for exact rerank simplicity.
+  - Staged q6 + scales: 0.250× fp32 router bytes.
+  - Ideal packed q6 + scales: 0.188× fp32 router bytes.
+
+**Next memory proof codex pre-declared**: remove full fp32 residency
+via (a) candidate-row packets (only the top-`width` rows extracted at
+high precision), (b) placement sparse pages (`MTLSparsePageSize16/64/256`
+per H1743), or (c) a route-aware exact-row cache (LRU on the
+boundary-fragile rows).
+
+**Composite picture with H1735** (this session's expert-side canary
+shipped commit 4b59348):
+
+  Router side  (H1746 q6 + rerank certificate)  → emit (selected_6,
+                                                       rerank_logits,
+                                                       pressure)
+  Expert side  (H1735 gate/up/down tiled fusion) → per (batch, route_pair)
+                                                   produce 64 down_rows
+                                                   in one dispatch
+
+Both kernels:
+  - MTL4 compute path only (no ML encoder / no MTLTensor)
+  - MTLResidencySet for all buffers (H1724 silent-zero hazard)
+  - 256 threads/threadgroup, MTL4ArgumentTable raw gpuAddress binding
+  - Dispatch sized by route_pairs + batches; tile policy from H1738
+
+Together they form the DEPLOYABLE INFERENCE STACK for DS4 V4 Flash on
+M1 Max with polar + pressure-aware-router. The Phase B integration
+plan (real-data hookup) is now structurally complete on the codex
+side; my Phase B-1 loader work in this repo brings the polar weights
+into the engine; B-2 will dispatch H1735; a future #566 / topk(k+1)
+hookup brings H1746 into the router slot.
+
+Memo scope now H1724 → H1746.
