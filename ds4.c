@@ -9950,7 +9950,7 @@ static uint64_t metal_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32
  return bytes;
 }
 
-static uint64_t metal_graph_context_bytes_for_kv_policy(
+static DS4_MAYBE_UNUSED uint64_t metal_graph_context_bytes_for_kv_policy(
  uint32_t ctx_size,
  uint32_t raw_cap,
  uint32_t prefill_cap,
