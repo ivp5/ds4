@@ -155,6 +155,33 @@ typedef struct {
 } ds4_route_weights_one_icb_slot;
 static ds4_route_weights_one_icb_slot g_route_weights_one_icb_slots[2];
 
+/* #557 ICB Phase 3: kernel_dsv4_topk_mask + kernel_dsv4_topk_mask_scatter.
+ * Two paired dispatches per call site (line 5533 + 5542 in ds4_gpu_dsv4_topk_mask_tensor).
+ * The args struct (ds4_gpu_dsv4_topk_mask_args, 8 fields × 8 bytes = 64 bytes) is
+ * passed via setBytes in the direct path; for ICB we allocate a small MTLBuffer per
+ * slot and memcpy the args before replay. Dispatch grid varies with
+ * (top_k, n_tokens, n_comp) so we key slots by those three. Opt-in via DS4_ICB_TOPK_MASK=1.
+ *
+ * Per Phase 6 (#560) measurement: ICB on simpler 3-buffer kernel regressed
+ * 19.1 → 17.1 t/s on trim50 decode. topk_mask has 2 kernels per call + an args
+ * buffer to update per replay; likely WORSE net-loss. Ship as opt-in only so a
+ * future workload (large prefill, repeat-stable args) can opt in and measure. */
+static id<MTLIndirectCommandBuffer> g_topk_mask_icb;
+typedef struct {
+    void *args_buf_ptr;       /* MTLBuffer holding the per-slot args bytes */
+    void *topk_ptr;
+    uint64_t topk_off;
+    void *mask_ptr;
+    uint64_t mask_off;
+    uint32_t top_k;
+    uint32_t n_tokens;
+    uint32_t n_comp;
+    int recorded;
+} ds4_topk_mask_icb_slot;
+#define DS4_TOPK_MASK_ICB_SLOTS 2
+static ds4_topk_mask_icb_slot g_topk_mask_icb_slots[DS4_TOPK_MASK_ICB_SLOTS];
+static id<MTLBuffer> g_topk_mask_icb_args_buffers[DS4_TOPK_MASK_ICB_SLOTS];
+
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_model_buffer_cache;
@@ -5493,6 +5520,96 @@ int ds4_gpu_indexer_topk_tensor(
  return 1;
 }
 
+/* #557 ICB Phase 3 helper for kernel_dsv4_topk_mask + scatter pair.
+ * Returns 1 if ICB path executed, 0 if fell through (caller does direct).
+ * Slot key: (top_k, n_tokens, n_comp, topk_ptr, mask_ptr) — re-records on mismatch. */
+static int ds4_topk_mask_dispatch_icb(id<MTLCommandBuffer> cb,
+                                       uint32_t slot_idx,
+                                       const ds4_gpu_dsv4_topk_mask_args *args,
+                                       id<MTLBuffer> topkbuf, NSUInteger topk_off,
+                                       id<MTLBuffer> maskbuf, NSUInteger mask_off,
+                                       uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
+    static int s_env_checked = 0;
+    static int s_env_active = 0;
+    if (!s_env_checked) {
+        s_env_active = getenv("DS4_ICB_TOPK_MASK") != NULL ? 1 : 0;
+        s_env_checked = 1;
+        if (s_env_active) {
+            fprintf(stderr, "ds4: DS4_ICB_TOPK_MASK=1 — topk_mask 2-kernel ICB engaged (opt-in; measurement pending)\n");
+        }
+    }
+    if (!s_env_active) return 0;
+    if (slot_idx >= DS4_TOPK_MASK_ICB_SLOTS) return 0;
+    if (!g_dsv4_topk_mask_pipeline || !g_dsv4_topk_mask_scatter_pipeline) return 0;
+
+    if (!g_topk_mask_icb) {
+        MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
+        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+        desc.inheritBuffers = NO;
+        desc.inheritPipelineState = NO;
+        desc.maxKernelBufferBindCount = 3;
+        /* 2 commands per slot (mask + scatter) × DS4_TOPK_MASK_ICB_SLOTS */
+        g_topk_mask_icb =
+            [g_device newIndirectCommandBufferWithDescriptor:desc
+                                              maxCommandCount:(NSUInteger)(DS4_TOPK_MASK_ICB_SLOTS * 2)
+                                                      options:MTLResourceStorageModeShared];
+        if (!g_topk_mask_icb) return 0;
+    }
+    if (!g_topk_mask_icb_args_buffers[slot_idx]) {
+        g_topk_mask_icb_args_buffers[slot_idx] =
+            [g_device newBufferWithLength:sizeof(*args)
+                                  options:MTLResourceStorageModeShared];
+        if (!g_topk_mask_icb_args_buffers[slot_idx]) return 0;
+    }
+
+    /* Args must be refreshed every replay if the args contents changed.
+     * The args struct is small (64 bytes); memcpy cost is negligible. */
+    memcpy([g_topk_mask_icb_args_buffers[slot_idx] contents], args, sizeof(*args));
+
+    ds4_topk_mask_icb_slot *slot = &g_topk_mask_icb_slots[slot_idx];
+    const int sig_match = slot->recorded &&
+        slot->topk_ptr == (__bridge void *)topkbuf && slot->topk_off == (uint64_t)topk_off &&
+        slot->mask_ptr == (__bridge void *)maskbuf && slot->mask_off == (uint64_t)mask_off &&
+        slot->args_buf_ptr == (__bridge void *)g_topk_mask_icb_args_buffers[slot_idx] &&
+        slot->top_k == top_k && slot->n_tokens == n_tokens && slot->n_comp == n_comp;
+
+    if (!sig_match) {
+        const NSUInteger groups_mask = ((NSUInteger)n_comp * n_tokens + 255u) / 256u;
+        const NSUInteger groups_scatter = ((NSUInteger)top_k * n_tokens + 255u) / 256u;
+        /* Command N*2 + 0 = mask, N*2 + 1 = scatter */
+        id<MTLIndirectComputeCommand> cmd_mask =
+            [g_topk_mask_icb indirectComputeCommandAtIndex:(slot_idx * 2 + 0)];
+        [cmd_mask setComputePipelineState:g_dsv4_topk_mask_pipeline];
+        [cmd_mask setKernelBuffer:g_topk_mask_icb_args_buffers[slot_idx] offset:0 atIndex:0];
+        [cmd_mask setKernelBuffer:topkbuf offset:topk_off atIndex:1];
+        [cmd_mask setKernelBuffer:maskbuf offset:mask_off atIndex:2];
+        [cmd_mask concurrentDispatchThreadgroups:MTLSizeMake(groups_mask, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        id<MTLIndirectComputeCommand> cmd_scatter =
+            [g_topk_mask_icb indirectComputeCommandAtIndex:(slot_idx * 2 + 1)];
+        [cmd_scatter setComputePipelineState:g_dsv4_topk_mask_scatter_pipeline];
+        [cmd_scatter setKernelBuffer:g_topk_mask_icb_args_buffers[slot_idx] offset:0 atIndex:0];
+        [cmd_scatter setKernelBuffer:topkbuf offset:topk_off atIndex:1];
+        [cmd_scatter setKernelBuffer:maskbuf offset:mask_off atIndex:2];
+        [cmd_scatter concurrentDispatchThreadgroups:MTLSizeMake(groups_scatter, 1, 1)
+                              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        slot->args_buf_ptr = (__bridge void *)g_topk_mask_icb_args_buffers[slot_idx];
+        slot->topk_ptr = (__bridge void *)topkbuf; slot->topk_off = (uint64_t)topk_off;
+        slot->mask_ptr = (__bridge void *)maskbuf; slot->mask_off = (uint64_t)mask_off;
+        slot->top_k = top_k; slot->n_tokens = n_tokens; slot->n_comp = n_comp;
+        slot->recorded = 1;
+    }
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc useResource:g_topk_mask_icb_args_buffers[slot_idx] usage:MTLResourceUsageRead];
+    [enc useResource:topkbuf usage:MTLResourceUsageRead];
+    [enc useResource:maskbuf usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    [enc executeCommandsInBuffer:g_topk_mask_icb
+                       withRange:NSMakeRange(slot_idx * 2, 2)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 int ds4_gpu_dsv4_topk_mask_tensor(
  ds4_gpu_tensor *mask,
  const ds4_gpu_tensor *topk,
@@ -5529,6 +5646,14 @@ int ds4_gpu_dsv4_topk_mask_tensor(
  id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
  if (!cb) return 0;
 
+ /* #557 ICB Phase 3: try ICB path first (opt-in via DS4_ICB_TOPK_MASK=1).
+  * Slot 0 = this single call-site path (indexer top-k mask).
+  * On miss / opt-out, fall through to direct encoding below. */
+ const int icb_ran = ds4_topk_mask_dispatch_icb(cb, 0, &args,
+                                                topkbuf, ds4_gpu_tensor_offset(topk),
+                                                maskbuf, ds4_gpu_tensor_offset(mask),
+                                                n_comp, n_tokens, top_k);
+ if (!icb_ran) {
  id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
  [enc setComputePipelineState:g_dsv4_topk_mask_pipeline];
  [enc setBytes:&args length:sizeof(args) atIndex:0];
@@ -5546,6 +5671,7 @@ int ds4_gpu_dsv4_topk_mask_tensor(
  [enc dispatchThreadgroups:MTLSizeMake((((NSUInteger)top_k * n_tokens) + 255u) / 256u, 1, 1)
  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
  ds4_gpu_end_compute_encoder(cb, enc);
+ }
 
  if (!ds4_gpu_finish_command_buffer(cb, owned, "dsv4 top-k mask")) return 0;
  }
