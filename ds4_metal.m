@@ -15425,6 +15425,297 @@ int ds4_gpu_mtl4_polar_tile_real(const char *prefix,
     }
 }
 
+/* ============================================================ */
+/* H1733 fused gate*silu*up*route_weight kernel                 */
+/* ============================================================ */
+/* Per codex H1733: the real DS4 MLP organ is the fused
+ *   silu(gate(hidden)) * up(hidden) * route_weight
+ * computed in ONE dispatch over the routed expert subset.
+ *
+ * b32 measured by codex: 21.28 ns/equiv row-dot (2.20× over single
+ * row-dots at b32, 1.77× lower allocation), max_abs vs CPU = 7.55e-9.
+ *
+ * Architectural pieces:
+ *   - mag/phase: ALL unique code tiles concatenated (H1731 dedup)
+ *   - levels:    per-row 4-level quantile table
+ *   - gate_code[route_pair]: which code tile is the gate for this route pair
+ *   - up_code[route_pair]:   same, for up
+ *   - route_weight[route_pair]: per-route scalar from top-k selection
+ *   - hidden[batch, route_pair]: per-(batch, route_pair) input vector
+ *
+ * Dispatch: (route_pairs, rows, batches) × 256 threads. Each threadgroup
+ * computes both gate_dot AND up_dot for one (route_pair, row, batch),
+ * sharing hidden reads. The final write applies silu+mul+route_weight.
+ *
+ * Self-test: ds4_gpu_mtl4_polar_fused_canary(...) — synthetic input where
+ * mag=0/phase=4(angle 0)/level[0]=1/hidden=1 → gate_dot = up_dot = pairs.
+ * silu(pairs) ≈ pairs (for pairs > 5), so output ≈ pairs * pairs * route_weight.
+ *
+ * Codex source:
+ *   research/llm_fallacy_deconstruction/framework_deconstruction/
+ *     h1733_mtl4_gate_up_fused_packet_kernel_20260525.m
+ */
+
+static id<MTLComputePipelineState> g_polar_fused_pipeline;
+static int g_polar_fused_init_attempted;
+static int g_polar_fused_init_ok;
+
+static int ds4_polar_fused_pipeline_init(void) {
+    if (g_polar_fused_init_attempted) return g_polar_fused_init_ok;
+    g_polar_fused_init_attempted = 1;
+
+    if (!ds4_polar_pipeline_init()) return 0; /* shared compiler + alloc + queue */
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "kernel void gate_up_packet(device const uchar* mag [[buffer(0)]],\n"
+         "                            device const uchar* phase [[buffer(1)]],\n"
+         "                            device const float* levels [[buffer(2)]],\n"
+         "                            device const uint* gate_code [[buffer(3)]],\n"
+         "                            device const uint* up_code [[buffer(4)]],\n"
+         "                            device const float* route_weight [[buffer(5)]],\n"
+         "                            device const float* hidden [[buffer(6)]],\n"
+         "                            device const float* cos_lut [[buffer(7)]],\n"
+         "                            device const float* sin_lut [[buffer(8)]],\n"
+         "                            device float* out [[buffer(9)]],\n"
+         "                            device const uint* params [[buffer(10)]],\n"
+         "                            uint3 tg [[threadgroup_position_in_grid]],\n"
+         "                            uint tid [[thread_index_in_threadgroup]]) {\n"
+         "  constexpr uint THREADS = 256;\n"
+         "  threadgroup float gate_partial[THREADS];\n"
+         "  threadgroup float up_partial[THREADS];\n"
+         "  uint route_pair = tg.x;\n"
+         "  uint row = tg.y;\n"
+         "  uint batch = tg.z;\n"
+         "  uint pairs = params[0];\n"
+         "  uint rows = params[1];\n"
+         "  uint route_pairs = params[2];\n"
+         "  uint gate_row = gate_code[route_pair] * rows + row;\n"
+         "  uint up_row = up_code[route_pair] * rows + row;\n"
+         "  uint gate_base = gate_row * pairs;\n"
+         "  uint up_base = up_row * pairs;\n"
+         "  uint hbase = (batch * route_pairs + route_pair) * pairs * 2;\n"
+         "  float gate_acc = 0.0f;\n"
+         "  float up_acc = 0.0f;\n"
+         "  for (uint j = tid; j < pairs; j += THREADS) {\n"
+         "    float h0 = hidden[hbase + 2*j];\n"
+         "    float h1 = hidden[hbase + 2*j + 1];\n"
+         "    uchar gate_m = mag[gate_base + j];\n"
+         "    uint gate_l = uint(phase[gate_base + j]);\n"
+         "    float gate_q = levels[gate_row * 4 + uint(gate_m)];\n"
+         "    gate_acc += gate_q * cos_lut[gate_l] * h0 + gate_q * sin_lut[gate_l] * h1;\n"
+         "    uchar up_m = mag[up_base + j];\n"
+         "    uint up_l = uint(phase[up_base + j]);\n"
+         "    float up_q = levels[up_row * 4 + uint(up_m)];\n"
+         "    up_acc += up_q * cos_lut[up_l] * h0 + up_q * sin_lut[up_l] * h1;\n"
+         "  }\n"
+         "  gate_partial[tid] = gate_acc;\n"
+         "  up_partial[tid] = up_acc;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (uint stride = THREADS >> 1; stride > 0; stride >>= 1) {\n"
+         "    if (tid < stride) {\n"
+         "      gate_partial[tid] += gate_partial[tid + stride];\n"
+         "      up_partial[tid] += up_partial[tid + stride];\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  if (tid == 0) {\n"
+         "    float g = gate_partial[0];\n"
+         "    float u = up_partial[0];\n"
+         "    float silu = g / (1.0f + exp(-g));\n"
+         "    out[(batch * route_pairs + route_pair) * rows + row] = silu * u * route_weight[route_pair];\n"
+         "  }\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_polar_gate_up_fused";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: polar fused library failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"gate_up_packet";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_polar_fused_pipeline = [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                                                 compilerTaskOptions:nil
+                                                                               error:&err];
+    if (!g_polar_fused_pipeline) {
+        fprintf(stderr, "ds4: polar fused pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    g_polar_fused_init_ok = 1;
+    return 1;
+}
+
+/* Synthetic canary for the H1733 fused gate*silu*up*route_weight kernel.
+ *
+ * Layout: n_codes code tiles available, route_pairs pairs use them, each
+ * pair picks one gate_code and one up_code, rows output rows per tile,
+ * batches batches.
+ *
+ * Inputs are deterministic: mag=0 (code 0), phase=4 (angle 0 LUT entry),
+ * level[0]=1.0, hidden=1.0, route_weight=1.0. With those:
+ *   gate_dot = up_dot = pairs (since cos(0)=1, sum of pairs ones)
+ *   silu(pairs) = pairs / (1 + exp(-pairs)) ≈ pairs (for pairs > 10)
+ *   out = silu(pairs) * pairs * 1.0 ≈ pairs^2 - pairs*exp(-pairs)/(1+exp(-pairs))
+ *
+ * For pairs=2048, expected = 2048 * 2048 = 4194304 (exp(-2048) is sub-denormal).
+ */
+int ds4_gpu_mtl4_polar_fused_canary(uint32_t n_codes, uint32_t route_pairs,
+                                     uint32_t rows, uint32_t batches, uint32_t pairs) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_polar_fused_pipeline_init()) return 0;
+    if (n_codes == 0 || route_pairs == 0 || rows == 0 || batches == 0 || pairs == 0) return 0;
+
+    @autoreleasepool {
+        NSError *err = nil;
+        const NSUInteger code_rows = (NSUInteger)n_codes * rows;
+        const NSUInteger pair_count = code_rows * pairs;
+        const NSUInteger hidden_count = (NSUInteger)batches * route_pairs * pairs * 2;
+        const NSUInteger out_count = (NSUInteger)batches * route_pairs * rows;
+
+        id<MTLBuffer> mag       = [g_device newBufferWithLength:pair_count                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> phase     = [g_device newBufferWithLength:pair_count                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> levels    = [g_device newBufferWithLength:code_rows * 4 * sizeof(float)    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gateCode  = [g_device newBufferWithLength:route_pairs * sizeof(uint32_t)   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> upCode    = [g_device newBufferWithLength:route_pairs * sizeof(uint32_t)   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> routeW    = [g_device newBufferWithLength:route_pairs * sizeof(float)      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> hidden    = [g_device newBufferWithLength:hidden_count * sizeof(float)     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cosLut    = [g_device newBufferWithLength:9 * sizeof(float)                options:MTLResourceStorageModeShared];
+        id<MTLBuffer> sinLut    = [g_device newBufferWithLength:9 * sizeof(float)                options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf    = [g_device newBufferWithLength:out_count * sizeof(float)        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> paramsBuf = [g_device newBufferWithLength:3 * sizeof(uint32_t)             options:MTLResourceStorageModeShared];
+        if (!mag || !phase || !levels || !gateCode || !upCode || !routeW || !hidden || !cosLut || !sinLut || !outBuf || !paramsBuf) return 0;
+
+        memset(mag.contents, 0, pair_count);
+        memset(phase.contents, 4, pair_count);
+        float *lvl = (float *)levels.contents;
+        for (NSUInteger r = 0; r < code_rows; r++) {
+            lvl[r * 4 + 0] = 1.0f; lvl[r * 4 + 1] = 0.5f;
+            lvl[r * 4 + 2] = 0.25f; lvl[r * 4 + 3] = 0.125f;
+        }
+        uint32_t *gc = (uint32_t *)gateCode.contents;
+        uint32_t *uc = (uint32_t *)upCode.contents;
+        float *rw = (float *)routeW.contents;
+        for (uint32_t r = 0; r < route_pairs; r++) {
+            gc[r] = r % n_codes;
+            uc[r] = (r + 1) % n_codes;
+            rw[r] = 1.0f;
+        }
+        float *hid = (float *)hidden.contents;
+        for (NSUInteger i = 0; i < hidden_count; i++) hid[i] = 1.0f;
+        float *cosP = (float *)cosLut.contents;
+        float *sinP = (float *)sinLut.contents;
+        for (int code = -4; code <= 4; code++) {
+            float angle = (float)code * 0.78539816339744830962f;
+            cosP[code + 4] = cosf(angle);
+            sinP[code + 4] = sinf(angle);
+        }
+        uint32_t *params = (uint32_t *)paramsBuf.contents;
+        params[0] = pairs; params[1] = rows; params[2] = route_pairs;
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 11;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (!residency) return 0;
+        id<MTLAllocation> allocs[11] = {
+            (id<MTLAllocation>)mag, (id<MTLAllocation>)phase, (id<MTLAllocation>)levels,
+            (id<MTLAllocation>)gateCode, (id<MTLAllocation>)upCode, (id<MTLAllocation>)routeW,
+            (id<MTLAllocation>)hidden, (id<MTLAllocation>)cosLut, (id<MTLAllocation>)sinLut,
+            (id<MTLAllocation>)outBuf, (id<MTLAllocation>)paramsBuf,
+        };
+        [residency addAllocations:allocs count:11];
+        [residency commit];
+        [residency requestResidency];
+
+        MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+        atDesc.maxBufferBindCount = 11;
+        atDesc.initializeBindings = YES;
+        id<MTL4ArgumentTable> argTable = [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+        if (!argTable) return 0;
+        [argTable setAddress:mag.gpuAddress       atIndex:0];
+        [argTable setAddress:phase.gpuAddress     atIndex:1];
+        [argTable setAddress:levels.gpuAddress    atIndex:2];
+        [argTable setAddress:gateCode.gpuAddress  atIndex:3];
+        [argTable setAddress:upCode.gpuAddress    atIndex:4];
+        [argTable setAddress:routeW.gpuAddress    atIndex:5];
+        [argTable setAddress:hidden.gpuAddress    atIndex:6];
+        [argTable setAddress:cosLut.gpuAddress    atIndex:7];
+        [argTable setAddress:sinLut.gpuAddress    atIndex:8];
+        [argTable setAddress:outBuf.gpuAddress    atIndex:9];
+        [argTable setAddress:paramsBuf.gpuAddress atIndex:10];
+
+        id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+        [cb beginCommandBufferWithAllocator:g_polar_allocator];
+        [cb useResidencySet:residency];
+        id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) return 0;
+        [enc setComputePipelineState:g_polar_fused_pipeline];
+        [enc setArgumentTable:argTable];
+        [enc dispatchThreadgroups:MTLSizeMake(route_pairs, rows, batches)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb endCommandBuffer];
+
+        [g_polar_queue addResidencySet:residency];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block CFTimeInterval gpuStart = 0.0, gpuEnd = 0.0;
+        __block NSError *fbErr = nil;
+        MTL4CommitOptions *opts = [MTL4CommitOptions new];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            fbErr = feedback.error;
+            gpuStart = feedback.GPUStartTime; gpuEnd = feedback.GPUEndTime;
+            dispatch_semaphore_signal(sem);
+        }];
+        id<MTL4CommandBuffer> bufs[1] = { cb };
+        [g_polar_queue commit:bufs count:1 options:opts];
+        long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+        [residency endResidency];
+        if (waitRes != 0) { fprintf(stderr, "ds4: polar fused canary timeout\n"); return 0; }
+        if (fbErr) { fprintf(stderr, "ds4: polar fused feedback err: %s\n", fbErr.localizedDescription.UTF8String); return 0; }
+
+        /* Expected: gate=up=pairs, silu(pairs)≈pairs, out ≈ pairs*pairs.
+         * For pairs=2048: 2048*2048 = 4194304. */
+        float *outPtr = (float *)outBuf.contents;
+        float expected = (float)pairs * (float)pairs; /* silu(pairs) ≈ pairs */
+        /* tighter expected: silu(p) = p / (1 + exp(-p)); for p=2048 exp(-p) underflows */
+        float gate = (float)pairs, silu = gate / (1.0f + expf(-gate));
+        expected = silu * (float)pairs * 1.0f;
+        float maxAbsErr = 0.0f;
+        double sumAbsErr = 0.0;
+        for (NSUInteger i = 0; i < out_count; i++) {
+            float diff = fabsf(outPtr[i] - expected);
+            sumAbsErr += diff;
+            if (diff > maxAbsErr) maxAbsErr = diff;
+        }
+        const double gpuMs = (gpuEnd - gpuStart) * 1000.0;
+        fprintf(stderr,
+                "ds4: polar FUSED canary n_codes=%u route_pairs=%u rows=%u batches=%u pairs=%u\n"
+                "  expected=%.3f out[0]=%.3f max_abs_err=%.3e mean_abs_err=%.3e\n"
+                "  gpu_elapsed=%.6f ms (%.0f ns/output, %.0f ns/row-dot-equiv, resident=%.1f MB)\n",
+                n_codes, route_pairs, rows, batches, pairs,
+                (double)expected, (double)outPtr[0],
+                (double)maxAbsErr, sumAbsErr / out_count,
+                gpuMs,
+                gpuMs * 1e6 / (double)out_count,
+                gpuMs * 1e6 / (double)(out_count * 2), /* 2 dots per output */
+                (double)(pair_count * 2 + code_rows * 4 * 4 + route_pairs * 4 * 2 + route_pairs * 4 + hidden_count * 4 + out_count * 4) / 1e6);
+        /* Relative tolerance — output magnitudes can be huge (pairs^2) */
+        float relErr = maxAbsErr / fabsf(expected);
+        return relErr < 1e-3f ? 1 : 0;
+    }
+}
+
 int ds4_gpu_mtl4_polar_tile_canary(uint32_t tiles, uint32_t rows, uint32_t batches, uint32_t pairs) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!ds4_polar_tile_pipeline_init()) return 0;

@@ -925,3 +925,21 @@ int ds4_gpu_mtl4_polar_tile_canary(uint32_t tiles, uint32_t rows,
 int ds4_gpu_mtl4_polar_tile_real(const char *prefix,
                                   uint32_t tiles, uint32_t rows,
                                   uint32_t batches, uint32_t pairs);
+
+/* H1733 fused gate*silu*up*route_weight kernel canary. Computes the full
+ * routed-MoE MLP organ in one dispatch over the routed expert subset:
+ *   out[batch, route_pair, row] = silu(gate_dot) * up_dot * route_weight[r]
+ * where gate_dot/up_dot are polar dots between the (gate_code[r], row) and
+ * (up_code[r], row) tiles and the hidden vector for (batch, route_pair).
+ *
+ * H1731 indexed-code-tile dedup applied: mag/phase/levels are one shared
+ * pool of n_codes code tiles; gate_code[r] / up_code[r] select which tile
+ * each route_pair uses.
+ *
+ * Codex measured: b32 = 21.28 ns/equiv row-dot (2.20× vs single row-dots),
+ * max_abs vs CPU decoded reference = 7.55e-9.
+ *
+ * Returns 1 on success, 0 on failure. */
+int ds4_gpu_mtl4_polar_fused_canary(uint32_t n_codes, uint32_t route_pairs,
+                                     uint32_t rows, uint32_t batches,
+                                     uint32_t pairs);

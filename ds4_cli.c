@@ -1645,6 +1645,17 @@ int main(int argc, char **argv) {
         uint32_t pairs   = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
         return ds4_gpu_mtl4_polar_tile_real(prefix, tiles, rows, batches, pairs) ? 0 : 1;
     }
+    /* --polar-fused-canary [n_codes [route_pairs [rows [batches [pairs]]]]] :
+     * H1733 fused gate*silu*up*route_weight in one dispatch. The deployable
+     * shape for routed-MoE inference. */
+    if (argc >= 2 && !strcmp(argv[1], "--polar-fused-canary")) {
+        uint32_t n_codes     = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        uint32_t route_pairs = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 8;
+        uint32_t rows        = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 32;
+        uint32_t batches     = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 1;
+        uint32_t pairs       = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
+        return ds4_gpu_mtl4_polar_fused_canary(n_codes, route_pairs, rows, batches, pairs) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
