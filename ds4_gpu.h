@@ -685,6 +685,41 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                n_tokens,
         bool                   *mid_is_f16);
 
+/* MTL4 ML packed-MoE entry point (group=6 for DS4 active-experts).
+ * Same signature as ds4_gpu_routed_moe_batch_tensor + one out-param:
+ *   mtl4_path_taken: written with true if MTL4 ML packed path was used;
+ *     false if fallback to legacy. May be NULL.
+ * Env-gated via DS4_MTL4_MOE_ENABLE. Preflight: n_expert==6, n_tokens≤16. */
+int ds4_gpu_routed_moe_batch_tensor_mtl4(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
+        uint32_t                n_tokens,
+        bool                   *mid_is_f16,
+        bool                   *mtl4_path_taken);
+
 /* =========================================================================
  * Hyper-Connection Kernels.
  * =========================================================================

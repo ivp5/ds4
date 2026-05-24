@@ -14158,7 +14158,12 @@ static bool metal_graph_encode_layer_ffn_batch(
         }
         if (ok) ok = (ds4_gpu_begin_commands() != 0);
     } else if (ok) {
-        ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
+        /* MTL4 entry: env-gated, falls back to legacy when disabled or
+         * preflight fails (n_expert != 6 or n_tokens > 16). The two
+         * functions share signature except for the extra mtl4_path_taken
+         * out-param. */
+        bool mtl4_taken = false;
+        ok = ds4_gpu_routed_moe_batch_tensor_mtl4(g->batch_routed_out,
                                                    g->batch_routed_gate,
                                                    g->batch_routed_up,
                                                    g->batch_routed_mid,
@@ -14184,7 +14189,9 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                    g->batch_ffn_norm,
                                                    il,
                                                    n_tokens,
-                                                   &g->batch_routed_mid_is_f16) != 0;
+                                                   &g->batch_routed_mid_is_f16,
+                                                   &mtl4_taken) != 0;
+        (void)mtl4_taken;  /* hook for future telemetry */
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,

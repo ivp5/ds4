@@ -14591,6 +14591,140 @@ int ds4_gpu_routed_moe_batch_tensor(
     return 1;
 }
 
+/* ==========================================================================
+ * MTL4 ML packed-MoE path (group=6 for DS4 active-experts).
+ * ==========================================================================
+ *
+ * Adapts codex H1672/H1673/H1674's split-packed MoE + legacy-blit gather
+ * pattern to DS4 specifically. Scaffold-shaped: the entry function is
+ * present, env-gated, and falls back to the legacy SIMD path unless ALL
+ * of the following are met:
+ *
+ *   - DS4_MTL4_MOE_ENABLE env var set
+ *   - n_tokens ≤ DS4_MTL4_MAX_T (default 16; matches the decode/short-prefill
+ *     regime where measured ledger shows 2.4-3.4× win at group=6)
+ *   - n_expert == DS4_N_EXPERT_USED (6 — the dispatch shape codex measured)
+ *   - mtl4_path_initialized successfully (Apple matmul mtlpackage + MTL4 ML
+ *     queue allocated)
+ *
+ * What's NOT yet implemented here (silv-side iteration territory):
+ *
+ *   - IQ2_XXS → F32 dequant of 6 selected experts' gate/up/down weights.
+ *     The legacy path does dequant inline at register level via NEON dot
+ *     products against the iq2xxs_signed_grid; reproducing that in a Metal
+ *     kernel OR doing it CPU-side and uploading is the main engineering.
+ *     Per-token cost estimate: 6 experts × (4096*2048 + 4096*2048 + 2048*4096)
+ *     × 4 bytes ≈ 270 MB. Wholesale dequant-then-MTL4-matmul is bandwidth-
+ *     bound and will lose to the legacy path. The win-path is either
+ *     (a) batch decode tokens so dequant cost amortizes, or (b) a Metal
+ *     compute kernel that does dequant + matmul fused (which is what the
+ *     legacy SIMD path already does).
+ *
+ *   - SwiGLU + expert-weight blending. Currently in DS4's metal/moe.metal;
+ *     would need to consume the packed gate/up output before the down
+ *     matmul.
+ *
+ *   - Apple matmul package path resolution. Hard-coded to a known path
+ *     in ds4_codex_artifacts/; needs deployment story.
+ *
+ * Verdict (per codex H1685 + DS4-shape ledger): MTL4 ML packed MoE is
+ * MEASURED to win 2.4×-3.4× at T=10 group=6 over exact-sparse FP MATMUL,
+ * but DS4's existing legacy path is quantized-inline, which the FP MTL4
+ * route does not directly beat without addressing the dequant bandwidth.
+ * The architectural seam exists; the productive next step is profiling
+ * whether the legacy path is currently CPU/GPU bound. If GPU-bound,
+ * MTL4 ML doesn't help. If CPU-bound (likely under --cpu-moe), porting
+ * to GPU at all (even via this MTL4 path) is a win regardless of
+ * absolute dispatch rank.
+ */
+
+static int ds4_mtl4_moe_env_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_MTL4_MOE_ENABLE");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+enum { DS4_MTL4_MOE_MAX_T = 16 };
+
+int ds4_gpu_routed_moe_batch_tensor_mtl4(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
+        uint32_t                n_tokens,
+        bool                   *mid_is_f16,
+        bool                   *mtl4_path_taken) {
+    /* Preflight: all conditions must hold or fall back to legacy. */
+    const int env_ok = ds4_mtl4_moe_env_enabled();
+    const int shape_ok = (n_expert == 6 && n_tokens <= DS4_MTL4_MOE_MAX_T);
+    if (mtl4_path_taken) *mtl4_path_taken = false;
+
+    if (!env_ok || !shape_ok) {
+        /* Legacy fallback — drop in. */
+        return ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, experts, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_expert, clamp, x,
+            layer_index, n_tokens, mid_is_f16);
+    }
+
+    /* TODO(silv): MTL4 ML packed path body.
+     * Outline (one-line per phase) the future implementation should follow:
+     *   1. Read 6 selected expert IDs from `selected` tensor (1 host sync).
+     *   2. Build per-token expert-weight vector from `weights` tensor.
+     *   3. Dequant 6 experts' gate/up weights from IQ2_XXS → F32 (or F16)
+     *      into packed B matrix layout (expert_in_dim × 6·expert_mid_dim).
+     *      Either (a) Metal compute kernel doing dequant inline, or
+     *      (b) CPU dequant + upload (bandwidth-bound, loses).
+     *   4. MTL4 ML dispatch: A=(n_tokens × expert_in_dim) @ B=(expert_in_dim
+     *      × 6·expert_mid_dim) → packed_gate_out=(n_tokens × 6·expert_mid_dim).
+     *   5. Same for up: packed_up_out same shape.
+     *   6. SwiGLU per expert chunk: mid_e = silu(clamp(gate_e)) ⊙ up_e.
+     *   7. Blend by expert_weight per token: sum_e weight[t,e] · mid_e[t,:].
+     *   8. Dequant down weights packed (expert_mid_dim × 6·out_dim).
+     *   9. Down matmul + sum across expert chunks → out=(n_tokens × out_dim).
+     *
+     * Until shipped, env-enabled callers still see the legacy result and
+     * the journal records the MTL4 path was REQUESTED but skipped. */
+    fprintf(stderr,
+            "ds4_mtl4_moe: requested layer=%u n_tokens=%u — scaffold path "
+            "not yet implemented, falling back to legacy\n",
+            layer_index, n_tokens);
+    return ds4_gpu_routed_moe_batch_tensor(
+        out, gate, up, mid, experts, model_map, model_size,
+        gate_offset, up_offset, down_offset, gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim,
+        selected, weights, n_expert, clamp, x,
+        layer_index, n_tokens, mid_is_f16);
+}
+
 int ds4_gpu_hc_split_sinkhorn_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *mix,
