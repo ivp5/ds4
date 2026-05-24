@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
+#include "ds4_polar_reader.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -1655,6 +1656,17 @@ int main(int argc, char **argv) {
         uint32_t batches     = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 1;
         uint32_t pairs       = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
         return ds4_gpu_mtl4_polar_fused_canary(n_codes, route_pairs, rows, batches, pairs) ? 0 : 1;
+    }
+    /* --polar-file-info <path> : open a PLR2 combined polar-encoded file
+     * (produced by analyzers/polar_encode_mlx.py --format combined) and
+     * print header + per-expert decode sanity. Phase A of task #563 —
+     * verifies the host-side reader before GPU MTLResidencySet binding. */
+    if (argc >= 3 && !strcmp(argv[1], "--polar-file-info")) {
+        ds4_polar_file pf = { .fd = -1 };
+        if (!ds4_polar_open(argv[2], &pf)) return 1;
+        ds4_polar_print_summary(&pf, argv[2]);
+        ds4_polar_close(&pf);
+        return 0;
     }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
