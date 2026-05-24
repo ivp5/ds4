@@ -14,13 +14,22 @@
  *     kernel_dsv4_hc_expand, kernel_dsv4_hc_split_weighted_sum
  *     (metal/dsv4_hc.metal). Fixed-structure dispatch every layer.
  *
- * Dispatch paths by hardware:
- *   - M5/A19+ : MTL4MachineLearningCommandEncoder (Metal 4 native).
- *               MTL4Device + MTLTensor classes available at runtime;
- *               supportsFamily:MTLGPUFamilyMetal4 returns YES.
- *   - M1-M4   : CoreML w/ computeUnits=.cpuAndNeuralEngine OR MPSGraph
- *               (compiler-dispatched, may target ANE for supported ops).
- *               MTL4 classes do NOT exist at runtime on Apple7/Apple8.
+ * Dispatch paths by hardware (corrected 2026-05-25 per codex H1722/H1723):
+ *   - M5/A19+ : Full MTL4MachineLearningCommandEncoder support.
+ *   - M1-M4   : MTL4 compute + ML encoder IS usable when the correct
+ *               lifecycle is followed: newCommandAllocator →
+ *               newCommandBuffer (from device, not from queue) →
+ *               beginCommandBufferWithAllocator → encoder →
+ *               endCommandBuffer → MTL4 queue commit. Vector-add canary
+ *               on M1 Max: maxerr=0, 0.0567 ms for 1024 floats. Apple8/9-
+ *               only features (specific Tensor ops) remain unavailable,
+ *               but the general MTL4 compute + ML packaging surface works.
+ *               Earlier "MTL4 disabled on Apple7/Apple8" conclusion
+ *               measured misuse of old command-buffer assumptions, not
+ *               absence of API.
+ *   - Fallback: classic Metal compute encoders + ICB record→replay (the
+ *               currently-shipping pillar A path) when MTL4 ML packaging
+ *               doesn't fit a given organ's shape constraints.
  *
  * All organs are non-dynamic (no per-token surgery), ideal accelerator
  * targets once the boundary-deletion path (ICB) lands.
