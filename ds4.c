@@ -503,6 +503,21 @@ static double now_sec(void) {
  return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+/* Sleep for `sec` seconds; tolerates EINTR so Ctrl+C cuts through power-throttle
+ * dwell. Used by graph_power_sleep below. From antirez/main:ds4.c line 524. */
+static void sleep_sec(double sec) {
+    if (sec <= 0.0 || !isfinite(sec)) return;
+    struct timespec req;
+    req.tv_sec = (time_t)sec;
+    req.tv_nsec = (long)((sec - (double)req.tv_sec) * 1000000000.0);
+    if (req.tv_nsec < 0) req.tv_nsec = 0;
+    if (req.tv_nsec >= 1000000000L) {
+        req.tv_sec++;
+        req.tv_nsec -= 1000000000L;
+    }
+    (void)nanosleep(&req, &req);
+}
+
 static const char *ds4_log_color_code(ds4_log_type type) {
  switch (type) {
  case DS4_LOG_PREFILL:
@@ -9485,6 +9500,13 @@ typedef struct {
  float directional_steering_ffn_scale;
  bool quality;
  bool mtp_enabled;
+ /* Power throttle (antirez upstream): graph_power_throttle_enabled fires
+  * when 0 < power_percent < 100. graph_power_note_prefill_layer +
+  * graph_power_note_decode_token maintain per-layer + per-decode-token
+  * EWMA, then sleep_sec((100-p)/p × work_sec) to hold duty cycle = p/100. */
+ uint32_t power_percent;
+ double prefill_layer_avg_sec[DS4_N_LAYER];
+ double decode_token_avg_sec;
  bool cpu_moe;
  bool cpu_moe_layer[DS4_N_LAYER];
  const ds4_model *cpu_model;
@@ -9525,6 +9547,12 @@ typedef struct {
  size_t phase_hc_snapshot_per_chunk_bytes;
  uint32_t phase_hc_snapshot_chunks_cap;
 } ds4_gpu_graph;
+
+/* Forward declarations for the power-throttle helpers (definitions live
+ * near line 15030 with the metal-graph block). They're called earlier from
+ * metal_graph_eval_token_raw_swa, so the prototype must precede that. */
+static bool graph_power_throttle_enabled(const ds4_gpu_graph *g);
+static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec);
 
 static void metal_graph_free_cpu_moe_scratch(ds4_gpu_graph *g) {
  free(g->cpu_moe_pair_ids);
@@ -14478,19 +14506,20 @@ static bool metal_graph_eval_token_raw_swa(
  uint32_t pos,
  float *logits) {
  const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
- const double t0 = profile ? now_sec() : 0.0;
+ const bool throttle = graph_power_throttle_enabled(g);
+ const double t0 = (profile || throttle) ? now_sec() : 0.0;
 
  bool ok = ds4_gpu_begin_commands() != 0;
  if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
- const double t_encoded = profile ? now_sec() : 0.0;
+ const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
  if (ok) ok = ds4_gpu_end_commands() != 0;
- const double t_done = profile ? now_sec() : 0.0;
+ const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
  if (ok && logits) {
  ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
  }
+ const double t_read = (profile || throttle) ? now_sec() : 0.0;
  if (profile) {
- const double t_read = now_sec();
  fprintf(stderr,
  "ds4: metal graph token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
  pos,
@@ -14500,6 +14529,7 @@ static bool metal_graph_eval_token_raw_swa(
  (t_read - t0) * 1000.0,
  logits != NULL);
  }
+ if (ok) graph_power_note_decode_token(g, t_read - t0);
  if (!ok) {
  if (ds4_gpu_synchronize() == 0) {
  fprintf(stderr, "ds4: Metal synchronize after graph eval failure also failed\n");
@@ -14990,14 +15020,45 @@ static bool ds4_layer_should_skip(uint32_t il) {
  * these helpers so the prefill_layer_major function compiles with
  * antirez's throttle/callback_split logic. Behavioral effect: throttle
  * gate always FALSE → split_commands is unaffected by power_percent. */
+/* Power throttle, pulled verbatim from antirez/main:ds4.c (lines 8349-8395).
+ * Engages when 0 < power_percent < 100. EWMA per-layer prefill time + per
+ * decode-token; after each measurement sleep_sec((100-p)/p × work_sec) to
+ * hold duty cycle. Stubs replaced 2026-05-25 (silv directive). */
 static bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
-    (void)g;
-    return false;
+    return g && g->power_percent > 0 && g->power_percent < 100;
 }
+
+static double graph_power_update_avg(double avg, double sample) {
+    if (sample <= 0.0 || !isfinite(sample)) return avg;
+    if (avg <= 0.0 || !isfinite(avg)) return sample;
+    return avg * 0.875 + sample * 0.125;
+}
+
+static void graph_power_sleep(double work_sec, uint32_t power_percent) {
+    if (power_percent == 0 || power_percent >= 100) return;
+    /* Target duty cycle: work / (work + sleep) = power / 100.
+     * At --power 50 this sleeps for one measured work interval; at 25 it
+     * sleeps for three. */
+    const double sleep = work_sec * (100.0 - (double)power_percent) /
+                         (double)power_percent;
+    sleep_sec(sleep);
+}
+
 static void graph_power_note_prefill_layer(ds4_gpu_graph *g,
                                             uint32_t il,
                                             double elapsed_sec) {
-    (void)g; (void)il; (void)elapsed_sec;
+    if (!graph_power_throttle_enabled(g)) return;
+    if (il >= DS4_N_LAYER) return;
+    g->prefill_layer_avg_sec[il] =
+        graph_power_update_avg(g->prefill_layer_avg_sec[il], elapsed_sec);
+    graph_power_sleep(g->prefill_layer_avg_sec[il], g->power_percent);
+}
+
+static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) {
+    if (!graph_power_throttle_enabled(g)) return;
+    g->decode_token_avg_sec =
+        graph_power_update_avg(g->decode_token_avg_sec, elapsed_sec);
+    graph_power_sleep(g->decode_token_avg_sec, g->power_percent);
 }
 /* antirez display_progress callback emitter — invoked per-layer (or per-chunk)
  * inside metal_graph_prefill_layer_major to report fine-grained progress. */
@@ -16157,6 +16218,7 @@ struct ds4_engine {
  float *directional_steering_dirs;
  float directional_steering_attn_scale;
  float directional_steering_ffn_scale;
+ uint32_t power_percent;     /* 1..100; 0 means uninitialized → treated as 100 */
  bool quality;
  bool metal_ready;
  bool mtp_ready;
@@ -16177,6 +16239,7 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
  g->cpu_moe = e->cpu_moe;
  g->cpu_model = e->cpu_moe ? &e->cpu_model : NULL;
  g->prefill_metal_phases = e->prefill_metal_phases;
+ g->power_percent = e->power_percent;   /* propagate throttle to graph */
  for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
  g->cpu_moe_layer[il] = e->cpu_moe_layer[il];
  }
@@ -19639,6 +19702,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  e->directional_steering_attn_scale = opt->directional_steering_attn;
  e->directional_steering_ffn_scale = opt->directional_steering_ffn;
  }
+ /* Power throttle: opt->power_percent ∈ [1,100], 0 ≡ no throttle. */
+ if (opt->power_percent >= 1 && opt->power_percent <= 100) {
+ e->power_percent = (uint32_t)opt->power_percent;
+ } else {
+ e->power_percent = 100;
+ }
  if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
  ds4_acquire_instance_lock();
 
@@ -21141,12 +21210,26 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
  return (int)DS4_N_VOCAB;
 }
 
+int ds4_engine_power(ds4_engine *e) {
+ return e ? e->power_percent : 100;
+}
+
+int ds4_engine_set_power(ds4_engine *e, int power_percent) {
+ if (!e || power_percent < 1 || power_percent > 100) return 1;
+ e->power_percent = power_percent;
+ return 0;
+}
+
 int ds4_session_power(ds4_session *s) {
- (void)s;
- return 100;
+ if (!s || !s->engine) return 100;
+ return s->engine->power_percent;
 }
 
 int ds4_session_set_power(ds4_session *s, int power_percent) {
- (void)s; (void)power_percent;
+ if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
+ s->engine->power_percent = power_percent;
+#ifndef DS4_NO_GPU
+ if (!ds4_session_is_cpu(s)) s->graph.power_percent = (uint32_t)power_percent;
+#endif
  return 0;
 }
