@@ -16,9 +16,22 @@ LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
-METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_metal.o ds4_expert_table.o ds4_moe_route_log.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o
+# Journal subsystem is opt-in: default builds
+# DO NOT include the journal — header inlines all functions as no-ops at zero
+# perf cost. Enable with: JOURNAL=1 make ...
+JOURNAL ?=
+ifeq ($(JOURNAL),1)
+CFLAGS += -DDS4_JOURNAL_ENABLE
+OBJCFLAGS += -DDS4_JOURNAL_ENABLE
+JOURNAL_OBJ := ds4_journal.o
+JOURNAL_LIB := -lsqlite3
+else
+JOURNAL_OBJ :=
+JOURNAL_LIB :=
+endif
+METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal $(JOURNAL_LIB)
+CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_metal.o ds4_expert_table.o ds4_moe_route_log.o ds4_pillars.o $(JOURNAL_OBJ)
+CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o $(JOURNAL_OBJ)
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -34,15 +47,15 @@ CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-# Decide how to enable ARMv8.6 FEAT_I8MM for ds4_neon_i8mm.c.  Evaluated
+# Decide how to enable ARMv8.6 FEAT_I8MM for ds4_neon_i8mm.c. Evaluated
 # AFTER the platform block above so CFLAGS already includes any
-# platform-specific additions (e.g. -D_GNU_SOURCE on Linux).  Order:
-#   1. If the existing native CPU flag (-mcpu=native / -march=native) already
-#      defines __ARM_FEATURE_MATMUL_INT8 then keep it as-is.  Apple M4 with
-#      -mcpu=native is the main intended host.
-#   2. Otherwise try -march=armv8.6-a+i8mm as a generic fallback.
-#   3. If neither works, ds4_neon_i8mm.c still compiles cleanly as a stub --
-#      its SMMLA path is guarded by __ARM_FEATURE_MATMUL_INT8.
+# platform-specific additions (e.g. -D_GNU_SOURCE on Linux). Order:
+# 1. If the existing native CPU flag (-mcpu=native / -march=native) already
+# defines __ARM_FEATURE_MATMUL_INT8 then keep it as-is. Apple M4 with
+# -mcpu=native is the main intended host.
+# 2. Otherwise try -march=armv8.6-a+i8mm as a generic fallback.
+# 3. If neither works, ds4_neon_i8mm.c still compiles cleanly as a stub --
+# its SMMLA path is guarded by __ARM_FEATURE_MATMUL_INT8.
 I8MM_BUILD_FLAGS :=
 ifneq (,$(filter $(UNAME_M),aarch64 arm64))
 I8MM_NATIVE_HAS := $(shell $(CC) $(NATIVE_CPU_FLAG) -dM -E -x c /dev/null 2>/dev/null | grep -c __ARM_FEATURE_MATMUL_INT8)
@@ -66,10 +79,10 @@ all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
 help:
 	@echo "DS4 build targets:"
-	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
-	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
-	@echo "  make test         Build and run tests"
-	@echo "  make clean        Remove build outputs"
+	@echo " make Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo " make cpu Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo " make test Build and run tests"
+	@echo " make clean Remove build outputs"
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -100,12 +113,12 @@ all: help
 
 help:
 	@echo "DS4 build targets:"
-	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10"
-	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
-	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
-	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
-	@echo "  make test                Build and run tests"
-	@echo "  make clean               Remove build outputs"
+	@echo " make cuda-spark Build CUDA for DGX Spark / GB10"
+	@echo " make cuda-generic Build CUDA for a generic local CUDA GPU"
+	@echo " make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
+	@echo " make cpu Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo " make test Build and run tests"
+	@echo " make clean Remove build outputs"
 
 cuda-spark:
 	$(MAKE) ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
@@ -116,7 +129,7 @@ cuda-generic:
 cuda:
 	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \
 		echo "error: specify CUDA_ARCH, for example: make cuda CUDA_ARCH=sm_120"; \
-		echo "       or use make cuda-spark / make cuda-generic"; \
+		echo " or use make cuda-spark / make cuda-generic"; \
 		exit 2; \
 	fi
 	$(MAKE) ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
