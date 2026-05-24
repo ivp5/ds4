@@ -1668,6 +1668,17 @@ int main(int argc, char **argv) {
         ds4_polar_close(&pf);
         return 0;
     }
+    /* --polar-dir-info <dir> : scan dir for L{LL}_{kind}.polar files and
+     * report the layer/kind matrix + total mmap bytes resident. Phase
+     * B-1 of #563 — verifies the pool API before engine integration. */
+    if (argc >= 3 && !strcmp(argv[1], "--polar-dir-info")) {
+        ds4_polar_pool pool;
+        ds4_polar_pool_init(&pool);
+        uint32_t opened = ds4_polar_pool_load_dir(&pool, argv[2]);
+        ds4_polar_pool_print_summary(&pool, argv[2]);
+        ds4_polar_pool_close(&pool);
+        return opened > 0 ? 0 : 1;
+    }
     /* --polar-gud-canary [n_codes [route_pairs [rows [batches [pairs [down_rows [act_rows]]]]]]]:
      * H1735 fused gate*silu*up*route_weight + down-projection in one
      * dispatch. Synthetic input where expected output = pairs^2 for all

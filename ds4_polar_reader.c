@@ -256,3 +256,146 @@ void ds4_polar_print_summary(const ds4_polar_file *p, const char *label) {
                 re0, im0, m0[0], p0[0]);
     }
 }
+
+
+/* ============================ ds4_polar_pool ============================ */
+
+#include <dirent.h>
+
+void ds4_polar_pool_init(ds4_polar_pool *pool) {
+    if (!pool) return;
+    memset(pool, 0, sizeof(*pool));
+    for (uint32_t l = 0; l < DS4_POLAR_MAX_LAYERS; l++)
+        for (uint32_t k = 0; k < 3; k++)
+            pool->files[l][k].fd = -1;
+}
+
+void ds4_polar_pool_close(ds4_polar_pool *pool) {
+    if (!pool) return;
+    for (uint32_t l = 0; l < DS4_POLAR_MAX_LAYERS; l++) {
+        for (uint32_t k = 0; k < 3; k++) {
+            if (pool->files[l][k].mmap_base) {
+                ds4_polar_close(&pool->files[l][k]);
+            }
+        }
+    }
+    memset(pool, 0, sizeof(*pool));
+    for (uint32_t l = 0; l < DS4_POLAR_MAX_LAYERS; l++)
+        for (uint32_t k = 0; k < 3; k++)
+            pool->files[l][k].fd = -1;
+}
+
+/* Filename matcher: returns true and sets *layer + *kind_id if the
+ * filename has the form "L{NN}_{kind}.polar" with kind in {gate,up,down}. */
+static bool parse_polar_filename(const char *name, uint32_t *layer, uint32_t *kind) {
+    /* expect "L"+digits+"_"+("gate"|"up"|"down")+".polar" */
+    if (name[0] != 'L') return false;
+    const char *p = name + 1;
+    uint32_t l = 0;
+    int digits = 0;
+    while (*p >= '0' && *p <= '9') {
+        l = l * 10 + (uint32_t)(*p - '0');
+        p++;
+        digits++;
+    }
+    if (digits == 0 || *p != '_') return false;
+    p++;
+    uint32_t k;
+    if (strncmp(p, "gate.polar", 11) == 0 && strlen(p) == 10) k = DS4_POLAR_KIND_GATE;
+    else if (strncmp(p, "up.polar", 9) == 0 && strlen(p) == 8) k = DS4_POLAR_KIND_UP;
+    else if (strncmp(p, "down.polar", 11) == 0 && strlen(p) == 10) k = DS4_POLAR_KIND_DOWN;
+    else return false;
+    *layer = l;
+    *kind = k;
+    return true;
+}
+
+uint32_t ds4_polar_pool_load_dir(ds4_polar_pool *pool, const char *dir) {
+    if (!pool || !dir) return 0;
+    DIR *d = opendir(dir);
+    if (!d) {
+        fprintf(stderr, "ds4_polar_pool_load_dir: opendir(%s) failed: %s\n",
+                dir, strerror(errno));
+        return 0;
+    }
+    uint32_t opened = 0;
+    uint64_t bytes_total = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        uint32_t layer, kind;
+        if (!parse_polar_filename(ent->d_name, &layer, &kind)) continue;
+        if (layer >= DS4_POLAR_MAX_LAYERS) {
+            fprintf(stderr, "ds4_polar_pool: skipping %s — layer %u out of range\n",
+                    ent->d_name, layer);
+            continue;
+        }
+        /* Replace any prior entry for (layer, kind) */
+        if (pool->files[layer][kind].mmap_base) {
+            ds4_polar_close(&pool->files[layer][kind]);
+            if (pool->opened_count > 0) pool->opened_count--;
+        }
+        /* Build full path */
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        if (!ds4_polar_open(path, &pool->files[layer][kind])) {
+            /* ds4_polar_open already emitted a diagnostic */
+            continue;
+        }
+        /* Verify the file's self-described (layer, kind) matches filename */
+        if (pool->files[layer][kind].layer != layer ||
+            pool->files[layer][kind].kind_id != kind) {
+            fprintf(stderr,
+                    "ds4_polar_pool: %s header (layer=%u, kind=%u) disagrees with "
+                    "filename (layer=%u, kind=%u); accepting filename binding\n",
+                    ent->d_name,
+                    pool->files[layer][kind].layer, pool->files[layer][kind].kind_id,
+                    layer, kind);
+        }
+        opened++;
+        bytes_total += pool->files[layer][kind].mmap_bytes;
+    }
+    closedir(d);
+    pool->opened_count += opened;
+    pool->total_bytes += bytes_total;
+    return opened;
+}
+
+const ds4_polar_file *ds4_polar_pool_get(const ds4_polar_pool *pool,
+                                          uint32_t layer, uint32_t kind) {
+    if (!pool || layer >= DS4_POLAR_MAX_LAYERS || kind > DS4_POLAR_KIND_DOWN) return NULL;
+    const ds4_polar_file *p = &pool->files[layer][kind];
+    return p->mmap_base ? p : NULL;
+}
+
+void ds4_polar_pool_print_summary(const ds4_polar_pool *pool, const char *label) {
+    if (!pool) {
+        fprintf(stderr, "ds4_polar_pool: %s — NULL\n", label ? label : "(unnamed)");
+        return;
+    }
+    fprintf(stderr, "ds4_polar_pool: %s — %u files open, %.1f MB total resident\n",
+            label ? label : "summary",
+            pool->opened_count,
+            (double)pool->total_bytes / (1024.0 * 1024.0));
+    /* Build a per-layer presence bitmask: 1 byte per layer, bit 0=gate, 1=up, 2=down */
+    uint32_t layers_any = 0;
+    for (uint32_t l = 0; l < DS4_POLAR_MAX_LAYERS; l++) {
+        uint8_t mask = 0;
+        for (uint32_t k = 0; k < 3; k++) {
+            if (pool->files[l][k].mmap_base) mask |= (uint8_t)(1u << k);
+        }
+        if (mask) {
+            if (!layers_any) fprintf(stderr, "  layer-kind matrix (G=gate, U=up, D=down):\n");
+            char tag[4] = "...";
+            tag[0] = (mask & 1) ? 'G' : '.';
+            tag[1] = (mask & 2) ? 'U' : '.';
+            tag[2] = (mask & 4) ? 'D' : '.';
+            fprintf(stderr, "    L%02u: %s  (n_experts=%u, n_rows=%u, n_pairs=%u)\n",
+                    l, tag,
+                    pool->files[l][(mask&1)?0:(mask&2)?1:2].n_experts,
+                    pool->files[l][(mask&1)?0:(mask&2)?1:2].n_rows,
+                    pool->files[l][(mask&1)?0:(mask&2)?1:2].n_pairs);
+            layers_any++;
+        }
+    }
+    if (!layers_any) fprintf(stderr, "  (no layers populated)\n");
+}

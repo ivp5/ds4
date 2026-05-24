@@ -94,6 +94,66 @@ float ds4_polar_decode_pair_im(const ds4_polar_file *p,
  * wiring it into inference. */
 void ds4_polar_print_summary(const ds4_polar_file *p, const char *label);
 
+
+/* =========================================================================
+ * Polar pool — collection of PLR2 files keyed by (layer, kind).
+ *
+ * Phase B-1 of #563: load all PLR2 files from a directory at engine
+ * open, hold them mmap-resident, expose per-(layer, kind) lookup so the
+ * H1735 dispatcher can find weight data without re-opening the file.
+ *
+ * Layout assumption: files are named `L{LL:02}_{kind}.polar` for kind
+ * ∈ {gate, up, down}.  Matches polar_encode_mlx.py --format combined.
+ *
+ * The pool is statically sized for DS4_N_LAYER × 3 kinds.  Missing
+ * (layer, kind) entries return NULL from ds4_polar_pool_get().  Pool
+ * objects DO NOT take ownership of the directory; the caller may
+ * delete files between calls, but the mmap regions stay valid until
+ * ds4_polar_pool_close() is called.
+ *
+ * Memory note: each open ds4_polar_file mmaps the full PLR2 file
+ * (header + mag + phase + levels).  At default 128-row encoding for
+ * DS4 V4 Flash, that's ~135 MB per (layer, kind) for gate/up and
+ * ~67 MB for down.  The OS pages in only the touched ranges.
+ * ========================================================================= */
+
+#ifndef DS4_N_LAYER
+#define DS4_POLAR_MAX_LAYERS 64   /* must be ≥ DS4_N_LAYER (=43 in DS4 V4) */
+#else
+#define DS4_POLAR_MAX_LAYERS DS4_N_LAYER
+#endif
+
+typedef struct {
+    ds4_polar_file files[DS4_POLAR_MAX_LAYERS][3]; /* indexed by [layer][kind_id] */
+    uint32_t       opened_count;   /* total successful opens */
+    uint64_t       total_bytes;    /* sum of mmap_bytes across opened files */
+} ds4_polar_pool;
+
+/* Zero-initialize a fresh pool. Safe to call on an existing pool only
+ * after ds4_polar_pool_close() — does not free anything. */
+void ds4_polar_pool_init(ds4_polar_pool *pool);
+
+/* Scan `dir` for L{LL:02}_{kind}.polar files and open each.  Returns
+ * the number of successfully opened files.  Bad / unreadable / wrong-
+ * magic files are skipped with a stderr warning; the pool is still
+ * usable for the files that did open.
+ *
+ * Idempotent: re-loading the same directory closes prior opens for
+ * any (layer, kind) being replaced. */
+uint32_t ds4_polar_pool_load_dir(ds4_polar_pool *pool, const char *dir);
+
+/* Close every open file in the pool and zero its state. Safe to call
+ * on a zero-initialized pool. */
+void ds4_polar_pool_close(ds4_polar_pool *pool);
+
+/* Lookup. Returns NULL if no file is open at (layer, kind). */
+const ds4_polar_file *ds4_polar_pool_get(const ds4_polar_pool *pool,
+                                          uint32_t layer, uint32_t kind);
+
+/* Diagnostic: print which (layer, kind) slots are populated + total
+ * resident bytes. */
+void ds4_polar_pool_print_summary(const ds4_polar_pool *pool, const char *label);
+
 #ifdef __cplusplus
 }
 #endif
