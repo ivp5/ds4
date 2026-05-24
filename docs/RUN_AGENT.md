@@ -32,13 +32,16 @@ Mask shipped at `masks/mask_asym_50gb_v2.csv`.
 
 ## 3. Run the agent
 
+ds4-agent does NOT take `--mtl4-moe` (that's a `ds4` flag only). Without
+`--prefill-metal-phases auto` or `--cpu-moe`, the engine goes full-Metal
+directly. Verified: `mapped 45475.62 MiB` for trim50.
+
 Minimal interactive (full-Metal MoE, ICB on, MTP off):
 
 ```bash
 DS4_EXPERT_REMAP_ACTIVE=1 DS4_ICB_ACTIVE=1 \
     ./ds4-agent \
-    -m ./gguf/DS4-trim50-asym-with-metadata.gguf \
-    --mtl4-moe
+    -m ./gguf/DS4-trim50-asym-with-metadata.gguf
 ```
 
 With MTP draft model (faster on structured prompts, see [perf table](#perf-table)):
@@ -48,8 +51,7 @@ DS4_EXPERT_REMAP_ACTIVE=1 DS4_ICB_ACTIVE=1 \
     ./ds4-agent \
     -m ./gguf/DS4-trim50-asym-with-metadata.gguf \
     --mtp ./gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
-    --mtp-draft 2 \
-    --mtl4-moe
+    --mtp-draft 2
 ```
 
 Non-interactive one-shot with a prompt:
@@ -58,10 +60,28 @@ Non-interactive one-shot with a prompt:
 DS4_EXPERT_REMAP_ACTIVE=1 DS4_ICB_ACTIVE=1 \
     ./ds4-agent \
     -m ./gguf/DS4-trim50-asym-with-metadata.gguf \
-    --mtl4-moe \
     --non-interactive \
+    --temp 0 \
     -p "Write a Python function that returns the n-th Fibonacci number."
 ```
+
+For raw `ds4` (non-agent, no DSML tool system prompt) use `--mtl4-moe` per [§4](#4-env-flags-reference):
+
+```bash
+DS4_EXPERT_REMAP_ACTIVE=1 DS4_ICB_ACTIVE=1 \
+    ./ds4 -m ./gguf/DS4-trim50-asym-with-metadata.gguf --mtl4-moe \
+    --temp 0 -p "Hello, my name is" -n 16
+```
+
+### Quality note on trim50
+
+The trim50 model has ~50% of its routed experts dropped via the layer-asymmetric
+mask. Quality is acceptable on chat-shaped continuations but degrades on
+out-of-distribution prompts and short-form factual queries — the agent may
+emit repetition loops or DSML-system-prompt continuations instead of the
+expected answer. The inference engine is correct; this is a model-quality
+ceiling that is inherent to the trim. For full quality, use the un-trimmed
+IQ2_XXS file directly (requires either `--cpu-moe` or wired_limit_mb >= 90 GiB).
 
 ## 4. Env flags reference
 
