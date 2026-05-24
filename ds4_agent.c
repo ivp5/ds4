@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_kvstore.h"
+#include "ds4_web.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -110,8 +111,8 @@ typedef struct {
     bool stop;
     bool interrupt;
     bool initialized;
-    bool queued_user_pending;
     bool save_requested;
+    bool compact_requested;
     bool power_requested;
     int requested_power;
     int progress_base;
@@ -121,6 +122,16 @@ typedef struct {
     char *out;
     size_t out_len;
     size_t out_cap;
+    ds4_web *web;
+    bool web_approval_pending;
+    bool web_approval_answered;
+    bool web_approval_result;
+    char web_approval_message[256];
+    char web_approval_error[160];
+    bool queued_user_drain_pending;
+    bool queued_user_drain_answered;
+    char *queued_user_drain_text;
+    bool datetime_context_injected;
     char more_path[PATH_MAX];
     int more_next_line;
     bool more_bare;
@@ -287,8 +298,14 @@ typedef struct {
 static volatile sig_atomic_t agent_sigint;
 static agent_worker *agent_completion_worker;
 
-static bool worker_has_queued_user_pending(agent_worker *w);
 static void worker_apply_pending_power(agent_worker *w);
+static void agent_trace(agent_worker *w, const char *fmt, ...);
+static void agent_trace_text(agent_worker *w, const char *label,
+                             const char *text, size_t len);
+static void agent_publish_system_status(agent_worker *w, const char *msg);
+static int agent_web_confirm(void *privdata, const char *message,
+                             char *err, size_t err_len);
+static void agent_web_log(void *privdata, const char *message);
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
 static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
@@ -408,6 +425,7 @@ static bool agent_slash_command_with_args(const char *cmd, const char *name) {
 static bool agent_slash_command_known(const char *cmd) {
     return !strcmp(cmd, "/help") ||
            !strcmp(cmd, "/save") ||
+           !strcmp(cmd, "/compact") ||
            !strcmp(cmd, "/list") ||
            !strcmp(cmd, "/quit") ||
            !strcmp(cmd, "/exit") ||
@@ -505,6 +523,7 @@ static void usage(FILE *fp) {
         "Commands:\n"
         "  /help                  Show runtime help.\n"
         "  /save                  Save the current agent session.\n"
+        "  /compact               Compact the current session context now.\n"
         "  /list                  List saved sessions in ~/.ds4/kvcache.\n"
         "  /switch SHA            Load a saved session and show recent history.\n"
         "  /del SHA               Delete a saved session.\n"
@@ -668,6 +687,7 @@ static const char agent_tools_prompt_intro[] =
 static const char agent_tools_prompt_edit_line[] =
     "## Editing files\n\n"
     "Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. "
+    "For edit, always put the edited file path as the first parameter. "
     "The old text must match exactly once in the current file; otherwise edit fails for safety.\n"
     "For large replacements, prefer anchored old text: write the first lines, then [upto], then the final lines. "
     "The tool replaces everything from the head through the tail. If the head or tail is ambiguous, the edit fails.\n"
@@ -698,7 +718,37 @@ static const char agent_tools_prompt_edit_line[] =
 static const char agent_tools_prompt_after_edit[] =
     "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
     "bash_status to check it early or bash_stop to terminate it.\n\n"
+    "Use google_search to find web pages. Use visit_page to read a known URL with a visible browser. "
+    "The first web call may ask the user for permission to start Chrome.\n\n"
     "### Available Tool Schemas\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"google_search\",\n"
+    "    \"description\": \"Search Google in a visible browser and return compact Markdown links.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"query\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"query\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"visit_page\",\n"
+    "    \"description\": \"Open a URL in a visible browser and return rendered page Markdown.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"url\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"url\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -915,6 +965,26 @@ static void agent_worker_note_system_prompt_seen(agent_worker *w) {
     w->last_system_prompt_reminder_at = w->transcript.len;
 }
 
+static void agent_worker_maybe_append_datetime_context(agent_worker *w) {
+    if (w->datetime_context_injected) return;
+
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+
+    char when[128];
+    if (strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S %Z", &tm) == 0)
+        snprintf(when, sizeof(when), "%lld", (long long)now);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "Current local date and time at session start: %s. "
+             "Use this only when date or time matters.", when);
+    ds4_chat_append_message(w->engine, &w->transcript, "system", msg);
+    agent_trace_text(w, "datetime-context", msg, strlen(msg));
+    w->datetime_context_injected = true;
+}
+
 /* The full tool/system reminder is separate from DSML syntax errors: it is a
  * pressure-controlled refresh of the same trusted prompt shape used at startup.
  * The built-in prompt is tokenized as rendered chat so DSML markers stay native
@@ -931,6 +1001,9 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
     }
 
     char *reminder = agent_build_system_prompt_reminder();
+    agent_publish_system_status(w, "Re-injecting system prompt reminder...");
+    agent_trace(w, "system prompt reminder injected at transcript=%d",
+                w->transcript.len);
     ds4_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
     free(reminder);
 
@@ -2583,6 +2656,8 @@ static const char *agent_tool_viz_prefix(const char *name) {
     if (!strcmp(name, "write")) return "write ";
     if (!strcmp(name, "edit")) return "edit ";
     if (!strcmp(name, "search")) return "search ";
+    if (!strcmp(name, "google_search")) return "google ";
+    if (!strcmp(name, "visit_page")) return "visit ";
     return NULL;
 }
 
@@ -3244,7 +3319,7 @@ static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_
         if (sr->dsml_active) {
             if (sr->dsml_ignored) {
                 agent_stream_finish_ignored_dsml(
-                    sr, "unfinished tool call inside <think></think>");
+                    sr, "tool calling is not allowed inside <think></think>");
             } else {
                 agent_tool_viz_finish(sr, sr->tool_preflight_error ?
                                       "[tool call stopped: edit old selector failed]\n" :
@@ -3737,6 +3812,107 @@ static void agent_publish_system_status(agent_worker *w, const char *msg) {
     }
 }
 
+static int agent_web_confirm(void *privdata, const char *message,
+                             char *err, size_t err_len) {
+    agent_worker *w = privdata;
+    if (!w || w->cfg->non_interactive) {
+        snprintf(err, err_len,
+                 "visible Chrome browser startup requires interactive approval");
+        return 0;
+    }
+
+    pthread_mutex_lock(&w->mu);
+    w->web_approval_pending = true;
+    w->web_approval_answered = false;
+    w->web_approval_result = false;
+    w->web_approval_error[0] = '\0';
+    snprintf(w->web_approval_message, sizeof(w->web_approval_message),
+             "%s", message ? message : "Start visible Chrome browser? (y/n) ");
+    agent_wake_locked(w);
+    while (!w->stop && !w->web_approval_answered)
+        pthread_cond_wait(&w->cond, &w->mu);
+    bool ok = w->web_approval_result;
+    if (!ok) {
+        snprintf(err, err_len, "%s",
+                 w->web_approval_error[0] ? w->web_approval_error :
+                 "user denied Chrome browser start");
+    }
+    pthread_mutex_unlock(&w->mu);
+    return ok ? 1 : 0;
+}
+
+static void agent_web_log(void *privdata, const char *message) {
+    agent_worker *w = privdata;
+    if (!w || !message || !message[0]) return;
+    agent_trace(w, "web: %s", message);
+}
+
+static bool worker_take_web_approval_request(agent_worker *w,
+                                             char *message, size_t message_len) {
+    pthread_mutex_lock(&w->mu);
+    bool pending = w->web_approval_pending;
+    if (pending) {
+        snprintf(message, message_len, "%s", w->web_approval_message);
+        w->web_approval_pending = false;
+    }
+    pthread_mutex_unlock(&w->mu);
+    return pending;
+}
+
+static void worker_answer_web_approval(agent_worker *w, bool allow,
+                                       const char *deny_error) {
+    pthread_mutex_lock(&w->mu);
+    w->web_approval_result = allow;
+    w->web_approval_answered = true;
+    if (!allow)
+        snprintf(w->web_approval_error, sizeof(w->web_approval_error),
+                 "%s", deny_error && deny_error[0] ? deny_error :
+                 "user denied Chrome browser start");
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
+/* When a model turn finishes with a tool call, queued user messages should not
+ * preempt that tool.  The worker asks the UI thread for the queue contents only
+ * after the tool result is appended, so the next model input can contain both
+ * the tool observation and the user's pending correction. */
+static char *worker_request_queued_user_drain(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    w->queued_user_drain_pending = true;
+    w->queued_user_drain_answered = false;
+    free(w->queued_user_drain_text);
+    w->queued_user_drain_text = NULL;
+    agent_wake_locked(w);
+    pthread_cond_signal(&w->cond);
+    while (!w->stop && !w->queued_user_drain_answered)
+        pthread_cond_wait(&w->cond, &w->mu);
+    char *text = w->queued_user_drain_text;
+    w->queued_user_drain_text = NULL;
+    w->queued_user_drain_pending = false;
+    w->queued_user_drain_answered = false;
+    pthread_mutex_unlock(&w->mu);
+    return text;
+}
+
+static bool worker_take_queued_user_drain_request(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    bool pending = w->queued_user_drain_pending;
+    if (pending) w->queued_user_drain_pending = false;
+    pthread_mutex_unlock(&w->mu);
+    return pending;
+}
+
+static void worker_answer_queued_user_drain(agent_worker *w, char *text) {
+    pthread_mutex_lock(&w->mu);
+    free(w->queued_user_drain_text);
+    w->queued_user_drain_text = text;
+    w->queued_user_drain_answered = true;
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
 /* Synchronize the live DS4 session to a transcript.  This is the agent's main
  * cache-saving operation: if the requested transcript extends the live session,
  * only the suffix is prefetched; otherwise the DS4 session rebuilds from the
@@ -3850,6 +4026,7 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     w->status.error[0] = '\0';
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
+    w->datetime_context_injected = false;
     agent_worker_clear_session_identity(w);
     free(text);
     ds4_tokens_free(&sys);
@@ -4881,6 +5058,7 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         free(w->legacy_session_path_to_delete);
         w->legacy_session_path_to_delete = meta.legacy_identity ? xstrdup(path) : NULL;
         agent_worker_note_system_prompt_seen(w);
+        w->datetime_context_injected = true;
         pthread_mutex_lock(&w->mu);
         w->user_activity = true;
         w->session_dirty = false;
@@ -5886,6 +6064,150 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
 }
 
 /* ============================================================================
+ * Browser Web Tools
+ * ============================================================================
+ *
+ * The browser subsystem lives in ds4_web.c: it owns visible Chrome and CDP.  The
+ * agent side only asks for permission, dispatches tools, and caps visit_page
+ * output using the same "head plus temp file" shape as bash.
+ */
+
+#define AGENT_WEB_HEAD_BYTES (8*1024)
+#define AGENT_WEB_HEAD_LINES 100
+
+static int agent_count_lines(const char *s) {
+    if (!s || !s[0]) return 0;
+    int lines = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == '\n') lines++;
+    }
+    if (s[strlen(s) - 1] != '\n') lines++;
+    return lines;
+}
+
+static char *agent_string_head(const char *s, int max_lines, size_t max_bytes,
+                               int *lines_read, bool *byte_limited) {
+    if (lines_read) *lines_read = 0;
+    if (byte_limited) *byte_limited = false;
+    if (!s) return xstrdup("");
+    size_t used = 0;
+    int lines = 0;
+    while (s[used] && used < max_bytes && lines < max_lines) {
+        if (s[used++] == '\n') lines++;
+    }
+    if (s[used] && used >= max_bytes && byte_limited) *byte_limited = true;
+    if (used && s[used - 1] != '\n' && lines < max_lines) lines++;
+    if (lines_read) *lines_read = lines;
+    return xstrndup(s, used);
+}
+
+static bool agent_write_temp_text(const char *prefix, const char *text,
+                                  char *path, size_t path_len,
+                                  char *err, size_t err_len) {
+    char tmpl[PATH_MAX];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/%s_XXXXXX", prefix);
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        snprintf(err, err_len, "failed to create temporary file: %s", strerror(errno));
+        return false;
+    }
+    size_t len = text ? strlen(text) : 0;
+    const char *p = text ? text : "";
+    size_t left = len;
+    while (left) {
+        ssize_t n = write(fd, p, left);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            snprintf(err, err_len, "failed to write temporary file: %s", strerror(errno));
+            close(fd);
+            unlink(tmpl);
+            return false;
+        }
+        p += n;
+        left -= (size_t)n;
+    }
+    if (close(fd) != 0) {
+        snprintf(err, err_len, "failed to close temporary file: %s", strerror(errno));
+        unlink(tmpl);
+        return false;
+    }
+    snprintf(path, path_len, "%s", tmpl);
+    return true;
+}
+
+static char *agent_tool_google_search(agent_worker *w, const agent_tool_call *call) {
+    const char *query = agent_tool_arg_value(call, "query");
+    if (!query || !query[0]) return xstrdup("Tool error: google_search requires query\n");
+    char err[256] = {0};
+    char *md = ds4_web_google_search(w->web, query, err, sizeof(err));
+    if (!md) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: google_search failed: ");
+        agent_buf_puts(&b, err[0] ? err : "unknown error");
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+    return md;
+}
+
+static char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call) {
+    const char *url = agent_tool_arg_value(call, "url");
+    if (!url || !url[0]) return xstrdup("Tool error: visit_page requires url\n");
+    char err[256] = {0};
+    char *md = ds4_web_visit_page(w->web, url, err, sizeof(err));
+    if (!md) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: visit_page failed: ");
+        agent_buf_puts(&b, err[0] ? err : "unknown error");
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    char path[PATH_MAX];
+    if (!agent_write_temp_text("ds4_agent_web", md, path, sizeof(path),
+                               err, sizeof(err)))
+    {
+        free(md);
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: visit_page failed: ");
+        agent_buf_puts(&b, err[0] ? err : "could not store rendered page");
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    int total_lines = agent_count_lines(md);
+    int shown_lines = 0;
+    bool byte_limited = false;
+    char *head = agent_string_head(md, AGENT_WEB_HEAD_LINES, AGENT_WEB_HEAD_BYTES,
+                                   &shown_lines, &byte_limited);
+    bool truncated = byte_limited || shown_lines < total_lines;
+    agent_buf out = {0};
+    char line[PATH_MAX + 256];
+    snprintf(line, sizeof(line),
+             "visit_page url=%s\noutput_path=%s (%zu bytes, %d lines)\n",
+             url, path, strlen(md), total_lines);
+    agent_buf_puts(&out, line);
+    if (truncated) {
+        snprintf(line, sizeof(line), "<head -%d %s>\n",
+                 AGENT_WEB_HEAD_LINES, path);
+        agent_buf_puts(&out, line);
+        agent_buf_puts(&out, head);
+        if (head[0] && head[strlen(head) - 1] != '\n') agent_buf_puts(&out, "\n");
+        agent_buf_puts(&out, "</head>\n");
+        agent_buf_puts(&out,
+            "Use read path=<output_path> start_line=<line> max_lines=<count> raw=true to inspect more rendered Markdown.\n");
+    } else {
+        agent_buf_puts(&out, "<markdown>\n");
+        agent_buf_puts(&out, head);
+        if (head[0] && head[strlen(head) - 1] != '\n') agent_buf_puts(&out, "\n");
+        agent_buf_puts(&out, "</markdown>\n");
+    }
+    free(head);
+    free(md);
+    return agent_buf_take(&out);
+}
+
+/* ============================================================================
  * Asynchronous Bash Jobs
  * ============================================================================
  *
@@ -6379,6 +6701,8 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "list")) return agent_tool_list(call);
     if (!strcmp(call->name, "edit")) return agent_tool_edit(w, call);
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
+    if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
+    if (!strcmp(call->name, "visit_page")) return agent_tool_visit_page(w, call);
 
     if (!strcmp(call->name, "bash")) {
         const char *cmd = agent_tool_arg_value(call, "command");
@@ -6800,6 +7124,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
         return 1;
     }
+    agent_worker_maybe_append_datetime_context(w);
     agent_trace_text(w, "user", user_text ? user_text : "",
                      user_text ? strlen(user_text) : 0);
     if (!w->session_title) {
@@ -6947,6 +7272,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 malformed_tool = true;
                 break;
             }
+            if (stream.dsml_in_think) {
+                malformed_tool = true;
+                break;
+            }
         }
 
         agent_stream_text(&stream, NULL, 0, true);
@@ -6968,39 +7297,6 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
 
         char *tool_result;
-        if (worker_has_queued_user_pending(w)) {
-            /* The live KV is append-only: generated assistant text is already
-             * the current state, so user interjection must not rewind it.  Close
-             * the tool round with a synthetic tool result and let the queued
-             * user prompt append after this stable transcript point. */
-            if (malformed_tool) {
-                agent_buf b = {0};
-                agent_buf_puts(&b, "Tool error: invalid DSML tool call: ");
-                agent_buf_puts(&b, dsml.error[0] ? dsml.error : "parse error");
-                agent_buf_puts(&b, "\n");
-                agent_buf_puts(&b, agent_dsml_syntax_reminder);
-                agent_buf_puts(&b, "Tool execution stopped because a queued user prompt is pending.\n");
-                tool_result = agent_buf_take(&b);
-            } else if (early_tool_error) {
-                agent_buf b = {0};
-                agent_buf_puts(&b, "Tool error: ");
-                agent_buf_puts(&b, stream.tool_preflight_error_msg[0] ?
-                               stream.tool_preflight_error_msg :
-                               "edit old selector failed before new was generated");
-                agent_buf_puts(&b, "\n");
-                agent_buf_puts(&b, "Tool execution stopped because a queued user prompt is pending.\n");
-                tool_result = agent_buf_take(&b);
-            } else {
-                tool_result = xstrdup(
-                    "Tool call not executed because a queued user prompt is pending.\n");
-            }
-            ds4_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
-            free(tool_result);
-            agent_dsml_parser_free(&dsml);
-            agent_set_status(w, AGENT_WORKER_IDLE);
-            return 0;
-        }
-
         if (early_tool_error) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: ");
@@ -7058,12 +7354,32 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         ds4_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
         free(tool_result);
         agent_dsml_parser_free(&dsml);
+
+        char *queued_user = worker_request_queued_user_drain(w);
+        if (queued_user && queued_user[0]) {
+            agent_trace_text(w, "queued_user", queued_user, strlen(queued_user));
+            ds4_chat_append_message(w->engine, &w->transcript, "user", queued_user);
+            pthread_mutex_lock(&w->mu);
+            w->user_activity = true;
+            w->session_dirty = true;
+            agent_wake_locked(w);
+            pthread_mutex_unlock(&w->mu);
+        }
+        free(queued_user);
     }
 }
 
 static void worker_request_save(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     w->save_requested = true;
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
+static void worker_request_compact(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    w->compact_requested = true;
     pthread_cond_signal(&w->cond);
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
@@ -7083,6 +7399,14 @@ static bool worker_take_save_requested(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool requested = w->save_requested;
     w->save_requested = false;
+    pthread_mutex_unlock(&w->mu);
+    return requested;
+}
+
+static bool worker_take_compact_requested(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    bool requested = w->compact_requested;
+    w->compact_requested = false;
     pthread_mutex_unlock(&w->mu);
     return requested;
 }
@@ -7125,6 +7449,30 @@ static void worker_run_deferred_save(agent_worker *w) {
     agent_set_status(w, AGENT_WORKER_IDLE);
 }
 
+static void worker_run_deferred_compact(agent_worker *w) {
+    if (!worker_take_compact_requested(w)) return;
+    if (!agent_worker_has_user_session(w)) {
+        agent_publishf(w, "\ncompact skipped: nothing to compact\n");
+        return;
+    }
+
+    int before = w->transcript.len;
+    char err[160] = {0};
+    if (agent_worker_compact(w, "user requested compaction", err, sizeof(err))) {
+        if (w->transcript.len != before) {
+            pthread_mutex_lock(&w->mu);
+            w->session_dirty = true;
+            agent_wake_locked(w);
+            pthread_mutex_unlock(&w->mu);
+        } else {
+            agent_publishf(w, "\ncompact skipped: nothing to compact\n");
+        }
+        agent_set_status(w, AGENT_WORKER_IDLE);
+    } else {
+        agent_set_error(w, err[0] ? err : "context compaction failed");
+    }
+}
+
 /* Worker thread entry point.  The UI thread submits plain user text; this
  * thread owns all DS4 session mutation, tool execution, and compaction. */
 static void *worker_main(void *arg) {
@@ -7146,7 +7494,8 @@ static void *worker_main(void *arg) {
 
     while (true) {
         pthread_mutex_lock(&w->mu);
-        while (!w->stop && !w->cmd_text && !w->save_requested && !w->power_requested)
+        while (!w->stop && !w->cmd_text && !w->save_requested &&
+               !w->compact_requested && !w->power_requested)
             pthread_cond_wait(&w->cond, &w->mu);
         if (w->stop) {
             pthread_mutex_unlock(&w->mu);
@@ -7162,6 +7511,11 @@ static void *worker_main(void *arg) {
             worker_run_deferred_save(w);
             continue;
         }
+        if (!w->cmd_text && w->compact_requested) {
+            pthread_mutex_unlock(&w->mu);
+            worker_run_deferred_compact(w);
+            continue;
+        }
         char *cmd = w->cmd_text;
         w->cmd_text = NULL;
         pthread_mutex_unlock(&w->mu);
@@ -7169,6 +7523,7 @@ static void *worker_main(void *arg) {
         worker_run_turn(w, cmd);
         free(cmd);
         worker_apply_pending_power(w);
+        worker_run_deferred_compact(w);
         worker_run_deferred_save(w);
     }
 
@@ -7288,24 +7643,6 @@ static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     bool initialized = w->initialized;
     pthread_mutex_unlock(&w->mu);
     return initialized;
-}
-
-/* The UI owns queued user text.  This flag tells the worker to stop at the next
- * stable append-only boundary: if the assistant emits a tool call, the worker
- * records a synthetic "not executed" tool result instead of running the tool,
- * then lets the queued user prompt append as the next turn. */
-static void worker_set_queued_user_pending(agent_worker *w, bool pending) {
-    pthread_mutex_lock(&w->mu);
-    w->queued_user_pending = pending;
-    agent_wake_locked(w);
-    pthread_mutex_unlock(&w->mu);
-}
-
-static bool worker_has_queued_user_pending(agent_worker *w) {
-    pthread_mutex_lock(&w->mu);
-    bool pending = w->queued_user_pending;
-    pthread_mutex_unlock(&w->mu);
-    return pending;
 }
 
 static bool stdout_is_tty(void) {
@@ -7474,6 +7811,34 @@ static void agent_prompt_queue_push_front(agent_prompt_queue *q, char *text) {
     q->len++;
 }
 
+static char *agent_prompt_queue_take_all(agent_prompt_queue *q) {
+    if (!q->len) return NULL;
+    if (q->len == 1) return agent_prompt_queue_pop(q);
+
+    agent_buf b = {0};
+    for (size_t i = 0; i < q->len; i++) {
+        char hdr[64];
+        if (i) agent_buf_puts(&b, "\n\n");
+        snprintf(hdr, sizeof(hdr), "Queued user message %zu:\n", i + 1);
+        agent_buf_puts(&b, hdr);
+        agent_buf_puts(&b, q->v[i]);
+        free(q->v[i]);
+    }
+    q->len = 0;
+    return agent_buf_take(&b);
+}
+
+static char *agent_prompt_queue_take_all_echo(agent_prompt_queue *q) {
+    if (!q->len) return NULL;
+    agent_buf b = {0};
+    for (size_t i = 0; i < q->len; i++) {
+        char *echo = agent_format_user_prompt_echo(q->v[i]);
+        agent_buf_puts(&b, echo);
+        free(echo);
+    }
+    return agent_buf_take(&b);
+}
+
 static const char *agent_prompt_queue_peek(const agent_prompt_queue *q) {
     return q->len ? q->v[0] : NULL;
 }
@@ -7541,7 +7906,6 @@ static void build_footer_text(const agent_status *st, const agent_prompt_queue *
     agent_buf_puts(&out, "\n");
     if (stdout_is_tty()) agent_buf_puts(&out, AGENT_STATUS_STYLE_START);
     agent_buf_puts(&out, status);
-    if (stdout_is_tty()) agent_buf_puts(&out, AGENT_STATUS_STYLE_END);
     snprintf(buf, len, "%s", out.ptr ? out.ptr : "");
     free(preview);
     free(out.ptr);
@@ -8103,9 +8467,12 @@ static int editor_start(agent_editor *ed, const char *prompt,
         return -1;
     }
     bool embedded_status = agent_footer_is_multiline(ed->status);
+    const char *status_start = stdout_is_tty() && !embedded_status ?
+        AGENT_STATUS_STYLE_START : "";
+    const char *status_end = stdout_is_tty() && ed->status[0] ?
+        AGENT_STATUS_STYLE_END : "";
     linenoiseEditSetStatus(&ed->edit, ed->status,
-                           stdout_is_tty() && !embedded_status ? AGENT_STATUS_STYLE_START : "",
-                           stdout_is_tty() && !embedded_status ? AGENT_STATUS_STYLE_END : "");
+                           status_start, status_end);
     linenoiseEditSetLayoutCallback(&ed->edit, editor_linenoise_layout_changed, ed);
     if (isatty(ed->edit.ifd) || getenv("LINENOISE_ASSUME_TTY")) {
         linenoiseHide(&ed->edit);
@@ -8208,9 +8575,12 @@ static void editor_update_prompt(agent_editor *ed, const char *prompt) {
 static void editor_update_status(agent_editor *ed, const char *status) {
     snprintf(ed->status, sizeof(ed->status), "%s", status ? status : "");
     bool embedded_status = agent_footer_is_multiline(ed->status);
+    const char *status_start = stdout_is_tty() && !embedded_status ?
+        AGENT_STATUS_STYLE_START : "";
+    const char *status_end = stdout_is_tty() && ed->status[0] ?
+        AGENT_STATUS_STYLE_END : "";
     linenoiseEditSetStatus(&ed->edit, ed->status,
-                           stdout_is_tty() && !embedded_status ? AGENT_STATUS_STYLE_START : "",
-                           stdout_is_tty() && !embedded_status ? AGENT_STATUS_STYLE_END : "");
+                           status_start, status_end);
 }
 
 static void editor_set_prompt_status(agent_editor *ed, const char *prompt,
@@ -8342,6 +8712,7 @@ static void runtime_help(void) {
     puts("Commands:");
     puts("  /help        Show this help.");
     puts("  /save        Save the current session.");
+    puts("  /compact     Compact the current session context now.");
     puts("  /list        List saved sessions.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
@@ -8414,6 +8785,15 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
                 w->cache_dir, strerror(errno));
         return -1;
     }
+    ds4_web_config web_cfg = {
+        .home_dir = getenv("HOME"),
+        .port = 9333,
+        .confirm = agent_web_confirm,
+        .confirm_privdata = w,
+        .log = agent_web_log,
+        .log_privdata = w,
+    };
+    w->web = ds4_web_create(&web_cfg);
     w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
@@ -8433,12 +8813,14 @@ static void agent_worker_free(agent_worker *w) {
     worker_stop(w);
     if (w->thread) pthread_join(w->thread, NULL);
     agent_bash_jobs_free(w);
+    ds4_web_free(w->web);
     ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
     free(w->cache_dir);
     free(w->sysprompt_path);
     free(w->session_title);
     free(w->legacy_session_path_to_delete);
+    free(w->queued_user_drain_text);
     if (w->wake_fd[0] >= 0) close(w->wake_fd[0]);
     if (w->wake_fd[1] >= 0) close(w->wake_fd[1]);
     if (w->trace) fclose(w->trace);
@@ -8448,17 +8830,77 @@ static void agent_worker_free(agent_worker *w) {
     pthread_mutex_destroy(&w->mu);
 }
 
-static bool agent_prompt_yes_no(const char *prompt) {
+typedef enum {
+    AGENT_YES_NO_AUTO_NONE,
+    AGENT_YES_NO_AUTO_NO,
+    AGENT_YES_NO_AUTO_YES,
+} agent_yes_no_auto;
+
+typedef struct {
+    int timeout_sec;
+    agent_yes_no_auto timeout_answer;
+} agent_yes_no_options;
+
+static const char *agent_yes_no_auto_name(agent_yes_no_auto answer) {
+    switch (answer) {
+    case AGENT_YES_NO_AUTO_NO: return "no";
+    case AGENT_YES_NO_AUTO_YES: return "yes";
+    default: return "";
+    }
+}
+
+/* Shared y/n prompt.  By default it blocks forever like the historical helper;
+ * callers that cannot safely stall the agent can request an automatic answer
+ * after timeout_sec seconds. */
+static bool agent_prompt_yes_no_ex(const char *prompt,
+                                   const agent_yes_no_options *opts,
+                                   bool *timed_out) {
     char buf[32];
+    int timeout_sec = opts ? opts->timeout_sec : 0;
+    agent_yes_no_auto auto_answer = opts ?
+        opts->timeout_answer : AGENT_YES_NO_AUTO_NONE;
+    bool use_timeout = timeout_sec > 0 && auto_answer != AGENT_YES_NO_AUTO_NONE;
+    double deadline = use_timeout ? now_sec() + timeout_sec : 0.0;
+
+    if (timed_out) *timed_out = false;
     for (;;) {
         printf("%s", prompt);
+        if (use_timeout) {
+            int rem = (int)(deadline - now_sec() + 0.999);
+            if (rem < 0) rem = 0;
+            printf("[auto-%s in %ds] ", agent_yes_no_auto_name(auto_answer), rem);
+        }
         fflush(stdout);
+        if (use_timeout) {
+            double rem_sec = deadline - now_sec();
+            if (rem_sec <= 0.0) {
+                if (timed_out) *timed_out = true;
+                printf("\n");
+                return auto_answer == AGENT_YES_NO_AUTO_YES;
+            }
+            struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
+            int timeout_ms = (int)(rem_sec * 1000.0) + 1;
+            int rc;
+            do {
+                rc = poll(&pfd, 1, timeout_ms);
+            } while (rc < 0 && errno == EINTR);
+            if (rc == 0) {
+                if (timed_out) *timed_out = true;
+                printf("\n");
+                return auto_answer == AGENT_YES_NO_AUTO_YES;
+            }
+            if (rc < 0) return false;
+        }
         if (!fgets(buf, sizeof(buf), stdin)) return false;
         char *p = buf;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == 'y' || *p == 'Y') return true;
         if (*p == 'n' || *p == 'N') return false;
     }
+}
+
+static bool agent_prompt_yes_no(const char *prompt) {
+    return agent_prompt_yes_no_ex(prompt, NULL, NULL);
 }
 
 /* Ask before discarding a dirty user session.  Fresh sessions that contain only
@@ -8560,14 +9002,12 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         }
 
         if (!one_shot && queue.len && idle) {
-            char *queued = agent_prompt_queue_pop(&queue);
-            worker_set_queued_user_pending(&worker, queue.len > 0);
+            char *queued = agent_prompt_queue_take_all(&queue);
             if (worker_submit(&worker, queued)) {
                 idle = false;
             } else {
                 agent_prompt_queue_push_front(&queue, queued);
                 queued = NULL;
-                worker_set_queued_user_pending(&worker, true);
             }
             free(queued);
         }
@@ -8625,6 +9065,11 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         }
         free(out);
 
+        if (worker_take_queued_user_drain_request(&worker)) {
+            char *queued = agent_prompt_queue_take_all(&queue);
+            worker_answer_queued_user_drain(&worker, queued);
+        }
+
         if (st.state == AGENT_WORKER_ERROR) {
             fprintf(stderr, "ds4-agent: %s\n",
                     st.error[0] ? st.error : "worker error");
@@ -8637,15 +9082,12 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         {
             char *prompt = agent_input_buf_take(&input);
             if (worker_is_idle(&worker) && queue.len == 0) {
-                worker_set_queued_user_pending(&worker, false);
                 if (!worker_submit(&worker, prompt)) {
                     agent_prompt_queue_push(&queue, prompt);
-                    worker_set_queued_user_pending(&worker, true);
                     agent_noninteractive_marker("+DWARFSTAR_QUEUED");
                 }
             } else {
                 agent_prompt_queue_push(&queue, prompt);
-                worker_set_queued_user_pending(&worker, true);
                 agent_noninteractive_marker("+DWARFSTAR_QUEUED");
             }
             free(prompt);
@@ -8772,29 +9214,67 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         }
         free(out);
 
+        if (worker_take_queued_user_drain_request(&worker)) {
+            char *echo = agent_prompt_queue_take_all_echo(&queue);
+            char *queued = agent_prompt_queue_take_all(&queue);
+            if (echo) {
+                build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
+                editor_write_async(&editor, echo, strlen(echo), prompt, statusline, true);
+                free(echo);
+            }
+            worker_answer_queued_user_drain(&worker, queued);
+            continue;
+        }
+
+        char web_approval_msg[256];
+        if (worker_take_web_approval_request(&worker, web_approval_msg,
+                                             sizeof(web_approval_msg)))
+        {
+            char *saved_input = NULL;
+            if (editor.active && editor.edit.buf && editor.edit.len)
+                saved_input = xstrndup(editor.edit.buf, editor.edit.len);
+            editor_stop(&editor);
+            editor_restore_terminal_layout(&editor);
+            agent_yes_no_options approval_opts = {
+                .timeout_sec = 30,
+                .timeout_answer = AGENT_YES_NO_AUTO_NO,
+            };
+            bool approval_timed_out = false;
+            bool allow = agent_prompt_yes_no_ex(web_approval_msg,
+                                                &approval_opts,
+                                                &approval_timed_out);
+            worker_answer_web_approval(&worker, allow,
+                approval_timed_out ? "Chrome browser start approval timed out" : NULL);
+            worker_get_status(&worker, &st);
+            build_prompt_text(&st, prompt, sizeof(prompt));
+            int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
+            build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
+            editor_start(&editor, prompt, statusline, saved_input);
+            free(saved_input);
+            continue;
+        }
+
         if (initial_pending && worker_is_idle(&worker)) {
             if (worker_submit(&worker, initial_pending)) {
-                worker_set_queued_user_pending(&worker, queue.len > 0);
                 free(initial_pending);
                 initial_pending = NULL;
             }
         }
 
         if (!initial_pending && queue.len && worker_is_idle(&worker)) {
-            char *queued = agent_prompt_queue_pop(&queue);
-            worker_set_queued_user_pending(&worker, queue.len > 0);
+            char *echo = agent_prompt_queue_take_all_echo(&queue);
+            char *queued = agent_prompt_queue_take_all(&queue);
             if (worker_submit(&worker, queued)) {
                 linenoiseHistoryAdd(queued);
                 linenoiseHistorySave(hist);
-                char *echo = agent_format_user_prompt_echo(queued);
                 build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
-                editor_write_async(&editor, echo, strlen(echo), prompt, statusline, true);
-                free(echo);
+                if (echo)
+                    editor_write_async(&editor, echo, strlen(echo), prompt, statusline, true);
             } else {
                 agent_prompt_queue_push_front(&queue, queued);
-                worker_set_queued_user_pending(&worker, true);
                 queued = NULL;
             }
+            free(echo);
             free(queued);
         }
 
@@ -8802,7 +9282,6 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
         if (queue.len && editor_take_queued_byte(&editor, 24)) { /* Ctrl+X */
             char *queued = agent_prompt_queue_pop(&queue);
-            worker_set_queued_user_pending(&worker, queue.len > 0);
             editor_replace_input(&editor, queued);
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
@@ -8864,6 +9343,10 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         if (!agent_worker_save_session(&worker, err, sizeof(err)))
                             printf("save failed: %s\n", err);
                     }
+                } else if (!strcmp(cmd, "/compact")) {
+                    worker_request_compact(&worker);
+                    if (busy)
+                        printf("compaction scheduled at next safe point\n");
                 } else if (!strcmp(cmd, "/list")) {
                     agent_worker_list_sessions(&worker);
                 } else if (!strncmp(cmd, "/power", 6) &&
@@ -8979,11 +9462,9 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         printf("history failed: %s\n", err);
                 } else if (busy) {
                     agent_prompt_queue_push(&queue, cmd);
-                    worker_set_queued_user_pending(&worker, true);
                 } else {
                     linenoiseHistoryAdd(cmd);
                     linenoiseHistorySave(hist);
-                    worker_set_queued_user_pending(&worker, false);
                     if (worker_submit(&worker, cmd)) {
                         agent_echo_user_prompt(cmd);
                     } else {
