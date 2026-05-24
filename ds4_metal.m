@@ -182,6 +182,23 @@ typedef struct {
 static ds4_topk_mask_icb_slot g_topk_mask_icb_slots[DS4_TOPK_MASK_ICB_SLOTS];
 static id<MTLBuffer> g_topk_mask_icb_args_buffers[DS4_TOPK_MASK_ICB_SLOTS];
 
+/* #558 ICB Phase 4: kernel_dsv4_softplus_sqrt_f32_4 via ds4_gpu_encode_unary_f32_rows.
+ * Called at line ~13676 + ~13762 with FIXED shape (width=256, rows=1, c4=1, min=0,
+ * max=0) — ideal for ICB record/replay since args + dispatch grid never change.
+ * 2 slots for the 2 call sites; args buffer pre-populated once at first record.
+ * Opt-in via DS4_ICB_SOFTPLUS=1. */
+static id<MTLIndirectCommandBuffer> g_softplus_sqrt_icb;
+typedef struct {
+    void *src_ptr;
+    uint64_t src_off;
+    void *dst_ptr;
+    uint64_t dst_off;
+    int recorded;
+} ds4_softplus_sqrt_icb_slot;
+#define DS4_SOFTPLUS_SQRT_ICB_SLOTS 2
+static ds4_softplus_sqrt_icb_slot g_softplus_sqrt_icb_slots[DS4_SOFTPLUS_SQRT_ICB_SLOTS];
+static id<MTLBuffer> g_softplus_sqrt_icb_args_buffer;  /* one buffer shared across slots — args constant */
+
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_model_buffer_cache;
@@ -12608,6 +12625,80 @@ static NSUInteger ds4_gpu_bin_threads(uint32_t width, id<MTLComputePipelineState
  return nth ? nth : 1u;
 }
 
+/* #558 ICB Phase 4 helper for kernel_dsv4_softplus_sqrt_f32_4. The fixed
+ * dispatch shape (width=256, rows=1, c4=1, min=0, max=0) means args + grid
+ * are constant across both call sites; only src/dst buffers vary. Returns 1
+ * if ICB executed, 0 if fell through. Opt-in via DS4_ICB_SOFTPLUS=1. */
+static int ds4_softplus_sqrt_dispatch_icb(id<MTLCommandBuffer> cb,
+                                           uint32_t slot_idx,
+                                           id<MTLComputePipelineState> pipeline,
+                                           id<MTLBuffer> src, NSUInteger src_off,
+                                           id<MTLBuffer> dst, NSUInteger dst_off) {
+    static int s_env_checked = 0;
+    static int s_env_active = 0;
+    if (!s_env_checked) {
+        s_env_active = getenv("DS4_ICB_SOFTPLUS") != NULL ? 1 : 0;
+        s_env_checked = 1;
+        if (s_env_active) {
+            fprintf(stderr, "ds4: DS4_ICB_SOFTPLUS=1 — softplus_sqrt ICB engaged (opt-in; measurement pending)\n");
+        }
+    }
+    if (!s_env_active) return 0;
+    if (slot_idx >= DS4_SOFTPLUS_SQRT_ICB_SLOTS) return 0;
+    if (!pipeline) return 0;
+
+    if (!g_softplus_sqrt_icb) {
+        MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
+        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+        desc.inheritBuffers = NO;
+        desc.inheritPipelineState = NO;
+        desc.maxKernelBufferBindCount = 3;
+        g_softplus_sqrt_icb =
+            [g_device newIndirectCommandBufferWithDescriptor:desc
+                                              maxCommandCount:(NSUInteger)DS4_SOFTPLUS_SQRT_ICB_SLOTS
+                                                      options:MTLResourceStorageModeShared];
+        if (!g_softplus_sqrt_icb) return 0;
+    }
+    if (!g_softplus_sqrt_icb_args_buffer) {
+        ds4_gpu_unary_args args = ds4_gpu_make_unary_rows_args(256u, 1u, 1, 0.0f, 0.0f);
+        args.min = 0.0f;
+        args.max = 0.0f;
+        g_softplus_sqrt_icb_args_buffer =
+            [g_device newBufferWithBytes:&args length:sizeof(args)
+                                 options:MTLResourceStorageModeShared];
+        if (!g_softplus_sqrt_icb_args_buffer) return 0;
+    }
+
+    ds4_softplus_sqrt_icb_slot *slot = &g_softplus_sqrt_icb_slots[slot_idx];
+    const int sig_match = slot->recorded &&
+        slot->src_ptr == (__bridge void *)src && slot->src_off == (uint64_t)src_off &&
+        slot->dst_ptr == (__bridge void *)dst && slot->dst_off == (uint64_t)dst_off;
+
+    if (!sig_match) {
+        /* width=256, c4=1 → ne00=64; nth=64 (≤ pipeline max); nk0=1; grid (1,1,1). */
+        id<MTLIndirectComputeCommand> cmd =
+            [g_softplus_sqrt_icb indirectComputeCommandAtIndex:slot_idx];
+        [cmd setComputePipelineState:pipeline];
+        [cmd setKernelBuffer:g_softplus_sqrt_icb_args_buffer offset:0 atIndex:0];
+        [cmd setKernelBuffer:src offset:src_off atIndex:1];
+        [cmd setKernelBuffer:dst offset:dst_off atIndex:2];
+        [cmd concurrentDispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        slot->src_ptr = (__bridge void *)src; slot->src_off = (uint64_t)src_off;
+        slot->dst_ptr = (__bridge void *)dst; slot->dst_off = (uint64_t)dst_off;
+        slot->recorded = 1;
+    }
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc useResource:g_softplus_sqrt_icb_args_buffer usage:MTLResourceUsageRead];
+    [enc useResource:src usage:MTLResourceUsageRead];
+    [enc useResource:dst usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    [enc executeCommandsInBuffer:g_softplus_sqrt_icb
+                       withRange:NSMakeRange(slot_idx, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static int ds4_gpu_encode_unary_f32_rows(
  id<MTLCommandBuffer> cb,
  id<MTLComputePipelineState> pipeline,
@@ -13673,6 +13764,9 @@ static int ds4_gpu_encode_router_select(
  "kernel_dsv4_router_weights_one");
  if (!softplus_sqrt_pipeline || !router_finalize_pipeline || !router_weights_pipeline) return 0;
 
+ /* #558 ICB Phase 4 attempt; slot 0 = this site (~13767). Falls through on opt-out. */
+ if (!ds4_softplus_sqrt_dispatch_icb(cb, 0, softplus_sqrt_pipeline,
+                                     logitsbuf, logits_off, probsbuf, probs_off)) {
  ok = ds4_gpu_encode_unary_f32_rows(cb,
  softplus_sqrt_pipeline,
  logitsbuf,
@@ -13685,6 +13779,7 @@ static int ds4_gpu_encode_router_select(
  0.0f,
  0.0f);
  if (!ok) return 0;
+ }
 
  const bool use_token_buffer = single_token == NULL;
  ds4_gpu_dsv4_router_select_one_args args = {
@@ -13758,6 +13853,11 @@ static int ds4_gpu_encode_router_select(
  id<MTLComputePipelineState> softplus_sqrt_pipeline =
  ds4_gpu_hot_pipeline(g_dsv4_softplus_sqrt_pipeline,
  "kernel_dsv4_softplus_sqrt_f32_4");
+ /* #558 ICB Phase 4 attempt; slot 1 = this site (~13857). */
+ if (softplus_sqrt_pipeline && ds4_softplus_sqrt_dispatch_icb(cb, 1, softplus_sqrt_pipeline,
+                                                              logitsbuf, logits_off, probsbuf, probs_off)) {
+ ok = 1;
+ } else {
  ok = softplus_sqrt_pipeline &&
  ds4_gpu_encode_unary_f32_rows(cb,
  softplus_sqrt_pipeline,
@@ -13770,6 +13870,7 @@ static int ds4_gpu_encode_router_select(
  1,
  0.0f,
  0.0f);
+ }
  } else {
  ok = ds4_gpu_encode_unary_f32_rows(cb,
  g_unary_softplus_pipeline,
