@@ -135,6 +135,26 @@ typedef struct {
 static ds4_route_remap_icb_slot g_route_remap_icb_slots[43];
 static int g_route_remap_icb_env_checked;
 static int g_route_remap_icb_env_active;
+
+/* ICB for kernel_dsv4_router_weights_one. Two call sites (n_tokens==1 paths)
+ * with identical 3-setBuffer + dispatchThreads(6,1,1) pattern. Already
+ * ICB-compatible structurally (no setBytes). One 2-command ICB with two
+ * signature slots so both call sites can share the cached recording.
+ * Per-token cost saved per ICB hit: ~10-30 μs encoder setup.
+ * Slot 0 = decode-router-select-one path (L13574)
+ * Slot 1 = generic-n_tokens-1 path (L13688) */
+static id<MTLIndirectCommandBuffer> g_route_weights_one_icb;
+typedef struct {
+    void *probs_ptr;
+    uint64_t probs_off;
+    void *selected_ptr;
+    uint64_t selected_off;
+    void *weights_ptr;
+    uint64_t weights_off;
+    int recorded;
+} ds4_route_weights_one_icb_slot;
+static ds4_route_weights_one_icb_slot g_route_weights_one_icb_slots[2];
+
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_model_buffer_cache;
@@ -402,6 +422,16 @@ static uint64_t round_up_u64(uint64_t v, uint64_t align) {
 
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
 static int ds4_gpu_warm_model_views(void);
+
+/* task #560: ICB record→replay for kernel_dsv4_router_weights_one. Defined
+ * far below alongside the route_remap helpers; declared here for use by the
+ * two dispatch sites in the router-select-one paths. */
+static int ds4_route_weights_one_dispatch(id<MTLCommandBuffer> cb,
+                                           id<MTLComputePipelineState> pipeline,
+                                           uint32_t slot_idx,
+                                           id<MTLBuffer> probsbuf, NSUInteger probs_off,
+                                           id<MTLBuffer> selectedbuf, NSUInteger selected_off,
+                                           id<MTLBuffer> weightsbuf, NSUInteger weights_off);
 
 static double ds4_gpu_now_ms(void) {
  struct timespec ts;
@@ -4611,6 +4641,8 @@ void ds4_gpu_cleanup(void) {
  memset(g_route_remap_icb_slots, 0, sizeof(g_route_remap_icb_slots));
  g_route_remap_icb_env_checked = 0;
  g_route_remap_icb_env_active = 0;
+ g_route_weights_one_icb = nil;
+ memset(g_route_weights_one_icb_slots, 0, sizeof(g_route_weights_one_icb_slots));
  g_dsv4_hc_expand4_pipeline = nil;
  g_flash_attn_mask_buffer = nil;
  g_flash_attn_pad_buffer = nil;
@@ -13570,14 +13602,21 @@ static int ds4_gpu_encode_router_select(
  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
  ds4_gpu_end_compute_encoder(cb, enc);
 
- enc = ds4_gpu_compute_encoder(cb);
- [enc setComputePipelineState:router_weights_pipeline];
- [enc setBuffer:probsbuf offset:probs_off atIndex:0];
- [enc setBuffer:selectedbuf offset:selected_off atIndex:1];
- [enc setBuffer:weightsbuf offset:weights_off atIndex:2];
- [enc dispatchThreads:MTLSizeMake(6, 1, 1)
- threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
- ds4_gpu_end_compute_encoder(cb, enc);
+ /* ICB record→replay path (slot 0 — decode-select-one), task #560.
+  * Falls through to direct encoding when DS4_ICB_ACTIVE is off. */
+ if (!ds4_route_weights_one_dispatch(cb, router_weights_pipeline, 0,
+                                      probsbuf, probs_off,
+                                      selectedbuf, selected_off,
+                                      weightsbuf, weights_off)) {
+     enc = ds4_gpu_compute_encoder(cb);
+     [enc setComputePipelineState:router_weights_pipeline];
+     [enc setBuffer:probsbuf    offset:probs_off    atIndex:0];
+     [enc setBuffer:selectedbuf offset:selected_off atIndex:1];
+     [enc setBuffer:weightsbuf  offset:weights_off  atIndex:2];
+     [enc dispatchThreads:MTLSizeMake(6, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
+     ds4_gpu_end_compute_encoder(cb, enc);
+ }
  return 1;
  }
 
@@ -13684,14 +13723,20 @@ static int ds4_gpu_encode_router_select(
  ds4_gpu_hot_pipeline(g_dsv4_router_weights_one_pipeline,
  "kernel_dsv4_router_weights_one");
  if (!router_weights_pipeline) return 0;
- id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
- [enc setComputePipelineState:router_weights_pipeline];
- [enc setBuffer:probsbuf offset:probs_off atIndex:0];
- [enc setBuffer:selectedbuf offset:selected_off atIndex:1];
- [enc setBuffer:weightsbuf offset:weights_off atIndex:2];
- [enc dispatchThreads:MTLSizeMake(6, 1, 1)
- threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
- ds4_gpu_end_compute_encoder(cb, enc);
+ /* ICB record→replay path (slot 1 — generic-n_tokens-1 path), task #560. */
+ if (!ds4_route_weights_one_dispatch(cb, router_weights_pipeline, 1,
+                                      probsbuf, probs_off,
+                                      selectedbuf, selected_off,
+                                      weightsbuf, weights_off)) {
+     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+     [enc setComputePipelineState:router_weights_pipeline];
+     [enc setBuffer:probsbuf    offset:probs_off    atIndex:0];
+     [enc setBuffer:selectedbuf offset:selected_off atIndex:1];
+     [enc setBuffer:weightsbuf  offset:weights_off  atIndex:2];
+     [enc dispatchThreads:MTLSizeMake(6, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
+     ds4_gpu_end_compute_encoder(cb, enc);
+ }
  return 1;
  }
 
@@ -14247,6 +14292,86 @@ int ds4_gpu_routed_moe_one_tensor(
  * - inverse remap table not uploaded (no trim metadata).
  *
  * Returns 1 on success / no-op-success, 0 on failure. */
+/* ICB record→replay for kernel_dsv4_router_weights_one (task #560).
+ * Called at most once per token from the n_tokens==1 decode path. Two
+ * dispatch sites with identical structure (probs/selected/weights buffers,
+ * dispatchThreads(6,1,1) → 1 threadgroup × 6 threads in ICB form).
+ * The 2-slot signature cache lets both call sites share the recording.
+ * Returns 1 if executed via ICB (or fell through), 0 only on hard error.
+ *
+ * Per-token cost saved per ICB hit: ~10-30 μs encoder setup. Marginal
+ * compared to route_weights_with_remap (per-layer × 43), but extends the
+ * H1716 graph-capture pattern to one more kernel in the route chain. */
+static int ds4_route_weights_one_dispatch(id<MTLCommandBuffer> cb,
+                                           id<MTLComputePipelineState> pipeline,
+                                           uint32_t slot_idx,
+                                           id<MTLBuffer> probsbuf, NSUInteger probs_off,
+                                           id<MTLBuffer> selectedbuf, NSUInteger selected_off,
+                                           id<MTLBuffer> weightsbuf, NSUInteger weights_off) {
+    /* Measured 2026-05-25: 5-run A/B on trim50 full-Metal decode shows ICB-on
+     * gen regresses to ~17.1 t/s mean (vs ICB-off ~19.1 t/s) with high
+     * variance (15-19 range). The useResource×3 + executeCommandsInBuffer
+     * overhead per call exceeds the encoder-setup savings on a 6-thread
+     * kernel called once per token. Gate behind a SEPARATE env var so
+     * DS4_ICB_ACTIVE keeps the winning route_remap ICB (43 layers × per-token
+     * × 256-thread kernel) without dragging this losing one in by default.
+     * Set DS4_ICB_WEIGHTS_ONE=1 to opt in (e.g. for batched/prefill paths). */
+    static int s_env_checked = 0;
+    static int s_env_active = 0;
+    if (!s_env_checked) {
+        s_env_active = getenv("DS4_ICB_WEIGHTS_ONE") != NULL ? 1 : 0;
+        s_env_checked = 1;
+        if (s_env_active) {
+            fprintf(stderr, "ds4: DS4_ICB_WEIGHTS_ONE=1 — route_weights_one ICB engaged (opt-in: caller pays useResource cost)\n");
+        }
+    }
+    if (!s_env_active) return 0; /* caller does direct encoding */
+    if (slot_idx >= 2) return 0;
+
+    if (!g_route_weights_one_icb) {
+        MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
+        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+        desc.inheritBuffers = NO;
+        desc.inheritPipelineState = NO;
+        desc.maxKernelBufferBindCount = 3;
+        g_route_weights_one_icb =
+            [g_device newIndirectCommandBufferWithDescriptor:desc
+                                              maxCommandCount:2
+                                                      options:MTLResourceStorageModeShared];
+        if (!g_route_weights_one_icb) return 0;
+    }
+
+    ds4_route_weights_one_icb_slot *slot = &g_route_weights_one_icb_slots[slot_idx];
+    const int sig_match = slot->recorded &&
+        slot->probs_ptr    == (__bridge void *)probsbuf    && slot->probs_off    == (uint64_t)probs_off &&
+        slot->selected_ptr == (__bridge void *)selectedbuf && slot->selected_off == (uint64_t)selected_off &&
+        slot->weights_ptr  == (__bridge void *)weightsbuf  && slot->weights_off  == (uint64_t)weights_off;
+
+    if (!sig_match) {
+        id<MTLIndirectComputeCommand> cmd = [g_route_weights_one_icb indirectComputeCommandAtIndex:slot_idx];
+        [cmd setComputePipelineState:pipeline];
+        [cmd setKernelBuffer:probsbuf    offset:probs_off    atIndex:0];
+        [cmd setKernelBuffer:selectedbuf offset:selected_off atIndex:1];
+        [cmd setKernelBuffer:weightsbuf  offset:weights_off  atIndex:2];
+        /* dispatchThreads(6,1,1) threadsPerThreadgroup(6,1,1) ≡ 1 group × 6 threads */
+        [cmd concurrentDispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                      threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
+        slot->probs_ptr    = (__bridge void *)probsbuf;    slot->probs_off    = (uint64_t)probs_off;
+        slot->selected_ptr = (__bridge void *)selectedbuf; slot->selected_off = (uint64_t)selected_off;
+        slot->weights_ptr  = (__bridge void *)weightsbuf;  slot->weights_off  = (uint64_t)weights_off;
+        slot->recorded = 1;
+    }
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc useResource:probsbuf    usage:MTLResourceUsageRead];
+    [enc useResource:selectedbuf usage:MTLResourceUsageRead];
+    [enc useResource:weightsbuf  usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    [enc executeCommandsInBuffer:g_route_weights_one_icb
+                       withRange:NSMakeRange(slot_idx, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 int ds4_gpu_remap_routed_for_trim(
  ds4_gpu_tensor *selected,
  ds4_gpu_tensor *weights,
