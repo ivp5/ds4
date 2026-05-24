@@ -13798,8 +13798,9 @@ static int ds4_gpu_encode_router_select(
  return 0;
  }
 
- /* #559 ICB Phase 5 — NOT shipped. Two structural blockers prevent
-  * record/replay of router_finalize_one:
+ /* #559 ICB Phase 5 + #566 multi-command finalize-sequence ICB —
+  * BOTH closed (no code) with shared structural blocker. Two reasons
+  * router_finalize_one cannot be ICB-recorded on its current shape:
   *
   *   1. setThreadgroupMemoryLength (line below, 2 KB workspace) has NO
   *      equivalent in MTLIndirectComputeCommand. ICB exposes
@@ -13817,7 +13818,15 @@ static int ds4_gpu_encode_router_select(
   * Closing #559 with the doctrine block here so future-claude (or
   * a future codex agent) doesn't re-attempt without first restructuring
   * the kernel + caller. The direct encoding below remains the only
-  * viable path on the current shape. */
+  * viable path on the current shape.
+  *
+  * #566 (multi-command finalize-sequence ICB: route_finalize +
+  * weights_one in one ICB dispatch) inherits this blocker. The
+  * weights_one half is already ICB-able (#560, ds4_route_weights_one_dispatch
+  * below this block) BUT chaining it with route_finalize in a single
+  * ICB requires route_finalize be ICB-able first. Same kernel refactor
+  * (move setThreadgroupMemoryLength → fixed-size MSL declarations) is
+  * the gate for both. */
  id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
  [enc setComputePipelineState:router_finalize_pipeline];
  [enc setBytes:&args length:sizeof(args) atIndex:0];
