@@ -365,3 +365,51 @@ The next end-to-end deliverable is therefore: read PLR2 polar weights
 gate the rerank by pressure (post-#566 win). Per-token cost moves
 from "constant" to "load-bearing on actual ambiguity," which is what
 H1738 first measured and H1744 turned into a policy table.
+
+### H1745 — Q6 approximate pressure can select its own safe width
+
+H1745 closes the main implementation leak H1744 left open: the H1744
+policy was generated assuming access to clean-precision pressure (full
+fp16 router logits), but at inference time the runtime only has the q6
+approximate logits. H1745 ran the rescue probe with pressure computed
+from q6-approximate entropy + q6 kth-vs-next margin (no clean-side
+peek) and got:
+
+  - widths 9/8/6 chosen per pressure bucket — same as H1744
+  - 0 under-allocation cases
+  - 100% clean-top-6 containment after rerank
+  - 1,553 candidates vs H1744's 1,563 (slightly fewer)
+
+**Why the approximate pressure still works**: q6 row preserves the
+boundary ordering with 88.89% top-6 set exact, 66.20% order exact,
+98.15% top-1 exact. The pressure signal (entropy norm, kth-margin) is
+a robust summary statistic that doesn't depend on perfect ranks —
+small router perturbations don't move pressure across buckets unless
+the boundary is actually fragile, and that's the case we wanted to
+catch anyway.
+
+**Budget shift made operational by H1745** (no clean-side dependency):
+
+  - High-precision router logit compute: 55,296 → 1,553 (**35.61× fewer**)
+  - Total byte traffic vs fp16 full scan: q6-full-scan + fp16-rerank
+    = 0.403× = **2.48× lower router weight traffic**
+
+**Integration consequence**: the H1744 `.inc` policy table (shipped
+this turn at `analyzers/ds4_route_policy.inc`) is correct AS-IS. No
+need to thread clean-pressure access through the pipeline. The
+runtime hot path:
+
+  q6 router scan (cheap)
+    → q6 pressure (entropy_q6, kth_margin_q6)
+      → width lookup from policy table
+        → top-`width` candidates
+          → fp16 rerank on the small candidate set
+            → route certificate emitted to expert dispatcher
+
+**Next proof codex pre-declared**: MTL4 q6-route certificate kernel
+that produces the certificate in one dispatch. That's the q6 router
+analog of H1735's polar tiled fusion for the expert MLPs — and
+together they form the deployable inference kernel for DS4 V4 on M1
+Max with the polar + pressure-aware-router stack.
+
+Memo scope is now H1724 → H1745.
