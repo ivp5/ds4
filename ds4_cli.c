@@ -105,7 +105,10 @@ static void usage(FILE *fp) {
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
-        "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "      Prefer exact kernels where faster approximate paths exist; disables Metal Tensor routes; MTP uses strict verification.\n"
+        "  -mt MODE, --mt MODE\n"
+        "      Metal Tensor policy: auto, on, or off. Default: auto. Auto enables validated safe routes; 'on' is a route diagnostic and may change output.\n"
+        "      Legacy alias: --mpp MODE.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -114,28 +117,6 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
-        "  --cpu-moe\n"
-        "      Compute routed MoE experts on the CPU and keep their weights out of the Metal\n"
-        "      residency set. Lets very large GGUFs (e.g. q4 on 128 GB) run by leaving routed\n"
-        "      expert pages to the OS page cache. Metal backend only.\n"
-        "      Equivalent to --n-cpu-moe with all layers on CPU.\n"
-        "  --n-cpu-moe N\n"
-        "      Compute the routed MoE on the CPU only for the first N layers; the\n"
-        "      remaining layers stay on the GPU. Matches llama.cpp's --n-cpu-moe\n"
-        "      semantics. Tune N to trade VRAM for speed: N=10..20 is a typical\n"
-        "      sweet spot for q4 on 128 GB. N=0 disables CPU MoE entirely.\n"
-        "  --prefill-metal-phases auto|N\n"
-        "      Run prefill on Metal in N evenly-split phases, swapping the routed\n"
-        "      expert residency between phases. Generation falls back to cpu-moe.\n"
-        "      \"auto\" sizes N from sysctl iogpu.wired_limit_mb (bounded by\n"
-        "      hw.memsize) so each phase fits the Metal wired-memory cap.\n"
-        "      Mutually exclusive with --cpu-moe / --n-cpu-moe. Metal backend only.\n"
-        "      Env overrides: DS4_PREFILL_METAL_PHASES_WIRED_LIMIT_MIB,\n"
-        "      DS4_PREFILL_METAL_PHASES_HEADROOM_MIB (default 14336),\n"
-        "      DS4_PREFILL_METAL_PHASES_MIN_TOKENS (default 0; set e.g. 1500\n"
-        "      for single-shot chat to fall back to cpu-moe on short prompts).\n"
-        "  --power N\n"
-        "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -168,8 +149,6 @@ static void usage(FILE *fp) {
         "      Select normal thinking, context-gated Think Max, or non-thinking mode.\n"
         "  /ctx N\n"
         "      Recreate the interactive session with a new context size.\n"
-        "  /power N\n"
-        "      Set GPU duty cycle percentage, 1..100.\n"
         "  /read FILE\n"
         "      Read a prompt from FILE and run it as the next user message.\n"
         "  /quit, /exit\n"
@@ -271,6 +250,15 @@ static ds4_backend default_backend(void) {
 #else
     return DS4_BACKEND_CUDA;
 #endif
+}
+
+static ds4_mpp_mode parse_mpp_mode(const char *s) {
+    if (!strcmp(s, "auto")) return DS4_MPP_AUTO;
+    if (!strcmp(s, "on")) return DS4_MPP_ON;
+    if (!strcmp(s, "off")) return DS4_MPP_OFF;
+    fprintf(stderr, "ds4: invalid Metal Tensor mode: %s\n", s);
+    fprintf(stderr, "ds4: valid Metal Tensor modes are: auto, on, off\n");
+    exit(2);
 }
 
 static void log_context_memory(ds4_backend backend, int ctx_size) {
@@ -709,9 +697,10 @@ static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_
     fprintf(fp, "{\n  \"source\":\"ds4\",\n  \"model\":");
     json_write_string(fp, cfg->engine.model_path, strlen(cfg->engine.model_path));
     fprintf(fp,
-            ",\n  \"backend\":\"%s\",\n  \"quant_bits\":%d,\n"
+            ",\n  \"backend\":\"%s\",\n  \"mt\":\"%s\",\n  \"quant_bits\":%d,\n"
             "  \"prompt_tokens\":%d,\n  \"ctx\":%d,\n  \"vocab\":%d,\n",
             ds4_backend_name(cfg->engine.backend),
+            ds4_mpp_mode_name(cfg->engine.mpp_mode),
             ds4_engine_routed_quant_bits(engine),
             prompt->len,
             cfg->gen.ctx_size,
@@ -994,18 +983,9 @@ static void print_repl_help(void) {
     puts("  /think-max     Use Think Max only when context is at least 393216 tokens.");
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
-    puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /read FILE     Read a prompt from FILE and run it.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
-}
-
-static bool parse_power_percent(const char *arg, int *out) {
-    char *end = NULL;
-    long v = strtol(arg, &end, 10);
-    if (!arg[0] || *end != '\0' || v < 1 || v > 100) return false;
-    *out = (int)v;
-    return true;
 }
 
 static void history_file_path(char *buf, size_t len) {
@@ -1289,21 +1269,6 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             cfg->gen.think_mode = DS4_THINK_NONE;
             repl_chat_apply_max_prefix(engine, &chat, false);
             puts("Thinking mode: none.");
-        } else if (!strncmp(cmd, "/power", 6) && (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
-            char *arg = trim_inplace(cmd + 6);
-            if (!arg[0]) {
-                printf("Power: %d%%.\n", ds4_session_power(chat.session));
-            } else {
-                int power = 0;
-                if (!parse_power_percent(arg, &power)) {
-                    fprintf(stderr, "ds4: /power must be between 1 and 100\n");
-                } else if (ds4_session_set_power(chat.session, power) != 0) {
-                    fprintf(stderr, "ds4: failed to set /power\n");
-                } else {
-                    cfg->engine.power_percent = power;
-                    printf("Power: %d%%.\n", power);
-                }
-            }
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
             char *arg = trim_inplace(cmd + 4);
             if (!arg[0]) {
@@ -1467,12 +1432,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
-        } else if (!strcmp(arg, "--power")) {
-            c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
-            if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
-                fprintf(stderr, "ds4: --power must be between 1 and 100\n");
-                exit(2);
-            }
+        } else if (!strcmp(arg, "-mt") || !strcmp(arg, "--mt") || !strcmp(arg, "--mpp")) {
+            c.engine.mpp_mode = parse_mpp_mode(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
@@ -1491,17 +1452,6 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
-        } else if (!strcmp(arg, "--cpu-moe")) {
-            c.engine.cpu_moe = true;
-        } else if (!strcmp(arg, "--n-cpu-moe")) {
-            c.engine.n_cpu_moe_layers = parse_int(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--prefill-metal-phases")) {
-            const char *s = need_arg(&i, argc, argv, arg);
-            if (!strcmp(s, "auto")) {
-                c.engine.prefill_metal_phases = -1;
-            } else {
-                c.engine.prefill_metal_phases = parse_int(s, arg);
-            }
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {

@@ -20857,3 +20857,26 @@ int ds4_session_pos(ds4_session *s) {
 int ds4_session_ctx(ds4_session *s) {
     return s->ctx_size;
 }
+
+/* --- upstream 23e1ea5/63ceed6 functions added during merge --- */
+
+int ds4_engine_vocab_size(ds4_engine *e) {
+    return e ? e->vocab.n_vocab : 0;
+}
+
+int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
+    if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
+    memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
+    return (int)DS4_N_VOCAB;
+}
+
+
+int ds4_session_power(ds4_session *s) {
+    (void)s;
+    return 100;
+}
+
+int ds4_session_set_power(ds4_session *s, int power_percent) {
+    (void)s; (void)power_percent;
+    return 0;
+}

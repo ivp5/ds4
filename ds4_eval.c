@@ -90,7 +90,6 @@ typedef struct {
     const char *answer;
 } eval_case;
 
-#include "eval_cases_data.inc.c"
 static const eval_case eval_cases[] = {
     {
         .source = "GPQA Diamond",
@@ -245,12 +244,12 @@ static const eval_case eval_cases[] = {
         .answer = "16",
     },
     {
-        .source = "GPQA Diamond (modified)",
+        .source = "GPQA Diamond",
         .id = "recDytVnNYZe2HuUU",
         .domain = "Physics",
         .title = "What is the energy of the Relativistic Heavy Ion Collider (RHIC)",
         .question = "What is the energy of the Relativistic Heavy Ion Collider (RHIC) so that the speed of the nucleus X is equal to 0.96c?\n\nKnowing that X is defined as Li with 3 neutrons.\n\nPS: the precision of the energy is at 1e-4.",
-        .choice[0] = "20.011 GeV",
+        .choice[0] = "20.132 GeV",
         .choice[1] = "18.475 GeV",
         .choice[2] = "21.419",
         .choice[3] = "23.069 GeV",
@@ -1204,7 +1203,6 @@ typedef struct {
     float min_p;
     uint64_t seed;
     int pause_ms;
-    int power_percent;
     int soft_limit_reply_budget;
     int hard_limit_reply_budget;
     int soft_limit_think_close_rank;
@@ -1212,9 +1210,6 @@ typedef struct {
     bool plain;
     bool warm_weights;
     bool quality;
-    bool cpu_moe;
-    int  n_cpu_moe_layers;
-    int  prefill_metal_phases;
     bool self_test_extractors;
 } eval_config;
 
@@ -1497,7 +1492,6 @@ static void usage(FILE *fp) {
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
         "  --warm-weights         Touch mapped tensor pages before evaluation.\n"
-        "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
         "Evaluation:\n"
         "  -n, --tokens N         Max generated tokens per question. Default: 16000\n"
@@ -1585,12 +1579,6 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
-        } else if (!strcmp(arg, "--power")) {
-            c.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-            if (c.power_percent < 1 || c.power_percent > 100) {
-                fprintf(stderr, "ds4-eval: --power must be between 1 and 100\n");
-                exit(2);
-            }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
         } else if (!strcmp(arg, "--think")) {
@@ -1599,18 +1587,6 @@ static eval_config parse_options(int argc, char **argv) {
             c.think_mode = DS4_THINK_NONE;
         } else if (!strcmp(arg, "--plain")) {
             c.plain = true;
-        } else if (!strcmp(arg, "--cpu-moe")) {
-            c.cpu_moe = true;
-        } else if (!strcmp(arg, "--n-cpu-moe")) {
-            const char *s = need_arg(&i, argc, argv, arg);
-            c.n_cpu_moe_layers = parse_int_arg(s, arg);
-        } else if (!strcmp(arg, "--prefill-metal-phases")) {
-            const char *s = need_arg(&i, argc, argv, arg);
-            if (!strcmp(s, "auto")) {
-                c.prefill_metal_phases = -1;
-            } else {
-                c.prefill_metal_phases = parse_int_arg(s, arg);
-            }
         } else if (!strcmp(arg, "--self-test-extractors")) {
             c.self_test_extractors = true;
         } else {
@@ -1921,7 +1897,7 @@ static void tui_signal_restore(int sig) {
     }
     if (ui && ui->active) {
         const char restore[] = ANSI_RESET "\x1b[?25h\x1b[?1049l";
-        if (write(STDOUT_FILENO, restore, sizeof(restore) - 1) == -1) {}
+        (void)write(STDOUT_FILENO, restore, sizeof(restore) - 1);
         ui->active = false;
     }
     signal(sig, SIG_DFL);
@@ -2419,8 +2395,6 @@ static int eval_auto_context_size(ds4_engine *engine,
 static void trace_write_block(FILE *trace, const char *label, const char *text) {
     if (!trace) return;
     size_t len = text ? strlen(text) : 0;
-    /* Counted blocks make regrading robust against model output that happens
-     * to contain trace-looking delimiters or embedded CASE headers. */
     fprintf(trace, "%s_BEGIN bytes=%zu\n", label, len);
     if (len) {
         fwrite(text, 1, len, trace);
@@ -2896,12 +2870,6 @@ static void copy_span(char *dst, size_t dstlen, const char *start, const char *e
 static const char *trace_skip_counted_block(const char *line,
                                             const char *line_end,
                                             const char *end) {
-    /*
-     * Trace regrading must scan metadata lines without being confused by model
-     * output.  Prefer the byte count written by trace_write_block(); the older
-     * delimiter-only parser is still accepted in trace_copy_model_output for
-     * compatibility with existing trace files.
-     */
     const char *begin = bounded_strstr(line, line_end, "_BEGIN bytes=");
     if (!begin || begin == line) return NULL;
 
@@ -3289,9 +3257,7 @@ static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
 
 static void eval_prefill_progress(void *ud, const char *event, int current, int total) {
     eval_ui *ui = ud;
-    if (!ui || !event) return;
-    if (strcmp(event, "prefill_chunk") && strcmp(event, "prefill_display"))
-        return;
+    if (!ui || !event || strcmp(event, "prefill_chunk")) return;
     tui_consume_input(ui);
     tui_run_clock_tick(ui);
     ui->prefill_current = current;
@@ -3388,10 +3354,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
 
     char err[256];
     ds4_session_set_progress(session, eval_prefill_progress, ui);
-    ds4_session_set_display_progress(session, eval_prefill_progress, ui);
     if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
         ds4_session_set_progress(session, NULL, NULL);
-        ds4_session_set_display_progress(session, NULL, NULL);
         tui_run_clock_stop(ui);
         fprintf(stderr, "ds4-eval: prefill failed for %s: %s\n", tc->id, err);
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
@@ -3401,7 +3365,6 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         return EVAL_RUN_ERROR;
     }
     ds4_session_set_progress(session, NULL, NULL);
-    ds4_session_set_display_progress(session, NULL, NULL);
     int prompt_tokens = prompt.len;
     ui->prompt_tokens[idx] = prompt_tokens;
     ds4_tokens_free(&prompt);
@@ -3729,12 +3692,8 @@ int main(int argc, char **argv) {
         .n_threads = cfg.threads,
         .mtp_draft_tokens = 1,
         .mtp_margin = 3.0f,
-        .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
-        .cpu_moe = cfg.cpu_moe,
-        .n_cpu_moe_layers = cfg.n_cpu_moe_layers,
-        .prefill_metal_phases = cfg.prefill_metal_phases,
     };
 
     ds4_engine *engine = NULL;
