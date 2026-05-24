@@ -42,21 +42,6 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
-int ds4_gpu_set_model_map_ranges(const void *model_map, uint64_t model_size,
-                                 const uint64_t *map_offsets, const uint64_t *map_sizes,
-                                 uint32_t n_ranges);
-/* Register an ADDITIONAL Metal model-view range without clearing existing views.
- * Used to map a secondary mmap (e.g. the MTP draft module) alongside the main
- * model so both can be wrapped by ds4_gpu_wrap_model_range() at inference time.
- * Returns 1 on success, 0 on failure. The set/ranges variants above clear all
- * existing views before mapping; this one does not. */
-int ds4_gpu_add_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
-/* Set a one-shot flag that suppresses the warmup touch-loop in the NEXT
- * call to a residency-establishing API.  Used by --prefill-metal-phases
- * so phase swaps avoid the 20-30s synchronous page-touch pass; the
- * initial residency at engine_open and any explicit user warmup still
- * pay the page-in cost.  Returns the previous flag value. */
-int ds4_gpu_set_skip_next_warmup(int skip);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
@@ -832,3 +817,10 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         uint32_t                n_hc);
 
 #endif
+
+/* silv-side helpers (preserved across upstream merge): */
+int ds4_gpu_set_model_map_ranges(const void *model_map, uint64_t model_size,
+                                  const uint64_t *map_offsets, const uint64_t *map_sizes,
+                                  uint32_t n_ranges);
+int ds4_gpu_add_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
+int ds4_gpu_set_skip_next_warmup(int skip);
