@@ -477,3 +477,41 @@ into the engine; B-2 will dispatch H1735; a future #566 / topk(k+1)
 hookup brings H1746 into the router slot.
 
 Memo scope now H1724 → H1746.
+
+### H1747 — Candidate rows are not automatically small; reuse is the organ
+
+Closes the H1746 router memory frontier with a measured surprise:
+naive per-token candidate-row extraction is WORSE than full fp32
+residency, not better.
+
+  - Naive per-token candidate rows: 31.85 MB = **1.266× full fp32 router**
+  - Deduplicated exact-row cache:   16.17 MB = **0.643× full fp32 router**
+  - Total input H1746 → H1747:      35.00 MB → 26.02 MB = **0.744×**
+
+Correctness on 216 cases: GPU qtop matched host qtop 100%, qtop
+contained clean top-6 100%, rerank set/order exact 100%, missing
+cache cases 0.
+
+**The shift "only candidate rows" is a false simplification**. The
+per-token candidate set spans many distinct (layer, expert) rows
+per token; aggregated across tokens, the SAME (layer, expert) rows
+recur. Naive per-token slicing pays for each occurrence; the
+deduplicated cache pays once. Reuse — not slicing — is the real
+memory organ.
+
+Codex pre-declared next targets: quantize the exact cache itself
+(currently fp32 in the cache; could be q6 or q4 with rerank only
+at use site), test larger prompt/token traces where reuse compounds
+(216-case probe may underestimate reuse on real workloads).
+
+**Generalizes beyond router**: the same lesson applies to expert
+MLPs. Per-token expert dispatch routes through 6 of 256; aggregated
+across a 1000-token prompt, expert reuse is high (per H1738
+attractor analysis, 65/72 cases are in low-pressure low-entropy
+basins where the same experts fire repeatedly). The polar Phase B-2
+integration can exploit this: each expert's gate/up/down PLR2 file
+gets mmap-resident on first use, cached for all subsequent tokens
+routing to it. The DS4 V4 page cache + my mmap-based reader
+(commit aad0608) gets this for free on the disk-paging side.
+
+**Memo scope now H1724 → H1747.**
