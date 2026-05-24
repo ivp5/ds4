@@ -15166,6 +15166,233 @@ int ds4_gpu_mtl4_polar_dot_canary(uint32_t packets, uint32_t pairs) {
     }
 }
 
+/* ============================================================ */
+/* H1729 tile×row×batch polar dot kernel                        */
+/* ============================================================ */
+/* Per codex H1729: real MoE execution unit = "resident expert-code tile +
+ * streaming hidden states". Same MSL kernel shape as H1725 but the
+ * dispatch is 3D (tile, row, batch) and the hidden vector is indexed by
+ * (batch, tile) — SAME hidden vector reused across all rows of a tile.
+ * That's the layout amortization: per-token hidden state fans out to all
+ * the weight rows of one expert sub-block in a single dispatch.
+ *
+ * Measured (codex H1729 on M1 Max): b8 = 46.70 ns/output (1.45× over
+ * per-packet H1725), b32 = 31.81× layout reduction. Best per-output at
+ * b8; best layout amortization at b32.
+ *
+ * Self-test: ds4_gpu_mtl4_polar_tile_canary(tiles, rows, batches, pairs).
+ * Synthetic deterministic input: mag=0, phase=4 (angle 0), level[0]=1,
+ * hidden=1. Expected per output = pairs × 1.0.
+ *
+ * Codex artifact source:
+ *   research/llm_fallacy_deconstruction/framework_deconstruction/
+ *     h1729_mtl4_polar_tile32_batched_kernel_20260525.m
+ */
+
+static id<MTLComputePipelineState> g_polar_tile_pipeline;
+static int g_polar_tile_init_attempted;
+static int g_polar_tile_init_ok;
+
+static int ds4_polar_tile_pipeline_init(void) {
+    if (g_polar_tile_init_attempted) return g_polar_tile_init_ok;
+    g_polar_tile_init_attempted = 1;
+
+    if (!ds4_polar_pipeline_init()) return 0; /* reuse the compiler + queue + allocator */
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "kernel void polar_dot_tile(device const uchar* mag [[buffer(0)]],\n"
+         "                            device const uchar* phase [[buffer(1)]],\n"
+         "                            device const float* levels [[buffer(2)]],\n"
+         "                            device const float* hidden [[buffer(3)]],\n"
+         "                            device const float* cos_lut [[buffer(4)]],\n"
+         "                            device const float* sin_lut [[buffer(5)]],\n"
+         "                            device float* out [[buffer(6)]],\n"
+         "                            device const uint* params [[buffer(7)]],\n"
+         "                            uint3 tg [[threadgroup_position_in_grid]],\n"
+         "                            uint tid [[thread_index_in_threadgroup]]) {\n"
+         "  constexpr uint THREADS = 256;\n"
+         "  threadgroup float partial[THREADS];\n"
+         "  uint tile = tg.x;\n"
+         "  uint row  = tg.y;\n"
+         "  uint batch = tg.z;\n"
+         "  uint pairs = params[0];\n"
+         "  uint rows  = params[1];\n"
+         "  uint tiles = params[2];\n"
+         "  uint row_packet = tile * rows + row;\n"
+         "  uint row_packets = tiles * rows;\n"
+         "  uint code_base = row_packet * pairs;\n"
+         "  uint hbase = (batch * tiles + tile) * pairs * 2;\n"
+         "  float acc = 0.0f;\n"
+         "  for (uint j = tid; j < pairs; j += THREADS) {\n"
+         "    uint idx = code_base + j;\n"
+         "    uchar mcode = mag[idx];\n"
+         "    float qmag = levels[row_packet * 4 + uint(mcode)];\n"
+         "    uint lut = uint(phase[idx]);\n"
+         "    float x0 = qmag * cos_lut[lut];\n"
+         "    float x1 = qmag * sin_lut[lut];\n"
+         "    acc += x0 * hidden[hbase + 2*j] + x1 * hidden[hbase + 2*j + 1];\n"
+         "  }\n"
+         "  partial[tid] = acc;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (uint stride = THREADS >> 1; stride > 0; stride >>= 1) {\n"
+         "    if (tid < stride) partial[tid] += partial[tid + stride];\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  if (tid == 0) out[batch * row_packets + row_packet] = partial[0];\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_polar_dot_tile";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: polar tile MTL4 library failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"polar_dot_tile";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_polar_tile_pipeline = [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                                                compilerTaskOptions:nil
+                                                                              error:&err];
+    if (!g_polar_tile_pipeline) {
+        fprintf(stderr, "ds4: polar tile pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    g_polar_tile_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_polar_tile_canary(uint32_t tiles, uint32_t rows, uint32_t batches, uint32_t pairs) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_polar_tile_pipeline_init()) return 0;
+    if (tiles == 0 || rows == 0 || batches == 0 || pairs == 0) return 0;
+
+    @autoreleasepool {
+        NSError *err = nil;
+        const NSUInteger row_packets = (NSUInteger)tiles * rows;
+        const NSUInteger pair_count = row_packets * pairs;
+        const NSUInteger hidden_count = (NSUInteger)batches * tiles * pairs * 2;
+        const NSUInteger out_count = (NSUInteger)batches * row_packets;
+
+        id<MTLBuffer> mag      = [g_device newBufferWithLength:pair_count                          options:MTLResourceStorageModeShared];
+        id<MTLBuffer> phase    = [g_device newBufferWithLength:pair_count                          options:MTLResourceStorageModeShared];
+        id<MTLBuffer> levels   = [g_device newBufferWithLength:row_packets * 4 * sizeof(float)     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> hidden   = [g_device newBufferWithLength:hidden_count * sizeof(float)        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cosLut   = [g_device newBufferWithLength:9 * sizeof(float)                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> sinLut   = [g_device newBufferWithLength:9 * sizeof(float)                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf   = [g_device newBufferWithLength:out_count * sizeof(float)           options:MTLResourceStorageModeShared];
+        id<MTLBuffer> paramsBuf= [g_device newBufferWithLength:3 * sizeof(uint32_t)                options:MTLResourceStorageModeShared];
+        if (!mag || !phase || !levels || !hidden || !cosLut || !sinLut || !outBuf || !paramsBuf) return 0;
+
+        memset(mag.contents, 0, pair_count);
+        memset(phase.contents, 4, pair_count);
+        float *lvl = (float *)levels.contents;
+        for (NSUInteger p = 0; p < row_packets; p++) {
+            lvl[p * 4 + 0] = 1.0f; lvl[p * 4 + 1] = 0.5f;
+            lvl[p * 4 + 2] = 0.25f; lvl[p * 4 + 3] = 0.125f;
+        }
+        float *hid = (float *)hidden.contents;
+        for (NSUInteger i = 0; i < hidden_count; i++) hid[i] = 1.0f;
+        float *cosP = (float *)cosLut.contents;
+        float *sinP = (float *)sinLut.contents;
+        for (int code = -4; code <= 4; code++) {
+            float angle = (float)code * 0.78539816339744830962f;
+            cosP[code + 4] = cosf(angle);
+            sinP[code + 4] = sinf(angle);
+        }
+        uint32_t *params = (uint32_t *)paramsBuf.contents;
+        params[0] = pairs; params[1] = rows; params[2] = tiles;
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (!residency) return 0;
+        id<MTLAllocation> allocs[8] = {
+            (id<MTLAllocation>)mag, (id<MTLAllocation>)phase,
+            (id<MTLAllocation>)levels, (id<MTLAllocation>)hidden,
+            (id<MTLAllocation>)cosLut, (id<MTLAllocation>)sinLut,
+            (id<MTLAllocation>)outBuf, (id<MTLAllocation>)paramsBuf,
+        };
+        [residency addAllocations:allocs count:8];
+        [residency commit];
+        [residency requestResidency];
+
+        MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+        atDesc.maxBufferBindCount = 8;
+        atDesc.initializeBindings = YES;
+        id<MTL4ArgumentTable> argTable = [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+        if (!argTable) return 0;
+        [argTable setAddress:mag.gpuAddress       atIndex:0];
+        [argTable setAddress:phase.gpuAddress     atIndex:1];
+        [argTable setAddress:levels.gpuAddress    atIndex:2];
+        [argTable setAddress:hidden.gpuAddress    atIndex:3];
+        [argTable setAddress:cosLut.gpuAddress    atIndex:4];
+        [argTable setAddress:sinLut.gpuAddress    atIndex:5];
+        [argTable setAddress:outBuf.gpuAddress    atIndex:6];
+        [argTable setAddress:paramsBuf.gpuAddress atIndex:7];
+
+        id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+        [cb beginCommandBufferWithAllocator:g_polar_allocator];
+        [cb useResidencySet:residency];
+        id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) return 0;
+        [enc setComputePipelineState:g_polar_tile_pipeline];
+        [enc setArgumentTable:argTable];
+        [enc dispatchThreadgroups:MTLSizeMake(tiles, rows, batches)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb endCommandBuffer];
+
+        [g_polar_queue addResidencySet:residency];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block CFTimeInterval gpuStart = 0.0;
+        __block CFTimeInterval gpuEnd = 0.0;
+        __block NSError *fbErr = nil;
+        MTL4CommitOptions *opts = [MTL4CommitOptions new];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            fbErr = feedback.error;
+            gpuStart = feedback.GPUStartTime;
+            gpuEnd = feedback.GPUEndTime;
+            dispatch_semaphore_signal(sem);
+        }];
+        id<MTL4CommandBuffer> bufs[1] = { cb };
+        [g_polar_queue commit:bufs count:1 options:opts];
+        long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+        [residency endResidency];
+        if (waitRes != 0) { fprintf(stderr, "ds4: polar tile canary timeout\n"); return 0; }
+        if (fbErr) { fprintf(stderr, "ds4: polar tile feedback err: %s\n", fbErr.localizedDescription.UTF8String); return 0; }
+
+        float *outPtr = (float *)outBuf.contents;
+        float expected = (float)pairs * 1.0f;
+        float maxAbsErr = 0.0f;
+        for (NSUInteger i = 0; i < out_count; i++) {
+            float diff = fabsf(outPtr[i] - expected);
+            if (diff > maxAbsErr) maxAbsErr = diff;
+        }
+        const double gpuMs = (gpuEnd - gpuStart) * 1000.0;
+        fprintf(stderr,
+                "ds4: polar TILE canary tiles=%u rows=%u batches=%u pairs=%u "
+                "expected=%.3f out[0]=%.3f max_abs_err=%.3e gpu=%.6f ms "
+                "(%.0f ns/output, %.0f ns/packet, resident=%.1f MB)\n",
+                tiles, rows, batches, pairs,
+                (double)expected, (double)outPtr[0], (double)maxAbsErr, gpuMs,
+                gpuMs * 1e6 / (double)out_count,
+                gpuMs * 1e6 / (double)(out_count),
+                (double)(pair_count * 2 + row_packets * 4 * 4 + hidden_count * 4 + out_count * 4) / 1e6);
+        return maxAbsErr < 1e-3f ? 1 : 0;
+    }
+}
+
 static int ds4_mtl4_moe_env_enabled(void) {
  static int cached = -1;
  if (cached < 0) {

@@ -902,3 +902,13 @@ int ds4_gpu_set_skip_next_warmup(int skip);
  * Smoke-test surface for task #563 (polar MTL4 inference integration).
  * Returns 1 on success, 0 on failure. */
 int ds4_gpu_mtl4_polar_dot_canary(uint32_t packets, uint32_t pairs);
+
+/* H1729 tile×row×batch variant of the polar canary. Stores mag/phase/levels
+ * ONCE across all (tile, row) packets; streams `batches` hidden vectors
+ * through them. Hidden indexing is (batch, tile), so the same token's hidden
+ * state fans out to all `rows` weight rows of a tile. Codex measured b8 =
+ * 46.70 ns/output (1.45× over per-packet), b32 = 31.81× layout amortization.
+ *
+ * Returns 1 on success, 0 on failure. */
+int ds4_gpu_mtl4_polar_tile_canary(uint32_t tiles, uint32_t rows,
+                                    uint32_t batches, uint32_t pairs);

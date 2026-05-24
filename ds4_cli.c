@@ -1623,6 +1623,17 @@ int main(int argc, char **argv) {
         uint32_t pairs   = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 2048;
         return ds4_gpu_mtl4_polar_dot_canary(packets, pairs) ? 0 : 1;
     }
+    /* --polar-tile-canary [tiles [rows [batches [pairs]]]] : H1729 tile×row×batch
+     * polar dot, the deployable layout for routed-MoE inference. Defaults
+     * match codex H1727: tiles=2592/32=81 (one expert layer's gate split into
+     * 32-row tiles × 32 batches), rows=32, batches=8, pairs=2048. */
+    if (argc >= 2 && !strcmp(argv[1], "--polar-tile-canary")) {
+        uint32_t tiles   = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 81;
+        uint32_t rows    = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        uint32_t batches = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
+        uint32_t pairs   = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2048;
+        return ds4_gpu_mtl4_polar_tile_canary(tiles, rows, batches, pairs) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
