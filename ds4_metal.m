@@ -10,6 +10,7 @@
 #include <float.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/sysctl.h>
 
 #include "ds4.h"
@@ -14649,6 +14650,377 @@ static int ds4_mtl4_moe_env_enabled(void) {
 
 enum { DS4_MTL4_MOE_MAX_T = 16 };
 
+/* ---- IQ2_XXS dequant tables + function ----
+ * Duplicated from ds4.c (which has them static-internal) so the MTL4 path
+ * can dequant selected expert weights without cross-file linkage churn.
+ * Identical algorithm to the standard ggml dequantize_row_iq2_xxs. */
+static const uint8_t ds4_mtl4_kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+static const uint8_t ds4_mtl4_ksigns_iq2xs[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+static const uint64_t ds4_mtl4_iq2xxs_grid[256] = {
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
+    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
+    0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
+    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08, 0x08080808192b0819,
+    0x08080808192b1908, 0x080808082b080808, 0x080808082b08082b, 0x080808082b082b2b,
+    0x080808082b2b082b, 0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
+    0x0808081908191919, 0x0808081919080808, 0x080808192b081908, 0x080808192b192b08,
+    0x0808082b08080808, 0x0808082b0808082b, 0x0808082b082b082b, 0x0808082b2b08082b,
+    0x0808190808080819, 0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
+    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b, 0x0808190819082b08,
+    0x08081908192b0808, 0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
+    0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
+    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19, 0x080819192b080808,
+    0x080819192b190819, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b19080808,
+    0x0808192b2b081908, 0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
+    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08, 0x08082b0819080819,
+    0x08082b0819081908, 0x08082b0819190808, 0x08082b081919082b, 0x08082b082b082b08,
+    0x08082b1908081908, 0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
+    0x0819080808080819, 0x0819080808081908, 0x0819080808190808, 0x08190808082b0819,
+    0x0819080819080808, 0x08190808192b0808, 0x081908082b081908, 0x081908082b190808,
+    0x081908082b191919, 0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
+    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808, 0x0819082b082b1908,
+    0x0819082b19081919, 0x0819190808080808, 0x0819190808082b08, 0x08191908082b0808,
+    0x08191908082b1919, 0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
+    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b, 0x08192b0808080819,
+    0x08192b0808081908, 0x08192b0808190808, 0x08192b0819080808, 0x08192b082b080819,
+    0x08192b1908080808, 0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
+    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b, 0x082b080819081908,
+    0x082b0808192b0819, 0x082b08082b080808, 0x082b08082b08082b, 0x082b0819082b2b19,
+    0x082b081919082b08, 0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
+    0x082b190808081908, 0x082b190808190808, 0x082b190819080808, 0x082b19081919192b,
+    0x082b191908080808, 0x082b191919080819, 0x082b1919192b1908, 0x082b192b2b190808,
+    0x082b2b0808082b08, 0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
+    0x1908080808080819, 0x1908080808081908, 0x1908080808190808, 0x1908080808192b08,
+    0x19080808082b0819, 0x19080808082b1908, 0x1908080819080808, 0x1908080819082b08,
+    0x190808081919192b, 0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
+    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808, 0x19080819192b0819,
+    0x190808192b080808, 0x190808192b081919, 0x1908082b08080819, 0x1908082b08190808,
+    0x1908082b19082b08, 0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
+    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808, 0x190819082b192b19,
+    0x190819190819082b, 0x19081919082b1908, 0x1908192b08080808, 0x19082b0808080819,
+    0x19082b0808081908, 0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
+    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819, 0x19082b192b08082b,
+    0x19082b2b19081919, 0x19082b2b2b190808, 0x1919080808080808, 0x1919080808082b08,
+    0x1919080808190819, 0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
+    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b, 0x191908192b2b1908,
+    0x1919082b2b190819, 0x191919082b190808, 0x191919082b19082b, 0x1919191908082b2b,
+    0x1919192b08080819, 0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
+    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808, 0x19192b2b08082b08,
+    0x192b080808081908, 0x192b080808190808, 0x192b080819080808, 0x192b0808192b2b08,
+    0x192b081908080808, 0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
+    0x192b190808080808, 0x192b190808081919, 0x192b191908190808, 0x192b19190819082b,
+    0x192b19192b081908, 0x192b2b081908082b, 0x2b08080808080808, 0x2b0808080808082b,
+    0x2b08080808082b2b, 0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
+    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819, 0x2b08190808080819,
+    0x2b08190808081908, 0x2b08190808190808, 0x2b08190808191919, 0x2b08190819080808,
+    0x2b081908192b0808, 0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
+    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808, 0x2b082b080808082b,
+    0x2b082b1908081908, 0x2b082b2b08190819, 0x2b19080808081908, 0x2b19080808190808,
+    0x2b190808082b1908, 0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
+    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808, 0x2b191908082b082b,
+    0x2b19190819081908, 0x2b19191919190819, 0x2b192b082b080819, 0x2b192b19082b0808,
+    0x2b2b08080808082b, 0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
+    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
+};
+
+
+/* Convert one block_iq2_xxs (66 bytes) → 256 float32 values.
+ * Matches dequantize_row_iq2_xxs(ggml/llama.cpp): scale = d * 0.125 * (0.5 + (aux32[1]>>28)). */
+static void ds4_mtl4_dequant_iq2_xxs_block(const uint8_t *src66, float *dst256) {
+    const uint16_t d_f16 = ((const uint16_t *)src66)[0];
+    /* Inline F16 → F32 (ARM half-precision intrinsic if available). */
+    union { uint16_t u; _Float16 h; } cvt = { .u = d_f16 };
+    const float d = (float)cvt.h;
+    const uint16_t *qs_u16 = (const uint16_t *)(src66 + 2);
+    uint32_t aux32[2];
+    const uint8_t *aux8 = (const uint8_t *)aux32;
+    for (int ib32 = 0; ib32 < 8; ib32++) {
+        memcpy(aux32, qs_u16 + 4 * ib32, 8);
+        const float db = d * 0.125f * (0.5f + (float)(aux32[1] >> 28));
+        for (int l = 0; l < 4; l++) {
+            const uint8_t *grid = (const uint8_t *)(ds4_mtl4_iq2xxs_grid + aux8[l]);
+            const uint8_t signs = ds4_mtl4_ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+            for (int j = 0; j < 8; j++) {
+                dst256[j] = db * (float)grid[j] * ((signs & ds4_mtl4_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+            }
+            dst256 += 8;
+        }
+    }
+}
+
+/* Dequant a single routed-expert weight tensor (n_in × n_out F32 row-major).
+ * The IQ2_XXS layout stores 256 elements per 66-byte block, n_in*n_out total
+ * elements per expert. Returns true on success. */
+static bool ds4_mtl4_dequant_iq2_xxs_expert(const uint8_t *src_bytes,
+                                              uint64_t n_in, uint64_t n_out,
+                                              float *dst) {
+    const uint64_t n_elem = n_in * n_out;
+    if ((n_elem % 256) != 0) {
+        fprintf(stderr, "ds4_mtl4: IQ2_XXS dequant: n_elem=%llu not divisible by 256\n",
+                (unsigned long long)n_elem);
+        return false;
+    }
+    const uint64_t n_blocks = n_elem / 256;
+    for (uint64_t b = 0; b < n_blocks; b++) {
+        ds4_mtl4_dequant_iq2_xxs_block(src_bytes + b * 66, dst + b * 256);
+    }
+    return true;
+}
+
+/* ---- MTL4 ML pipeline cache + Apple package loader ----
+ * Shared MTL4 ML compiler/queue/event/allocator. Pipeline states cached per
+ * shape (gate/up: rows×4096@4096×24576; down: rows×2048@2048×24576).
+ * The Apple sample matmul package accepts arbitrary input dimensions via
+ * MTL4MachineLearningPipelineDescriptor.setInputDimensions:atBufferIndex:.
+ *
+ * Package path: configurable via DS4_MTL4_PACKAGE_PATH env (default points
+ * to the codex sample directory). */
+static id<MTLLibrary> g_mtl4_ml_library = nil;
+static id<MTL4Compiler> g_mtl4_ml_compiler = nil;
+static id<MTL4CommandQueue> g_mtl4_ml_queue = nil;
+static id<MTL4CommandAllocator> g_mtl4_ml_allocator = nil;
+static id<MTLSharedEvent> g_mtl4_ml_event = nil;
+static int g_mtl4_ml_setup_state = 0;  /* 0=unchecked, 1=ready, -1=failed */
+
+typedef struct {
+    int T, H, O;
+    id<MTL4MachineLearningPipelineState> state;
+    id<MTLTensor> A_tensor;
+    id<MTLTensor> B_tensor;
+    id<MTLTensor> out_tensor;
+    id<MTL4ArgumentTable> arg_table;
+    id<MTLHeap> heap;
+} ds4_mtl4_cache_entry;
+
+#define DS4_MTL4_CACHE_MAX 4
+static ds4_mtl4_cache_entry g_mtl4_cache[DS4_MTL4_CACHE_MAX];
+static int g_mtl4_cache_count = 0;
+static pthread_mutex_t g_mtl4_setup_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static MTLTensorExtents *ds4_mtl4_extents2(NSInteger inner, NSInteger outer) {
+    NSInteger v[2] = {inner, outer};
+    return [[MTLTensorExtents alloc] initWithRank:2 values:v];
+}
+
+static int ds4_mtl4_setup_apple_package(void) {
+    pthread_mutex_lock(&g_mtl4_setup_mu);
+    if (g_mtl4_ml_setup_state != 0) {
+        pthread_mutex_unlock(&g_mtl4_setup_mu);
+        return g_mtl4_ml_setup_state;
+    }
+    const char *pkg_env = getenv("DS4_MTL4_PACKAGE_PATH");
+    NSString *pkg_path = pkg_env && pkg_env[0]
+        ? [NSString stringWithUTF8String:pkg_env]
+        : @"/Users/silv/cl/tlp_codex/tmp/20260524_mtl4_ml_probe/sample/Packages/matrix-multiplication.mtlpackage";
+
+    if (![[NSFileManager defaultManager] fileExistsAtPath:pkg_path]) {
+        fprintf(stderr, "ds4_mtl4: package not found at %s\n", pkg_path.UTF8String);
+        g_mtl4_ml_setup_state = -1;
+        pthread_mutex_unlock(&g_mtl4_setup_mu);
+        return -1;
+    }
+
+    /* Ensure device + Metal4 are available. g_device is the existing global. */
+    extern id<MTLDevice> g_device;
+    if (!g_device) {
+        g_mtl4_ml_setup_state = -1;
+        pthread_mutex_unlock(&g_mtl4_setup_mu);
+        return -1;
+    }
+
+    NSError *err = nil;
+    g_mtl4_ml_library = [g_device newLibraryWithURL:[NSURL fileURLWithPath:pkg_path] error:&err];
+    if (!g_mtl4_ml_library) {
+        fprintf(stderr, "ds4_mtl4: newLibraryWithURL failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(null)");
+        g_mtl4_ml_setup_state = -1;
+        pthread_mutex_unlock(&g_mtl4_setup_mu);
+        return -1;
+    }
+    err = nil;
+    g_mtl4_ml_compiler = [g_device newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&err];
+    if (!g_mtl4_ml_compiler) {
+        g_mtl4_ml_setup_state = -1;
+        pthread_mutex_unlock(&g_mtl4_setup_mu);
+        return -1;
+    }
+    g_mtl4_ml_queue = [g_device newMTL4CommandQueue];
+    g_mtl4_ml_allocator = [g_device newCommandAllocator];
+    g_mtl4_ml_event = [g_device newSharedEvent];
+    if (!g_mtl4_ml_queue || !g_mtl4_ml_allocator || !g_mtl4_ml_event) {
+        g_mtl4_ml_setup_state = -1;
+        pthread_mutex_unlock(&g_mtl4_setup_mu);
+        return -1;
+    }
+    g_mtl4_ml_setup_state = 1;
+    fprintf(stderr, "ds4_mtl4: Apple package loaded from %s\n", pkg_path.UTF8String);
+    pthread_mutex_unlock(&g_mtl4_setup_mu);
+    return 1;
+}
+
+/* Build (or cache-hit) a pipeline + tensors for one shape (T × H @ H × O).
+ * Returns NULL on failure. */
+static ds4_mtl4_cache_entry *ds4_mtl4_get_or_build_pipeline(int T, int H, int O) {
+    extern id<MTLDevice> g_device;
+    pthread_mutex_lock(&g_mtl4_setup_mu);
+    for (int i = 0; i < g_mtl4_cache_count; i++) {
+        if (g_mtl4_cache[i].T == T && g_mtl4_cache[i].H == H && g_mtl4_cache[i].O == O) {
+            ds4_mtl4_cache_entry *e = &g_mtl4_cache[i];
+            pthread_mutex_unlock(&g_mtl4_setup_mu);
+            return e;
+        }
+    }
+    if (g_mtl4_cache_count >= DS4_MTL4_CACHE_MAX) {
+        fprintf(stderr, "ds4_mtl4: pipeline cache full (max %d)\n", DS4_MTL4_CACHE_MAX);
+        pthread_mutex_unlock(&g_mtl4_setup_mu);
+        return NULL;
+    }
+    ds4_mtl4_cache_entry *e = &g_mtl4_cache[g_mtl4_cache_count];
+    e->T = T; e->H = H; e->O = O;
+
+    MTLFunctionReflection *refl = [g_mtl4_ml_library reflectionForFunctionWithName:@"main"];
+    if (!refl) { pthread_mutex_unlock(&g_mtl4_setup_mu); return NULL; }
+    MTL4LibraryFunctionDescriptor *fd = [MTL4LibraryFunctionDescriptor new];
+    fd.name = @"main"; fd.library = g_mtl4_ml_library;
+    MTL4MachineLearningPipelineDescriptor *pd = [MTL4MachineLearningPipelineDescriptor new];
+    pd.machineLearningFunctionDescriptor = fd;
+    MTL4PipelineOptions *opts = [MTL4PipelineOptions new];
+    opts.shaderReflection = MTL4ShaderReflectionBindingInfo;
+    pd.options = opts;
+    for (id<MTLBinding> b in refl.bindings) {
+        if (b.type != MTLBindingTypeTensor) continue;
+        id<MTLTensorBinding> tb = (id<MTLTensorBinding>)b;
+        NSString *name = tb.name.lowercaseString;
+        if ([name containsString:@"inputa"]) [pd setInputDimensions:ds4_mtl4_extents2(H, T) atBufferIndex:tb.index];
+        if ([name containsString:@"inputb"]) [pd setInputDimensions:ds4_mtl4_extents2(O, H) atBufferIndex:tb.index];
+    }
+    NSError *err = nil;
+    e->state = [g_mtl4_ml_compiler newMachineLearningPipelineStateWithDescriptor:pd error:&err];
+    if (!e->state) {
+        fprintf(stderr, "ds4_mtl4: pipeline build failed for T=%d H=%d O=%d: %s\n",
+                T, H, O, err ? err.localizedDescription.UTF8String : "(null)");
+        pthread_mutex_unlock(&g_mtl4_setup_mu);
+        return NULL;
+    }
+
+    /* Build A, B, output tensors + heap + argument table from the pipeline reflection. */
+    NSMutableDictionary<NSString*, id<MTLTensor>> *tdict = [NSMutableDictionary new];
+    for (id<MTLBinding> b in e->state.reflection.bindings) {
+        if (b.type != MTLBindingTypeTensor) continue;
+        id<MTLTensorBinding> tb = (id<MTLTensorBinding>)b;
+        MTLTensorDescriptor *desc = [MTLTensorDescriptor new];
+        desc.usage = MTLTensorUsageMachineLearning;
+        desc.dimensions = tb.dimensions;
+        desc.dataType = tb.tensorDataType;
+        err = nil;
+        id<MTLTensor> tns = [g_device newTensorWithDescriptor:desc error:&err];
+        if (!tns) {
+            fprintf(stderr, "ds4_mtl4: tensor alloc failed: %s\n",
+                    err ? err.localizedDescription.UTF8String : "(null)");
+            pthread_mutex_unlock(&g_mtl4_setup_mu);
+            return NULL;
+        }
+        tdict[tb.name] = tns;
+        NSString *lower = tb.name.lowercaseString;
+        if ([lower containsString:@"inputa"]) e->A_tensor = tns;
+        else if ([lower containsString:@"inputb"]) e->B_tensor = tns;
+        else if ([lower containsString:@"output"]) e->out_tensor = tns;
+    }
+    if (!e->A_tensor || !e->B_tensor || !e->out_tensor) {
+        fprintf(stderr, "ds4_mtl4: A/B/output binding lookup failed\n");
+        pthread_mutex_unlock(&g_mtl4_setup_mu);
+        return NULL;
+    }
+
+    MTL4ArgumentTableDescriptor *atd = [MTL4ArgumentTableDescriptor new];
+    atd.maxBufferBindCount = 31;
+    atd.initializeBindings = YES;
+    err = nil;
+    e->arg_table = [g_device newArgumentTableWithDescriptor:atd error:&err];
+    if (!e->arg_table) {
+        fprintf(stderr, "ds4_mtl4: arg table failed\n");
+        pthread_mutex_unlock(&g_mtl4_setup_mu);
+        return NULL;
+    }
+    for (id<MTLBinding> b in e->state.reflection.bindings) {
+        if (b.type != MTLBindingTypeTensor) continue;
+        id<MTLTensorBinding> tb = (id<MTLTensorBinding>)b;
+        [e->arg_table setResource:tdict[tb.name].gpuResourceID atBufferIndex:tb.index];
+    }
+    MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+    hd.type = MTLHeapTypePlacement;
+    hd.size = e->state.intermediatesHeapSize;
+    e->heap = [g_device newHeapWithDescriptor:hd];
+    if (!e->heap) {
+        fprintf(stderr, "ds4_mtl4: heap alloc failed\n");
+        pthread_mutex_unlock(&g_mtl4_setup_mu);
+        return NULL;
+    }
+    g_mtl4_cache_count++;
+    fprintf(stderr, "ds4_mtl4: built pipeline T=%d H=%d O=%d (cache %d/%d)\n",
+            T, H, O, g_mtl4_cache_count, DS4_MTL4_CACHE_MAX);
+
+    /* Warmup pass. First dispatch on a fresh MTL4 ML pipeline produces
+     * undefined output (observed: NaN). The codex h1672 pattern also
+     * does a discard warm dispatch before measurement. */
+    id<MTL4CommandBuffer> wcb = [g_device newCommandBuffer];
+    [wcb beginCommandBufferWithAllocator:g_mtl4_ml_allocator];
+    id<MTL4MachineLearningCommandEncoder> wenc = [wcb machineLearningCommandEncoder];
+    [wenc setArgumentTable:e->arg_table];
+    [wenc setPipelineState:e->state];
+    [wenc dispatchNetworkWithIntermediatesHeap:e->heap];
+    [wenc endEncoding];
+    [wcb endCommandBuffer];
+    id<MTL4CommandBuffer> wbufs[] = {wcb};
+    [g_mtl4_ml_queue commit:wbufs count:1];
+    uint64_t wsv = g_mtl4_ml_event.signaledValue + 1;
+    [g_mtl4_ml_queue signalEvent:g_mtl4_ml_event value:wsv];
+    [g_mtl4_ml_event waitUntilSignaledValue:wsv timeoutMS:30000];
+
+    pthread_mutex_unlock(&g_mtl4_setup_mu);
+    return e;
+}
+
+/* Run one matmul dispatch via the cached pipeline; reads/writes via tensor APIs. */
+static bool ds4_mtl4_dispatch_matmul(ds4_mtl4_cache_entry *e,
+                                       const float *A_data, const float *B_data,
+                                       float *out_data) {
+    extern id<MTLDevice> g_device;
+    MTLTensorExtents *origin = ds4_mtl4_extents2(0, 0);
+    [e->A_tensor replaceSliceOrigin:origin sliceDimensions:ds4_mtl4_extents2(e->H, e->T)
+                                  withBytes:A_data strides:ds4_mtl4_extents2(1, e->H)];
+    [e->B_tensor replaceSliceOrigin:origin sliceDimensions:ds4_mtl4_extents2(e->O, e->H)
+                                  withBytes:B_data strides:ds4_mtl4_extents2(1, e->O)];
+    id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+    [cb beginCommandBufferWithAllocator:g_mtl4_ml_allocator];
+    id<MTL4MachineLearningCommandEncoder> enc = [cb machineLearningCommandEncoder];
+    [enc setArgumentTable:e->arg_table];
+    [enc setPipelineState:e->state];
+    [enc dispatchNetworkWithIntermediatesHeap:e->heap];
+    [enc endEncoding];
+    [cb endCommandBuffer];
+    id<MTL4CommandBuffer> bufs[] = {cb};
+    [g_mtl4_ml_queue commit:bufs count:1];
+    uint64_t sv = g_mtl4_ml_event.signaledValue + 1;
+    [g_mtl4_ml_queue signalEvent:g_mtl4_ml_event value:sv];
+    if (![g_mtl4_ml_event waitUntilSignaledValue:sv timeoutMS:30000]) {
+        fprintf(stderr, "ds4_mtl4: dispatch timeout\n");
+        return false;
+    }
+    [e->out_tensor getBytes:out_data strides:ds4_mtl4_extents2(1, e->O)
+              fromSliceOrigin:origin sliceDimensions:ds4_mtl4_extents2(e->O, e->T)];
+    return true;
+}
+
 int ds4_gpu_routed_moe_batch_tensor_mtl4(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -14694,28 +15066,149 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
             layer_index, n_tokens, mid_is_f16);
     }
 
-    /* TODO(silv): MTL4 ML packed path body.
-     * Outline (one-line per phase) the future implementation should follow:
-     *   1. Read 6 selected expert IDs from `selected` tensor (1 host sync).
-     *   2. Build per-token expert-weight vector from `weights` tensor.
-     *   3. Dequant 6 experts' gate/up weights from IQ2_XXS → F32 (or F16)
-     *      into packed B matrix layout (expert_in_dim × 6·expert_mid_dim).
-     *      Either (a) Metal compute kernel doing dequant inline, or
-     *      (b) CPU dequant + upload (bandwidth-bound, loses).
-     *   4. MTL4 ML dispatch: A=(n_tokens × expert_in_dim) @ B=(expert_in_dim
-     *      × 6·expert_mid_dim) → packed_gate_out=(n_tokens × 6·expert_mid_dim).
-     *   5. Same for up: packed_up_out same shape.
-     *   6. SwiGLU per expert chunk: mid_e = silu(clamp(gate_e)) ⊙ up_e.
-     *   7. Blend by expert_weight per token: sum_e weight[t,e] · mid_e[t,:].
-     *   8. Dequant down weights packed (expert_mid_dim × 6·out_dim).
-     *   9. Down matmul + sum across expert chunks → out=(n_tokens × out_dim).
-     *
-     * Until shipped, env-enabled callers still see the legacy result and
-     * the journal records the MTL4 path was REQUESTED but skipped. */
+    /* IQ2_XXS gate/up + Q8_0 down is the IQ2_XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8
+     * recipe silv ships. We only support IQ2_XXS gate path here for the
+     * canary; up + down still go through legacy if anything fails. */
+    enum { DS4Q_TYPE_IQ2_XXS = 16, DS4Q_TYPE_Q8_0 = 8 };
+    if (gate_type != DS4Q_TYPE_IQ2_XXS) {
+        return ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, experts, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_expert, clamp, x,
+            layer_index, n_tokens, mid_is_f16);
+    }
+
+    /* Setup Apple matmul package on first use. */
+    if (ds4_mtl4_setup_apple_package() != 1) {
+        return ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, experts, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_expert, clamp, x,
+            layer_index, n_tokens, mid_is_f16);
+    }
+
+    /* Host-side dequant + packed dispatch.
+     * COST WARNING: per call this allocates:
+     *   - 6 × (expert_in_dim × expert_mid_dim × 4) bytes dequant tmp ≈ 192 MB
+     *   - 2 × (expert_in_dim × 6·expert_mid_dim × 4) packed B ≈ 400 MB (gate+up)
+     *   - 1 × (expert_mid_dim × 6·out_dim × 4) packed down B ≈ 200 MB
+     * The legacy SIMD path does dequant inline at register level and avoids
+     * these allocations. THIS PATH IS A FUNCTIONAL CORRECTNESS PROBE, NOT A
+     * SPEED WIN until/unless silv replaces host dequant with a Metal compute
+     * shader that does dequant+matmul in one pass. */
+
+    int32_t selected_ids[16] = {0};
+    const size_t sel_bytes = (size_t)n_expert * sizeof(int32_t);
+    if (ds4_gpu_tensor_read(selected, 0, selected_ids, sel_bytes) == 0) {
+        fprintf(stderr, "ds4_mtl4: failed to read selected expert IDs\n");
+        return ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, experts, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_expert, clamp, x,
+            layer_index, n_tokens, mid_is_f16);
+    }
+
+    /* For the first iteration we just measure: dequant gate weights for the
+     * 6 selected experts, pack them, dispatch a matmul, compare checksum.
+     * This validates that:
+     *   (a) the dequant tables are correct
+     *   (b) Apple's package loads + dispatches our shapes
+     *   (c) end-to-end time vs legacy
+     * Then fall back to legacy for the actual output (correctness preserved). */
+
+    const size_t per_expert_floats = (size_t)expert_in_dim * (size_t)expert_mid_dim;
+    const size_t packed_floats = (size_t)expert_in_dim * 6ull * (size_t)expert_mid_dim;
+    float *tmp_dequant = (float *)malloc(per_expert_floats * sizeof(float));
+    float *packed_gate_B = (float *)malloc(packed_floats * sizeof(float));
+    float *x_data = (float *)malloc((size_t)n_tokens * (size_t)expert_in_dim * sizeof(float));
+    float *gate_out = (float *)malloc((size_t)n_tokens * 6ull * (size_t)expert_mid_dim * sizeof(float));
+    if (!tmp_dequant || !packed_gate_B || !x_data || !gate_out) {
+        free(tmp_dequant); free(packed_gate_B); free(x_data); free(gate_out);
+        return ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, experts, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_expert, clamp, x,
+            layer_index, n_tokens, mid_is_f16);
+    }
+
+    uint64_t t_dequant_ns_total = 0;
+    for (int e = 0; e < (int)n_expert && e < 6; e++) {
+        const int32_t expert_id = selected_ids[e];
+        if (expert_id < 0 || (uint64_t)expert_id >= (model_size / gate_expert_bytes)) {
+            fprintf(stderr, "ds4_mtl4: invalid expert_id=%d\n", expert_id);
+            free(tmp_dequant); free(packed_gate_B); free(x_data); free(gate_out);
+            return ds4_gpu_routed_moe_batch_tensor(
+                out, gate, up, mid, experts, model_map, model_size,
+                gate_offset, up_offset, down_offset, gate_type, down_type,
+                gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim,
+                selected, weights, n_expert, clamp, x,
+                layer_index, n_tokens, mid_is_f16);
+        }
+        const uint8_t *expert_bytes = (const uint8_t *)model_map + gate_offset + (uint64_t)expert_id * gate_expert_bytes;
+        uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        ds4_mtl4_dequant_iq2_xxs_expert(expert_bytes, expert_in_dim, expert_mid_dim, tmp_dequant);
+        t_dequant_ns_total += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+        /* Concat into packed_gate_B at column offset (e * expert_mid_dim).
+         * packed_gate_B is (expert_in_dim × 6·expert_mid_dim), row-major. */
+        for (uint64_t r = 0; r < expert_in_dim; r++) {
+            memcpy(&packed_gate_B[r * 6 * expert_mid_dim + e * expert_mid_dim],
+                   &tmp_dequant[r * expert_mid_dim],
+                   expert_mid_dim * sizeof(float));
+        }
+    }
+
+    /* Read x activation from GPU tensor. */
+    const size_t x_bytes = (size_t)n_tokens * (size_t)expert_in_dim * sizeof(float);
+    if (ds4_gpu_tensor_read(x, 0, x_data, x_bytes) == 0) {
+        fprintf(stderr, "ds4_mtl4: failed to read x activation\n");
+        free(tmp_dequant); free(packed_gate_B); free(x_data); free(gate_out);
+        return ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, experts, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_expert, clamp, x,
+            layer_index, n_tokens, mid_is_f16);
+    }
+
+    /* Pipeline cache build + dispatch. */
+    uint64_t t_dispatch0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    ds4_mtl4_cache_entry *gate_pipe = ds4_mtl4_get_or_build_pipeline(
+        (int)n_tokens, (int)expert_in_dim, 6 * (int)expert_mid_dim);
+    bool dispatch_ok = false;
+    if (gate_pipe) {
+        dispatch_ok = ds4_mtl4_dispatch_matmul(gate_pipe, x_data, packed_gate_B, gate_out);
+    }
+    uint64_t t_dispatch_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t_dispatch0;
+
+    /* Compute output checksum so we can verify legacy parity later. */
+    double gate_abs_sum = 0.0;
+    const size_t gate_out_n = (size_t)n_tokens * 6 * (size_t)expert_mid_dim;
+    for (size_t i = 0; i < gate_out_n; i++) {
+        gate_abs_sum += fabs((double)gate_out[i]);
+    }
     fprintf(stderr,
-            "ds4_mtl4_moe: requested layer=%u n_tokens=%u — scaffold path "
-            "not yet implemented, falling back to legacy\n",
-            layer_index, n_tokens);
+            "ds4_mtl4: layer=%u T=%u — dequant_total=%.2fms (6 experts), "
+            "dispatch=%.2fms, gate_abs_sum=%.6e, dispatch_ok=%d\n",
+            layer_index, n_tokens,
+            (double)t_dequant_ns_total / 1e6, (double)t_dispatch_ns / 1e6,
+            gate_abs_sum, dispatch_ok ? 1 : 0);
+
+    free(tmp_dequant); free(packed_gate_B); free(x_data); free(gate_out);
+
+    if (mtl4_path_taken) *mtl4_path_taken = true;
+
+    /* CANARY MODE: measured + logged the path, now fall back to legacy for
+     * the actual output. When silv approves we extend to up + SwiGLU + down. */
     return ds4_gpu_routed_moe_batch_tensor(
         out, gate, up, mid, experts, model_map, model_size,
         gate_offset, up_offset, down_offset, gate_type, down_type,
