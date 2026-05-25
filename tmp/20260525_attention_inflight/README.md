@@ -44,14 +44,22 @@ escape; it actually MAKES IT WORSE on P01 — bf16 traps in interpretation
 paralysis before truth derivation completes. Inferguard rescue is
 structurally necessary at all precisions, with precision-tuned cap_window.
 
-## Layer-class codec taxonomy — 4 REGIMES (codex H1855-H1861)
+## Layer-class codec taxonomy — 7 REGIMES (codex H1855-H1863)
 
-| layer | tensor winner | margin behavior | classification |
-|-------|---------------|-----------------|----------------|
-| **L22** | H1853 max-q | wins | **positive transfer, safe** |
-| **L25** | (max-q tensor) | **LOSES** | negative transfer (tensor lies) |
-| **L35** | H1853 max-q + case | **LOSES 5.55×** | partial transfer (case wins, margin loses) |
-| **L42** | **H1830 BASE** | gains but watchlist flips don't | base-wins (max-q regresses; positive-but-not-safe) |
+| layer | depth | tensor winner | margin behavior | classification |
+|-------|-------|---------------|-----------------|----------------|
+| **L0** | early | s42_n100k +3.7% | **WORSENS top-k p95** | early-risky |
+| **L4** | early | s777_n500k +4.1% | **wins 4× (0.064→0.016)** | **EARLY POSITIVE-SAFE (best)** |
+| **L10** | early | direct/reference | no improvement | direct-best (codec saturated) |
+| **L22** | mid | s777_n1000k +3.7% | wins | mid positive-safe |
+| **L25** | mid | (max-q tensor) | **LOSES** | mid negative-transfer |
+| **L35** | deep | s777_n1000k + case | **LOSES 5.55× top-k p95** | deep partial-transfer |
+| **L42** | deep | **H1830 BASE** | gains but watchlist unchanged | deep base-wins-risky |
+
+L4 is the surprise — EARLIEST tested layer has BEST positive-safe ratio.
+Refutes "early layers are simple, easy to compress." 36 of 43 layers still
+empirically untested by codex; this 7-regime map is anchor points, not
+saturation.
 
 Codex's final live unit (H1861, after reading my precision_attractor memo):
 `(model, layer, hidden profile, routed FFN delta, readout margin band, precision/codec)`
