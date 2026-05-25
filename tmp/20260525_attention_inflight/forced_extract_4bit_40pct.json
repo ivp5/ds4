@@ -1,0 +1,100 @@
+{
+  "prefix_frac": 0.4,
+  "n_chars_cap": 12000,
+  "k_tokens": 8,
+  "model_id": "mlx-community/Qwen3.5-4B-MLX-4bit",
+  "n_correct": 5,
+  "n_total": 10,
+  "results": [
+    {
+      "cell": "p01",
+      "truth": 277,
+      "predicted": 85,
+      "is_correct": false,
+      "emit": "85}}.\n\nThe problem asks",
+      "prefix_chars": 12000,
+      "elapsed_s": 11.106102228164673
+    },
+    {
+      "cell": "p02",
+      "truth": 62,
+      "predicted": 56,
+      "is_correct": false,
+      "emit": "56}}.\n\nThe problem asks",
+      "prefix_chars": 12000,
+      "elapsed_s": 12.509696960449219
+    },
+    {
+      "cell": "p03",
+      "truth": 79,
+      "predicted": 79,
+      "is_correct": true,
+      "emit": "79}}.\nThe steps are",
+      "prefix_chars": 12000,
+      "elapsed_s": 9.13103199005127
+    },
+    {
+      "cell": "p04",
+      "truth": 70,
+      "predicted": 56,
+      "is_correct": false,
+      "emit": "56}}.\n\nThe problem asks",
+      "prefix_chars": 12000,
+      "elapsed_s": 10.521039962768555
+    },
+    {
+      "cell": "p05",
+      "truth": 65,
+      "predicted": 65,
+      "is_correct": true,
+      "emit": "65}}.\n\nLet's double",
+      "prefix_chars": 12000,
+      "elapsed_s": 11.520270109176636
+    },
+    {
+      "cell": "p06",
+      "truth": 441,
+      "predicted": 441,
+      "is_correct": true,
+      "emit": "441}}.\n\nLet's",
+      "prefix_chars": 12000,
+      "elapsed_s": 14.416980028152466
+    },
+    {
+      "cell": "p07",
+      "truth": 396,
+      "predicted": 396,
+      "is_correct": true,
+      "emit": "396}}.\n\nThe problem",
+      "prefix_chars": 12000,
+      "elapsed_s": 13.621947050094604
+    },
+    {
+      "cell": "p08",
+      "truth": 244,
+      "predicted": 244,
+      "is_correct": true,
+      "emit": "244}}.\n\nLet's",
+      "prefix_chars": 12000,
+      "elapsed_s": 14.56631875038147
+    },
+    {
+      "cell": "p09",
+      "truth": 29,
+      "predicted": 1,
+      "is_correct": false,
+      "emit": "1 \\over 12}}.",
+      "prefix_chars": 12000,
+      "elapsed_s": 7.952208042144775
+    },
+    {
+      "cell": "p10",
+      "truth": 156,
+      "predicted": 100,
+      "is_correct": false,
+      "emit": "100}}.\n\nWait,",
+      "prefix_chars": 12000,
+      "elapsed_s": 13.408176898956299
+    }
+  ]
+}
