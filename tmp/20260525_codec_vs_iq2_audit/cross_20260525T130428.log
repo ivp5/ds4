@@ -1,0 +1,43 @@
+/Users/silv/cl/tlp/montyneg/ivp5_ds4/tmp/20260525_codec_vs_iq2_audit/dequant_iq2_xxs.py:108: RuntimeWarning: invalid value encountered in cast
+  d_f16 = np.frombuffer(arr[:, 0:2].copy().tobytes(), dtype=np.float16).astype(np.float32)
+Reading GGUF metadata once...
+  1328 tensors loaded
+
+layer  kind     exp   iq2_full   iq2_128     polar        vq
+  -----  ------  ----  ---------  --------  --------  --------
+  raw blob shape: (2048, 2048) dtype: uint8
+  raw scale shape: (2048, 128) dtype: uint8
+      0  gate       0     0.3544    0.3543    0.1218    0.0212    (0.2s)
+  raw blob shape: (2048, 2048) dtype: uint8
+  raw scale shape: (2048, 128) dtype: uint8
+      0  gate     100     0.3542    0.3540    0.1189    0.0193    (0.1s)
+  raw blob shape: (2048, 2048) dtype: uint8
+  raw scale shape: (2048, 128) dtype: uint8
+      0  gate     255     0.3539    0.3540    0.1193    0.0187    (0.1s)
+  raw blob shape: (2048, 2048) dtype: uint8
+  raw scale shape: (2048, 128) dtype: uint8
+      0  up         0     0.3542    0.3537    0.1208    0.0217    (0.1s)
+  raw blob shape: (4096, 1024) dtype: uint8
+  raw scale shape: (4096, 64) dtype: uint8
+      0  down       0        nan       nan    0.1200    0.0209    (0.1s)
+  raw blob shape: (2048, 2048) dtype: uint8
+  raw scale shape: (2048, 128) dtype: uint8
+      5  gate       0     0.3522    0.3522    0.1190       N/A    (0.1s)
+  raw blob shape: (2048, 2048) dtype: uint8
+  raw scale shape: (2048, 128) dtype: uint8
+     10  gate       0     0.3527    0.3532    0.1233       N/A    (0.1s)
+  raw blob shape: (2048, 2048) dtype: uint8
+  raw scale shape: (2048, 128) dtype: uint8
+     20  gate       0     0.3530    0.3528    0.1228       N/A    (0.1s)
+  raw blob shape: (2048, 2048) dtype: uint8
+  raw scale shape: (2048, 128) dtype: uint8
+     42  gate       0     0.3526    0.3526    0.1241       N/A    (0.1s)
+
+=== Summary ===
+  IQ2_XXS rel_L2 (full expert): mean=nan  range=[0.3522, 0.3544]  n=9
+  VQ K=256 rel_L2 (first 128 rows): mean=0.0204  n=5
+  IQ2/VQ ratio (first 128): mean=nan× (VQ this much better)
+  polar p32_m8 rel_L2 (first 128 rows): mean=0.1211  n=9
+  IQ2/polar ratio (first 128): mean=nan× (polar this much better)
+
+Saved cross_layer_kind_20260525T040429Z.json

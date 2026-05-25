@@ -1,0 +1,146 @@
+[
+  {
+    "layer": 0,
+    "kind": "gate",
+    "expert": 0,
+    "fp4_shape": [
+      2048,
+      4096
+    ],
+    "iq2_full_rel_l2": 0.3544231355190277,
+    "iq2_first128_rel_l2": 0.3543284833431244,
+    "iq2_bytes_per_pair": 0.5156,
+    "polar_rel_l2": 0.12179767340421677,
+    "polar_bytes_per_pair": 2.0,
+    "vq_rel_l2": 0.021230297163128853,
+    "vq_bytes_per_pair": 1.0
+  },
+  {
+    "layer": 0,
+    "kind": "gate",
+    "expert": 100,
+    "fp4_shape": [
+      2048,
+      4096
+    ],
+    "iq2_full_rel_l2": 0.35422176122665405,
+    "iq2_first128_rel_l2": 0.3539503514766693,
+    "iq2_bytes_per_pair": 0.5156,
+    "polar_rel_l2": 0.11893631517887115,
+    "polar_bytes_per_pair": 2.0,
+    "vq_rel_l2": 0.019286023452878,
+    "vq_bytes_per_pair": 1.0
+  },
+  {
+    "layer": 0,
+    "kind": "gate",
+    "expert": 255,
+    "fp4_shape": [
+      2048,
+      4096
+    ],
+    "iq2_full_rel_l2": 0.3539104759693146,
+    "iq2_first128_rel_l2": 0.3539685010910034,
+    "iq2_bytes_per_pair": 0.5156,
+    "polar_rel_l2": 0.11927425861358643,
+    "polar_bytes_per_pair": 2.0,
+    "vq_rel_l2": 0.018687374889850616,
+    "vq_bytes_per_pair": 1.0
+  },
+  {
+    "layer": 0,
+    "kind": "up",
+    "expert": 0,
+    "fp4_shape": [
+      2048,
+      4096
+    ],
+    "iq2_full_rel_l2": 0.3541571795940399,
+    "iq2_first128_rel_l2": 0.3537232279777527,
+    "iq2_bytes_per_pair": 0.5156,
+    "polar_rel_l2": 0.12082815170288086,
+    "polar_bytes_per_pair": 2.0,
+    "vq_rel_l2": 0.021708332002162933,
+    "vq_bytes_per_pair": 1.0
+  },
+  {
+    "layer": 0,
+    "kind": "down",
+    "expert": 0,
+    "fp4_shape": [
+      4096,
+      2048
+    ],
+    "iq2_full_rel_l2": NaN,
+    "iq2_first128_rel_l2": NaN,
+    "iq2_bytes_per_pair": 0.5156,
+    "polar_rel_l2": 0.11995716392993927,
+    "polar_bytes_per_pair": 2.0,
+    "vq_rel_l2": 0.020935915410518646,
+    "vq_bytes_per_pair": 1.0
+  },
+  {
+    "layer": 5,
+    "kind": "gate",
+    "expert": 0,
+    "fp4_shape": [
+      2048,
+      4096
+    ],
+    "iq2_full_rel_l2": 0.3521941602230072,
+    "iq2_first128_rel_l2": 0.3521656095981598,
+    "iq2_bytes_per_pair": 0.5156,
+    "polar_rel_l2": 0.11903655529022217,
+    "polar_bytes_per_pair": 2.0,
+    "vq_rel_l2": null,
+    "vq_bytes_per_pair": null
+  },
+  {
+    "layer": 10,
+    "kind": "gate",
+    "expert": 0,
+    "fp4_shape": [
+      2048,
+      4096
+    ],
+    "iq2_full_rel_l2": 0.3526614010334015,
+    "iq2_first128_rel_l2": 0.3532254099845886,
+    "iq2_bytes_per_pair": 0.5156,
+    "polar_rel_l2": 0.12333622574806213,
+    "polar_bytes_per_pair": 2.0,
+    "vq_rel_l2": null,
+    "vq_bytes_per_pair": null
+  },
+  {
+    "layer": 20,
+    "kind": "gate",
+    "expert": 0,
+    "fp4_shape": [
+      2048,
+      4096
+    ],
+    "iq2_full_rel_l2": 0.35299918055534363,
+    "iq2_first128_rel_l2": 0.3528403043746948,
+    "iq2_bytes_per_pair": 0.5156,
+    "polar_rel_l2": 0.12276250123977661,
+    "polar_bytes_per_pair": 2.0,
+    "vq_rel_l2": null,
+    "vq_bytes_per_pair": null
+  },
+  {
+    "layer": 42,
+    "kind": "gate",
+    "expert": 0,
+    "fp4_shape": [
+      2048,
+      4096
+    ],
+    "iq2_full_rel_l2": 0.35261788964271545,
+    "iq2_first128_rel_l2": 0.3526090383529663,
+    "iq2_bytes_per_pair": 0.5156,
+    "polar_rel_l2": 0.12414784729480743,
+    "polar_bytes_per_pair": 2.0,
+    "vq_rel_l2": null,
+    "vq_bytes_per_pair": null
+  }
+]
