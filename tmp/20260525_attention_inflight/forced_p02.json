@@ -1,0 +1,234 @@
+{
+  "label": "p02_rescue_forced",
+  "truth_digit": "6",
+  "prefix_chars": 12000,
+  "total_prompt_tokens": 6126,
+  "per_layer": {
+    "0": {
+      "p_truth": 4.682245275944297e-07,
+      "rank_truth": 2509,
+      "top1_id": 90,
+      "top1_token": "{",
+      "top1_prob": 0.9779386520385742
+    },
+    "1": {
+      "p_truth": 3.7599415918521117e-06,
+      "rank_truth": 54502,
+      "top1_id": 90,
+      "top1_token": "{",
+      "top1_prob": 0.2392161786556244
+    },
+    "2": {
+      "p_truth": 2.372916014792281e-06,
+      "rank_truth": 84649,
+      "top1_id": 90,
+      "top1_token": "{",
+      "top1_prob": 0.008839812129735947
+    },
+    "3": {
+      "p_truth": 2.526056277929456e-06,
+      "rank_truth": 105810,
+      "top1_id": 90,
+      "top1_token": "{",
+      "top1_prob": 0.001803217688575387
+    },
+    "4": {
+      "p_truth": 3.962728442274965e-06,
+      "rank_truth": 67182,
+      "top1_id": 37052,
+      "top1_token": "theses",
+      "top1_prob": 0.0008276867447420955
+    },
+    "5": {
+      "p_truth": 2.3749094907543622e-05,
+      "rank_truth": 5196,
+      "top1_id": 254,
+      "top1_token": "\ufffd",
+      "top1_prob": 0.002291472628712654
+    },
+    "6": {
+      "p_truth": 1.3627020052808803e-05,
+      "rank_truth": 13933,
+      "top1_id": 1424,
+      "top1_token": "\u0430",
+      "top1_prob": 0.0018442529253661633
+    },
+    "7": {
+      "p_truth": 5.907031209062552e-06,
+      "rank_truth": 42047,
+      "top1_id": 96215,
+      "top1_token": "\u4f9b",
+      "top1_prob": 0.002796434098854661
+    },
+    "8": {
+      "p_truth": 1.4247544640966225e-05,
+      "rank_truth": 12788,
+      "top1_id": 88544,
+      "top1_token": " multiplic",
+      "top1_prob": 0.0010202887933701277
+    },
+    "9": {
+      "p_truth": 2.2033493678463856e-06,
+      "rank_truth": 106186,
+      "top1_id": 6887,
+      "top1_token": "imately",
+      "top1_prob": 0.0011961362324655056
+    },
+    "10": {
+      "p_truth": 8.429286936006974e-06,
+      "rank_truth": 27077,
+      "top1_id": 100608,
+      "top1_token": "\u5929\u4e0b",
+      "top1_prob": 0.0009711113525554538
+    },
+    "11": {
+      "p_truth": 1.2272695130377542e-05,
+      "rank_truth": 15618,
+      "top1_id": 88544,
+      "top1_token": " multiplic",
+      "top1_prob": 0.001519203302450478
+    },
+    "12": {
+      "p_truth": 1.140604854299454e-05,
+      "rank_truth": 17113,
+      "top1_id": 88544,
+      "top1_token": " multiplic",
+      "top1_prob": 0.0020423256792128086
+    },
+    "13": {
+      "p_truth": 6.9885377342870925e-06,
+      "rank_truth": 32781,
+      "top1_id": 2542,
+      "top1_token": " sum",
+      "top1_prob": 0.0026476001366972923
+    },
+    "14": {
+      "p_truth": 3.109111275989562e-05,
+      "rank_truth": 4053,
+      "top1_id": 100608,
+      "top1_token": "\u5929\u4e0b",
+      "top1_prob": 0.0015232600271701813
+    },
+    "15": {
+      "p_truth": 4.8390156734967604e-05,
+      "rank_truth": 1979,
+      "top1_id": 2542,
+      "top1_token": " sum",
+      "top1_prob": 0.0027143049519509077
+    },
+    "16": {
+      "p_truth": 3.2155692224478116e-06,
+      "rank_truth": 59608,
+      "top1_id": 154761,
+      "top1_token": "\u0645\u0646\u064a",
+      "top1_prob": 0.0031616631895303726
+    },
+    "17": {
+      "p_truth": 3.030450170626864e-05,
+      "rank_truth": 4875,
+      "top1_id": 2702,
+      "top1_token": " total",
+      "top1_prob": 0.004171581007540226
+    },
+    "18": {
+      "p_truth": 1.644665280764457e-05,
+      "rank_truth": 10601,
+      "top1_id": 240689,
+      "top1_token": " toal",
+      "top1_prob": 0.003388259094208479
+    },
+    "19": {
+      "p_truth": 2.1479345377883874e-06,
+      "rank_truth": 69174,
+      "top1_id": 2542,
+      "top1_token": " sum",
+      "top1_prob": 0.009607972577214241
+    },
+    "20": {
+      "p_truth": 2.9746311156486627e-06,
+      "rank_truth": 55087,
+      "top1_id": 154803,
+      "top1_token": "\u0648\u0642\u064a",
+      "top1_prob": 0.0036569107323884964
+    },
+    "21": {
+      "p_truth": 1.2254650755494367e-05,
+      "rank_truth": 13049,
+      "top1_id": 2542,
+      "top1_token": " sum",
+      "top1_prob": 0.041377775371074677
+    },
+    "22": {
+      "p_truth": 1.2917955700686434e-06,
+      "rank_truth": 94982,
+      "top1_id": 90952,
+      "top1_token": " \uacc4",
+      "top1_prob": 0.005055599845945835
+    },
+    "23": {
+      "p_truth": 3.1440544034921913e-07,
+      "rank_truth": 174751,
+      "top1_id": 19796,
+      "top1_token": " apolog",
+      "top1_prob": 0.006162820849567652
+    },
+    "24": {
+      "p_truth": 1.3078118854537024e-07,
+      "rank_truth": 211398,
+      "top1_id": 19796,
+      "top1_token": " apolog",
+      "top1_prob": 0.006178748328238726
+    },
+    "25": {
+      "p_truth": 1.1584047570067924e-06,
+      "rank_truth": 104784,
+      "top1_id": 107649,
+      "top1_token": "\u63c9\u4e86",
+      "top1_prob": 0.006822867318987846
+    },
+    "26": {
+      "p_truth": 5.434623631117574e-07,
+      "rank_truth": 147473,
+      "top1_id": 163575,
+      "top1_token": "utel",
+      "top1_prob": 0.003972254693508148
+    },
+    "27": {
+      "p_truth": 7.426812771882396e-06,
+      "rank_truth": 26196,
+      "top1_id": 101088,
+      "top1_token": "\u603b\u652f",
+      "top1_prob": 0.004693769849836826
+    },
+    "28": {
+      "p_truth": 7.44061908335425e-05,
+      "rank_truth": 1333,
+      "top1_id": 38966,
+      "top1_token": ".HasValue",
+      "top1_prob": 0.0038058513309806585
+    },
+    "29": {
+      "p_truth": 0.0003022932796739042,
+      "rank_truth": 131,
+      "top1_id": 20,
+      "top1_token": "5",
+      "top1_prob": 0.004557128995656967
+    },
+    "30": {
+      "p_truth": 0.09725667536258698,
+      "rank_truth": 1,
+      "top1_id": 20,
+      "top1_token": "5",
+      "top1_prob": 0.5497829914093018
+    },
+    "31": {
+      "p_truth": 0.2833625376224518,
+      "rank_truth": 1,
+      "top1_id": 20,
+      "top1_token": "5",
+      "top1_prob": 0.5490502119064331
+    }
+  },
+  "digit_top1_count": 0,
+  "final3_agreement": 0
+}
