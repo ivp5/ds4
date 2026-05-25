@@ -11428,6 +11428,9 @@ static bool metal_graph_encode_decode_layer(
  layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
  layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
  (uint32_t)token,
+ DS4_N_EXPERT,
+ DS4_N_EXPERT_USED,
+ DS4_EXPERT_WEIGHT_SCALE,
  0,
  0,
  layer->ffn_exp_probs_b != NULL,
@@ -11478,7 +11481,7 @@ static bool metal_graph_encode_decode_layer(
  (uint32_t)down_in_dim,
  (uint32_t)routed_out_dim,
  g->router_selected, g->router_weights,
- DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+ DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
  }
  DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
  if (ok) {
@@ -14308,6 +14311,9 @@ static bool metal_graph_encode_layer_ffn_batch(
  layer->ffn_gate_tid2eid != NULL,
  g->batch_router_logits,
  g->prefill_tokens,
+ DS4_N_EXPERT,
+ DS4_N_EXPERT_USED,
+ DS4_EXPERT_WEIGHT_SCALE,
  n_tokens) != 0;
 
  /* Inference plumbing port .
@@ -14410,6 +14416,7 @@ static bool metal_graph_encode_layer_ffn_batch(
  (uint32_t)routed_out_dim,
  g->batch_router_selected,
  g->batch_router_weights,
+ DS4_N_EXPERT,
  DS4_N_EXPERT_USED,
  DS4_SWIGLU_CLAMP_EXP,
  g->batch_ffn_norm,
@@ -19569,7 +19576,8 @@ static bool engine_map_metal_views_with_routed_holes(ds4_engine *e) {
  free(routed);
  return ds4_gpu_set_model_map_range(e->model.map, e->model.size,
  e->model.tensor_data_pos,
- e->model.size - e->model.tensor_data_pos) != 0;
+ e->model.size - e->model.tensor_data_pos,
+ e->model.size) != 0;
  }
 
  uint64_t routed_bytes = 0;
@@ -20020,7 +20028,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  mapped_ok = (ds4_gpu_set_model_map_range(e->model.map,
  e->model.size,
  e->model.tensor_data_pos,
- e->model.size - e->model.tensor_data_pos) != 0);
+ e->model.size - e->model.tensor_data_pos,
+ e->model.size) != 0);
  }
  if (!mapped_ok) {
  fprintf(stderr,

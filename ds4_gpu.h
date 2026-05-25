@@ -597,6 +597,7 @@ int ds4_gpu_directional_steering_project_tensor(
  uint32_t rows,
  float scale);
 
+int ds4_gpu_router_select_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,
         ds4_gpu_tensor       *probs,

@@ -5030,7 +5030,8 @@ int ds4_gpu_embed_tokens_hc_tensor(
  return 1;
 }
 
-int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
+ (void)max_tensor_bytes; /* silv-merge: param added by antirez 26ee1fa; not yet used in silv's metal impl */
  if (!g_initialized && !ds4_gpu_init()) return 0;
  if (!model_map || model_size == 0) return 0;
  if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) return 0;
@@ -5062,7 +5063,7 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
 }
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
- return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size);
+ return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, model_size);
 }
 
 int ds4_gpu_set_model_fd(int fd) {
@@ -14065,11 +14066,15 @@ int ds4_gpu_router_select_tensor(
  uint64_t hash_offset,
  uint32_t hash_rows,
  uint32_t token,
+ uint32_t n_expert,
+ uint32_t n_expert_used,
+ float expert_weight_scale,
  uint32_t n_expert_groups,
  uint32_t n_group_used,
  bool has_bias,
  bool hash_mode,
  const ds4_gpu_tensor *logits) {
+ (void)n_expert; (void)n_expert_used; (void)expert_weight_scale; /* PRO params; silv non-PRO path hardcodes DS4_N_EXPERT/USED/SCALE */
  if (!g_initialized && !ds4_gpu_init()) return 0;
  if (!selected || !weights || !probs || !logits || !model_map) return 0;
  if (hash_mode && token >= hash_rows) return 0;
@@ -14158,7 +14163,11 @@ int ds4_gpu_router_select_batch_tensor(
  bool hash_mode,
  const ds4_gpu_tensor *logits,
  const ds4_gpu_tensor *tokens,
+ uint32_t n_expert,
+ uint32_t n_expert_used,
+ float expert_weight_scale,
  uint32_t n_tokens) {
+ (void)n_expert; (void)n_expert_used; (void)expert_weight_scale;
  if (!g_initialized && !ds4_gpu_init()) return 0;
  if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0) return 0;
  if (n_expert_groups > 1u || n_group_used > 0u) {
