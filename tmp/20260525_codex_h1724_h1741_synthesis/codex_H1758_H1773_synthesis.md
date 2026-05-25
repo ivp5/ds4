@@ -583,6 +583,70 @@ implements the optimal raw-IQ2-in-kernel-decode pattern.
 A.4 has essentially zero deployable engineering target. DS4 ships
 the answer to H1783's measurement.
 
+### H1788 + H1789 close the loop on codex's parallel arc
+
+Codex shipped H1788 (M1 Max Metal4 surface re-survey) + H1789 (raw
+IQ2 DS4 gate/up route packet consumption, no f32 staging). Both
+appeared on disk before CODEX_SHIFTS.md was updated.
+
+H1788 key conclusion: "The next DS4 improvement should not chase
+ANE through MTL4MachineLearningCommandEncoder. It should continue
+H1786/H1787's direct compressed-representation compute path."
+
+H1789 result (864 cases × 4 act_rows, real DS4 route trace):
+- 3.91 ms GPU, 26.4 MB resident allocation, raw_iq2=true
+- 15.5× f32 expansion AVOIDED (vs codex's prior f32 staging baseline)
+- Three fallacies explicitly tested + REFUTED:
+  - "Expert rows must be expanded to f32 before GPU compute" — false
+  - "The route packet is metadata rather than executable compact
+    control/data plane" — false
+  - "Reducing memory necessarily costs exactness at the gate/up
+    activation boundary" — false
+
+The codex arc has now demonstrated the architectural pattern at MoE
+scale, with real DS4 route packets, without any f32 staging. This
+matches what DS4 production has done all along via
+`kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32`.
+
+### The honest narrative arc
+
+Codex arc (parallel session) climbed the technical ladder:
+1. H1740s: route packet as boundary certificate
+2. H1758-H1782: layer windows + row-streamed + reusable buffers
+3. H1783: identified f32 materialization as the 84% bottleneck
+4. H1784: measured 15.5× f32 expansion overhead
+5. H1786: built raw-IQ2 single-row MTL4 dot kernel (fp32 noise floor)
+6. H1787: parallelized to 6.41× speedup
+7. H1788: surveyed surface, redirected from ANE toward compressed
+   compute path
+8. H1789: consumed real DS4 route packet from raw IQ2 directly,
+   refuted three load-bearing f32-required fallacies
+
+DS4 production has had this pattern in `metal/moe.metal:991` from
+the beginning. The codex arc was rediscovering the architectural
+choice silv made. The convergence of independent codex measurement
++ existing DS4 production design is the strongest validation of the
+direction.
+
+The codec arc (this session) contributed a parallel implementation
+of the same pattern with learned codebooks (polar/VQ) — weaker on
+numbers, valuable as B-2.3c dispatch infrastructure for future
+codec experiments.
+
+### Final state inheritance
+
+For next session opening with "codec arc continuation":
+- Read this synthesis memo top-to-bottom
+- The codec arc is RESEARCH-COMPLETE; production deployment of
+  raw-IQ2 already exists in DS4 (`kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32`)
+- The codec arc's B-2.3c stub remains useful for experiment dispatch
+- Branch A sub-decisions (A.1/A.2/A.3/A.4) are largely moot —
+  silv-deferral is the correct posture pending demonstration that
+  any specific tensor needs codec replacement
+- Codex H1789's "route packet as executable compact control/data
+  plane" matches DS4's existing per-expert dispatch via `ids` +
+  `iid1` — codex has now independently confirmed the design works
+
 ### What survives this correction
 
 - The MLX-parallel polar encoder (1.86 OOMs vs numpy) — still useful
