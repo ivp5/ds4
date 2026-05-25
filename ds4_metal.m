@@ -17161,6 +17161,61 @@ int ds4_gpu_mtl4_vq_real_canary(const char *vqb1_dir,
     }
 }
 
+/* ============================================================ */
+/* Phase B-2.3c: polar hot-path dispatcher (stub)                */
+/* ============================================================ */
+/* silv chose Branch A (polar hot-path + runtime). Per BRANCH_A_PREFLIGHT.md
+ * memo (commit b5e84f1), the row-coverage prerequisite forks into A.1
+ * (full-row corpus, needs disk approval), A.2 (full-row VQ corpus), or
+ * A.3 (hybrid polar+FP4). silv decision pending.
+ *
+ * This stub ships the hot-path GATE wiring without yet performing actual
+ * polar substitution. Validates:
+ *   - Pool reference reaches the hot path correctly
+ *   - Per-layer enable check works
+ *   - Diagnostic emits when polar would dispatch
+ *   - Graceful fallback to FP4 (returns 0)
+ *
+ * silv can runtime-test the gate logic without risking incorrect inference:
+ *   DS4_POLAR_DIR=tmp/polar_full_p32m8 DS4_POLAR_LAYERS=0,1,2,3 ./ds4 ...
+ * Expected: stderr emits "polar pool has GUD for layer=N" lines on FFN
+ * boundaries; FP4 path runs normally; AIME hold-rate unchanged.
+ *
+ * Body fills in once silv resolves A.1/A.2/A.3 sub-decision.
+ */
+int ds4_gpu_mtl4_polar_routed_moe_batch_stub(const void *pool_opaque,
+                                              uint32_t layer,
+                                              uint32_t n_tokens) {
+    const ds4_polar_pool *pool = (const ds4_polar_pool *)pool_opaque;
+    if (!pool) return 0;
+    const ds4_polar_file *gate = ds4_polar_pool_get(pool, layer, DS4_POLAR_KIND_GATE);
+    const ds4_polar_file *up   = ds4_polar_pool_get(pool, layer, DS4_POLAR_KIND_UP);
+    const ds4_polar_file *down = ds4_polar_pool_get(pool, layer, DS4_POLAR_KIND_DOWN);
+    if (!gate || !up || !down) {
+        /* Layer not in polar pool — silent fallback (some layers may be
+         * intentionally polar-disabled per DS4_POLAR_LAYERS mask). */
+        return 0;
+    }
+    /* Diagnostic: confirm pool has all GUD files; stub returns 0 to fall
+     * through to FP4 path. Once row-coverage decision resolves and body
+     * lands, this returns 1 on successful polar dispatch instead. */
+    static int diag_emitted[DS4_POLAR_MAX_LAYERS] = {0};
+    if (layer < DS4_POLAR_MAX_LAYERS && !diag_emitted[layer]) {
+        fprintf(stderr,
+                "ds4: polar B-2.3c gate engaged layer=%u "
+                "(gate=%ux%u up=%ux%u down=%ux%u K_or_M=p%u_m%u  n_tokens=%u) "
+                "— STUB returns 0 → FP4 fallback. Body pending A.1/A.2/A.3 decision.\n",
+                layer,
+                gate->n_rows, gate->n_pairs,
+                up->n_rows, up->n_pairs,
+                down->n_rows, down->n_pairs,
+                gate->phase_levels, gate->mag_levels,
+                n_tokens);
+        diag_emitted[layer] = 1;
+    }
+    return 0;  /* Stub: always fall back to FP4 (no actual polar substitution yet) */
+}
+
 int ds4_gpu_mtl4_polar_tile_canary(uint32_t tiles, uint32_t rows, uint32_t batches, uint32_t pairs) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!ds4_polar_tile_pipeline_init()) return 0;

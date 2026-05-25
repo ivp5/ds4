@@ -14367,6 +14367,23 @@ static bool metal_graph_encode_layer_ffn_batch(
  }
  if (ok) ok = (ds4_gpu_begin_commands() != 0);
  } else if (ok) {
+ /* Phase B-2.3c stub: polar hot-path gate. If polar pool + per-layer
+  * enable both engaged, give polar dispatcher first chance at this
+  * FFN. Stub returns 0 → falls through to FP4 path (body pending
+  * silv decision on row-coverage strategy per BRANCH_A_PREFLIGHT.md). */
+ bool polar_taken = false;
+ if (g->polar_pool_ref &&
+     g->polar_layer_enabled_ref &&
+     il < DS4_POLAR_MAX_LAYERS &&
+     g->polar_layer_enabled_ref[il]) {
+  polar_taken = ds4_gpu_mtl4_polar_routed_moe_batch_stub(
+   g->polar_pool_ref, (uint32_t)il, (uint32_t)n_tokens) != 0;
+ }
+ if (polar_taken) {
+  /* Polar dispatcher claimed the FFN — output is in batch_routed_out.
+   * Skip FP4 path entirely. (Stub currently never returns 1, so this
+   * branch is dead until body lands.) */
+ } else {
  /* MTL4 entry: env-gated, falls back to legacy when disabled or
  * preflight fails (n_expert != 6 or n_tokens > 16). The two
  * functions share signature except for the extra mtl4_path_taken
@@ -14401,6 +14418,7 @@ static bool metal_graph_encode_layer_ffn_batch(
  &g->batch_routed_mid_is_f16,
  &mtl4_taken) != 0;
  (void)mtl4_taken; /* hook for future telemetry */
+ }  /* end polar_taken else (FP4 fallback) */
  }
  if (ok) {
  metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,

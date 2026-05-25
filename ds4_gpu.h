@@ -1000,3 +1000,21 @@ int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
 int ds4_gpu_mtl4_vq_real_canary(const char *vqb1_dir,
                                   uint32_t layer, uint32_t expert,
                                   uint32_t down_rows, uint32_t act_rows);
+
+/* Phase B-2.3c stub: polar hot-path dispatcher entry. Validates pool
+ * has gate/up/down PLR2 files for the layer; emits diagnostic; always
+ * returns 0 (fallback to FP4 path). Body implementation pending silv
+ * decision on row-coverage sub-strategy (A.1 full-row corpus / A.2
+ * VQ / A.3 hybrid). See BRANCH_A_PREFLIGHT.md.
+ *
+ * Hot-path integration: called from metal_graph_encode_layer_ffn_batch
+ * when g->polar_pool_ref != NULL && g->polar_layer_enabled_ref[il].
+ * Returns 1 if polar substitution claimed the FFN output; 0 to
+ * fall through to existing FP4 path.
+ */
+/* Forward declaration via void* — caller (ds4.c) passes g->polar_pool_ref
+ * which is const ds4_polar_pool*. Stub casts back internally. This avoids
+ * pulling ds4_polar_reader.h into ds4_gpu.h's already-deep dependency tree. */
+int ds4_gpu_mtl4_polar_routed_moe_batch_stub(const void *pool,
+                                              uint32_t layer,
+                                              uint32_t n_tokens);
