@@ -1,0 +1,42 @@
+{
+  "n_samples": 4,
+  "n_with_truth": 0,
+  "results": [
+    {
+      "k": 0,
+      "seed": 20260525,
+      "n_chars": 13284,
+      "n_truth_occurrences": 0,
+      "truth_first_at": -1,
+      "wall_s": 56.94724917411804,
+      "text_tail": " 6\\}$, then 6 is visible, 1 is covered.\nIf $A_D = \\{6\\}$, 6 is visible.\nSo, the set of visible stickers is exactly the set of values $\\{ \\max(A_D) : A_D \\neq \\emptyset \\}$.\nLet $V$ be the set of visible stickers. $V = \\{ \\max(A_D) : D \\in \\{1, \\dots, 6\\} \\}$.\nWait, if $A_D = \\emptyset$, then $\\max(A"
+    },
+    {
+      "k": 1,
+      "seed": 20260526,
+      "n_chars": 12246,
+      "n_truth_occurrences": 0,
+      "truth_first_at": -1,
+      "wall_s": 61.10768485069275,
+      "text_tail": "_6$ is always visible?\n      Wait, \"all even-numbered stickers are visible on faces of the die\".\n      This means the set of visible stickers $V$ must contain $\\{S_2, S_4, S_6\\}$.\n      But wait, $S_6$ visible means it is on the die.\n      Wait, $S_6$ is placed on $D_6$.\n      Is it possible that $S"
+    },
+    {
+      "k": 2,
+      "seed": 20260527,
+      "n_chars": 12524,
+      "n_truth_occurrences": 0,
+      "truth_first_at": -1,
+      "wall_s": 60.87059283256531,
+      "text_tail": "4 = G$ and $G \\notin \\{r_5, r_6\\}$, then sticker 4 is on face $G$.\n      Is it possible that $G = r_3$? No, because if $G = r_3$, then at step 3, face $G$ had sticker 3.\n      Then at step 4, we place sticker 4 on face $G$, covering sticker 3.\n      Then at step 5 or 6, if we roll $G$, sticker 5 or "
+    },
+    {
+      "k": 3,
+      "seed": 20260528,
+      "n_chars": 15409,
+      "n_truth_occurrences": 0,
+      "truth_first_at": -1,
+      "wall_s": 59.916971921920776,
+      "text_tail": "ver chosen, it remains blank.\n            *   But wait, if we place 6 stickers, and there are 6 faces.\n            *   If every face is visited at least once, then every face has at least one sticker on it (the topmost one).\n            *   If a face is visited $N_f$ times, we have $N_f$ stickers on"
+    }
+  ]
+}
