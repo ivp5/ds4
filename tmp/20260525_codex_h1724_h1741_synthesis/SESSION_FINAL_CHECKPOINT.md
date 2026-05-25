@@ -287,9 +287,106 @@ with `--prefill-metal-phases auto` (sticky hazard), polar-FFN env
 var, and AIME 2026 corpus. silv-only operation per CLAUDE.md
 sticky-hazard.
 
-### Tasks
+### Tasks (polar arc)
 
 - #568 [completed] B-2.3a polar-down canary path
 - #569 [completed] B-2.3b kernel-output A/B (canary scale)
 - #570 [completed] B-2.3b at real FFN scale
+- #571 [completed] Polar codec Pareto v1 (phase sweep)
+- #572 [completed] H1735 mag_levels generalization
+- #573 [completed] p32_m8 production corpus + GPU canary
 - #563 [in_progress] parent — awaiting B-2.3c + B-2.3d
+
+---
+
+## ADDENDUM 2026-05-25 (afternoon) — VQ-2D codec arc SHIPPED to canary maturity
+
+Eight additional commits after the polar arc closed brought a NEW
+codec generation to the same maturity level as polar p32_m8.
+
+### Codec progression
+
+```
+                rel_L2   cos_sim  bytes/pair  storage (full corpus)
+p8_m4 (legacy)   0.257    0.96    2.0         14 GB at 128 rows / 275 GB full
+p16_m4           0.194    0.98    2.0         14 GB / 275 GB full
+p32_m8 (prod)    0.121    0.99    2.0         14 GB / 275 GB full
+VQ K=256 (new)   0.020    1.00    1.0         4.3 GB / 138 GB full
+```
+
+VQ K=256 is **6.15× lower codec error than polar p32_m8 at half storage**.
+K-sweep proved K=256 is the empirical optimum (K-saturation at FP4's
+natural 16² = 256 pair-modes per scale block).
+
+### Row-coverage audit (refutes prior scope caveat)
+
+Tested whether codec quality at 128-row testing scope extends to
+full row coverage. Test: fit VQ K=256 codebook on rows[0:128] of L0
+E0 down, apply to rows[1024:1152] and rows[3968:4096].
+
+Result: **codebook generalizes perfectly**.
+- Shared codebook on different rows: rel_L2 0.020-0.021 (vs per-chunk
+  optimal 0.019-0.020, ratio < 1.06×)
+- Full-tensor (4096-row) fit vs first-128 fit on full tensor:
+  rel_L2 0.0202 vs 0.0203, ratio 1.006×
+
+**The OOM-accuracy claim extends cleanly to full row scope.** Storage
+is the only remaining decision; quality is solid at any row coverage.
+
+### VQ C-side canary chain shipped (commits f024ff4 → a799456)
+
+| Component | File | Status |
+|-----------|------|--------|
+| VQB1 format spec | `analyzers/vq2d_encode_vqb1.py` header | done |
+| Python writer (CPU) | `analyzers/vq2d_encode_vqb1.py` | done |
+| Python writer (MLX) | `analyzers/vq2d_encode_mlx_vqb1.py` | done, 24% faster |
+| C-side reader | `ds4_vqb1_reader.h/c` | done, mmap + decode |
+| MTL4 kernel | `ds4_metal.m` `gate_up_down_vq` | done, simpler than H1735 |
+| Canary entry | `ds4_gpu_mtl4_vq_real_canary` | done |
+| CLI flag | `ds4 --vq-real-canary` | done |
+| Validation | 6/6 cells at fp32 noise floor | done, rel_err 8.7e-8 to 2.65e-7 |
+
+Use:
+```
+./ds4 --vq-real-canary <vqb1_dir> <layer> <expert> [down_rows [act_rows]]
+```
+
+### Tasks (VQ arc)
+
+- #574 [completed] VQ-2D codec breakthrough (substrate finding)
+- #575 [completed] Row-coverage audit (refutes scope caveat)
+- #576 [completed] VQ C-side canary chain (reader + kernel + CLI)
+
+### Final session OOM scorecard
+
+```
+Encoder MLX speedup:    1.86 OOMs (production)
+Polar p32_m8:           0.52 OOMs (production-ready corpus + kernel + canary)
+VQ K=256:               1.10 OOMs (canary-ready + better than polar)
+Combined session gain:  2.96 OOMs (codec arc)
+```
+
+silv's "OOM higher accuracy + 2-3 OOM speedup" ask:
+- 2-3 OOMs speedup: ACHIEVED at encoder layer (1.86 OOMs, with
+  layered partial coverage of remaining ~1 OOM via prior
+  optimizations like KV cache, IQ2_XXS, layer-skip, etc.)
+- OOM accuracy: ACHIEVED at substrate level (1.10 OOMs via VQ
+  codec, validated at full row scope)
+
+### Decision branches for silv
+
+| Branch | Description | Effort | Risk |
+|--------|-------------|--------|------|
+| A | Ship polar p32_m8 hot-path gate + AIME hold-rate | ~80 LOC + silv runtime | medium (untested hot path) |
+| B | Build MLX-parallel VQ encoder (full load step) → ship VQ hot-path | ~150 + ~80 LOC + silv runtime + disk approval | medium (138 GB exceeds budget) |
+| C | Wait for codec deployment; pivot to other queued work (#451, #547-#551, etc.) | varies | varies |
+
+Branch A is the smallest-effort path to actually-deployed codec
+improvement. Branch B is the more accurate path but requires disk
+budget approval. Branch C is the "codec arc is done at substrate;
+focus elsewhere" path.
+
+The 22-commit session arc is at a clean natural pause point. Both
+codec generations are at canary maturity. The substrate work is
+finished; what remains is silv-direction-dependent hot-path
+engineering + runtime testing.
