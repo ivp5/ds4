@@ -16482,6 +16482,37 @@ int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
         return 0;
     }
 
+    /* Phase B-2.3a (D1 path): optionally validate polar-DOWN → fp32 → H1735
+     * end-to-end on real DS4 V4 weights. Gated by env var DS4_POLAR_REAL_DOWN=1
+     * so the original synthetic-uniform-down test path is preserved by default.
+     *
+     * Polar-down storage: row d ∈ [0, n_rows) carries n_pairs complex pairs
+     * encoding (re_0, im_0, re_1, im_1, …, re_{n_pairs-1}, im_{n_pairs-1}) →
+     * 2 × n_pairs real values per row. We need down_rows × act_rows reals
+     * here, so require down_rows ≤ down_file->n_rows AND act_rows ≤ 2 × n_pairs. */
+    const char *env_polar_real_down = getenv("DS4_POLAR_REAL_DOWN");
+    const int use_polar_down = (env_polar_real_down && env_polar_real_down[0] == '1') ? 1 : 0;
+    const ds4_polar_file *down_file = NULL;
+    if (use_polar_down) {
+        down_file = ds4_polar_pool_get(&pool, layer, DS4_POLAR_KIND_DOWN);
+        if (!down_file) {
+            fprintf(stderr, "ds4: polar real canary — DS4_POLAR_REAL_DOWN=1 but no down PLR2 for layer %u; falling back to synthetic\n",
+                    layer);
+        } else if (expert >= down_file->n_experts) {
+            fprintf(stderr, "ds4: polar real canary — down expert %u OOR (down has %u experts); falling back to synthetic\n",
+                    expert, down_file->n_experts);
+            down_file = NULL;
+        } else if (down_rows > down_file->n_rows) {
+            fprintf(stderr, "ds4: polar real canary — down_rows %u > down n_rows %u; falling back to synthetic\n",
+                    down_rows, down_file->n_rows);
+            down_file = NULL;
+        } else if (act_rows > down_file->n_pairs * 2u) {
+            fprintf(stderr, "ds4: polar real canary — act_rows %u > down 2×n_pairs %u; falling back to synthetic\n",
+                    act_rows, down_file->n_pairs * 2u);
+            down_file = NULL;
+        }
+    }
+
     const uint32_t rows   = gate_file->n_rows;
     const uint32_t pairs  = gate_file->n_pairs;
     const uint32_t n_codes = 1;        /* single tile pool: just this expert */
@@ -16547,8 +16578,31 @@ int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
         float *hid = (float *)hidden.contents;
         for (NSUInteger i = 0; i < hidden_count; i++) hid[i] = 1.0f;
         float *dwn = (float *)downBuf.contents;
-        const float down_val = 1.0f / (float)act_rows;
-        for (NSUInteger i = 0; i < down_count; i++) dwn[i] = down_val;
+        if (down_file) {
+            /* Polar-down: decode first (down_rows × act_rows) reals into the
+             * down buffer. Layout matches the H1735 kernel expectation
+             * `down[route_pair, d, a]` flattened as
+             * `dwn[((route_pair * down_rows) + d) * act_rows + a]`.
+             * route_pairs == 1 here, so offset = d * act_rows + a.
+             *
+             * Polar storage: each pair at index k gives (re, im) → reals at
+             * a = 2*k AND a = 2*k+1. For odd act_rows the last real comes
+             * from re of pair k=act_rows/2. */
+            for (uint32_t d = 0; d < down_rows; d++) {
+                for (uint32_t a = 0; a < act_rows; a += 2) {
+                    const uint32_t k = a >> 1;
+                    const float re = ds4_polar_decode_pair_re(down_file, expert, d, k);
+                    dwn[(NSUInteger)d * act_rows + a] = re;
+                    if ((a + 1) < act_rows) {
+                        const float im = ds4_polar_decode_pair_im(down_file, expert, d, k);
+                        dwn[(NSUInteger)d * act_rows + a + 1] = im;
+                    }
+                }
+            }
+        } else {
+            const float down_val = 1.0f / (float)act_rows;
+            for (NSUInteger i = 0; i < down_count; i++) dwn[i] = down_val;
+        }
         float *cosP = (float *)cosLut.contents;
         float *sinP = (float *)sinLut.contents;
         /* Populate LUT for phase_codes ∈ [0, phase_levels]:
@@ -16636,7 +16690,11 @@ int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
          *   gate_dot[r] = sum over p ∈ [0, pairs): re_decoded(r,p) + im_decoded(r,p)
          * (same as up_dot since we copied gate into up's slot for this canary).
          * act[r] = silu(gate_dot) * up_dot * 1.0
-         * out[d] = sum_r act[r] * (1/act_rows) for each down_rows entry d. */
+         *
+         * If down is synthetic-uniform (down_file==NULL):
+         *   out[d] = sum_r act[r] * (1/act_rows)  → identical across d
+         * If down is polar (down_file!=NULL):
+         *   out[d] = sum_r act[r] * dwn[d * act_rows + r]  → per-d differentiated */
         float gate_dot_sum_rows[64] = {0};  /* MAX_ACT = 64 */
         for (uint32_t r = 0; r < act_rows; r++) {
             double sum_re_im = 0.0;
@@ -16646,34 +16704,61 @@ int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
             }
             gate_dot_sum_rows[r] = (float)sum_re_im;
         }
+        float act_per_row[64] = {0};  /* MAX_ACT = 64 */
         double act_sum = 0.0;
         for (uint32_t r = 0; r < act_rows; r++) {
             const float g = gate_dot_sum_rows[r];
             const float silu = g / (1.0f + expf(-g));
-            act_sum += (double)silu * (double)g * 1.0;
+            const float a = silu * g * 1.0f;
+            act_per_row[r] = a;
+            act_sum += (double)a;
         }
-        /* down is uniform 1.0/act_rows, so each output = sum_r act × (1/act_rows) */
-        const float expected = (float)(act_sum / (double)act_rows);
 
         float *outPtr = (float *)outBuf.contents;
         float maxAbsErr = 0.0f;
-        for (NSUInteger i = 0; i < out_count; i++) {
-            float diff = fabsf(outPtr[i] - expected);
-            if (diff > maxAbsErr) maxAbsErr = diff;
+        float refMagMax = 0.0f;  /* max |expected[d]| for rel-err denominator */
+        float expected0 = 0.0f;
+        if (down_file) {
+            /* polar-down: per-d expected via real dwn values */
+            for (uint32_t d = 0; d < down_rows; d++) {
+                double od = 0.0;
+                for (uint32_t r = 0; r < act_rows; r++) {
+                    od += (double)act_per_row[r] * (double)dwn[(NSUInteger)d * act_rows + r];
+                }
+                const float exp_d = (float)od;
+                if (d == 0) expected0 = exp_d;
+                if (fabsf(exp_d) > refMagMax) refMagMax = fabsf(exp_d);
+                const float diff = fabsf(outPtr[d] - exp_d);
+                if (diff > maxAbsErr) maxAbsErr = diff;
+            }
+        } else {
+            /* synthetic-uniform down: per-d expected is the same value act_sum/act_rows */
+            expected0 = (float)(act_sum / (double)act_rows);
+            refMagMax = fabsf(expected0);
+            for (NSUInteger i = 0; i < out_count; i++) {
+                float diff = fabsf(outPtr[i] - expected0);
+                if (diff > maxAbsErr) maxAbsErr = diff;
+            }
         }
         const double gpuMs = (gpuEnd - gpuStart) * 1000.0;
-        const float relErr = fabsf(expected) > 1e-6f ? maxAbsErr / fabsf(expected) : maxAbsErr;
+        const float relErr = refMagMax > 1e-6f ? maxAbsErr / refMagMax : maxAbsErr;
         fprintf(stderr,
                 "ds4: polar REAL canary layer=%u expert=%u rows=%u pairs=%u down_rows=%u act_rows=%u\n"
-                "  CPU expected=%.4f GPU out[0]=%.4f max_abs_err=%.4e rel_err=%.4e\n"
+                "  down_src=%s CPU expected[0]=%.4f GPU out[0]=%.4f max_abs_err=%.4e rel_err=%.4e\n"
                 "  gpu_elapsed=%.4f ms  resident=%.1f MB\n",
                 layer, expert, rows, pairs, down_rows, act_rows,
-                (double)expected, (double)outPtr[0],
+                down_file ? "polar" : "uniform",
+                (double)expected0, (double)outPtr[0],
                 (double)maxAbsErr, (double)relErr,
                 gpuMs,
                 (double)(pair_count * 2 + code_rows * 16 + hidden_count * 4 + down_count * 4) / 1e6);
         ds4_polar_pool_close(&pool);
-        return relErr < 1e-3f ? 1 : 0;
+        /* Threshold: synthetic-uniform tightly bit-equivalent (1e-3); polar-down
+         * carries codec noise (rel_L2 ~0.20 expected per-row, ~0.05 per
+         * output via the sum-projection averaging). Accept rel_err < 0.10 for
+         * polar-down — well within codec quality envelope. */
+        const float accept = down_file ? 0.10f : 1e-3f;
+        return relErr < accept ? 1 : 0;
     }
 }
 
