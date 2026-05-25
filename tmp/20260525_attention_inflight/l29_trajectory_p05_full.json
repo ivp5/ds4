@@ -1,0 +1,516 @@
+{
+  "label": "p05_l29_full",
+  "model_id": "mlx-community/Qwen3.5-4B-MLX-4bit",
+  "layer": 29,
+  "stride": 200,
+  "n_tok": 14283,
+  "boxed_positions": [
+    33696
+  ],
+  "trajectory": [
+    {
+      "tok_pos": 0,
+      "char_pos": 3,
+      "top1_id": 12791,
+      "top1_token": "orem",
+      "top1_prob": 0.010121522471308708
+    },
+    {
+      "tok_pos": 200,
+      "char_pos": 608,
+      "top1_id": 43219,
+      "top1_token": "'$",
+      "top1_prob": 0.9895804524421692
+    },
+    {
+      "tok_pos": 400,
+      "char_pos": 1138,
+      "top1_id": 283,
+      "top1_token": " =",
+      "top1_prob": 0.9048048853874207
+    },
+    {
+      "tok_pos": 600,
+      "char_pos": 1701,
+      "top1_id": 8937,
+      "top1_token": " angle",
+      "top1_prob": 0.8171718120574951
+    },
+    {
+      "tok_pos": 800,
+      "char_pos": 2217,
+      "top1_id": 15,
+      "top1_token": "0",
+      "top1_prob": 0.6905211210250854
+    },
+    {
+      "tok_pos": 1000,
+      "char_pos": 2642,
+      "top1_id": 378,
+      "top1_token": " e",
+      "top1_prob": 0.9832220673561096
+    },
+    {
+      "tok_pos": 1200,
+      "char_pos": 3014,
+      "top1_id": 12576,
+      "top1_token": "$.",
+      "top1_prob": 0.6943076848983765
+    },
+    {
+      "tok_pos": 1400,
+      "char_pos": 3399,
+      "top1_id": 1088,
+      "top1_token": " \\",
+      "top1_prob": 0.6370821595191956
+    },
+    {
+      "tok_pos": 1600,
+      "char_pos": 3872,
+      "top1_id": 12402,
+      "top1_token": "Real",
+      "top1_prob": 0.10404840856790543
+    },
+    {
+      "tok_pos": 1800,
+      "char_pos": 4285,
+      "top1_id": 185756,
+      "top1_token": " -**",
+      "top1_prob": 0.09169650822877884
+    },
+    {
+      "tok_pos": 2000,
+      "char_pos": 4692,
+      "top1_id": 2413,
+      "top1_token": "pi",
+      "top1_prob": 0.8634954690933228
+    },
+    {
+      "tok_pos": 2200,
+      "char_pos": 5123,
+      "top1_id": 9828,
+      "top1_token": ",n",
+      "top1_prob": 0.9117874503135681
+    },
+    {
+      "tok_pos": 2400,
+      "char_pos": 5699,
+      "top1_id": 90146,
+      "top1_token": " Checked",
+      "top1_prob": 0.5028812885284424
+    },
+    {
+      "tok_pos": 2600,
+      "char_pos": 6207,
+      "top1_id": 15504,
+      "top1_token": "theta",
+      "top1_prob": 0.009795747697353363
+    },
+    {
+      "tok_pos": 2800,
+      "char_pos": 6709,
+      "top1_id": 53031,
+      "top1_token": "$,",
+      "top1_prob": 0.42461520433425903
+    },
+    {
+      "tok_pos": 3000,
+      "char_pos": 7224,
+      "top1_id": 283,
+      "top1_token": " =",
+      "top1_prob": 0.9492437839508057
+    },
+    {
+      "tok_pos": 3200,
+      "char_pos": 7763,
+      "top1_id": 89,
+      "top1_token": "z",
+      "top1_prob": 0.1521572768688202
+    },
+    {
+      "tok_pos": 3400,
+      "char_pos": 8245,
+      "top1_id": 567,
+      "top1_token": " we",
+      "top1_prob": 0.412852019071579
+    },
+    {
+      "tok_pos": 3600,
+      "char_pos": 8734,
+      "top1_id": 14,
+      "top1_token": "/",
+      "top1_prob": 0.3870202898979187
+    },
+    {
+      "tok_pos": 3800,
+      "char_pos": 9205,
+      "top1_id": 7251,
+      "top1_token": " vec",
+      "top1_prob": 0.10135141015052795
+    },
+    {
+      "tok_pos": 4000,
+      "char_pos": 9649,
+      "top1_id": 478,
+      "top1_token": " +",
+      "top1_prob": 0.5121270418167114
+    },
+    {
+      "tok_pos": 4200,
+      "char_pos": 10178,
+      "top1_id": 1070,
+      "top1_token": " them",
+      "top1_prob": 0.9992615580558777
+    },
+    {
+      "tok_pos": 4400,
+      "char_pos": 10611,
+      "top1_id": 8866,
+      "top1_token": ")}",
+      "top1_prob": 0.977432131767273
+    },
+    {
+      "tok_pos": 4600,
+      "char_pos": 11063,
+      "top1_id": 8263,
+      "top1_token": "$(",
+      "top1_prob": 0.7945735454559326
+    },
+    {
+      "tok_pos": 4800,
+      "char_pos": 11461,
+      "top1_id": 11189,
+      "top1_token": "(\\",
+      "top1_prob": 0.17224997282028198
+    },
+    {
+      "tok_pos": 5000,
+      "char_pos": 11851,
+      "top1_id": 21,
+      "top1_token": "6",
+      "top1_prob": 0.08480130136013031
+    },
+    {
+      "tok_pos": 5200,
+      "char_pos": 12280,
+      "top1_id": 92743,
+      "top1_token": "{(",
+      "top1_prob": 0.024425869807600975
+    },
+    {
+      "tok_pos": 5400,
+      "char_pos": 12712,
+      "top1_id": 17,
+      "top1_token": "2",
+      "top1_prob": 0.04270748421549797
+    },
+    {
+      "tok_pos": 5600,
+      "char_pos": 13068,
+      "top1_id": 239456,
+      "top1_token": "\u201d(",
+      "top1_prob": 0.08816006779670715
+    },
+    {
+      "tok_pos": 5800,
+      "char_pos": 13427,
+      "top1_id": 94,
+      "top1_token": "\ufffd",
+      "top1_prob": 0.042786870151758194
+    },
+    {
+      "tok_pos": 6000,
+      "char_pos": 13879,
+      "top1_id": 189506,
+      "top1_token": " **.**",
+      "top1_prob": 0.00874779000878334
+    },
+    {
+      "tok_pos": 6200,
+      "char_pos": 14212,
+      "top1_id": 24,
+      "top1_token": "9",
+      "top1_prob": 0.23717264831066132
+    },
+    {
+      "tok_pos": 6400,
+      "char_pos": 14672,
+      "top1_id": 5821,
+      "top1_token": " distance",
+      "top1_prob": 0.23082736134529114
+    },
+    {
+      "tok_pos": 6600,
+      "char_pos": 15217,
+      "top1_id": 506,
+      "top1_token": " at",
+      "top1_prob": 0.0905032828450203
+    },
+    {
+      "tok_pos": 6800,
+      "char_pos": 15660,
+      "top1_id": 4391,
+      "top1_token": "=(",
+      "top1_prob": 0.8744125962257385
+    },
+    {
+      "tok_pos": 7000,
+      "char_pos": 16041,
+      "top1_id": 32,
+      "top1_token": "A",
+      "top1_prob": 0.07657450437545776
+    },
+    {
+      "tok_pos": 7200,
+      "char_pos": 16436,
+      "top1_id": 7271,
+      "top1_token": " Law",
+      "top1_prob": 0.21102996170520782
+    },
+    {
+      "tok_pos": 7400,
+      "char_pos": 16893,
+      "top1_id": 1088,
+      "top1_token": " \\",
+      "top1_prob": 0.018845709040760994
+    },
+    {
+      "tok_pos": 7600,
+      "char_pos": 17358,
+      "top1_id": 78717,
+      "top1_token": " Leads",
+      "top1_prob": 0.1258576214313507
+    },
+    {
+      "tok_pos": 7800,
+      "char_pos": 17837,
+      "top1_id": 2094,
+      "top1_token": " around",
+      "top1_prob": 0.8767579793930054
+    },
+    {
+      "tok_pos": 8000,
+      "char_pos": 18378,
+      "top1_id": 23734,
+      "top1_token": "Equ",
+      "top1_prob": 0.1581147462129593
+    },
+    {
+      "tok_pos": 8200,
+      "char_pos": 18970,
+      "top1_id": 2423,
+      "top1_token": " ...",
+      "top1_prob": 0.9117804169654846
+    },
+    {
+      "tok_pos": 8400,
+      "char_pos": 19473,
+      "top1_id": 20837,
+      "top1_token": " triangle",
+      "top1_prob": 0.9352083802223206
+    },
+    {
+      "tok_pos": 8600,
+      "char_pos": 19964,
+      "top1_id": 1088,
+      "top1_token": " \\",
+      "top1_prob": 0.400350421667099
+    },
+    {
+      "tok_pos": 8800,
+      "char_pos": 20369,
+      "top1_id": 3307,
+      "top1_token": "}}",
+      "top1_prob": 0.998855471611023
+    },
+    {
+      "tok_pos": 9000,
+      "char_pos": 20780,
+      "top1_id": 35790,
+      "top1_token": "frac",
+      "top1_prob": 0.9926942586898804
+    },
+    {
+      "tok_pos": 9200,
+      "char_pos": 21234,
+      "top1_id": 19600,
+      "top1_token": "'^",
+      "top1_prob": 0.999788224697113
+    },
+    {
+      "tok_pos": 9400,
+      "char_pos": 21595,
+      "top1_id": 9128,
+      "top1_token": "cos",
+      "top1_prob": 0.802092969417572
+    },
+    {
+      "tok_pos": 9600,
+      "char_pos": 22027,
+      "top1_id": 189506,
+      "top1_token": " **.**",
+      "top1_prob": 0.2186497151851654
+    },
+    {
+      "tok_pos": 9800,
+      "char_pos": 22341,
+      "top1_id": 15,
+      "top1_token": "0",
+      "top1_prob": 0.46924498677253723
+    },
+    {
+      "tok_pos": 10000,
+      "char_pos": 22729,
+      "top1_id": 189506,
+      "top1_token": " **.**",
+      "top1_prob": 0.06163614243268967
+    },
+    {
+      "tok_pos": 10200,
+      "char_pos": 23369,
+      "top1_id": 32,
+      "top1_token": "A",
+      "top1_prob": 0.09278872609138489
+    },
+    {
+      "tok_pos": 10400,
+      "char_pos": 23851,
+      "top1_id": 283,
+      "top1_token": " =",
+      "top1_prob": 0.23958109319210052
+    },
+    {
+      "tok_pos": 10600,
+      "char_pos": 24352,
+      "top1_id": 283,
+      "top1_token": " =",
+      "top1_prob": 0.900469183921814
+    },
+    {
+      "tok_pos": 10800,
+      "char_pos": 24868,
+      "top1_id": 283,
+      "top1_token": " =",
+      "top1_prob": 0.16319383680820465
+    },
+    {
+      "tok_pos": 11000,
+      "char_pos": 25298,
+      "top1_id": 18,
+      "top1_token": "3",
+      "top1_prob": 0.4084700345993042
+    },
+    {
+      "tok_pos": 11200,
+      "char_pos": 25800,
+      "top1_id": 2867,
+      "top1_token": "erc",
+      "top1_prob": 0.9975367784500122
+    },
+    {
+      "tok_pos": 11400,
+      "char_pos": 26325,
+      "top1_id": 3387,
+      "top1_token": " points",
+      "top1_prob": 0.01872393488883972
+    },
+    {
+      "tok_pos": 11600,
+      "char_pos": 26798,
+      "top1_id": 69054,
+      "top1_token": "_TRANSL",
+      "top1_prob": 0.10466407984495163
+    },
+    {
+      "tok_pos": 11800,
+      "char_pos": 27299,
+      "top1_id": 15470,
+      "top1_token": "sin",
+      "top1_prob": 0.937433123588562
+    },
+    {
+      "tok_pos": 12000,
+      "char_pos": 27725,
+      "top1_id": 2984,
+      "top1_token": " length",
+      "top1_prob": 0.09144140779972076
+    },
+    {
+      "tok_pos": 12200,
+      "char_pos": 28315,
+      "top1_id": 15060,
+      "top1_token": " carefully",
+      "top1_prob": 0.7502194046974182
+    },
+    {
+      "tok_pos": 12400,
+      "char_pos": 28881,
+      "top1_id": 5022,
+      "top1_token": "pm",
+      "top1_prob": 0.4811975955963135
+    },
+    {
+      "tok_pos": 12600,
+      "char_pos": 29385,
+      "top1_id": 1412,
+      "top1_token": " error",
+      "top1_prob": 0.9067339301109314
+    },
+    {
+      "tok_pos": 12800,
+      "char_pos": 29919,
+      "top1_id": 59,
+      "top1_token": "\\",
+      "top1_prob": 0.00677274726331234
+    },
+    {
+      "tok_pos": 13000,
+      "char_pos": 30451,
+      "top1_id": 30835,
+      "top1_token": " cleaner",
+      "top1_prob": 0.8255371451377869
+    },
+    {
+      "tok_pos": 13200,
+      "char_pos": 30894,
+      "top1_id": 44102,
+      "top1_token": " rotated",
+      "top1_prob": 0.8214699625968933
+    },
+    {
+      "tok_pos": 13400,
+      "char_pos": 31621,
+      "top1_id": 1925,
+      "top1_token": " place",
+      "top1_prob": 0.9427542090415955
+    },
+    {
+      "tok_pos": 13600,
+      "char_pos": 32167,
+      "top1_id": 1406,
+      "top1_token": " point",
+      "top1_prob": 0.9630572199821472
+    },
+    {
+      "tok_pos": 13800,
+      "char_pos": 32639,
+      "top1_id": 21774,
+      "top1_token": " ?,",
+      "top1_prob": 0.005616606213152409
+    },
+    {
+      "tok_pos": 14000,
+      "char_pos": 33078,
+      "top1_id": 137481,
+      "top1_token": "\u56db\u4e2a\u81ea\u4fe1",
+      "top1_prob": 0.0035112700425088406
+    },
+    {
+      "tok_pos": 14200,
+      "char_pos": 33539,
+      "top1_id": 9944,
+      "top1_token": " prime",
+      "top1_prob": 0.9486080408096313
+    }
+  ]
+}

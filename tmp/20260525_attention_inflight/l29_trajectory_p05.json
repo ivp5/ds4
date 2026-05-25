@@ -1,0 +1,619 @@
+{
+  "label": "p05_l29_trajectory",
+  "model_id": "mlx-community/Qwen3.5-4B-MLX-4bit",
+  "layer": 29,
+  "stride": 100,
+  "n_tok": 8617,
+  "boxed_positions": [],
+  "trajectory": [
+    {
+      "tok_pos": 0,
+      "char_pos": 3,
+      "top1_id": 12791,
+      "top1_token": "orem",
+      "top1_prob": 0.010121522471308708
+    },
+    {
+      "tok_pos": 100,
+      "char_pos": 299,
+      "top1_id": 18090,
+      "top1_token": " centers",
+      "top1_prob": 0.7429031729698181
+    },
+    {
+      "tok_pos": 200,
+      "char_pos": 608,
+      "top1_id": 43219,
+      "top1_token": "'$",
+      "top1_prob": 0.9895804524421692
+    },
+    {
+      "tok_pos": 300,
+      "char_pos": 892,
+      "top1_id": 15504,
+      "top1_token": "theta",
+      "top1_prob": 0.02755914069712162
+    },
+    {
+      "tok_pos": 400,
+      "char_pos": 1138,
+      "top1_id": 283,
+      "top1_token": " =",
+      "top1_prob": 0.9048048853874207
+    },
+    {
+      "tok_pos": 500,
+      "char_pos": 1420,
+      "top1_id": 32,
+      "top1_token": "A",
+      "top1_prob": 0.07229883968830109
+    },
+    {
+      "tok_pos": 600,
+      "char_pos": 1701,
+      "top1_id": 8937,
+      "top1_token": " angle",
+      "top1_prob": 0.8171718120574951
+    },
+    {
+      "tok_pos": 700,
+      "char_pos": 2003,
+      "top1_id": 16547,
+      "top1_token": " geometry",
+      "top1_prob": 0.6408432126045227
+    },
+    {
+      "tok_pos": 800,
+      "char_pos": 2217,
+      "top1_id": 15,
+      "top1_token": "0",
+      "top1_prob": 0.6905211210250854
+    },
+    {
+      "tok_pos": 900,
+      "char_pos": 2445,
+      "top1_id": 4272,
+      "top1_token": "So",
+      "top1_prob": 0.0339459665119648
+    },
+    {
+      "tok_pos": 1000,
+      "char_pos": 2642,
+      "top1_id": 378,
+      "top1_token": " e",
+      "top1_prob": 0.9832220673561096
+    },
+    {
+      "tok_pos": 1100,
+      "char_pos": 2816,
+      "top1_id": 478,
+      "top1_token": " +",
+      "top1_prob": 0.7959631681442261
+    },
+    {
+      "tok_pos": 1200,
+      "char_pos": 3014,
+      "top1_id": 12576,
+      "top1_token": "$.",
+      "top1_prob": 0.6943076848983765
+    },
+    {
+      "tok_pos": 1300,
+      "char_pos": 3187,
+      "top1_id": 471,
+      "top1_token": " -",
+      "top1_prob": 0.6854884624481201
+    },
+    {
+      "tok_pos": 1400,
+      "char_pos": 3399,
+      "top1_id": 1088,
+      "top1_token": " \\",
+      "top1_prob": 0.6370821595191956
+    },
+    {
+      "tok_pos": 1500,
+      "char_pos": 3629,
+      "top1_id": 27478,
+      "top1_token": " -(",
+      "top1_prob": 0.5795390009880066
+    },
+    {
+      "tok_pos": 1600,
+      "char_pos": 3872,
+      "top1_id": 12402,
+      "top1_token": "Real",
+      "top1_prob": 0.10404840856790543
+    },
+    {
+      "tok_pos": 1700,
+      "char_pos": 4085,
+      "top1_id": 9128,
+      "top1_token": "cos",
+      "top1_prob": 0.50131756067276
+    },
+    {
+      "tok_pos": 1800,
+      "char_pos": 4285,
+      "top1_id": 185756,
+      "top1_token": " -**",
+      "top1_prob": 0.09169650822877884
+    },
+    {
+      "tok_pos": 1900,
+      "char_pos": 4467,
+      "top1_id": 160098,
+      "top1_token": "\u0636\u064a",
+      "top1_prob": 0.00670796912163496
+    },
+    {
+      "tok_pos": 2000,
+      "char_pos": 4692,
+      "top1_id": 2413,
+      "top1_token": "pi",
+      "top1_prob": 0.8634954690933228
+    },
+    {
+      "tok_pos": 2100,
+      "char_pos": 4852,
+      "top1_id": 4324,
+      "top1_token": "}/",
+      "top1_prob": 0.999229907989502
+    },
+    {
+      "tok_pos": 2200,
+      "char_pos": 5123,
+      "top1_id": 9828,
+      "top1_token": ",n",
+      "top1_prob": 0.9117874503135681
+    },
+    {
+      "tok_pos": 2300,
+      "char_pos": 5338,
+      "top1_id": 94,
+      "top1_token": "\ufffd",
+      "top1_prob": 0.07660486549139023
+    },
+    {
+      "tok_pos": 2400,
+      "char_pos": 5699,
+      "top1_id": 90146,
+      "top1_token": " Checked",
+      "top1_prob": 0.5028812885284424
+    },
+    {
+      "tok_pos": 2500,
+      "char_pos": 5980,
+      "top1_id": 43219,
+      "top1_token": "'$",
+      "top1_prob": 0.9314266443252563
+    },
+    {
+      "tok_pos": 2600,
+      "char_pos": 6207,
+      "top1_id": 15504,
+      "top1_token": "theta",
+      "top1_prob": 0.009795747697353363
+    },
+    {
+      "tok_pos": 2700,
+      "char_pos": 6432,
+      "top1_id": 40028,
+      "top1_token": " rotating",
+      "top1_prob": 0.14240700006484985
+    },
+    {
+      "tok_pos": 2800,
+      "char_pos": 6709,
+      "top1_id": 53031,
+      "top1_token": "$,",
+      "top1_prob": 0.42461520433425903
+    },
+    {
+      "tok_pos": 2900,
+      "char_pos": 6963,
+      "top1_id": 43219,
+      "top1_token": "'$",
+      "top1_prob": 0.8414723873138428
+    },
+    {
+      "tok_pos": 3000,
+      "char_pos": 7224,
+      "top1_id": 283,
+      "top1_token": " =",
+      "top1_prob": 0.9492437839508057
+    },
+    {
+      "tok_pos": 3100,
+      "char_pos": 7471,
+      "top1_id": 2413,
+      "top1_token": "pi",
+      "top1_prob": 0.7831321954727173
+    },
+    {
+      "tok_pos": 3200,
+      "char_pos": 7763,
+      "top1_id": 89,
+      "top1_token": "z",
+      "top1_prob": 0.1521572768688202
+    },
+    {
+      "tok_pos": 3300,
+      "char_pos": 7972,
+      "top1_id": 44421,
+      "top1_token": "'B",
+      "top1_prob": 0.9810945987701416
+    },
+    {
+      "tok_pos": 3400,
+      "char_pos": 8245,
+      "top1_id": 567,
+      "top1_token": " we",
+      "top1_prob": 0.412852019071579
+    },
+    {
+      "tok_pos": 3500,
+      "char_pos": 8527,
+      "top1_id": 11,
+      "top1_token": ",",
+      "top1_prob": 0.009331917390227318
+    },
+    {
+      "tok_pos": 3600,
+      "char_pos": 8734,
+      "top1_id": 14,
+      "top1_token": "/",
+      "top1_prob": 0.3870202898979187
+    },
+    {
+      "tok_pos": 3700,
+      "char_pos": 8970,
+      "top1_id": 16,
+      "top1_token": "1",
+      "top1_prob": 0.041406985372304916
+    },
+    {
+      "tok_pos": 3800,
+      "char_pos": 9205,
+      "top1_id": 7251,
+      "top1_token": " vec",
+      "top1_prob": 0.10135141015052795
+    },
+    {
+      "tok_pos": 3900,
+      "char_pos": 9441,
+      "top1_id": 1088,
+      "top1_token": " \\",
+      "top1_prob": 0.4817618429660797
+    },
+    {
+      "tok_pos": 4000,
+      "char_pos": 9649,
+      "top1_id": 478,
+      "top1_token": " +",
+      "top1_prob": 0.5121270418167114
+    },
+    {
+      "tok_pos": 4100,
+      "char_pos": 9915,
+      "top1_id": 369,
+      "top1_token": " is",
+      "top1_prob": 0.7586408853530884
+    },
+    {
+      "tok_pos": 4200,
+      "char_pos": 10178,
+      "top1_id": 1070,
+      "top1_token": " them",
+      "top1_prob": 0.9992615580558777
+    },
+    {
+      "tok_pos": 4300,
+      "char_pos": 10399,
+      "top1_id": 1918,
+      "top1_token": " product",
+      "top1_prob": 0.9234724640846252
+    },
+    {
+      "tok_pos": 4400,
+      "char_pos": 10611,
+      "top1_id": 8866,
+      "top1_token": ")}",
+      "top1_prob": 0.977432131767273
+    },
+    {
+      "tok_pos": 4500,
+      "char_pos": 10834,
+      "top1_id": 12576,
+      "top1_token": "$.",
+      "top1_prob": 0.5382561087608337
+    },
+    {
+      "tok_pos": 4600,
+      "char_pos": 11063,
+      "top1_id": 8263,
+      "top1_token": "$(",
+      "top1_prob": 0.7945735454559326
+    },
+    {
+      "tok_pos": 4700,
+      "char_pos": 11261,
+      "top1_id": 185756,
+      "top1_token": " -**",
+      "top1_prob": 0.06265820562839508
+    },
+    {
+      "tok_pos": 4800,
+      "char_pos": 11461,
+      "top1_id": 11189,
+      "top1_token": "(\\",
+      "top1_prob": 0.17224997282028198
+    },
+    {
+      "tok_pos": 4900,
+      "char_pos": 11664,
+      "top1_id": 12576,
+      "top1_token": "$.",
+      "top1_prob": 0.9748650193214417
+    },
+    {
+      "tok_pos": 5000,
+      "char_pos": 11851,
+      "top1_id": 21,
+      "top1_token": "6",
+      "top1_prob": 0.08480130136013031
+    },
+    {
+      "tok_pos": 5100,
+      "char_pos": 12079,
+      "top1_id": 12576,
+      "top1_token": "$.",
+      "top1_prob": 0.8540370464324951
+    },
+    {
+      "tok_pos": 5200,
+      "char_pos": 12280,
+      "top1_id": 92743,
+      "top1_token": "{(",
+      "top1_prob": 0.024425869807600975
+    },
+    {
+      "tok_pos": 5300,
+      "char_pos": 12496,
+      "top1_id": 9128,
+      "top1_token": "cos",
+      "top1_prob": 0.45572996139526367
+    },
+    {
+      "tok_pos": 5400,
+      "char_pos": 12712,
+      "top1_id": 17,
+      "top1_token": "2",
+      "top1_prob": 0.04270748421549797
+    },
+    {
+      "tok_pos": 5500,
+      "char_pos": 12894,
+      "top1_id": 17,
+      "top1_token": "2",
+      "top1_prob": 0.0033412082120776176
+    },
+    {
+      "tok_pos": 5600,
+      "char_pos": 13068,
+      "top1_id": 239456,
+      "top1_token": "\u201d(",
+      "top1_prob": 0.08816006779670715
+    },
+    {
+      "tok_pos": 5700,
+      "char_pos": 13268,
+      "top1_id": 1803,
+      "top1_token": "AB",
+      "top1_prob": 0.01509073842316866
+    },
+    {
+      "tok_pos": 5800,
+      "char_pos": 13427,
+      "top1_id": 94,
+      "top1_token": "\ufffd",
+      "top1_prob": 0.042786870151758194
+    },
+    {
+      "tok_pos": 5900,
+      "char_pos": 13676,
+      "top1_id": 26026,
+      "top1_token": "sqrt",
+      "top1_prob": 0.8134574294090271
+    },
+    {
+      "tok_pos": 6000,
+      "char_pos": 13879,
+      "top1_id": 189506,
+      "top1_token": " **.**",
+      "top1_prob": 0.00874779000878334
+    },
+    {
+      "tok_pos": 6100,
+      "char_pos": 14047,
+      "top1_id": 78717,
+      "top1_token": " Leads",
+      "top1_prob": 0.1941390037536621
+    },
+    {
+      "tok_pos": 6200,
+      "char_pos": 14212,
+      "top1_id": 24,
+      "top1_token": "9",
+      "top1_prob": 0.23717264831066132
+    },
+    {
+      "tok_pos": 6300,
+      "char_pos": 14443,
+      "top1_id": 19185,
+      "top1_token": " (\\",
+      "top1_prob": 0.9985857009887695
+    },
+    {
+      "tok_pos": 6400,
+      "char_pos": 14672,
+      "top1_id": 5821,
+      "top1_token": " distance",
+      "top1_prob": 0.23082736134529114
+    },
+    {
+      "tok_pos": 6500,
+      "char_pos": 14935,
+      "top1_id": 1179,
+      "top1_token": " then",
+      "top1_prob": 0.9790734052658081
+    },
+    {
+      "tok_pos": 6600,
+      "char_pos": 15217,
+      "top1_id": 506,
+      "top1_token": " at",
+      "top1_prob": 0.0905032828450203
+    },
+    {
+      "tok_pos": 6700,
+      "char_pos": 15491,
+      "top1_id": 64950,
+      "top1_token": " Factors",
+      "top1_prob": 0.4902995228767395
+    },
+    {
+      "tok_pos": 6800,
+      "char_pos": 15660,
+      "top1_id": 4391,
+      "top1_token": "=(",
+      "top1_prob": 0.8744125962257385
+    },
+    {
+      "tok_pos": 6900,
+      "char_pos": 15828,
+      "top1_id": 15504,
+      "top1_token": "theta",
+      "top1_prob": 0.3076830208301544
+    },
+    {
+      "tok_pos": 7000,
+      "char_pos": 16041,
+      "top1_id": 32,
+      "top1_token": "A",
+      "top1_prob": 0.07657450437545776
+    },
+    {
+      "tok_pos": 7100,
+      "char_pos": 16235,
+      "top1_id": 49550,
+      "top1_token": "'A",
+      "top1_prob": 0.6747211813926697
+    },
+    {
+      "tok_pos": 7200,
+      "char_pos": 16436,
+      "top1_id": 7271,
+      "top1_token": " Law",
+      "top1_prob": 0.21102996170520782
+    },
+    {
+      "tok_pos": 7300,
+      "char_pos": 16631,
+      "top1_id": 31981,
+      "top1_token": "(($",
+      "top1_prob": 0.01868417300283909
+    },
+    {
+      "tok_pos": 7400,
+      "char_pos": 16893,
+      "top1_id": 1088,
+      "top1_token": " \\",
+      "top1_prob": 0.018845709040760994
+    },
+    {
+      "tok_pos": 7500,
+      "char_pos": 17157,
+      "top1_id": 393,
+      "top1_token": " $",
+      "top1_prob": 0.08154214173555374
+    },
+    {
+      "tok_pos": 7600,
+      "char_pos": 17358,
+      "top1_id": 78717,
+      "top1_token": " Leads",
+      "top1_prob": 0.1258576214313507
+    },
+    {
+      "tok_pos": 7700,
+      "char_pos": 17603,
+      "top1_id": 92,
+      "top1_token": "}",
+      "top1_prob": 0.48887425661087036
+    },
+    {
+      "tok_pos": 7800,
+      "char_pos": 17837,
+      "top1_id": 2094,
+      "top1_token": " around",
+      "top1_prob": 0.8767579793930054
+    },
+    {
+      "tok_pos": 7900,
+      "char_pos": 18143,
+      "top1_id": 1088,
+      "top1_token": " \\",
+      "top1_prob": 0.06815269589424133
+    },
+    {
+      "tok_pos": 8000,
+      "char_pos": 18378,
+      "top1_id": 23734,
+      "top1_token": "Equ",
+      "top1_prob": 0.1581147462129593
+    },
+    {
+      "tok_pos": 8100,
+      "char_pos": 18662,
+      "top1_id": 56005,
+      "top1_token": " ?',",
+      "top1_prob": 0.00577267911285162
+    },
+    {
+      "tok_pos": 8200,
+      "char_pos": 18970,
+      "top1_id": 2423,
+      "top1_token": " ...",
+      "top1_prob": 0.9117804169654846
+    },
+    {
+      "tok_pos": 8300,
+      "char_pos": 19266,
+      "top1_id": 283,
+      "top1_token": " =",
+      "top1_prob": 0.44557425379753113
+    },
+    {
+      "tok_pos": 8400,
+      "char_pos": 19473,
+      "top1_id": 20837,
+      "top1_token": " triangle",
+      "top1_prob": 0.9352083802223206
+    },
+    {
+      "tok_pos": 8500,
+      "char_pos": 19737,
+      "top1_id": 9128,
+      "top1_token": "cos",
+      "top1_prob": 0.9304534196853638
+    },
+    {
+      "tok_pos": 8600,
+      "char_pos": 19964,
+      "top1_id": 1088,
+      "top1_token": " \\",
+      "top1_prob": 0.400350421667099
+    }
+  ]
+}
