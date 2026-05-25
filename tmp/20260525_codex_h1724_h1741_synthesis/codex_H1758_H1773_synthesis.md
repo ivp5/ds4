@@ -128,7 +128,84 @@ The codex arc is shipping fast; staying caught up on synthesis is
 itself valuable session work that doesn't depend on silv runtime or
 disk approval.
 
-## Addendum: H1775 — MTL4 non-divisible dispatch silently corrupts (NEWEST)
+## Addendum: H1776-H1782 — row-streamed execution + LRU layer windows (NEWEST)
+
+Codex shipped 7 more shifts at 11:55 UTC after my H1775 integration.
+Key findings:
+
+**H1776**: 81 GB GGUF runs locally via row-streamed seek/read.
+Resident set ≠ file size. Real DS4 act_rows=4 over 864 cases used
+1,396 unique tiles, 197 MB residency, 1.7 ms GPU. Refutes "can't
+run locally" — direct row decode from disk is the right organ.
+
+**H1777-H1779**: Layer-window LRU. 239-tile LRU = full global
+residency at 5.84× reduction (31 MB vs 197 MB). Layer-window
+execution preserves correctness at 1e-8 max error.
+
+**H1780**: Reusable native MTL4 process across windows. Memory win
+preserved (5.83×), but GPU time didn't improve (3.15 ms vs 1.7 ms).
+"Launch ceremony is the whole penalty" REFUTED.
+
+**H1781**: Grouped window frontier:
+- pairs: 2.9× resident at 2.79 ms
+- triples: 1.99× resident at 2.73 ms (best wall)
+- quartets: dominated
+
+**H1782** (newest): Reusable buffer set + residency set + arg table
+across grouped windows. Pairs improved native wall (0.63s → 0.25s)
+but GPU sums noisy. **"Allocation/residency ceremony is NOT the main
+order-of-magnitude lever."** Next speed organ: direct GGUF row decode
+into reusable MTL buffers with two-buffer ring overlapping CPU
+decode and GPU gate/up dispatch.
+
+### Direct codec arc relevance
+
+H1782 explicitly validates the codec architecture pattern:
+> "Montyneg's ds4_expert_table.c matches the substrate direction:
+> small global layer/expert metadata is good; global hot-row
+> materialization is not. The hot cache should be windowed by route
+> packet, not model-global."
+
+This maps onto my codec design:
+- VQ K=256 = 2 KB codebook (small global metadata) + 1 byte per
+  pair code (per-route consumption)
+- Polar p32_m8 = per-(layer, kind) levels table (small) + 2 byte
+  mag+phase per pair (per-route consumption)
+- Both AVOID global hot-row materialization (codec compression
+  reduces the bytes streamed per route packet)
+
+The complete substrate frontier per H1776-H1782 + codec:
+```
+Layer              codex contribution         my session
+                                              contribution
+-----------------  -------------------------  -----------------
+Disk → resident    H1776 row-streamed seek    polar/VQ encoder
+                                              (offline)
+Resident set       H1778 layer-window LRU     codec compression
+                   (5.84× memory)             (3.2× compression
+                                              VQ vs polar)
+Window execution   H1779-H1782 reusable       codec consumption
+                   process + buffer set       per-route packet
+Bandwidth          H1782 next: two-buffer    (codec halves
+                   ring CPU↔GPU overlap       bandwidth)
+```
+
+These compose: codec halves the bytes transferred per row +
+layer-window LRU bounds residency to active layers + reusable
+buffers cut launch overhead + two-buffer ring overlaps decode
+with dispatch. Combined: 5.84× × 2× = ~11× memory reduction
+potential at maybe 1.2-1.5× GPU time cost.
+
+### Sharpened H1782 shift for next session
+
+"The two-buffer ring overlapping CPU decode and GPU dispatch" is
+the NEXT speed organ codex names. My codec encoder is the CPU-side
+decode. The GPU-side dispatch is the H1735 kernel. Connecting them
+through a two-buffer ring (one buffer fills while other dispatches)
+is engineering work that someone (codex or silv or me with
+direction) would land next.
+
+## Addendum: H1775 — MTL4 non-divisible dispatch silently corrupts
 
 H1775 shipped right after H1774. MTL4 consumed the H1774 raw route
 packet directly and emitted host-exact checksums over 864 cases:
