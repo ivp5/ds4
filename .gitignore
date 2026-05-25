@@ -16,3 +16,8 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+
+# codec_audit SQLite databases (regenerable, large)
+codec_audit/codec_audit.db
+codec_audit/codec_audit.db-shm
+codec_audit/codec_audit.db-wal
