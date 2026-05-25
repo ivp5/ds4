@@ -1,0 +1,136 @@
+{
+  "model_dir": "/Users/silv/cl/tlp/montyneg/ds4/gguf/DeepSeek-V4-Flash",
+  "layers": [
+    0,
+    22,
+    42
+  ],
+  "experts": [
+    0,
+    100,
+    255
+  ],
+  "k": 256,
+  "act_rows": 2048,
+  "down_rows": 128,
+  "results": [
+    {
+      "layer": 0,
+      "expert": 0,
+      "k": 256,
+      "act_rows": 2048,
+      "down_rows": 128,
+      "out_rel_l2": 0.019020995125174522,
+      "out_cos_sim": 0.9998197555541992,
+      "weight_rel_l2": 0.020769668743014336,
+      "weight_cos_sim": 0.9997843503952026,
+      "act_norm": 79.11627197265625
+    },
+    {
+      "layer": 0,
+      "expert": 100,
+      "k": 256,
+      "act_rows": 2048,
+      "down_rows": 128,
+      "out_rel_l2": 0.019375525414943695,
+      "out_cos_sim": 0.9998122453689575,
+      "weight_rel_l2": 0.0198013037443161,
+      "weight_cos_sim": 0.9998041987419128,
+      "act_norm": 88.5340805053711
+    },
+    {
+      "layer": 0,
+      "expert": 255,
+      "k": 256,
+      "act_rows": 2048,
+      "down_rows": 128,
+      "out_rel_l2": 0.01976948045194149,
+      "out_cos_sim": 0.9998072385787964,
+      "weight_rel_l2": 0.018277833238244057,
+      "weight_cos_sim": 0.9998332262039185,
+      "act_norm": 82.59444427490234
+    },
+    {
+      "layer": 22,
+      "expert": 0,
+      "k": 256,
+      "act_rows": 2048,
+      "down_rows": 128,
+      "out_rel_l2": 0.022408809512853622,
+      "out_cos_sim": 0.9997519254684448,
+      "weight_rel_l2": 0.020026501268148422,
+      "weight_cos_sim": 0.999798059463501,
+      "act_norm": 66.20066833496094
+    },
+    {
+      "layer": 22,
+      "expert": 100,
+      "k": 256,
+      "act_rows": 2048,
+      "down_rows": 128,
+      "out_rel_l2": 0.01853560283780098,
+      "out_cos_sim": 0.9998359084129333,
+      "weight_rel_l2": 0.01857609674334526,
+      "weight_cos_sim": 0.9998260736465454,
+      "act_norm": 82.3509521484375
+    },
+    {
+      "layer": 22,
+      "expert": 255,
+      "k": 256,
+      "act_rows": 2048,
+      "down_rows": 128,
+      "out_rel_l2": 0.019280971959233284,
+      "out_cos_sim": 0.9998188614845276,
+      "weight_rel_l2": 0.01689312979578972,
+      "weight_cos_sim": 0.9998559951782227,
+      "act_norm": 84.81005859375
+    },
+    {
+      "layer": 42,
+      "expert": 0,
+      "k": 256,
+      "act_rows": 2048,
+      "down_rows": 128,
+      "out_rel_l2": 0.02171074040234089,
+      "out_cos_sim": 0.9997670650482178,
+      "weight_rel_l2": 0.02059597708284855,
+      "weight_cos_sim": 0.9997850060462952,
+      "act_norm": 95.49970245361328
+    },
+    {
+      "layer": 42,
+      "expert": 100,
+      "k": 256,
+      "act_rows": 2048,
+      "down_rows": 128,
+      "out_rel_l2": 0.01838183030486107,
+      "out_cos_sim": 0.9998342394828796,
+      "weight_rel_l2": 0.017532069236040115,
+      "weight_cos_sim": 0.9998434782028198,
+      "act_norm": 89.75535583496094
+    },
+    {
+      "layer": 42,
+      "expert": 255,
+      "k": 256,
+      "act_rows": 2048,
+      "down_rows": 128,
+      "out_rel_l2": 0.018639620393514633,
+      "out_cos_sim": 0.9998262524604797,
+      "weight_rel_l2": 0.017692655324935913,
+      "weight_cos_sim": 0.9998406767845154,
+      "act_norm": 86.56611633300781
+    }
+  ],
+  "aggregate": {
+    "out_rel_l2_mean": 0.019680397378073797,
+    "out_cos_sim_mean": 0.9998081657621596,
+    "weight_rel_l2_mean": 0.018907248352964718,
+    "weight_cos_sim_mean": 0.9998190071847703,
+    "ratio_output_to_weight": 1.0408916734299862,
+    "polar_p32m8_baseline_rel_l2": 0.121,
+    "vq_vs_polar_improvement": 6.148249838430995,
+    "wall_sec": 54.2828049659729
+  }
+}
