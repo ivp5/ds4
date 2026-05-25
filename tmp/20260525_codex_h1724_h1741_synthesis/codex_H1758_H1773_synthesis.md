@@ -128,10 +128,51 @@ The codex arc is shipping fast; staying caught up on synthesis is
 itself valuable session work that doesn't depend on silv runtime or
 disk approval.
 
+## Addendum: H1774 — tinygrad route packet transplant (newest)
+
+H1774 (just shipped) emitted a deployable DS4 MoE route packet on the
+live METAL path: top20 ids/logits, top6 weights, entropy, kth-margin,
+pressure bucket, and H1760 q6 width policy. Six-layer run over 864
+route cases stayed exact vs CPU full-logit reference: top6 exact
+100%, top20 order/set exact 100%, q6 width policy containment 100%.
+
+Packet size: 104 bytes/case vs full logits 1024 bytes/case = 9.846×
+transfer reduction.
+
+This closes the loop from H1739 (route packet as boundary
+certificate) → H1742 (route topk is certificate, not hard set) →
+H1746 (q6 route certificate as MTL4 compute) → H1774 (live tinygrad
+emission).
+
+## Complete deployment picture (codex + my codec arc together)
+
+```
+   Layer              Codex                   My session
+   ----------         -------------           -------------
+   Router             H1774 route packet      —
+                      (104 bytes vs 1024)
+   Phase rerank       H1772 39-bit packet     —
+                      + H1773 chunk512
+   Expert weights     —                       polar p32_m8 or
+                                              VQ K=256 (6× better)
+   FFN compute        H1735 H1736 H1768       B-2.3c stub gate
+                      streamed hidden          (body pending sub-decision)
+```
+
+The two arcs compose at different layers. Combined deployable target:
+- H1774 packet (104 bytes route certificate)
+- H1773 chunk512 streaming (8.61× memory @ 1.173× slow)
+- VQ K=256 codec (2× weight bytes, 6× lower error)
+- Total: ~30 MB resident DS4 substrate + 6× lower codec error per
+  FFN call + 9.846× smaller router boundary signal
+
+This is the substrate frontier as of 2026-05-25 evening on M1 Max.
+
 ## Tasks
 
 - The codex arc work is in `/Users/silv/cl/tlp_codex/CODEX_SHIFTS.md`
   (read-only reference)
-- My arc closes at 26+ commits this session
-- Combined deployable: codec body + codex streaming = the actual
-  "deploy DS4 at 50% memory + 6× lower codec error" target
+- My arc closes at 28+ commits this session (including this addendum)
+- Combined deployable: codec body + codex streaming + H1774 route
+  packet = the actual "deploy DS4 at 30 MB resident + 6× lower codec
+  error" target
