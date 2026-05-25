@@ -1,0 +1,57 @@
+loading model...
+loaded in 1.5s
+prompt tokens: 191
+prefill: 0.4s
+pos=500: top1=16/'1' logit=28.62 margin=2.38 p=0.895
+  recent_text: "{v_T} = 2 + \\frac{D}{v_J}$.\n\nLet's substitute the expressions for speeds in terms of $v_P$.\n$v_T = v_P + 2$.\n$v_J = v_P + 9$.\n\nSo the equations are:\n1"
+pos=1000: top1=343/' v' logit=27.50 margin=2.38 p=0.914
+  recent_text: ' 0$.\nSince $v_P > 0$, $v_P + 2 > 0$.\nWe can divide both sides by $(v_P + 2)$.\n$\\frac{v_P}{2} = \\frac{2(v_P + 9)}{7}$\n$7 v'
+pos=2000: top1=35790/'frac' logit=32.75 margin=15.25 p=1.000
+  recent_text: ")(v_P + 9)}{7}$.\nLet's check the algebra again.\n$D(\\frac{1}{v_P + 2} - \\frac{1}{v_P + 9}) = 1$\n$\\frac{1}{v_P + 2} - \\frac"
+  [progress] pos=3808, wall=60.0s, 63.5 t/s
+pos=4000: top1=5951/' equal' logit=25.25 margin=1.88 p=0.695
+  recent_text: 'quations.\nPatrick starts at $t=0$, speed $v_P$.\nTanya starts at $t=1$, speed $v_P + 2$.\nJose starts at $t=2$, speed $v_P + 9$.\nArrival times are equal'
+  [progress] pos=7199, wall=120.0s, 60.0 t/s
+pos=8000: top1=413/' if' logit=28.38 margin=7.88 p=1.000
+  recent_text: 'an integer.\nThe integer is 277.\n\nOne more check.\nWhat if the speeds were different?\n$v_T = v_P + 2$.\n$v_J = v_T + 7 = v_P + 9$.\nThis is fixed.\nWhat if'
+  [progress] pos=10443, wall=180.0s, 58.0 t/s
+pos=12000: top1=220/' ' logit=33.25 margin=18.44 p=1.000
+  recent_text: 'swer is 277.\nI will write the solution.\nThe solution is 277.\nThe reasoning is complete.\nThe answer is 277.\nI will write the solution.\nThe solution is '
+  [progress] pos=13676, wall=240.0s, 57.0 t/s
+pos=15000: top1=279/' the' logit=32.25 margin=17.12 p=1.000
+  recent_text: 'asoning is complete.\nThe answer is 277.\nI will write the solution.\nThe solution is 277.\nThe reasoning is complete.\nThe answer is 277.\nI will write the'
+pos=15999: top1=220/' ' logit=32.00 margin=16.12 p=1.000
+  recent_text: 'swer is 277.\nI will write the solution.\nThe solution is 277.\nThe reasoning is complete.\nThe answer is 277.\nI will write the solution.\nThe solution is '
+
+Done. 16000 tokens in 283.8s = 56.4 t/s
+saved tmp/20260525_attention_inflight/ssm_attractor_temporal_result.json
+
+=== Cross-position recent-token comparison ===
+  pos 500 ↔ pos 1000: last-32 tokens match 1/32
+  pos 500 ↔ pos 2000: last-32 tokens match 0/32
+  pos 500 ↔ pos 4000: last-32 tokens match 0/32
+  pos 500 ↔ pos 8000: last-32 tokens match 7/32
+  pos 500 ↔ pos 12000: last-32 tokens match 0/32
+  pos 500 ↔ pos 15000: last-32 tokens match 0/32
+  pos 500 ↔ pos 15999: last-32 tokens match 0/32
+  pos 1000 ↔ pos 2000: last-32 tokens match 0/32
+  pos 1000 ↔ pos 4000: last-32 tokens match 0/32
+  pos 1000 ↔ pos 8000: last-32 tokens match 0/32
+  pos 1000 ↔ pos 12000: last-32 tokens match 1/32
+  pos 1000 ↔ pos 15000: last-32 tokens match 1/32
+  pos 1000 ↔ pos 15999: last-32 tokens match 1/32
+  pos 2000 ↔ pos 4000: last-32 tokens match 0/32
+  pos 2000 ↔ pos 8000: last-32 tokens match 0/32
+  pos 2000 ↔ pos 12000: last-32 tokens match 0/32
+  pos 2000 ↔ pos 15000: last-32 tokens match 0/32
+  pos 2000 ↔ pos 15999: last-32 tokens match 0/32
+  pos 4000 ↔ pos 8000: last-32 tokens match 0/32
+  pos 4000 ↔ pos 12000: last-32 tokens match 1/32
+  pos 4000 ↔ pos 15000: last-32 tokens match 0/32
+  pos 4000 ↔ pos 15999: last-32 tokens match 1/32
+  pos 8000 ↔ pos 12000: last-32 tokens match 1/32
+  pos 8000 ↔ pos 15000: last-32 tokens match 0/32
+  pos 8000 ↔ pos 15999: last-32 tokens match 1/32
+  pos 12000 ↔ pos 15000: last-32 tokens match 2/32
+  pos 12000 ↔ pos 15999: last-32 tokens match 32/32
+  pos 15000 ↔ pos 15999: last-32 tokens match 2/32
