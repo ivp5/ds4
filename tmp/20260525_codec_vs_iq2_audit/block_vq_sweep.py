@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from polar_encode_bulk import dequant_fp4_tensor
 
 
-def kmeans_nd(vectors, K, max_iter=20, seed=42):
+def kmeans_nd(vectors, K, max_iter=10, seed=42):
     """K-means on n-dimensional vectors. Returns (codebook K×D, codes N)."""
     rng = np.random.default_rng(seed)
     N, D = vectors.shape
@@ -162,20 +162,21 @@ def main():
     print(f"  {'-'*45}  {'-'*10}  {'-'*8}  {'-'*5}  {'-'*6}")
 
     # A. Pure Block-VQ — joint encoding of N-pair blocks
+    # IMPORTANT: K must be << n_blocks else encoding is trivial. With 262144 pairs:
+    # - 4-pair blocks: 65536 blocks → cap K=8192
+    # - 8-pair blocks: 32768 blocks → cap K=4096
+    # - 16-pair blocks: 16384 blocks → cap K=2048
     block_configs = [
         # (n_pairs_block, K)
         (4,    256),    # 8-weight block × K=256 = 8 bits / 4 pairs = 0.25 byte/pair
-        (4,    1024),   # 8-weight block × K=1024 = 10 bits / 4 pairs = 0.3125 byte/pair
-        (4,    4096),   # 0.375 byte/pair
-        (4,    16384),  # 0.4375
+        (4,    1024),   # 0.3125
+        (4,    4096),   # 0.375
         (8,    256),    # 16-weight block × K=256 = 8/8 = 0.125 byte/pair
         (8,    1024),   # 0.156
-        (8,    4096),   # 0.1875
-        (8,    16384),  # 0.21875
+        (8,    2048),   # 0.172
         (16,   256),    # 32-weight block × K=256 = 8/16 = 0.0625 byte/pair (matches IQ2 block)
         (16,   1024),   # 0.078
-        (16,   4096),   # 0.094
-        (16,   16384),  # 0.109
+        (16,   2048),   # 0.0859
     ]
     print(f"\n--- Block-VQ (joint encoding of N-pair blocks) ---")
     for n_pb, K in block_configs:
@@ -193,7 +194,7 @@ def main():
 
     # A'. Block-VQ + scale (covers wider dynamic range with fewer K)
     print(f"\n--- Block-VQ + per-block fp16 scale ---")
-    for n_pb, K in [(8, 256), (8, 1024), (16, 256), (16, 1024), (16, 4096)]:
+    for n_pb, K in [(8, 256), (8, 1024), (16, 256), (16, 1024), (16, 2048)]:
         name = f"Block-VQ block={n_pb}pairs K={K} +scale"
         t0 = time.time()
         try:

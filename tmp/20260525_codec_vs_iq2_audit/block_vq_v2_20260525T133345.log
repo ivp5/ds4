@@ -1,0 +1,70 @@
+FP4 source: 524288 weights = 262144 pairs
+
+recipe                                          byte/pair    rel_L2   lift   cb_KB
+  ---------------------------------------------  ----------  --------  -----  ------
+
+--- Block-VQ (joint encoding of N-pair blocks) ---
+  Block-VQ block=4pairs K=256                        0.2500    0.5655   0.63×     8.0    (4.4s)
+  Block-VQ block=4pairs K=1024                       0.3125    0.4681   0.76×    32.0    (12.3s)
+  Block-VQ block=4pairs K=4096                       0.3750    0.3688   0.96×   128.0    (55.7s)
+  Block-VQ block=8pairs K=256                        0.1250    0.7469   0.47×    16.0    (1.7s)
+  Block-VQ block=8pairs K=1024                       0.1562    0.6631   0.53×    64.0    (6.1s)
+  Block-VQ block=8pairs K=2048                       0.1719    0.6144   0.58×   128.0    (16.0s)
+  Block-VQ block=16pairs K=256                       0.0625    0.8509   0.42×    32.0    (1.2s)
+  Block-VQ block=16pairs K=1024                      0.0781    0.7816   0.45×   128.0    (4.6s)
+  Block-VQ block=16pairs K=2048                      0.0859    0.7292   0.49×   256.0    (12.8s)
+
+--- Block-VQ + per-block fp16 scale ---
+  Block-VQ block=8pairs K=256 +scale                 0.3750    0.7368   0.48×    16.0    (1.8s)
+  Block-VQ block=8pairs K=1024 +scale                0.4062    0.6494   0.55×    64.0    (6.2s)
+  Block-VQ block=16pairs K=256 +scale                0.1875    0.8476   0.42×    32.0    (1.2s)
+  Block-VQ block=16pairs K=1024 +scale               0.2031    0.7731   0.46×   128.0    (4.5s)
+  Block-VQ block=16pairs K=2048 +scale               0.2109    0.7218   0.49×   256.0    (12.4s)
+
+--- Product-Quantization (PQ): N-pair block split into M sub-blocks ---
+  PQ block=8p sub=2 K_sub=256                        0.2500    0.5597   0.63×    16.0    (4.3s)
+  PQ block=8p sub=4 K_sub=256                        0.5000    0.3067   1.16×    16.0    (6.3s)
+  PQ block=16p sub=2 K_sub=256                       0.1250    0.7364   0.48×    32.0    (1.8s)
+  PQ block=16p sub=4 K_sub=256                       0.2500    0.5511   0.64×    32.0    (4.4s)
+  PQ block=16p sub=8 K_sub=256                       0.5000    0.3018   1.17×    32.0    (6.3s)
+  PQ block=16p sub=2 K_sub=1024                      0.1562    0.6404   0.55×   128.0    (6.1s)
+  PQ block=16p sub=4 K_sub=1024                      0.3125    0.4371   0.81×   128.0    (12.3s)
+  PQ block=16p sub=2 K_sub=4096                      0.1875    0.4972   0.71×   512.0    (30.0s)
+  PQ block=16p sub=4 K_sub=4096                      0.3750    0.3062   1.16×   512.0    (49.3s)
+
+=== Pareto frontier (sorted by byte/pair ascending) ===
+  recipe                                          byte/pair    rel_L2   lift    F-DS4 GB      T50 GB  F-fit52   T-fit52 
+  ---------------------------------------------  ----------  --------  -----  ----------  ----------  --------  --------
+  Block-VQ block=16pairs K=256                       0.0625    0.8509   0.42×       19.30       14.65  YES       YES     
+  Block-VQ block=16pairs K=1024                      0.0781    0.7816   0.45×       21.62       15.81  YES       YES     
+  Block-VQ block=16pairs K=2048                      0.0859    0.7292   0.49×       22.78       16.39  YES       YES     
+  Block-VQ block=8pairs K=256                        0.1250    0.7469   0.47×       28.59       19.30  YES       YES     
+  PQ block=16p sub=2 K_sub=256                       0.1250    0.7364   0.48×       28.59       19.30  YES       YES     
+  Block-VQ block=8pairs K=1024                       0.1562    0.6631   0.53×       33.24       21.62  YES       YES     
+  PQ block=16p sub=2 K_sub=1024                      0.1562    0.6404   0.55×       33.24       21.62  YES       YES     
+  Block-VQ block=8pairs K=2048                       0.1719    0.6144   0.58×       35.57       22.78  YES       YES     
+  Block-VQ block=16pairs K=256 +scale                0.1875    0.8476   0.42×       37.89       23.95  YES       YES     
+  PQ block=16p sub=2 K_sub=4096                      0.1875    0.4972   0.71×       37.89       23.95  YES       YES     
+  Block-VQ block=16pairs K=1024 +scale               0.2031    0.7731   0.46×       40.22       25.11  YES       YES     
+  Block-VQ block=16pairs K=2048 +scale               0.2109    0.7218   0.49×       41.38       25.69  YES       YES     
+  Block-VQ block=4pairs K=256                        0.2500    0.5655   0.63×       47.19       28.59  YES       YES     
+  PQ block=8p sub=2 K_sub=256                        0.2500    0.5597   0.63×       47.19       28.59  YES       YES     
+  PQ block=16p sub=4 K_sub=256                       0.2500    0.5511   0.64×       47.19       28.59  YES       YES     
+  Block-VQ block=4pairs K=1024                       0.3125    0.4681   0.76×       56.49       33.24  no        YES     
+  PQ block=16p sub=4 K_sub=1024                      0.3125    0.4371   0.81×       56.49       33.24  no        YES     
+  Block-VQ block=4pairs K=4096                       0.3750    0.3688   0.96×       65.78       37.89  no        YES     
+  Block-VQ block=8pairs K=256 +scale                 0.3750    0.7368   0.48×       65.78       37.89  no        YES     
+  PQ block=16p sub=4 K_sub=4096                      0.3750    0.3062   1.16×       65.78       37.89  no        YES     
+  Block-VQ block=8pairs K=1024 +scale                0.4062    0.6494   0.55×       70.43       40.22  no        YES     
+  PQ block=8p sub=4 K_sub=256                        0.5000    0.3067   1.16×       84.38       47.19  no        YES     
+  PQ block=16p sub=8 K_sub=256                       0.5000    0.3018   1.17×       84.38       47.19  no        YES     
+
+=== Recipes that FIT in <52 GB on FULL DS4 AND beat IQ2 quality (lift > 1×) ===
+  (none — full DS4 in <52GB with quality > IQ2 not yet achievable in this sweep)
+
+=== Recipes that FIT in <52 GB on TRIM50 AND beat IQ2 quality ===
+  PQ block=16p sub=8 K_sub=256                       0.5000 byte/pair   47.19 GB  rel_L2 0.3018 (1.17× IQ2)
+  PQ block=16p sub=4 K_sub=4096                      0.3750 byte/pair   37.89 GB  rel_L2 0.3062 (1.16× IQ2)
+  PQ block=8p sub=4 K_sub=256                        0.5000 byte/pair   47.19 GB  rel_L2 0.3067 (1.16× IQ2)
+
+Saved block_vq_sweep_20260525T043807Z.json
