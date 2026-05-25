@@ -1,0 +1,241 @@
+{
+  "label": "p05_native_truth65",
+  "text_from": "/Users/silv/cl/tlp/montyneg/tmp/20260524_quant_matrix/4bit/p05_1779583520.json",
+  "truth_digit": "6",
+  "n_boxed_emissions": 1,
+  "commits_analyzed": 1,
+  "results": [
+    {
+      "commit_position_idx": 0,
+      "char_position": 33696,
+      "context_before_50": " to find $m + n$.\n$m + n = 29 + 36 = 65$.\n\n\\boxed{",
+      "context_after_30": "65}",
+      "per_layer": {
+        "0": {
+          "p_truth": 3.5571815715229604e-07,
+          "rank_truth": 2714,
+          "top1_id": 90,
+          "top1_token": "{",
+          "top1_prob": 0.9829360246658325
+        },
+        "1": {
+          "p_truth": 4.138328222325072e-06,
+          "rank_truth": 36833,
+          "top1_id": 90,
+          "top1_token": "{",
+          "top1_prob": 0.3723192811012268
+        },
+        "2": {
+          "p_truth": 4.974370767740766e-06,
+          "rank_truth": 38527,
+          "top1_id": 90,
+          "top1_token": "{",
+          "top1_prob": 0.07764898985624313
+        },
+        "3": {
+          "p_truth": 3.330400659251609e-06,
+          "rank_truth": 72288,
+          "top1_id": 90,
+          "top1_token": "{",
+          "top1_prob": 0.020849129185080528
+        },
+        "4": {
+          "p_truth": 3.7088441331434296e-06,
+          "rank_truth": 64212,
+          "top1_id": 90,
+          "top1_token": "{",
+          "top1_prob": 0.0038981707766652107
+        },
+        "5": {
+          "p_truth": 1.1807265764218755e-05,
+          "rank_truth": 16668,
+          "top1_id": 254,
+          "top1_token": "\ufffd",
+          "top1_prob": 0.001509842579253018
+        },
+        "6": {
+          "p_truth": 1.765330307534896e-05,
+          "rank_truth": 9543,
+          "top1_id": 96397,
+          "top1_token": "\u7387",
+          "top1_prob": 0.0037533901631832123
+        },
+        "7": {
+          "p_truth": 5.528484052774729e-06,
+          "rank_truth": 45979,
+          "top1_id": 96215,
+          "top1_token": "\u4f9b",
+          "top1_prob": 0.0010688748443499207
+        },
+        "8": {
+          "p_truth": 4.129193257540464e-06,
+          "rank_truth": 62013,
+          "top1_id": 55031,
+          "top1_token": "rive",
+          "top1_prob": 0.000704179226886481
+        },
+        "9": {
+          "p_truth": 1.1500623031679424e-06,
+          "rank_truth": 157529,
+          "top1_id": 213901,
+          "top1_token": "Einst",
+          "top1_prob": 0.0011058644158765674
+        },
+        "10": {
+          "p_truth": 3.6215342333889566e-06,
+          "rank_truth": 64182,
+          "top1_id": 17697,
+          "top1_token": " representative",
+          "top1_prob": 0.0009464042959734797
+        },
+        "11": {
+          "p_truth": 5.802308805868961e-06,
+          "rank_truth": 41304,
+          "top1_id": 14558,
+          "top1_token": "lah",
+          "top1_prob": 0.0010075451573356986
+        },
+        "12": {
+          "p_truth": 1.6940937257459154e-06,
+          "rank_truth": 113055,
+          "top1_id": 247101,
+          "top1_token": "\u6841",
+          "top1_prob": 0.0012586951488628983
+        },
+        "13": {
+          "p_truth": 1.7233954849871225e-06,
+          "rank_truth": 118535,
+          "top1_id": 105676,
+          "top1_token": "\u6d3e\u9063",
+          "top1_prob": 0.0019351127557456493
+        },
+        "14": {
+          "p_truth": 4.53567918157205e-06,
+          "rank_truth": 48036,
+          "top1_id": 102646,
+          "top1_token": "\u6559\u79d1",
+          "top1_prob": 0.00777115672826767
+        },
+        "15": {
+          "p_truth": 1.077314664144069e-05,
+          "rank_truth": 19366,
+          "top1_id": 96397,
+          "top1_token": "\u7387",
+          "top1_prob": 0.0014828343410044909
+        },
+        "16": {
+          "p_truth": 1.489376359131711e-06,
+          "rank_truth": 122602,
+          "top1_id": 96397,
+          "top1_token": "\u7387",
+          "top1_prob": 0.0015267039416357875
+        },
+        "17": {
+          "p_truth": 1.602900283614872e-06,
+          "rank_truth": 119020,
+          "top1_id": 96397,
+          "top1_token": "\u7387",
+          "top1_prob": 0.003475305624306202
+        },
+        "18": {
+          "p_truth": 1.0023521099356003e-05,
+          "rank_truth": 20003,
+          "top1_id": 149946,
+          "top1_token": "ayaan",
+          "top1_prob": 0.004019404761493206
+        },
+        "19": {
+          "p_truth": 3.40379738190677e-05,
+          "rank_truth": 3768,
+          "top1_id": 220929,
+          "top1_token": "\u0645\u0627\u0626\u0629",
+          "top1_prob": 0.001778904115781188
+        },
+        "20": {
+          "p_truth": 8.473931666230783e-05,
+          "rank_truth": 817,
+          "top1_id": 220929,
+          "top1_token": "\u0645\u0627\u0626\u0629",
+          "top1_prob": 0.002069061156362295
+        },
+        "21": {
+          "p_truth": 6.084769847802818e-05,
+          "rank_truth": 1548,
+          "top1_id": 21112,
+          "top1_token": "()}",
+          "top1_prob": 0.0019345904001966119
+        },
+        "22": {
+          "p_truth": 1.283601341128815e-05,
+          "rank_truth": 14488,
+          "top1_id": 64040,
+          "top1_token": "[]}",
+          "top1_prob": 0.006395077332854271
+        },
+        "23": {
+          "p_truth": 0.006330446805804968,
+          "rank_truth": 0,
+          "top1_id": 21,
+          "top1_token": "6",
+          "top1_prob": 0.006330446805804968
+        },
+        "24": {
+          "p_truth": 0.004066884983330965,
+          "rank_truth": 2,
+          "top1_id": 220929,
+          "top1_token": "\u0645\u0627\u0626\u0629",
+          "top1_prob": 0.006853267550468445
+        },
+        "25": {
+          "p_truth": 0.001496472512371838,
+          "rank_truth": 4,
+          "top1_id": 220929,
+          "top1_token": "\u0645\u0627\u0626\u0629",
+          "top1_prob": 0.007493403274565935
+        },
+        "26": {
+          "p_truth": 0.005585328675806522,
+          "rank_truth": 2,
+          "top1_id": 220929,
+          "top1_token": "\u0645\u0627\u0626\u0629",
+          "top1_prob": 0.013677109032869339
+        },
+        "27": {
+          "p_truth": 0.019311128184199333,
+          "rank_truth": 0,
+          "top1_id": 21,
+          "top1_token": "6",
+          "top1_prob": 0.019311128184199333
+        },
+        "28": {
+          "p_truth": 0.032838210463523865,
+          "rank_truth": 1,
+          "top1_id": 50614,
+          "top1_token": " sixty",
+          "top1_prob": 0.05484721064567566
+        },
+        "29": {
+          "p_truth": 0.5542258024215698,
+          "rank_truth": 0,
+          "top1_id": 21,
+          "top1_token": "6",
+          "top1_prob": 0.5542258024215698
+        },
+        "30": {
+          "p_truth": 0.9989277720451355,
+          "rank_truth": 0,
+          "top1_id": 21,
+          "top1_token": "6",
+          "top1_prob": 0.9989277720451355
+        },
+        "31": {
+          "p_truth": 0.999784529209137,
+          "rank_truth": 0,
+          "top1_id": 21,
+          "top1_token": "6",
+          "top1_prob": 0.999784529209137
+        }
+      }
+    }
+  ]
+}
