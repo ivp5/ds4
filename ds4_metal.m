@@ -16762,6 +16762,405 @@ int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
     }
 }
 
+/* ============================================================ */
+/* VQ-2D: fused gate*silu*up*route_weight + down projection     */
+/* ============================================================ */
+/* Per the VQ-2D codec exploration (commit cf39af8 + breakthrough memo):
+ * VQ K=256 with per-(layer, kind) codebook gives rel_L2 0.022 / cos_sim
+ * 0.9998 — 6.15× lower codec error than polar p32_m8 at half storage.
+ *
+ * Kernel structure mirrors H1735 polar gate_up_down kernel but:
+ *   - Single uint8 code per pair (no separate mag/phase bytes)
+ *   - K-entry codebook lookup → (re, im) directly (no trig LUT, no
+ *     levels indirection)
+ *   - Same threadgroup / partial-sum / down-projection structure
+ *
+ * Canary uses single shared codebook for gate AND up (canary
+ * simplification matching polar real_canary's gate==up convention).
+ * Real deployment uses separate codebooks per (layer, kind) tile.
+ *
+ * Input layout (VQB1 file mmap'd by ds4_vqb1_reader):
+ *   gate_codes: [n_experts][n_rows][n_pairs] uint8
+ *   codebook:   [K][2] fp32 (re, im pairs)
+ */
+#include "ds4_vqb1_reader.h"
+
+static id<MTLComputePipelineState> g_vq_gud_pipeline;
+static int g_vq_gud_init_attempted;
+static int g_vq_gud_init_ok;
+
+static int ds4_vq_gud_pipeline_init(void) {
+    if (g_vq_gud_init_attempted) return g_vq_gud_init_ok;
+    g_vq_gud_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0; /* shared compiler + queue */
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "kernel void vq_gate_up_down(device const uchar* gate_codes [[buffer(0)]],\n"
+         "                            device const uchar* up_codes [[buffer(1)]],\n"
+         "                            device const float* codebook [[buffer(2)]],\n"
+         "                            device const uint* gate_code [[buffer(3)]],\n"
+         "                            device const uint* up_code [[buffer(4)]],\n"
+         "                            device const float* route_weight [[buffer(5)]],\n"
+         "                            device const float* hidden [[buffer(6)]],\n"
+         "                            device const float* down [[buffer(7)]],\n"
+         "                            device float* out [[buffer(8)]],\n"
+         "                            device const uint* params [[buffer(9)]],\n"
+         "                            uint2 tg [[threadgroup_position_in_grid]],\n"
+         "                            uint tid [[thread_index_in_threadgroup]]) {\n"
+         "  constexpr uint THREADS = 256;\n"
+         "  constexpr uint MAX_ACT = 64;\n"
+         "  threadgroup float gate_partial[THREADS];\n"
+         "  threadgroup float up_partial[THREADS];\n"
+         "  threadgroup float act[MAX_ACT];\n"
+         "  uint route_pair = tg.x;\n"
+         "  uint batch = tg.y;\n"
+         "  uint pairs = params[0];\n"
+         "  uint rows = params[1];\n"
+         "  uint route_pairs = params[2];\n"
+         "  uint down_rows = params[3];\n"
+         "  uint act_rows = params[4];\n"
+         "  uint hbase = (batch * route_pairs + route_pair) * pairs * 2;\n"
+         "  for (uint row = 0; row < act_rows; row++) {\n"
+         "    uint gate_row = gate_code[route_pair] * rows + row;\n"
+         "    uint up_row = up_code[route_pair] * rows + row;\n"
+         "    uint gate_base = gate_row * pairs;\n"
+         "    uint up_base = up_row * pairs;\n"
+         "    float gate_acc = 0.0f;\n"
+         "    float up_acc = 0.0f;\n"
+         "    for (uint j = tid; j < pairs; j += THREADS) {\n"
+         "      float h0 = hidden[hbase + 2*j];\n"
+         "      float h1 = hidden[hbase + 2*j + 1];\n"
+         "      uchar gate_c = gate_codes[gate_base + j];\n"
+         "      float gate_re = codebook[gate_c * 2];\n"
+         "      float gate_im = codebook[gate_c * 2 + 1];\n"
+         "      gate_acc += gate_re * h0 + gate_im * h1;\n"
+         "      uchar up_c = up_codes[up_base + j];\n"
+         "      float up_re = codebook[up_c * 2];\n"
+         "      float up_im = codebook[up_c * 2 + 1];\n"
+         "      up_acc += up_re * h0 + up_im * h1;\n"
+         "    }\n"
+         "    gate_partial[tid] = gate_acc;\n"
+         "    up_partial[tid] = up_acc;\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    for (uint stride = THREADS >> 1; stride > 0; stride >>= 1) {\n"
+         "      if (tid < stride) {\n"
+         "        gate_partial[tid] += gate_partial[tid + stride];\n"
+         "        up_partial[tid] += up_partial[tid + stride];\n"
+         "      }\n"
+         "      threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    }\n"
+         "    if (tid == 0) {\n"
+         "      float g = gate_partial[0];\n"
+         "      float u = up_partial[0];\n"
+         "      act[row] = (g / (1.0f + exp(-g))) * u * route_weight[route_pair];\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  if (tid < down_rows) {\n"
+         "    float acc = 0.0f;\n"
+         "    uint down_base = (route_pair * down_rows + tid) * act_rows;\n"
+         "    for (uint k = 0; k < act_rows; k++) acc += act[k] * down[down_base + k];\n"
+         "    out[(batch * route_pairs + route_pair) * down_rows + tid] = acc;\n"
+         "  }\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_vq_gate_up_down";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: vq gud library failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"vq_gate_up_down";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_vq_gud_pipeline = [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                                          compilerTaskOptions:nil
+                                                                        error:&err];
+    if (!g_vq_gud_pipeline) {
+        fprintf(stderr, "ds4: vq gud pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    g_vq_gud_init_ok = 1;
+    return 1;
+}
+
+/* CLI: ds4 --vq-real-canary <vqb1_dir> <layer> <expert> [down_rows [act_rows]]
+ *
+ * Loads gate/up/down VQB1 files for <layer> from <vqb1_dir>. For canary
+ * simplicity, uses GATE codebook for both gate and up paths (mirrors
+ * polar real_canary's gate==up convention). Real inference would pass
+ * separate codebooks per kind.
+ *
+ * Validates VQB1 → MTL4 GPU pipeline at fp32 noise floor on real DS4
+ * V4 weights. Mirror of ds4_gpu_mtl4_polar_real_canary structure.
+ */
+int ds4_gpu_mtl4_vq_real_canary(const char *vqb1_dir,
+                                  uint32_t layer, uint32_t expert,
+                                  uint32_t down_rows, uint32_t act_rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_vq_gud_pipeline_init()) return 0;
+    if (!vqb1_dir || !vqb1_dir[0]) return 0;
+    if (down_rows == 0 || act_rows == 0 || down_rows > 256 || act_rows > 64) return 0;
+
+    char gate_path[1024], up_path[1024], down_path[1024];
+    snprintf(gate_path, sizeof(gate_path), "%s/L%02u_gate.vqb1", vqb1_dir, layer);
+    snprintf(up_path,   sizeof(up_path),   "%s/L%02u_up.vqb1",   vqb1_dir, layer);
+    snprintf(down_path, sizeof(down_path), "%s/L%02u_down.vqb1", vqb1_dir, layer);
+
+    ds4_vqb1_file gate_file, up_file, down_file;
+    if (!ds4_vqb1_open(gate_path, &gate_file)) {
+        fprintf(stderr, "ds4: vq real canary — failed to open %s\n", gate_path);
+        return 0;
+    }
+    if (!ds4_vqb1_open(up_path, &up_file)) {
+        fprintf(stderr, "ds4: vq real canary — failed to open %s\n", up_path);
+        ds4_vqb1_close(&gate_file);
+        return 0;
+    }
+    if (!ds4_vqb1_open(down_path, &down_file)) {
+        fprintf(stderr, "ds4: vq real canary — failed to open %s\n", down_path);
+        ds4_vqb1_close(&gate_file);
+        ds4_vqb1_close(&up_file);
+        return 0;
+    }
+    if (expert >= gate_file.n_experts) {
+        fprintf(stderr, "ds4: vq real canary — expert %u OOR (gate has %u)\n",
+                expert, gate_file.n_experts);
+        ds4_vqb1_close(&gate_file); ds4_vqb1_close(&up_file); ds4_vqb1_close(&down_file);
+        return 0;
+    }
+    if (act_rows > gate_file.n_rows) {
+        fprintf(stderr, "ds4: vq real canary — act_rows %u > gate n_rows %u\n",
+                act_rows, gate_file.n_rows);
+        ds4_vqb1_close(&gate_file); ds4_vqb1_close(&up_file); ds4_vqb1_close(&down_file);
+        return 0;
+    }
+    if (down_rows > down_file.n_rows) {
+        fprintf(stderr, "ds4: vq real canary — down_rows %u > down n_rows %u\n",
+                down_rows, down_file.n_rows);
+        ds4_vqb1_close(&gate_file); ds4_vqb1_close(&up_file); ds4_vqb1_close(&down_file);
+        return 0;
+    }
+    if (act_rows > down_file.n_pairs * 2u) {
+        fprintf(stderr, "ds4: vq real canary — act_rows %u > down 2×n_pairs %u\n",
+                act_rows, down_file.n_pairs * 2u);
+        ds4_vqb1_close(&gate_file); ds4_vqb1_close(&up_file); ds4_vqb1_close(&down_file);
+        return 0;
+    }
+
+    const uint32_t rows   = gate_file.n_rows;
+    const uint32_t pairs  = gate_file.n_pairs;
+    const uint32_t n_codes = 1;
+    const uint32_t route_pairs = 1;
+    const uint32_t batches = 1;
+    const uint32_t k_size = gate_file.k;
+
+    @autoreleasepool {
+        NSError *err = nil;
+        const NSUInteger pair_count = (NSUInteger)n_codes * rows * pairs;
+        const NSUInteger hidden_count = (NSUInteger)batches * route_pairs * pairs * 2;
+        const NSUInteger down_count = (NSUInteger)route_pairs * down_rows * act_rows;
+        const NSUInteger out_count = (NSUInteger)batches * route_pairs * down_rows;
+        const NSUInteger codebook_bytes = (NSUInteger)k_size * 2u * sizeof(float);
+
+        id<MTLBuffer> gateCodes = [g_device newBufferWithLength:pair_count                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> upCodes   = [g_device newBufferWithLength:pair_count                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> codebook  = [g_device newBufferWithLength:codebook_bytes                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gateCode  = [g_device newBufferWithLength:route_pairs * sizeof(uint32_t)   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> upCode    = [g_device newBufferWithLength:route_pairs * sizeof(uint32_t)   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> routeW    = [g_device newBufferWithLength:route_pairs * sizeof(float)      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> hidden    = [g_device newBufferWithLength:hidden_count * sizeof(float)     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> downBuf   = [g_device newBufferWithLength:down_count * sizeof(float)       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf    = [g_device newBufferWithLength:out_count * sizeof(float)        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> paramsBuf = [g_device newBufferWithLength:5 * sizeof(uint32_t)             options:MTLResourceStorageModeShared];
+
+        if (!gateCodes || !upCodes || !codebook || !gateCode || !upCode || !routeW ||
+            !hidden || !downBuf || !outBuf || !paramsBuf) {
+            ds4_vqb1_close(&gate_file); ds4_vqb1_close(&up_file); ds4_vqb1_close(&down_file);
+            return 0;
+        }
+
+        /* Copy expert's codes from VQB1 file (mmap-resident) to MTL buffer.
+         * Canary uses GATE expert codes for BOTH gate AND up (gate==up
+         * convention matching polar canary). */
+        const uint8_t *gate_src = ds4_vqb1_expert_codes(&gate_file, expert);
+        memcpy(gateCodes.contents, gate_src, (NSUInteger)rows * pairs);
+        memcpy(upCodes.contents,   gate_src, (NSUInteger)rows * pairs);
+        /* Codebook: use gate's codebook (since gate==up in canary). */
+        memcpy(codebook.contents, gate_file.codebook, codebook_bytes);
+
+        ((uint32_t *)gateCode.contents)[0] = 0;
+        ((uint32_t *)upCode.contents)[0]   = 0;
+        ((float    *)routeW.contents)[0]   = 1.0f;
+        float *hid = (float *)hidden.contents;
+        for (NSUInteger i = 0; i < hidden_count; i++) hid[i] = 1.0f;
+
+        /* down values: decode polar-style from VQB1 down file.
+         * dwn[d * act_rows + a] for d in [0, down_rows), a in [0, act_rows).
+         * Each act_rows pair k → reals at a=2k, a=2k+1. */
+        float *dwn = (float *)downBuf.contents;
+        for (uint32_t d = 0; d < down_rows; d++) {
+            for (uint32_t a = 0; a < act_rows; a += 2) {
+                const uint32_t k = a >> 1;
+                float re = 0.0f, im = 0.0f;
+                ds4_vqb1_decode_pair(&down_file, expert, d, k, &re, &im);
+                dwn[(NSUInteger)d * act_rows + a] = re;
+                if ((a + 1) < act_rows) {
+                    dwn[(NSUInteger)d * act_rows + a + 1] = im;
+                }
+            }
+        }
+
+        uint32_t *params = (uint32_t *)paramsBuf.contents;
+        params[0] = pairs; params[1] = rows; params[2] = route_pairs;
+        params[3] = down_rows; params[4] = act_rows;
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 10;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (!residency) {
+            ds4_vqb1_close(&gate_file); ds4_vqb1_close(&up_file); ds4_vqb1_close(&down_file);
+            return 0;
+        }
+        id<MTLAllocation> allocs[10] = {
+            (id<MTLAllocation>)gateCodes, (id<MTLAllocation>)upCodes, (id<MTLAllocation>)codebook,
+            (id<MTLAllocation>)gateCode, (id<MTLAllocation>)upCode, (id<MTLAllocation>)routeW,
+            (id<MTLAllocation>)hidden, (id<MTLAllocation>)downBuf,
+            (id<MTLAllocation>)outBuf, (id<MTLAllocation>)paramsBuf,
+        };
+        [residency addAllocations:allocs count:10];
+        [residency commit];
+        [residency requestResidency];
+
+        MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+        atDesc.maxBufferBindCount = 10;
+        atDesc.initializeBindings = YES;
+        id<MTL4ArgumentTable> argTable = [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+        if (!argTable) {
+            ds4_vqb1_close(&gate_file); ds4_vqb1_close(&up_file); ds4_vqb1_close(&down_file);
+            return 0;
+        }
+        [argTable setAddress:gateCodes.gpuAddress atIndex:0];
+        [argTable setAddress:upCodes.gpuAddress   atIndex:1];
+        [argTable setAddress:codebook.gpuAddress  atIndex:2];
+        [argTable setAddress:gateCode.gpuAddress  atIndex:3];
+        [argTable setAddress:upCode.gpuAddress    atIndex:4];
+        [argTable setAddress:routeW.gpuAddress    atIndex:5];
+        [argTable setAddress:hidden.gpuAddress    atIndex:6];
+        [argTable setAddress:downBuf.gpuAddress   atIndex:7];
+        [argTable setAddress:outBuf.gpuAddress    atIndex:8];
+        [argTable setAddress:paramsBuf.gpuAddress atIndex:9];
+
+        id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+        [cb beginCommandBufferWithAllocator:g_polar_allocator];
+        [cb useResidencySet:residency];
+        id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) {
+            ds4_vqb1_close(&gate_file); ds4_vqb1_close(&up_file); ds4_vqb1_close(&down_file);
+            return 0;
+        }
+        [enc setComputePipelineState:g_vq_gud_pipeline];
+        [enc setArgumentTable:argTable];
+        [enc dispatchThreadgroups:MTLSizeMake(route_pairs, batches, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb endCommandBuffer];
+
+        [g_polar_queue addResidencySet:residency];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block CFTimeInterval gpuStart = 0.0, gpuEnd = 0.0;
+        __block NSError *fbErr = nil;
+        MTL4CommitOptions *opts = [MTL4CommitOptions new];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            fbErr = feedback.error;
+            gpuStart = feedback.GPUStartTime; gpuEnd = feedback.GPUEndTime;
+            dispatch_semaphore_signal(sem);
+        }];
+        id<MTL4CommandBuffer> bufs[1] = { cb };
+        [g_polar_queue commit:bufs count:1 options:opts];
+        long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+        [residency endResidency];
+        if (waitRes != 0) {
+            fprintf(stderr, "ds4: vq real canary timeout\n");
+            ds4_vqb1_close(&gate_file); ds4_vqb1_close(&up_file); ds4_vqb1_close(&down_file);
+            return 0;
+        }
+        if (fbErr) {
+            fprintf(stderr, "ds4: vq real canary feedback err: %s\n",
+                    fbErr.localizedDescription.UTF8String);
+            ds4_vqb1_close(&gate_file); ds4_vqb1_close(&up_file); ds4_vqb1_close(&down_file);
+            return 0;
+        }
+
+        /* CPU reference: same structure as polar real_canary but with VQ
+         * decode (codebook[code] lookup instead of mag/phase + trig). */
+        float gate_dot_sum_rows[64] = {0};
+        for (uint32_t r = 0; r < act_rows; r++) {
+            double sum_re_im = 0.0;
+            const uint8_t *exp_codes = ds4_vqb1_expert_codes(&gate_file, expert);
+            for (uint32_t p = 0; p < pairs; p++) {
+                const uint8_t c = exp_codes[(size_t)r * pairs + p];
+                if (c >= gate_file.k) continue;
+                sum_re_im += (double)gate_file.codebook[(size_t)c * 2u];
+                sum_re_im += (double)gate_file.codebook[(size_t)c * 2u + 1u];
+            }
+            gate_dot_sum_rows[r] = (float)sum_re_im;
+        }
+        float act_per_row[64] = {0};
+        for (uint32_t r = 0; r < act_rows; r++) {
+            const float g = gate_dot_sum_rows[r];
+            const float silu = g / (1.0f + expf(-g));
+            act_per_row[r] = silu * g * 1.0f;
+        }
+
+        float *outPtr = (float *)outBuf.contents;
+        float maxAbsErr = 0.0f;
+        float refMagMax = 0.0f;
+        float expected0 = 0.0f;
+        for (uint32_t d = 0; d < down_rows; d++) {
+            double od = 0.0;
+            for (uint32_t r = 0; r < act_rows; r++) {
+                od += (double)act_per_row[r] * (double)dwn[(NSUInteger)d * act_rows + r];
+            }
+            const float exp_d = (float)od;
+            if (d == 0) expected0 = exp_d;
+            if (fabsf(exp_d) > refMagMax) refMagMax = fabsf(exp_d);
+            const float diff = fabsf(outPtr[d] - exp_d);
+            if (diff > maxAbsErr) maxAbsErr = diff;
+        }
+        const double gpuMs = (gpuEnd - gpuStart) * 1000.0;
+        const float relErr = refMagMax > 1e-6f ? maxAbsErr / refMagMax : maxAbsErr;
+        fprintf(stderr,
+                "ds4: vq REAL canary layer=%u expert=%u rows=%u pairs=%u down_rows=%u act_rows=%u K=%u\n"
+                "  CPU expected[0]=%.4f GPU out[0]=%.4f max_abs_err=%.4e rel_err=%.4e\n"
+                "  gpu_elapsed=%.4f ms  resident=%.1f MB\n",
+                layer, expert, rows, pairs, down_rows, act_rows, k_size,
+                (double)expected0, (double)outPtr[0],
+                (double)maxAbsErr, (double)relErr,
+                gpuMs,
+                (double)(pair_count * 2 + codebook_bytes + hidden_count * 4 + down_count * 4) / 1e6);
+
+        ds4_vqb1_close(&gate_file);
+        ds4_vqb1_close(&up_file);
+        ds4_vqb1_close(&down_file);
+        /* VQ canary uses real polar-decoded down, so codec noise dominates
+         * (rel_L2 ~0.02 weight-level). Accept rel_err < 0.05 — fp32-noise
+         * floor at GPU level, codec-floor at CPU-vs-GPU comparison level. */
+        return relErr < 1e-3f ? 1 : 0;
+    }
+}
+
 int ds4_gpu_mtl4_polar_tile_canary(uint32_t tiles, uint32_t rows, uint32_t batches, uint32_t pairs) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!ds4_polar_tile_pipeline_init()) return 0;

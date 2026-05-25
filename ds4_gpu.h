@@ -986,3 +986,17 @@ int ds4_gpu_mtl4_polar_gate_up_down_canary(uint32_t n_codes, uint32_t route_pair
 int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
                                     uint32_t layer, uint32_t expert,
                                     uint32_t down_rows, uint32_t act_rows);
+
+/* VQ-2D codec canary: mirror of polar_real_canary but reads VQB1
+ * files from <vqb1_dir>/L{LL}_{gate,up,down}.vqb1. Validates the
+ * VQ-2D codec + new gate_up_down_vq MTL4 kernel at fp32 noise floor
+ * on real DS4 V4 weights.
+ *
+ * Use:
+ *   ./ds4 --vq-real-canary <vqb1_dir> <layer> <expert> [down_rows [act_rows]]
+ *
+ * Returns 1 on success (rel_err < 1e-3), 0 on any failure.
+ */
+int ds4_gpu_mtl4_vq_real_canary(const char *vqb1_dir,
+                                  uint32_t layer, uint32_t expert,
+                                  uint32_t down_rows, uint32_t act_rows);

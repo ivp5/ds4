@@ -30,8 +30,8 @@ JOURNAL_OBJ :=
 JOURNAL_LIB :=
 endif
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal $(JOURNAL_LIB)
-CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_metal.o ds4_expert_table.o ds4_moe_route_log.o ds4_pillars.o ds4_polar_reader.o $(JOURNAL_OBJ)
-CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_polar_reader.o $(JOURNAL_OBJ)
+CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_metal.o ds4_expert_table.o ds4_moe_route_log.o ds4_pillars.o ds4_polar_reader.o ds4_vqb1_reader.o $(JOURNAL_OBJ)
+CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_polar_reader.o ds4_vqb1_reader.o $(JOURNAL_OBJ)
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -42,8 +42,8 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_cuda.o ds4_polar_reader.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_polar_reader.o
+CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_cuda.o ds4_polar_reader.o ds4_vqb1_reader.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_polar_reader.o ds4_vqb1_reader.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 

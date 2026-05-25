@@ -1711,6 +1711,20 @@ int main(int argc, char **argv) {
         uint32_t act_rows  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 16;
         return ds4_gpu_mtl4_polar_real_canary(dir, layer, expert, down_rows, act_rows) ? 0 : 1;
     }
+    /* --vq-real-canary <vqb1_dir> [layer [expert [down_rows [act_rows]]]]:
+     * VQ-2D codec validation. Reads VQB1 files from <vqb1_dir>/L{LL}_{kind}.vqb1,
+     * loads expert codes + codebook into MTL buffers, dispatches gate_up_down_vq
+     * kernel. Compares GPU output to a CPU reference computed via the same
+     * codebook lookup. Validates VQB1 format → MTL4 GPU pipeline end-to-end.
+     * Mirror of --polar-real-canary structure for the VQ codec arc. */
+    if (argc >= 3 && !strcmp(argv[1], "--vq-real-canary")) {
+        const char *dir   = argv[2];
+        uint32_t layer    = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 0;
+        uint32_t expert   = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 0;
+        uint32_t down_rows = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 8;
+        uint32_t act_rows  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 16;
+        return ds4_gpu_mtl4_vq_real_canary(dir, layer, expert, down_rows, act_rows) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
