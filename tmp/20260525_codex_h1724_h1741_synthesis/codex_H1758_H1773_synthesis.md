@@ -259,6 +259,83 @@ Tile materialization  ←── H1783 NEW BOTTLENECK ──→  CODEC IS
 The codec arc's strategic position just escalated from "enabler"
 to "named-next-speed-lever" by codex H1783's profile.
 
+### H1784 confirms + extends with measurements (12:05 UTC)
+
+H1784 separated raw IQ2 row I/O from dequant/f32 materialization:
+- Raw IQ2 rows: **11.8 MB** for pair/triple windows
+- f32 gate/up tiles: **183 MB** for same windows
+- **15.5× f32 expansion overhead** at materialization stage
+
+File I/O is small (0.04s persistent handle). **Dequant/materialization
+dominates wall: pairs 5.88s, triples 5.65s** — matching H1783's 84%
+diagnosis.
+
+**Shift quote**: "The f32 tile is the wrong intermediate
+representation. Next load-bearing test: **MTL4 IQ2 raw-row dot
+products that delete the 15.5× f32 expansion and Python dequant
+path**."
+
+### My codec kernel IS H1784's architectural pattern
+
+The H1735 polar kernel + gate_up_down_vq kernel both implement
+"no-f32-tile" dot products:
+
+```msl
+// Polar H1735 inner loop:
+uchar gate_m = mag[gate_base + j];           // 1 byte read
+uint  gate_l = uint(phase[gate_base + j]);   // 1 byte read
+float gate_q = levels[gate_row * M + gate_m]; // codebook lookup
+gate_acc += gate_q * cos_lut[gate_l] * h0 +   // fused dequant
+            gate_q * sin_lut[gate_l] * h1;    // + matmul
+
+// VQ gate_up_down_vq inner loop:
+uchar gate_c = gate_codes[gate_base + j];    // 1 byte read
+float gate_re = codebook[gate_c * 2];        // direct lookup
+float gate_im = codebook[gate_c * 2 + 1];    // direct lookup
+gate_acc += gate_re * h0 + gate_im * h1;     // fused matmul
+```
+
+Both patterns avoid materializing the f32 tile — they fuse decode
+into the matmul at register level. This is H1784's "delete the
+15.5× f32 expansion" architectural call.
+
+Differences from H1784's raw-IQ2 path:
+- IQ2 codebook is hardcoded (16 values × E8M0 scale per 32-block)
+- Polar codebook is LEARNED per-row magnitude + uniform phase LUT
+- VQ codebook is LEARNED per-(layer, kind) K=256 in R²
+
+The codec arc trades hardcoded-IQ2 for learned-polar-or-VQ at the
+same architectural pattern: in-kernel decode, no f32 materialization.
+Per codec quality measurements:
+- Raw IQ2 at FP4: rel_L2 0 (it's the source)
+- Polar p32_m8: rel_L2 0.12 (decode imperfect, but matmul direct)
+- VQ K=256: rel_L2 0.02 (decode near-perfect, matmul direct)
+
+VQ K=256 at 1 byte/pair achieves rel_L2 0.02 with the same
+architectural advantage as H1784's raw-IQ2 path. Polar at 2 byte/pair
+achieves 0.12. Both DELETE the 15.5× f32 expansion.
+
+### Final composition picture (H1776-H1784)
+
+```
+Stage              codex (H1776-H1784)        my codec arc
+-----------------  -------------------------  --------------------
+Disk → resident    H1776 row-streamed seek    encoder offline
+Resident set       H1778 layer-window LRU     compression 2-4×
+Tile dequant       BOTTLENECK (84%, 15.5× f32 expansion)
+  ← H1784 calls for: "MTL4 raw-row dot products"
+  ← MY ARC DELIVERS: H1735 polar kernel + gate_up_down_vq kernel
+  ← Both fuse decode into matmul at register level
+  ← Polar 2× expansion saved / VQ 4× saved
+Window execution   H1779-H1782 reusable       n/a (codec kernel
+                                              is already this)
+```
+
+The codec arc lands directly at the stage codex H1783/H1784 just
+identified as the bottleneck. Strategic alignment is now sharp:
+codec deployment is BOTH the next memory organ AND the next speed
+organ on M1 Max DS4 substrate.
+
 ## Addendum: H1775 — MTL4 non-divisible dispatch silently corrupts
 
 H1775 shipped right after H1774. MTL4 consumed the H1774 raw route
