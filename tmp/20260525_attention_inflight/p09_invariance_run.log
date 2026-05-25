@@ -1,0 +1,42 @@
+P09 truth: 29, problem len: 746 chars
+loading mlx-community/Qwen3.5-4B-MLX-4bit...
+loaded in 1.3s
+prompt: 235 tokens
+  pos=0 t=0.0s recent='Let'
+  pos=2000 t=33.1s recent='f$ are $S_{t_1}, \\dots'
+  pos=4000 t=67.3s recent=' 6.\nSo $S_6$ is always'
+  pos=6000 t=103.6s recent='x_6$ appears at index 6, then the'
+  pos=8000 t=141.4s recent='_6$ is the last occurrence of $x_6'
+  pos=10000 t=178.5s recent='6$ is always visible.\nWait, I need to'
+  pos=12000 t=216.7s recent='6, then the last occurrence is at 6.\n'
+finished in 218.5s
+
+P09 ||delta|| per layer × position:
+   pos  L 0  L22  L25  L26  L27  L31
+  2000   2.38   9.44   9.06   9.38  15.06  53.75
+  4000   2.20   7.91   7.09   9.25  17.75  48.75
+  6000   2.58   5.78   5.47   7.50  22.00  34.75
+  8000   2.75   6.09   5.66   7.97  18.00  36.50
+ 10000   2.75   6.75   5.25   8.62  21.50  35.50
+ 12000   1.97   6.53   5.31   7.88  21.50  39.75
+ 12031   2.58   6.09   5.91   8.00  19.25  41.00
+ 12032   2.75   8.62   7.75  11.56  20.88  37.25
+ 12062   2.69   6.47   5.75   7.91  22.88  38.25
+ 12064   2.22   5.69   5.75   7.38  18.88  42.00
+ 12093   2.45   6.72   6.38   7.78  19.75  42.25
+
+P09 cycle-period determinism candidates at L31:
+  L31 12000 vs 12000+31: base=39.75, off=41.00  diff=1.250
+  L31 12000 vs 12000+32: base=39.75, off=37.25  diff=2.500
+
+P01 baseline (from prior probes) for comparison:
+  L22 in-cycle: 5.69, L25: 5.56, L26: 6.53, L27: 19.25, L31: 37.50
+P09 measured at pos 12000:
+  L0: 1.97
+  L22: 6.53
+  L25: 5.31
+  L26: 7.88
+  L27: 21.50
+  L31: 39.75
+
+saved p09_cell_invariance_result.json
