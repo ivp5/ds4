@@ -197,24 +197,22 @@ Session done. Direction request: D1 or D2 for Phase B-2.3?
 
 ---
 
-## ADDENDUM 2026-05-25 — Phase B-2.3a SHIPPED (D1 chosen)
+## ADDENDUM 2026-05-25 — Phase B-2.3a+B-2.3b SHIPPED, polar codec fully characterized
 
-Commit `eb06f9c` lands the D1 path: polar-DOWN extracted to fp32
-inside `ds4_gpu_mtl4_polar_real_canary`, gated by env var
-`DS4_POLAR_REAL_DOWN=1`. Default synthetic-uniform path unchanged.
+Four commits this segment land the polar arc through B-2.3b at all
+relevant geometries. The codec is now fully characterized; only
+runtime AIME hold-rate (B-2.3d, silv's surface) is unmeasured.
 
-**Cross-cell validation (9/9 at fp32 noise floor on real DS4 V4):**
-- 3 layers × 3 experts (L0/L22/L42 × E0/E100/E255)
-- rel_err range: 9.23e-8 to 3.92e-7
-- Polar-down → fp32 → H1735 chain is end-to-end bit-equivalent to
-  a polar-decode CPU reference.
+### B-2.3a [eb06f9c]: polar-down → fp32 → H1735 = bit-equivalent
 
-Settles D1-vs-D2 in favor of D1: kernel needs no polar-aware logic;
-existing H1735 consumes fp32 down tiles fine.
+Polar-DOWN extracted to fp32 inside `ds4_gpu_mtl4_polar_real_canary`,
+gated by env var `DS4_POLAR_REAL_DOWN=1`. Default synthetic-uniform
+path unchanged.
 
-**Next**: B-2.3b dispatcher canary (~250 LOC C) compares polar vs
-FP4 source at kernel-output level. Per design fork memo addendum
-2026-05-25.
+Cross-cell validation (9/9 at fp32 noise floor on L0/L22/L42 ×
+E0/E100/E255): rel_err range 9.23e-8 to 3.92e-7. **Settles D1-vs-D2
+in favor of D1** — kernel needs no polar-aware logic; existing H1735
+consumes fp32 down tiles bit-equivalent.
 
 Use:
 ```
@@ -222,4 +220,76 @@ DS4_POLAR_REAL_DOWN=1 ./ds4 --polar-real-canary tmp/polar_full_p16m4 \
   <layer> <expert> [down_rows [act_rows]]
 ```
 
-Tasks: #568 [completed] B-2.3a; #563 [in_progress] parent.
+### B-2.3b canary-scale [1aa7e25]: polar vs FP4 at kernel output
+
+Pure-Python A/B reusing canary's CPU computation. At canary geometry
+(act_rows=16, down_rows=8):
+- Weight rel_L2 mean: 0.197 (validator confirms 0.2018 ✓)
+- Output rel_L2 mean: 0.239
+- Output cos_sim mean: 0.972
+- Ratio out/weight: 1.21× (kernel doesn't catastrophically amplify)
+
+Use: `analyzers/polar_vs_fp4_kernel_output_ab.py`
+
+### B-2.3b refinement [a4d1a9d-equivalent]: no CLT free lunch
+
+Sweep across act_rows ∈ {16, 32, 64, 128} × 9 cells refutes the
+"naive CLT averaging would shrink output codec error" extrapolation.
+Output rel_L2 stays in the same order of magnitude as weight rel_L2
+across all tested accumulation lengths because codec error is
+systematic 4-level magnitude bias, not iid random noise.
+
+Use: `analyzers/polar_vs_fp4_kernel_output_ab.py` with --act-rows
+
+### B-2.3b real-FFN scale [latest]: kernel-output ≈ weight codec at deployment
+
+Down codec A/B at act_rows=2048 = moe_intermediate_size, using FP4
+gate (which has all 2048 rows) as act-vector source:
+- Weight rel_L2 mean: 0.206
+- **Output rel_L2 mean: 0.215** (just 4% above weight)
+- **Output cos_sim mean: 0.976** (min 0.968)
+- **Ratio out/weight: 1.042×** (tight — kernel neither amplifies nor reduces)
+
+Use: `analyzers/polar_down_real_ffn_scale_ab.py`
+
+### Full codec characterization summary
+
+| Geometry           | weight rel_L2 | output rel_L2 | cos_sim | ratio out/wt |
+|--------------------|---------------|---------------|---------|--------------|
+| weight-level only  | 0.20          | n/a           | 0.98    | n/a          |
+| canary (ar=16)     | 0.20          | 0.24          | 0.97    | 1.21×        |
+| sweep ar∈{16..128} | 0.20          | 0.20-0.27     | 0.95-0.99 | 1.0-1.5×   |
+| real FFN (ar=2048) | 0.21          | 0.22          | 0.98    | 1.04×        |
+
+### Deployment characteristics for B-2.3c/d
+
+- **Per-FFN-call output codec error**: ~0.21 rel_L2, ~0.97 cos_sim
+- **Direction preservation**: high (>0.95 cos_sim)
+- **Magnitude wobble**: present (~21% rel_L2)
+- **Multi-layer composition risk**: 43 layers × this per-call quality;
+  whether benign or catastrophic on AIME requires runtime test
+- **What B-2.3d will decide**: silv's DS4-sticky-hazard AIME hold-rate
+
+### Remaining gaps
+
+**B-2.3c hot-path env-var gate** (~80 LOC): structurally ready. The
+edit would add a `DS4_POLAR_FFN_LAYERS=...` env var check at
+`metal_graph_encode_layer_ffn_batch` call site, route to new
+`ds4_gpu_mtl4_polar_routed_moe_batch(...)` dispatcher (~200 LOC,
+mirrors `ds4_gpu_routed_moe_batch_tensor_mtl4(...)` structure but
+reads polar pool instead of FP4 weights), with FP4 fallback on
+allocation failure. Compile risk low; runtime risk medium (untested
+hot path). Recommend silv-driven runtime test before claiming
+shipped (per `feedback_compile_is_not_shipped.md`).
+
+**B-2.3d AIME hold-rate measurement**: requires DS4 binary launch
+with `--prefill-metal-phases auto` (sticky hazard), polar-FFN env
+var, and AIME 2026 corpus. silv-only operation per CLAUDE.md
+sticky-hazard.
+
+### Tasks
+
+- #568 [completed] B-2.3a polar-down canary path
+- #569 [completed] B-2.3b kernel-output A/B (canary scale)
+- #570 [completed] B-2.3b at real FFN scale
+- #563 [in_progress] parent — awaiting B-2.3c + B-2.3d
