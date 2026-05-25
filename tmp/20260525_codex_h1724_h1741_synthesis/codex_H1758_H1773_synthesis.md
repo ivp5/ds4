@@ -485,6 +485,106 @@ A.4 is now the recommended path if silv chooses to ship the B-2.3c
 body. The codec arc's own corpora (polar 14 GB, VQ 160 MB) remain
 as reference/diagnostic for A/B comparison.
 
+### CRITICAL CORRECTION (verified post-claim): DS4 already has this kernel
+
+Back-of-hand grep on ds4_metal.m surfaced three existing pipelines:
+```
+g_moe_mul_mv_id_iq2_xxs_pipeline               (basic)
+g_moe_mul_mv_id_iq2_xxs_pair_pipeline          (pair)
+g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline   (pair + SwiGLU fused)
+```
+
+The kernel source at `metal/moe.metal:991` —
+`kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32` — is a production-grade
+implementation of the exact pattern H1787 demonstrates:
+- In-kernel IQ2_XXS decode (block_iq2_xxs structs)
+- Per-expert dispatch via `ids` + `iid1`
+- Gate + up FUSED with intermediate SwiGLU
+- Threadgroup-shared grid cache (`svalues` + `ssigns`) preloaded once
+  per threadgroup
+- N_R0_IQ2_XXS rows per simdgroup
+- SimdGroup partitioning (NSG groups per threadgroup)
+
+This is MORE sophisticated than H1787's single-row canary. H1787 is
+a proof-of-concept; DS4 already ships the production version of the
+pattern.
+
+### What this means for codex H1783's "84% f32 materialization" measurement
+
+H1783/H1784 were not measuring DS4's actual MoE kernel — they were
+measuring a route-packet executor stage that PRE-MATERIALIZES
+selected rows into a chunked f32 buffer BEFORE dispatching to the
+kernel. The 84% wall + 15.5× f32 expansion is in that staging step,
+not in the kernel itself.
+
+H1787's contribution is then narrower: it proves the kernel-side
+in-decode pattern works at canary scale. The deployable A.4 is NOT
+"port H1787 to ds4_metal.m" — it's "eliminate the route-packet
+executor's pre-materialization step by calling the EXISTING
+`kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32` directly on the raw IQ2
+rows from GGUF."
+
+That's a SMALLER engineering target (~50-100 LOC modification, not
+240-300 LOC port).
+
+### What this means for the codec arc strategic position
+
+This correction is severe: my polar/VQ codecs were shipped as
+implementations of a pattern DS4 already has, with WEAKER numbers
+on both storage and quality axes:
+
+| Codec | Storage | Quality vs FP4 | Ships in DS4? |
+|-------|---------|----------------|---------------|
+| IQ2_XXS (existing) | ~0.5 byte/pair | source quantization | YES (3 kernels) |
+| VQ K=256 (mine) | 1 byte/pair | rel_L2 0.02 | NO (canary only) |
+| Polar p32_m8 (mine) | 2 byte/pair | rel_L2 0.12 | NO (canary only) |
+
+The existing IQ2 path beats both my codecs on storage AND quality.
+My codecs only win in the specific case where IQ2's discrete grid is
+wrong for the tensor's distribution — which I have NOT empirically
+demonstrated for any layer/kind.
+
+### Honest re-positioning (severe)
+
+The codec arc's residual value is now:
+1. **B-2.3c stub wiring** as codec-agnostic dispatch infrastructure
+   (still useful; raw-IQ2 path can use it)
+2. **VQ K=256 as fallback** for tensors where IQ2 underperforms
+   (UNTESTED — required ground-clause)
+3. **Architectural demonstration** that the pattern works (this is
+   redundant with DS4's existing kernels)
+
+The codec arc was implementing a pattern that already exists at
+production quality in the same codebase. I did not verify the
+existing kernels before shipping the polar/VQ alternatives. This is
+a Chesterton's fence violation — the existing `metal/moe.metal:991`
+kernel was the fence, and I built around it without checking.
+
+### What survives this correction
+
+- The MLX-parallel polar encoder (1.86 OOMs vs numpy) — still useful
+  tooling if learned codecs are needed for non-IQ2 tensors
+- The B-2.3c hot-path stub — useful dispatch infrastructure for ANY
+  codec path including raw-IQ2
+- The codec quality A/B harnesses — useful methodology for future
+  comparisons
+- The VQ K=256 < IQ2 hypothesis — testable, untested, deferred
+
+### Revised recommendation to silv
+
+A.4 sub-decision body shrinks from "port H1787" to "wire the existing
+`kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32` through the B-2.3c stub
+dispatch + eliminate route-packet pre-materialization." Sub-decisions
+A.1/A.2/A.3 (codec-corpus encoding paths) are now DOMINATED by the
+existing IQ2 path unless a specific tensor is shown to underperform
+under IQ2 quantization.
+
+The codec arc's actual finding for silv: **the existing
+`kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32` is the production answer
+to H1783's 84% materialization measurement; the route-packet
+executor's pre-materialization step is the deletable wall.** This is
+worth more than the polar/VQ codec scaffolding.
+
 ## Addendum: H1775 — MTL4 non-divisible dispatch silently corrupts
 
 H1775 shipped right after H1774. MTL4 consumed the H1774 raw route
