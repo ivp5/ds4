@@ -1,0 +1,140 @@
+loading mlx-community/Qwen3.5-4B-MLX-4bit...
+loaded in 1.3s
+prompt: 191 tokens
+  pos=0 t=0.0s
+  pos=2000 t=27.6s
+  pos=4000 t=58.1s
+  pos=6000 t=90.3s
+  pos=8000 t=123.2s
+  pos=10000 t=157.2s
+  pos=12000 t=191.2s
+
+finished in 192.9s
+
+Top-10 logit distribution per position:
+
+  pos=5000:
+    margin(top1-top2)=7.876, margin(top1-top5)=12.125
+    competitors within 2 log_p of top1: 0
+    competitors within 5 log_p of top1: 0
+      rank1:                  '3' p=1.0000 log_p=  0.000  <-- top1
+      rank2:                  '6' p=0.0004 log_p= -7.876
+      rank3:                  '7' p=0.0002 log_p= -8.374
+      rank4:                  '9' p=0.0000 log_p=-10.500
+      rank5:                  '2' p=0.0000 log_p=-12.125
+      rank6:                  '5' p=0.0000 log_p=-12.373
+      rank7:                  '1' p=0.0000 log_p=-14.503
+      rank8:                  '4' p=0.0000 log_p=-14.625
+      rank9:                  '8' p=0.0000 log_p=-16.999
+      rank10:                  '0' p=0.0000 log_p=-19.498
+
+  pos=6000:
+    margin(top1-top2)=0.000, margin(top1-top5)=9.622
+    competitors within 2 log_p of top1: 1
+    competitors within 5 log_p of top1: 1
+      rank1:                 '_P' p=0.5000 log_p= -0.693  <-- top1
+      rank2:                 '_T' p=0.5000 log_p= -0.693
+      rank3:                 '_J' p=0.0005 log_p= -7.693
+      rank4:                 '_V' p=0.0000 log_p=-10.193
+      rank5:                 '_F' p=0.0000 log_p=-10.315
+      rank6:                 '_{' p=0.0000 log_p=-10.504
+      rank7:                 '_p' p=0.0000 log_p=-10.567
+      rank8:                 '_R' p=0.0000 log_p=-10.695
+      rank9:                 '_L' p=0.0000 log_p=-11.130
+      rank10:                 '_B' p=0.0000 log_p=-11.506
+
+  pos=7000:
+    margin(top1-top2)=0.127, margin(top1-top5)=4.747
+    competitors within 2 log_p of top1: 1
+    competitors within 5 log_p of top1: 4
+      rank1:            'Patrick' p=0.4922 log_p= -0.709  <-- top1
+      rank2:              'start' p=0.4336 log_p= -0.836
+      rank3:                  'T' p=0.0403 log_p= -3.212
+      rank4:                  'P' p=0.0055 log_p= -5.210
+      rank5:                 '\\' p=0.0043 log_p= -5.456
+      rank6:             'school' p=0.0029 log_p= -5.833
+      rank7:                'Pat' p=0.0020 log_p= -6.208
+      rank8:                  't' p=0.0014 log_p= -6.585
+      rank9:                'pat' p=0.0014 log_p= -6.585
+      rank10:              'Start' p=0.0012 log_p= -6.715
+
+  pos=8000:
+    margin(top1-top2)=7.876, margin(top1-top5)=13.500
+    competitors within 2 log_p of top1: 0
+    competitors within 5 log_p of top1: 0
+      rank1:                ' if' p=1.0000 log_p=  0.000  <-- top1
+      rank2:             ' about' p=0.0004 log_p= -7.876
+      rank3:              ' time' p=0.0000 log_p=-11.753
+      rank4:             ' times' p=0.0000 log_p=-12.001
+      rank5:               ' was' p=0.0000 log_p=-13.500
+      rank6:                 'if' p=0.0000 log_p=-13.875
+      rank7:                ' is' p=0.0000 log_p=-13.875
+      rank8:              ' else' p=0.0000 log_p=-14.249
+      rank9:                ' If' p=0.0000 log_p=-14.249
+      rank10:             ' start' p=0.0000 log_p=-14.314
+
+  pos=10500:
+    margin(top1-top2)=17.750, margin(top1-top5)=20.499
+    competitors within 2 log_p of top1: 0
+    competitors within 5 log_p of top1: 0
+      rank1:                  '.' p=1.0000 log_p=  0.000  <-- top1
+      rank2:                 '\n' p=0.0000 log_p=-17.750
+      rank3:                 '.I' p=0.0000 log_p=-17.877
+      rank4:                 '."' p=0.0000 log_p=-19.997
+      rank5:                '.**' p=0.0000 log_p=-20.499
+      rank6:                '.</' p=0.0000 log_p=-20.749
+      rank7:                 '.`' p=0.0000 log_p=-20.749
+      rank8:                 '.<' p=0.0000 log_p=-20.749
+      rank9:                 '.l' p=0.0000 log_p=-21.125
+      rank10:                 '.i' p=0.0000 log_p=-21.125
+
+  pos=11000:
+    margin(top1-top2)=12.001, margin(top1-top5)=15.001
+    competitors within 2 log_p of top1: 0
+    competitors within 5 log_p of top1: 0
+      rank1:             ' write' p=1.0000 log_p=  0.000  <-- top1
+      rank2:              ' stop' p=0.0000 log_p=-12.001
+      rank3:            ' output' p=0.0000 log_p=-13.875
+      rank4:            ' finish' p=0.0000 log_p=-14.876
+      rank5:               ' end' p=0.0000 log_p=-15.001
+      rank6:              ' wrap' p=0.0000 log_p=-15.249
+      rank7:                  '写' p=0.0000 log_p=-15.374
+      rank8:              'write' p=0.0000 log_p=-15.624
+      rank9:          ' conclude' p=0.0000 log_p=-15.688
+      rank10:             '.write' p=0.0000 log_p=-16.126
+
+  pos=12000:
+    margin(top1-top2)=18.498, margin(top1-top5)=20.749
+    competitors within 2 log_p of top1: 0
+    competitors within 5 log_p of top1: 0
+      rank1:                  ' ' p=1.0000 log_p=  0.000  <-- top1
+      rank2:                 '\n' p=0.0000 log_p=-18.498
+      rank3:                 ' a' p=0.0000 log_p=-20.125
+      rank4:         '<|im_end|>' p=0.0000 log_p=-20.248
+      rank5:               ' the' p=0.0000 log_p=-20.749
+      rank6:                 ' $' p=0.0000 log_p=-21.002
+      rank7:               ' ...' p=0.0000 log_p=-21.002
+      rank8:      '<|endoftext|>' p=0.0000 log_p=-21.125
+      rank9:               '\n\n' p=0.0000 log_p=-21.377
+      rank10:                  '.' p=0.0000 log_p=-21.499
+
+  pos=12031:
+    margin(top1-top2)=18.374, margin(top1-top5)=20.499
+    competitors within 2 log_p of top1: 0
+    competitors within 5 log_p of top1: 0
+      rank1:                  ' ' p=1.0000 log_p=  0.000  <-- top1
+      rank2:                 '\n' p=0.0000 log_p=-18.374
+      rank3:                 ' a' p=0.0000 log_p=-20.125
+      rank4:         '<|im_end|>' p=0.0000 log_p=-20.125
+      rank5:               ' the' p=0.0000 log_p=-20.499
+      rank6:                 ' $' p=0.0000 log_p=-20.876
+      rank7:               ' ...' p=0.0000 log_p=-21.002
+      rank8:      '<|endoftext|>' p=0.0000 log_p=-21.002
+      rank9:               '\n\n' p=0.0000 log_p=-21.252
+      rank10:                  '.' p=0.0000 log_p=-21.499
+
+--- H_BIMODAL vs H_MULTIMODAL VERDICT ---
+  pos=6000: H_BIMODAL (only 1 competitor within 1 log_p of top1)
+  pos=7000: H_BIMODAL (only 1 competitor within 1 log_p of top1)
+
+saved multi_competitor_fragile_result.json
