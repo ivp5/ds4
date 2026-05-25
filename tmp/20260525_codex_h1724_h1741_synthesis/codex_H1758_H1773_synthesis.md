@@ -438,6 +438,53 @@ kernel into the B-2.3c stub instead of polar/VQ. Storage cost = 0
 + integrating into ds4.c hot-path; risk = low (source quality is
 baseline); estimated effort = 200-300 LOC.
 
+### A.4 concrete sizing (codex H1787 source inspection)
+
+Read /Users/silv/cl/tlp_codex/research/llm_fallacy_deconstruction/framework_deconstruction/h1787_mtl4_iq2_parallel_dot_canary_20260525.m
+(195 lines standalone ObjC; verified before claiming "low effort"):
+
+Reusable kernel core (~30 lines MSL):
+- `iq2_value()` decoder: 16 lines (super-block index → byte lane →
+  grid index → sign decode → scaled return)
+- `iq2_dot_parallel` kernel: 14 lines (per-row threadgroup, stride
+  loop, partial sum, tree reduction)
+
+Hardcoded constants in H1787 source:
+- `DIM = 4096`, `ROW_BYTES = 1056`, `THREADS = 256`
+- `1056 = 16 super-blocks × 66 bytes/super-block` (each super-block
+  covers 256 weights = 4 sub-blocks × 64 weights)
+- Signed grid: 256 × 128 × 8 = 262,144 bytes (~256 KB constant table)
+
+Porting work required for A.4 integration:
+1. Lift kernel source into `ds4_metal.m` as new MSL string (~30 lines)
+2. Add `ds4_gpu_mtl4_iq2_real_canary` entry mirroring polar/VQ
+   canaries (~60 lines)
+3. Hot-path dispatcher: pull IQ2 raw rows + signed_grid from
+   existing GGUF reader at route-time; dispatch one kernel per
+   gate/up/down × route_pair (~150 LOC)
+4. Three-position dispatch: gate, up, down (currently the H1787
+   canary does one-row dot; FFN needs gate/up SwiGLU and down
+   projection — composition logic)
+5. Total estimated: 240-300 LOC for A.4 body
+
+The IQ2 raw rows + signed_grid are already accessible from ds4.c's
+GGUF reader (used by current FP4 fallback path). No new file I/O
+infrastructure needed.
+
+Trade-offs vs A.1/A.2/A.3:
+- A.4 uses 30 lines of validated kernel from codex vs writing 300+
+  lines of dispatcher around polar/VQ encoded corpora
+- A.4 inherits production-quality at fp32 noise floor (codex tested);
+  A.1/A.2/A.3 introduce codec rel_L2 0.02-0.12 noise
+- A.4 needs no encode time (uses existing IQ2_XXS file); A.1 needs
+  37 min, A.2 needs 6 min (after MLX VQ encoder port)
+- A.4 uses 4.3 MB IQ2 rows for 4096-row matmul vs A.1's 275 GB / A.2's
+  138 GB corpus on disk
+
+A.4 is now the recommended path if silv chooses to ship the B-2.3c
+body. The codec arc's own corpora (polar 14 GB, VQ 160 MB) remain
+as reference/diagnostic for A/B comparison.
+
 ## Addendum: H1775 — MTL4 non-divisible dispatch silently corrupts
 
 H1775 shipped right after H1774. MTL4 consumed the H1774 raw route
