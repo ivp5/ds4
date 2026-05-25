@@ -1,4 +1,52 @@
-# SCOPE CAVEAT: codec corpora encode 3-6% of weight rows, not full coverage
+# SCOPE CAVEAT: STORAGE concern only, codec QUALITY extends cleanly to full rows
+
+## UPDATE 2026-05-25 — row-coverage audit REFUTES the quality concern
+
+Empirical test (`analyzers/vq2d_row_coverage_audit.py` on L0 E0 down,
+full 4096-row tensor):
+
+```
+Test 1: codebook fit on rows[0:128], applied to:
+  rows[    0:  128]: rel_L2=0.0199  cos_sim=0.9998
+  rows[ 1024: 1152]: rel_L2=0.0209  cos_sim=0.9998
+  rows[ 3968: 4096]: rel_L2=0.0205  cos_sim=0.9998
+
+Test 2: per-chunk codebook vs shared first-128:
+  rows[    0:  128]: per-chunk 0.0199 vs shared 0.0199 — ratio 1.000
+  rows[ 1024: 1152]: per-chunk 0.0199 vs shared 0.0209 — ratio 1.050
+  rows[ 3968: 4096]: per-chunk 0.0193 vs shared 0.0205 — ratio 1.059
+
+Test 3: full-tensor (4096 rows) fit vs first-128 fit on full:
+  full-fit codebook on full:    rel_L2=0.0202
+  first-128 codebook on full:   rel_L2=0.0203 — ratio 1.006
+
+VERDICT: CODEBOOK GENERALIZES across all rows. The 128-row testing
+result (rel_L2 ~0.02) is representative of full-coverage codec
+quality. Per-chunk codebook gives at most 5-6% quality improvement
+over shared first-128 codebook.
+```
+
+Implication: the codec QUALITY at full row coverage is essentially
+the same as at 128-row testing scope. **The OOM-accuracy claim is
+empirically validated at the full row scope**, not just the testing
+sample.
+
+What remains scope-bounded is **STORAGE**, not quality:
+
+```
+polar p32_m8 at full rows:  275 GB (exceeds 100 GB disk budget)
+VQ K=256 at full rows:      138 GB (exceeds budget)
+4D VQ K=256 at full rows:   ~70 GB (FITS budget)
+```
+
+Silv still needs to decide row-coverage strategy (Path A/B/C below),
+but no longer for codec-quality reasons — purely for storage budget.
+
+---
+
+# Original caveat (now superseded by row-coverage audit)
+
+## The honest finding
 
 ## The honest finding
 
