@@ -336,6 +336,49 @@ identified as the bottleneck. Strategic alignment is now sharp:
 codec deployment is BOTH the next memory organ AND the next speed
 organ on M1 Max DS4 substrate.
 
+### H1786 actually built the MTL4 raw-IQ2 dot kernel
+
+Codex shipped H1786 around 03:20 UTC (skipping H1785). H1786
+ported DS4 IQ2_XXS row decode into M1 Max MTL4 raw-buffer kernel
+and computed raw-row × hidden dot products without f32 tile
+materialization.
+
+Validation:
+- 96-row max abs error: 1.080e-7 (fp32 noise floor)
+- 1024-row max abs error: 2.459e-7 (mean 2.505e-8)
+- 1024 rows used 1.08 MB raw IQ2 vs 16.78 MB f32 (15.5× expansion
+  AVOIDED in practice, matching H1784's projection)
+- 1.18 ms GPU time for 1024 dots (kernel intentionally serial per
+  row; parallelism left for future)
+
+Shift quote: "Compressed expert rows can be the compute
+representation at the route-packet boundary; next organ is parallel
+IQ2 decode/reduction, not more f32 tile scheduling."
+
+### H1786 directly validates the codec arc architectural pattern
+
+| Codec | Storage | rel_L2 | Decode | Validates |
+|-------|---------|--------|--------|-----------|
+| Raw IQ2 (H1786) | ~0.625 byte/pair | 0 (source) | In-kernel | Codex |
+| Polar p32_m8 | 2 byte/pair | 0.12 | In-kernel | My session H1735 |
+| VQ K=256 | 1 byte/pair | 0.02 | In-kernel | My session gate_up_down_vq |
+
+All three implement the same architectural pattern: compressed
+representation as the compute boundary, in-kernel decode, no f32
+tile materialization. H1786 proves it at fp32 noise floor on real
+DS4 IQ2_XXS source weights — same pattern as polar/VQ kernels prove
+on learned codebooks.
+
+Different storage/quality Pareto points:
+- Raw IQ2 (smallest, source quality)
+- VQ K=256 (small, learned-near-perfect)
+- Polar p32_m8 (medium, learned with magnitude/phase split)
+
+Future session could integrate H1786's raw-IQ2 kernel alongside
+polar/VQ kernels as a third codec path in the same B-2.3c stub
+dispatch infrastructure — same wiring, different kernel, choice of
+quality/storage point per-layer or per-experiment.
+
 ## Addendum: H1775 — MTL4 non-divisible dispatch silently corrupts
 
 H1775 shipped right after H1774. MTL4 consumed the H1774 raw route
