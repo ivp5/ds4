@@ -560,6 +560,29 @@ existing kernels before shipping the polar/VQ alternatives. This is
 a Chesterton's fence violation — the existing `metal/moe.metal:991`
 kernel was the fence, and I built around it without checking.
 
+### Second-order correction (verified at call site)
+
+The production hot path at `ds4_metal.m:14302` constructs:
+```c
+gate_buf = ds4_gpu_wrap_model_range(model_map, model_size,
+  gate_offset, gate_tensor_bytes /* = 256 * gate_expert_bytes */,
+  &gate_inner);
+```
+
+This wraps the ENTIRE 256-expert raw IQ2_XXS tensor as a Metal
+buffer view into model_map. NO f32 materialization happens before
+kernel dispatch. The kernel indexes per-expert at runtime via
+`src0_gate + i02 * args.nb02 + first_row * args.nb01`.
+
+Codex H1783's "84% f32 materialization" measurement was in codex's
+experimental tinygrad-style row-streamed executor (their separate
+repo), NOT in DS4 production. The codex arc was diagnosing their
+own development infrastructure's bottleneck. DS4 production already
+implements the optimal raw-IQ2-in-kernel-decode pattern.
+
+A.4 has essentially zero deployable engineering target. DS4 ships
+the answer to H1783's measurement.
+
 ### What survives this correction
 
 - The MLX-parallel polar encoder (1.86 OOMs vs numpy) — still useful
