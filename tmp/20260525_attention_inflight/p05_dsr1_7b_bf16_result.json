@@ -1,0 +1,220 @@
+{
+  "label": "p05_dsr1_7b_bf16_AMD",
+  "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+  "n_boxed_emissions": 1,
+  "commits_analyzed": 1,
+  "results": [
+    {
+      "commit_idx": 0,
+      "char_pos": 33696,
+      "n_tokens": 13830,
+      "context_before_50": " to find $m + n$.\n$m + n = 29 + 36 = 65$.\n\n\\boxed{",
+      "context_after_30": "65}",
+      "per_layer": {
+        "0": {
+          "p_truth": 2.0531340396701125e-06,
+          "rank_truth": 21773,
+          "top1_id": 2554,
+          "top1_token": "ination",
+          "top1_prob": 0.09573770314455032
+        },
+        "1": {
+          "p_truth": 1.8624188857785384e-09,
+          "rank_truth": 145401,
+          "top1_id": 90815,
+          "top1_token": " cuz",
+          "top1_prob": 0.08536963909864426
+        },
+        "2": {
+          "p_truth": 1.3570141677021752e-09,
+          "rank_truth": 147344,
+          "top1_id": 79350,
+          "top1_token": "-floor",
+          "top1_prob": 0.08910150825977325
+        },
+        "3": {
+          "p_truth": 7.205250840414124e-10,
+          "rank_truth": 148982,
+          "top1_id": 79350,
+          "top1_token": "-floor",
+          "top1_prob": 0.14801880717277527
+        },
+        "4": {
+          "p_truth": 5.457821972143506e-10,
+          "rank_truth": 149096,
+          "top1_id": 28372,
+          "top1_token": "\u2014\n\n",
+          "top1_prob": 0.10050465911626816
+        },
+        "5": {
+          "p_truth": 7.374079125099797e-11,
+          "rank_truth": 151025,
+          "top1_id": 28372,
+          "top1_token": "\u2014\n\n",
+          "top1_prob": 0.29033640027046204
+        },
+        "6": {
+          "p_truth": 8.889532859823746e-11,
+          "rank_truth": 151135,
+          "top1_id": 28372,
+          "top1_token": "\u2014\n\n",
+          "top1_prob": 0.5420963168144226
+        },
+        "7": {
+          "p_truth": 4.090521671384906e-11,
+          "rank_truth": 151142,
+          "top1_id": 28372,
+          "top1_token": "\u2014\n\n",
+          "top1_prob": 0.5448398590087891
+        },
+        "8": {
+          "p_truth": 3.4944860893837415e-10,
+          "rank_truth": 148467,
+          "top1_id": 28372,
+          "top1_token": "\u2014\n\n",
+          "top1_prob": 0.2709246277809143
+        },
+        "9": {
+          "p_truth": 3.947811244575661e-10,
+          "rank_truth": 146575,
+          "top1_id": 28372,
+          "top1_token": "\u2014\n\n",
+          "top1_prob": 0.27010634541511536
+        },
+        "10": {
+          "p_truth": 2.5564492189822374e-10,
+          "rank_truth": 149538,
+          "top1_id": 28372,
+          "top1_token": "\u2014\n\n",
+          "top1_prob": 0.2625715434551239
+        },
+        "11": {
+          "p_truth": 8.328082147512905e-12,
+          "rank_truth": 151604,
+          "top1_id": 54109,
+          "top1_token": "?):",
+          "top1_prob": 0.5812129974365234
+        },
+        "12": {
+          "p_truth": 5.7679663129084346e-11,
+          "rank_truth": 150796,
+          "top1_id": 54109,
+          "top1_token": "?):",
+          "top1_prob": 0.2573375701904297
+        },
+        "13": {
+          "p_truth": 2.599243216494518e-11,
+          "rank_truth": 147153,
+          "top1_id": 54109,
+          "top1_token": "?):",
+          "top1_prob": 0.9410907626152039
+        },
+        "14": {
+          "p_truth": 1.7436586896568684e-10,
+          "rank_truth": 144342,
+          "top1_id": 54109,
+          "top1_token": "?):",
+          "top1_prob": 0.8543919324874878
+        },
+        "15": {
+          "p_truth": 2.1198731658955694e-09,
+          "rank_truth": 139240,
+          "top1_id": 54109,
+          "top1_token": "?):",
+          "top1_prob": 0.39651769399642944
+        },
+        "16": {
+          "p_truth": 2.3530126735948897e-09,
+          "rank_truth": 133888,
+          "top1_id": 54109,
+          "top1_token": "?):",
+          "top1_prob": 0.35365110635757446
+        },
+        "17": {
+          "p_truth": 2.376433716477777e-09,
+          "rank_truth": 128001,
+          "top1_id": 54109,
+          "top1_token": "?):",
+          "top1_prob": 0.5707581043243408
+        },
+        "18": {
+          "p_truth": 1.0189502575030929e-09,
+          "rank_truth": 140585,
+          "top1_id": 54109,
+          "top1_token": "?):",
+          "top1_prob": 0.4228478670120239
+        },
+        "19": {
+          "p_truth": 1.0127807481552509e-09,
+          "rank_truth": 143977,
+          "top1_id": 54109,
+          "top1_token": "?):",
+          "top1_prob": 0.2509652078151703
+        },
+        "20": {
+          "p_truth": 6.646340811045093e-09,
+          "rank_truth": 128491,
+          "top1_id": 95651,
+          "top1_token": "-pe",
+          "top1_prob": 0.079474076628685
+        },
+        "21": {
+          "p_truth": 5.61755619798987e-09,
+          "rank_truth": 125484,
+          "top1_id": 94058,
+          "top1_token": " dismantle",
+          "top1_prob": 0.2615528106689453
+        },
+        "22": {
+          "p_truth": 7.628216991406589e-08,
+          "rank_truth": 93094,
+          "top1_id": 43507,
+          "top1_token": ")?.",
+          "top1_prob": 0.11779297888278961
+        },
+        "23": {
+          "p_truth": 2.4732858605602814e-07,
+          "rank_truth": 56827,
+          "top1_id": 43507,
+          "top1_token": ")?.",
+          "top1_prob": 0.26506438851356506
+        },
+        "24": {
+          "p_truth": 0.0002997699484694749,
+          "rank_truth": 281,
+          "top1_id": 43507,
+          "top1_token": ")?.",
+          "top1_prob": 0.15528467297554016
+        },
+        "25": {
+          "p_truth": 0.00018686699331738055,
+          "rank_truth": 115,
+          "top1_id": 4226,
+          "top1_token": " answer",
+          "top1_prob": 0.761387050151825
+        },
+        "26": {
+          "p_truth": 0.43389758467674255,
+          "rank_truth": 0,
+          "top1_id": 21,
+          "top1_token": "6",
+          "top1_prob": 0.43389758467674255
+        },
+        "27": {
+          "p_truth": 0.999997615814209,
+          "rank_truth": 0,
+          "top1_id": 21,
+          "top1_token": "6",
+          "top1_prob": 0.999997615814209
+        },
+        "28": {
+          "p_truth": 0.9997705817222595,
+          "rank_truth": 0,
+          "top1_id": 21,
+          "top1_token": "6",
+          "top1_prob": 0.9997705817222595
+        }
+      }
+    }
+  ]
+}
