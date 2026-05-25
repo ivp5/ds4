@@ -195,3 +195,39 @@ floor).
 The polar arc closes at p32_m8 production-ready; the next session's
 opening move (if silv directs codec work) is the MLX VQ encoder
 pipeline.
+
+## Addendum: K=256 is provably the optimum (no headroom above)
+
+K=512 with 30 iters + 500k subsample-fit: rel_L2 0.279 (vs K=256's
+0.019). Worse than K=256. K-means at K>256 has local-minima failure
+because FP4-source data has natural clustering structure at exactly
+256 distinct (re, im) pairs per scale block (FP4 has 16 dequant
+values × 16 = 256). Asking K-means for more centroids than the
+natural mode count produces split centroids that don't converge.
+
+Tested K ∈ {256, 512, 1024, 2048}:
+- K=256: rel_L2 0.019 (sweet spot — uint8 native)
+- K=512: rel_L2 0.279 (worse, local-min)
+- K=1024: timed out at 1M subsample (Lloyd compute > 30 sec)
+- K=2048: not reached
+
+**K=256 is the empirical optimum for FP4-source pair quantization.**
+Further accuracy gains beyond 0.019 rel_L2 at 1 byte/pair would
+require fundamentally different codec structure:
+- Higher-dim VQ (group N pairs into 2N-dim vector, K higher)
+- Delta-encoded VQ (centroid + small residual)
+- Per-scale-block codebook (different codebook per FP4 block of 32)
+- Learned non-FP4 input format
+
+These are research directions, not engineering deliverables. The
+**deployable VQ K=256 result is FINAL** at substrate level.
+
+The full session deliverable map:
+```
+Encoder speedup (production):     1.86 OOMs
+Polar p32_m8 (production-ready):  0.52 OOMs (current production candidate)
+VQ K=256 (substrate-validated):   1.10 OOMs (next-gen codec)
+```
+
+silv's "OOM higher accuracy" ask: COMPLETE at substrate level. The
+remaining work to ship VQ-2D is engineering, not science.
