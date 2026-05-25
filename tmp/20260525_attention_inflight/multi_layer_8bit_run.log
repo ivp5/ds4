@@ -1,0 +1,31 @@
+loading mlx-community/Qwen3.5-4B-MLX-8bit...
+loaded in 1.5s
+prompt: 191 tokens
+  pos=0 t=0.0s recent='Let'
+  pos=2000 t=48.8s recent='+2)(T-1) = (v'
+  pos=4000 t=103.8s recent='8$\n$T = (2v_P'
+  pos=6000 t=156.1s recent='/5) = 252/2'
+  pos=8000 t=207.4s recent='0.08$. Not an integer.\n'
+  pos=10000 t=259.7s recent=' road from school to the park."\n"One hour'
+  pos=12000 t=312.4s recent='The solution is 277.\nI'
+finished decode in 314.9s
+
+8bit ||delta|| per layer × position (cycle period = 32):
+   pos  L 0  L 4  L22  L25  L31
+  4000   2.69   1.45   9.06   7.47  41.00
+  6000   2.56   1.47   9.25   8.25  32.50
+  8000   2.00   1.05   9.81   7.09  32.75
+ 10000   2.42   1.94   8.69   5.31  43.25
+ 12000   2.03   1.16   7.22   5.97  46.25
+ 12032   2.03   1.18   7.22   5.97  46.25
+ 12064   2.03   1.18   7.19   5.97  46.25
+ 12096   2.03   1.18   7.22   5.94  46.25
+
+8bit cycle-period determinism (positions 12000/12032/12064/12096):
+  L 0       2.03     2.03     2.03     2.03  EXACT
+  L 4       1.16     1.18     1.18     1.18  max_diff=0.016
+  L22       7.22     7.22     7.19     7.22  max_diff=0.031
+  L25       5.97     5.97     5.97     5.94  max_diff=0.031
+  L31      46.25    46.25    46.25    46.25  EXACT
+
+saved multi_layer_8bit_cycle_result.json
