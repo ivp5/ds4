@@ -16958,6 +16958,20 @@ int ds4_gpu_mtl4_vq_real_canary(const char *vqb1_dir,
         ds4_vqb1_close(&gate_file); ds4_vqb1_close(&up_file); ds4_vqb1_close(&down_file);
         return 0;
     }
+    /* Soundness: kernel reads codebook[code * 2] with code being uint8.
+     * If K < 256 and any code value >= K, this is OOB on the codebook
+     * buffer. Validate K matches kernel's uint8 code domain. */
+    if (gate_file.k != 256 || up_file.k != 256 || down_file.k != 256) {
+        fprintf(stderr, "ds4: vq real canary — only K=256 supported by kernel "
+                        "(gate.k=%u up.k=%u down.k=%u)\n",
+                gate_file.k, up_file.k, down_file.k);
+        ds4_vqb1_close(&gate_file); ds4_vqb1_close(&up_file); ds4_vqb1_close(&down_file);
+        return 0;
+    }
+    /* NOTE: canary uses gate_file's codes AND codebook for BOTH gate
+     * and up paths (gate==up convention). up_file is loaded only to
+     * validate it exists; its data is not consumed in this canary.
+     * Real-inference dispatcher will use separate codebooks per kind. */
 
     const uint32_t rows   = gate_file.n_rows;
     const uint32_t pairs  = gate_file.n_pairs;
