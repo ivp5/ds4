@@ -85,6 +85,101 @@ def cmd_codecs(args):
                   f"byte/pair={c['storage_byte_per_pair']:>6.4f}")
 
 
+def cmd_report(args):
+    """Unified DB report: codec quality + per-token compute + ngram locks."""
+    with open_db() as conn:
+        # 1. Codec registry
+        codecs = list_codecs(conn)
+        print(f"\n=== Registered codecs ({len(codecs)}) ===")
+        for c in codecs:
+            print(f"  #{c['codec_id']:>2} {c['name']:<18} {c['family']:<10} "
+                  f"byte/pair={c['storage_byte_per_pair']:>6.4f}")
+
+        # 2. Cross-codec quality summary
+        rows = query(conn, """
+            SELECT codec_name, codec_family, bits_per_pair,
+                   COUNT(*) AS n, AVG(rel_l2) AS mean_rl2,
+                   AVG(sign_flip) AS mean_sf, AVG(angle_rms_rad) AS mean_ang
+            FROM v_measurement_full GROUP BY codec_name
+            ORDER BY mean_rl2
+        """)
+        if rows:
+            print(f"\n=== Codec quality summary (across all measurements) ===")
+            print(f"  {'codec':<14} {'family':<10} {'b/pair':>7} {'n':>4} "
+                  f"{'rel_L2':>8} {'sign_flip':>9} {'angle_rms':>9}")
+            for r in rows:
+                print(f"  {r['codec_name']:<14} {r['codec_family']:<10} "
+                      f"{r['bits_per_pair']:>7.3f} {r['n']:>4} "
+                      f"{r['mean_rl2']:>8.4f} {r['mean_sf']:>9.4f} "
+                      f"{r['mean_ang']:>9.4f}")
+
+        # 3. Aberration outliers (per-codec, worst K cells)
+        rows = query(conn, """
+            SELECT layer, kind, expert, codec_name, rel_l2, sign_flip
+            FROM v_measurement_full
+            WHERE codec_name = 'vq_k256'
+            ORDER BY rel_l2 DESC LIMIT ?
+        """, (args.top_n,))
+        if rows:
+            print(f"\n=== VQ K=256 worst {args.top_n} cells (aberration outliers) ===")
+            print(f"  {'layer':>5} {'kind':<6} {'expert':>6} {'rel_L2':>8} {'sign_flip':>9}")
+            for r in rows:
+                print(f"  {r['layer']:>5} {r['kind']:<6} {r['expert']:>6} "
+                      f"{r['rel_l2']:>8.4f} {r['sign_flip']:>9.4f}")
+
+        # 4. Per-token compute distribution per prompt
+        rows = query(conn, """
+            SELECT pr.prompt_id, pr.notes, pr.n_tokens,
+                   SUM(CASE WHEN tc.compute_class='trivial' THEN 1 ELSE 0 END) AS n_t,
+                   SUM(CASE WHEN tc.compute_class='easy' THEN 1 ELSE 0 END) AS n_e,
+                   SUM(CASE WHEN tc.compute_class='medium' THEN 1 ELSE 0 END) AS n_m,
+                   SUM(CASE WHEN tc.compute_class='hard' THEN 1 ELSE 0 END) AS n_h,
+                   SUM(CASE WHEN tc.compute_class='undecided' THEN 1 ELSE 0 END) AS n_u,
+                   AVG(tc.min_stabilize_layer) AS mean_L
+            FROM token_compute tc JOIN prompt_run pr USING(prompt_id)
+            GROUP BY pr.prompt_id ORDER BY pr.prompt_id
+        """)
+        if rows:
+            print(f"\n=== Per-token compute distribution (per prompt) ===")
+            print(f"  {'id':>3} {'notes':<48} {'n':>4} {'triv%':>5} "
+                  f"{'easy%':>5} {'med%':>5} {'hard%':>5} {'und%':>5} {'mL':>5}")
+            for r in rows:
+                n = r['n_tokens']
+                if n == 0: continue
+                print(f"  {r['prompt_id']:>3} {r['notes'][:48]:<48} {n:>4} "
+                      f"{100*r['n_t']/n:>4.1f}% {100*r['n_e']/n:>4.1f}% "
+                      f"{100*r['n_m']/n:>4.1f}% {100*r['n_h']/n:>4.1f}% "
+                      f"{100*r['n_u']/n:>4.1f}% {r['mean_L']:>5.1f}")
+
+        # 5. N-gram lock events
+        try:
+            rows = query(conn, """
+                SELECT prompt_id, position, repeat_factor, top_ngram, top_count,
+                       triggered_rescue
+                FROM ngram_lock_event WHERE triggered_rescue = 1
+                ORDER BY repeat_factor DESC LIMIT ?
+            """, (args.top_n,))
+            if rows:
+                print(f"\n=== N-gram lock events (top {args.top_n} by repeat_factor) ===")
+                print(f"  {'p_id':>4} {'pos':>6} {'rep_factor':>10} {'count':>5} {'top 5-gram':<60}")
+                for r in rows:
+                    print(f"  {r['prompt_id']:>4} {r['position']:>6} "
+                          f"{r['repeat_factor']:>10.2f} {r['top_count']:>5} "
+                          f"{(r['top_ngram'] or '')[:60]!r:<60}")
+        except Exception:
+            pass
+
+        # 6. Recent journal
+        rows = query(conn,
+            "SELECT entry_id, ts, action, target FROM journal "
+            "ORDER BY entry_id DESC LIMIT ?", (args.journal_tail,))
+        if rows:
+            print(f"\n=== Recent journal (last {args.journal_tail}) ===")
+            for r in rows:
+                print(f"  #{r['entry_id']:>4} {r['ts']}  {r['action']:<25} "
+                      f"{r['target'][:50] if r['target'] else ''}")
+
+
 def main():
     p = argparse.ArgumentParser("codec_audit")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -109,6 +204,12 @@ def main():
     sp.set_defaults(func=cmd_journal)
 
     sub.add_parser("codecs").set_defaults(func=cmd_codecs)
+
+    sp = sub.add_parser("report",
+        help="unified DB report: codec quality + compute distribution + locks")
+    sp.add_argument("--top-n", type=int, default=10)
+    sp.add_argument("--journal-tail", type=int, default=15)
+    sp.set_defaults(func=cmd_report)
 
     args = p.parse_args()
     args.func(args)
