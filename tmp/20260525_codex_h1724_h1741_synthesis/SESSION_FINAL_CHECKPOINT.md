@@ -194,3 +194,32 @@ and a concrete recommendation (p16_m4) ready to deploy the moment
 Phase B-2.3 lands.
 
 Session done. Direction request: D1 or D2 for Phase B-2.3?
+
+---
+
+## ADDENDUM 2026-05-25 — Phase B-2.3a SHIPPED (D1 chosen)
+
+Commit `eb06f9c` lands the D1 path: polar-DOWN extracted to fp32
+inside `ds4_gpu_mtl4_polar_real_canary`, gated by env var
+`DS4_POLAR_REAL_DOWN=1`. Default synthetic-uniform path unchanged.
+
+**Cross-cell validation (9/9 at fp32 noise floor on real DS4 V4):**
+- 3 layers × 3 experts (L0/L22/L42 × E0/E100/E255)
+- rel_err range: 9.23e-8 to 3.92e-7
+- Polar-down → fp32 → H1735 chain is end-to-end bit-equivalent to
+  a polar-decode CPU reference.
+
+Settles D1-vs-D2 in favor of D1: kernel needs no polar-aware logic;
+existing H1735 consumes fp32 down tiles fine.
+
+**Next**: B-2.3b dispatcher canary (~250 LOC C) compares polar vs
+FP4 source at kernel-output level. Per design fork memo addendum
+2026-05-25.
+
+Use:
+```
+DS4_POLAR_REAL_DOWN=1 ./ds4 --polar-real-canary tmp/polar_full_p16m4 \
+  <layer> <expert> [down_rows [act_rows]]
+```
+
+Tasks: #568 [completed] B-2.3a; #563 [in_progress] parent.

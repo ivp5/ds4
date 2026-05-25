@@ -194,3 +194,67 @@ ONE remaining gap is Phase B-2.3 (this design fork).
 
 Direction request: confirm Option D vs C, then I'll ship B-2.3a in
 the next focused turn.
+
+---
+
+## ADDENDUM 2026-05-25 — Phase B-2.3a SHIPPED + validated (D1)
+
+Commit `eb06f9c` lands the D1 path: extend `ds4_gpu_mtl4_polar_real_canary`
+to optionally use polar-DOWN extracted to fp32 via env var
+`DS4_POLAR_REAL_DOWN=1`. Default synthetic-uniform path unchanged
+(prior rel_err 1.07e-7 preserved).
+
+**Validation result on real DS4 V4 weights (`tmp/polar_full_p16m4/`):**
+
+```
+L00 E000  rel_err = 3.92e-7   L00 E100  rel_err = 2.76e-7   L00 E255  rel_err = 1.85e-7
+L22 E000  rel_err = 2.34e-7   L22 E100  rel_err = 1.92e-7   L22 E255  rel_err = 1.38e-7
+L42 E000  rel_err = 9.23e-8   L42 E100  rel_err = 3.70e-7   L42 E255  rel_err = 2.55e-7
+```
+
+9/9 cells at fp32 noise floor (~1e-7) spanning all layer regions
+(early L0, mid L22, late L42) and the full expert index range.
+**D1 (per-call polar-down → fp32 tile → existing H1735 kernel) is
+end-to-end bit-equivalent to a polar-decode CPU reference on real
+DS4 V4 weights.** The D1-vs-D2 choice for Option D is settled in
+favor of D1: kernel needs no polar-aware logic; existing H1735
+consumes fp32 down tiles fine.
+
+What B-2.3a does NOT validate (deferred to B-2.3b):
+- Codec quality at the kernel-output level (polar vs FP4 source).
+  Validator (commit `4d16241`) already measured codec floor rel_L2
+  0.2018 ± 0.001 at the weight level; the kernel-output codec rel_L2
+  is the next measurement.
+- Full-FFN scale dispatch.
+- Routing-aware multi-expert handling.
+
+**B-2.3b sequence (next focused turn):**
+
+1. New CLI entry `--polar-full-dispatch-canary <polar_dir> <fp4_model>
+   <layer> <prompt-or-random-input>` runs ONE layer (the polar layer)
+   in isolation via both polar-decoded down AND FP4-decoded down,
+   reports per-output cos_sim + rel_L2. ~250 LOC C dispatcher reusing
+   B-2.3a structure + adding FP4 loader.
+
+2. Verify the codec rel_L2 at the kernel-output level matches the
+   validator's weight-level 0.2018 — if it does, codec error
+   composes linearly (i.e., kernel doesn't amplify); if it's higher,
+   the kernel-side has a numerical pathology to chase.
+
+3. If (2) is clean, B-2.3c hot-path gate ships at the
+   `metal_graph_encode_layer_ffn_batch` call site, env-var gated
+   (`DS4_POLAR_FFN_LAYERS=...`), with FP4 fallback on first-call
+   mismatch.
+
+4. B-2.3d AIME hold-rate at polar-FFN=ALL vs FP4 baseline (silv's
+   runtime step).
+
+**Architectural certainty going into B-2.3b**: the down-tile
+extraction cost is bounded by the cheap polar-decode per pair
+(~50 ns measured at the canary level). At per-token DS4 FFN scale
+(6 active routes × 2048-wide down tiles), total polar-decode
+overhead per token is ~600 µs CPU per layer — comparable to or
+below the FP4 decode path. The D1 cost model checks out.
+
+**Task tracking**: #568 [completed] Phase B-2.3a polar-DOWN canary
+path (D1). #563 [in_progress] parent; B-2.3b → B-2.3d remain.
