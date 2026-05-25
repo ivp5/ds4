@@ -16177,6 +16177,7 @@ static int ds4_polar_gud_pipeline_init(void) {
          "  uint route_pairs = params[2];\n"
          "  uint down_rows = params[3];\n"
          "  uint act_rows = params[4];\n"
+         "  uint mag_levels = params[5];\n"  /* H1735+m8: parameterized magnitude codebook size */
          "  uint hbase = (batch * route_pairs + route_pair) * pairs * 2;\n"
          "  for (uint row = 0; row < act_rows; row++) {\n"
          "    uint gate_row = gate_code[route_pair] * rows + row;\n"
@@ -16190,11 +16191,11 @@ static int ds4_polar_gud_pipeline_init(void) {
          "      float h1 = hidden[hbase + 2*j + 1];\n"
          "      uchar gate_m = mag[gate_base + j];\n"
          "      uint gate_l = uint(phase[gate_base + j]);\n"
-         "      float gate_q = levels[gate_row * 4 + uint(gate_m)];\n"
+         "      float gate_q = levels[gate_row * mag_levels + uint(gate_m)];\n"
          "      gate_acc += gate_q * cos_lut[gate_l] * h0 + gate_q * sin_lut[gate_l] * h1;\n"
          "      uchar up_m = mag[up_base + j];\n"
          "      uint up_l = uint(phase[up_base + j]);\n"
-         "      float up_q = levels[up_row * 4 + uint(up_m)];\n"
+         "      float up_q = levels[up_row * mag_levels + uint(up_m)];\n"
          "      up_acc += up_q * cos_lut[up_l] * h0 + up_q * sin_lut[up_l] * h1;\n"
          "    }\n"
          "    gate_partial[tid] = gate_acc;\n"
@@ -16289,7 +16290,7 @@ int ds4_gpu_mtl4_polar_gate_up_down_canary(uint32_t n_codes, uint32_t route_pair
         id<MTLBuffer> cosLut    = [g_device newBufferWithLength:9 * sizeof(float)                options:MTLResourceStorageModeShared];
         id<MTLBuffer> sinLut    = [g_device newBufferWithLength:9 * sizeof(float)                options:MTLResourceStorageModeShared];
         id<MTLBuffer> outBuf    = [g_device newBufferWithLength:out_count * sizeof(float)        options:MTLResourceStorageModeShared];
-        id<MTLBuffer> paramsBuf = [g_device newBufferWithLength:5 * sizeof(uint32_t)             options:MTLResourceStorageModeShared];
+        id<MTLBuffer> paramsBuf = [g_device newBufferWithLength:6 * sizeof(uint32_t)             options:MTLResourceStorageModeShared];
         if (!mag || !phase || !levels || !gateCode || !upCode || !routeW || !hidden ||
             !downBuf || !cosLut || !sinLut || !outBuf || !paramsBuf) return 0;
 
@@ -16324,6 +16325,7 @@ int ds4_gpu_mtl4_polar_gate_up_down_canary(uint32_t n_codes, uint32_t route_pair
         uint32_t *params = (uint32_t *)paramsBuf.contents;
         params[0] = pairs; params[1] = rows; params[2] = route_pairs;
         params[3] = down_rows; params[4] = act_rows;
+        params[5] = 4;  /* synthetic canary uses m4 codebook */
 
         MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
         rsDesc.initialCapacity = 12;
@@ -16527,12 +16529,6 @@ int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
         const NSUInteger down_count = (NSUInteger)route_pairs * down_rows * act_rows;
         const NSUInteger out_count = (NSUInteger)batches * route_pairs * down_rows;
 
-        id<MTLBuffer> mag       = [g_device newBufferWithLength:pair_count                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> phase     = [g_device newBufferWithLength:pair_count                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> levels    = [g_device newBufferWithLength:code_rows * 4 * sizeof(float)    options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gateCode  = [g_device newBufferWithLength:route_pairs * sizeof(uint32_t)   options:MTLResourceStorageModeShared];
-        id<MTLBuffer> upCode    = [g_device newBufferWithLength:route_pairs * sizeof(uint32_t)   options:MTLResourceStorageModeShared];
-        id<MTLBuffer> routeW    = [g_device newBufferWithLength:route_pairs * sizeof(float)      options:MTLResourceStorageModeShared];
         /* LUT sizes depend on file's phase_levels (legacy=8 → 9 entries; new
          * p16 → 17 entries; ... up to p+1). H1735 kernel reads
          * cos_lut[phase_code] where phase_code ∈ [0, phase_levels], so
@@ -16541,24 +16537,27 @@ int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
         const uint32_t mag_levels   = gate_file->mag_levels;
         const NSUInteger lut_entries = (NSUInteger)phase_levels + 1u;
         const NSUInteger levels_bytes_per_expert = (NSUInteger)rows * mag_levels * sizeof(float);
-        id<MTLBuffer> hidden    = [g_device newBufferWithLength:hidden_count * sizeof(float)     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> downBuf   = [g_device newBufferWithLength:down_count * sizeof(float)       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cosLut    = [g_device newBufferWithLength:lut_entries * sizeof(float)      options:MTLResourceStorageModeShared];
-        id<MTLBuffer> sinLut    = [g_device newBufferWithLength:lut_entries * sizeof(float)      options:MTLResourceStorageModeShared];
-        id<MTLBuffer> outBuf    = [g_device newBufferWithLength:out_count * sizeof(float)        options:MTLResourceStorageModeShared];
-        id<MTLBuffer> paramsBuf = [g_device newBufferWithLength:5 * sizeof(uint32_t)             options:MTLResourceStorageModeShared];
+
+        id<MTLBuffer> mag       = [g_device newBufferWithLength:pair_count                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> phase     = [g_device newBufferWithLength:pair_count                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> levels    = [g_device newBufferWithLength:code_rows * mag_levels * sizeof(float)           options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gateCode  = [g_device newBufferWithLength:route_pairs * sizeof(uint32_t)                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> upCode    = [g_device newBufferWithLength:route_pairs * sizeof(uint32_t)                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> routeW    = [g_device newBufferWithLength:route_pairs * sizeof(float)                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> hidden    = [g_device newBufferWithLength:hidden_count * sizeof(float)                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> downBuf   = [g_device newBufferWithLength:down_count * sizeof(float)                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cosLut    = [g_device newBufferWithLength:lut_entries * sizeof(float)                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> sinLut    = [g_device newBufferWithLength:lut_entries * sizeof(float)                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf    = [g_device newBufferWithLength:out_count * sizeof(float)                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> paramsBuf = [g_device newBufferWithLength:6 * sizeof(uint32_t)                             options:MTLResourceStorageModeShared];
         if (!mag || !phase || !levels || !gateCode || !upCode || !routeW || !hidden ||
             !downBuf || !cosLut || !sinLut || !outBuf || !paramsBuf) {
             ds4_polar_pool_close(&pool); return 0;
         }
 
-        /* `levels` buffer was allocated above as code_rows * 4 * sizeof(float).
-         * That hardcoded 4 must match mag_levels for correctness. Reject if not. */
-        if (mag_levels != 4) {
-            fprintf(stderr, "ds4: polar real canary — mag_levels=%u not 4; "
-                            "kernel + canary support 4 only at this time\n", mag_levels);
-            ds4_polar_pool_close(&pool); return 0;
-        }
+        /* H1735+m8: levels buffer now sized from mag_levels (was hardcoded 4).
+         * Any mag_levels ∈ {1..32} works; m4 = legacy, m8 = OOM-accuracy
+         * candidate per codec_pareto_frontier.md. */
 
         /* Copy expert's real polar data from PLR2 (mmap-resident in pool).
          * For this canary, we use the SAME expert for gate AND up to keep
@@ -16623,6 +16622,7 @@ int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
         uint32_t *params = (uint32_t *)paramsBuf.contents;
         params[0] = pairs; params[1] = rows; params[2] = route_pairs;
         params[3] = down_rows; params[4] = act_rows;
+        params[5] = mag_levels;  /* H1735+m8: dynamic magnitude codebook size */
 
         MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
         rsDesc.initialCapacity = 12;
