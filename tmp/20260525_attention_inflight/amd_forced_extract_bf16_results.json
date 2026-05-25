@@ -1,0 +1,100 @@
+{
+  "model_id": "Qwen/Qwen3.5-4B",
+  "prefix_frac": 0.6,
+  "n_chars_cap": 16000,
+  "k_tokens": 8,
+  "n_correct": 5,
+  "n_total": 10,
+  "results": [
+    {
+      "cell": "p01",
+      "truth": 277,
+      "predicted": 85,
+      "is_correct": false,
+      "emit": "85}.\n\nThe problem asks for",
+      "prefix_chars": 12000,
+      "elapsed_s": 4.83491063117981
+    },
+    {
+      "cell": "p02",
+      "truth": 62,
+      "predicted": 60,
+      "is_correct": false,
+      "emit": "60}.\n\nThe problem asks for",
+      "prefix_chars": 12000,
+      "elapsed_s": 2.339339256286621
+    },
+    {
+      "cell": "p03",
+      "truth": 79,
+      "predicted": 79,
+      "is_correct": true,
+      "emit": "79}.\n\nLet's double check",
+      "prefix_chars": 12000,
+      "elapsed_s": 1.8542540073394775
+    },
+    {
+      "cell": "p04",
+      "truth": 70,
+      "predicted": 67,
+      "is_correct": false,
+      "emit": "67}.\n\nThe problem asks for",
+      "prefix_chars": 12000,
+      "elapsed_s": 1.9068262577056885
+    },
+    {
+      "cell": "p05",
+      "truth": 65,
+      "predicted": 65,
+      "is_correct": true,
+      "emit": "65}.\n\nLet's double check",
+      "prefix_chars": 12000,
+      "elapsed_s": 1.9467287063598633
+    },
+    {
+      "cell": "p06",
+      "truth": 441,
+      "predicted": 441,
+      "is_correct": true,
+      "emit": "441}.\n\nLet's double",
+      "prefix_chars": 12000,
+      "elapsed_s": 2.390255928039551
+    },
+    {
+      "cell": "p07",
+      "truth": 396,
+      "predicted": 396,
+      "is_correct": true,
+      "emit": "396}.\n\nLet's double",
+      "prefix_chars": 12000,
+      "elapsed_s": 2.1819264888763428
+    },
+    {
+      "cell": "p08",
+      "truth": 244,
+      "predicted": 244,
+      "is_correct": true,
+      "emit": "244}.\n\nLet's double",
+      "prefix_chars": 12000,
+      "elapsed_s": 2.2393417358398438
+    },
+    {
+      "cell": "p09",
+      "truth": 29,
+      "predicted": 1,
+      "is_correct": false,
+      "emit": "1/2}.\n\nThe problem asks",
+      "prefix_chars": 12000,
+      "elapsed_s": 1.5498175621032715
+    },
+    {
+      "cell": "p10",
+      "truth": 156,
+      "predicted": 100,
+      "is_correct": false,
+      "emit": "100}.\n\n### Step-by",
+      "prefix_chars": 12000,
+      "elapsed_s": 2.398301601409912
+    }
+  ]
+}
