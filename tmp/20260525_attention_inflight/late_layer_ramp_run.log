@@ -1,0 +1,57 @@
+loading mlx-community/Qwen3.5-4B-MLX-4bit...
+loaded in 1.3s
+target layers: [22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+L31 sub-modules:
+  L31.self_attn: Qwen3NextAttention
+  L31.mlp: Qwen3NextMLP
+L27 sub-modules:
+  L27.self_attn: Qwen3NextAttention
+  L27.mlp: Qwen3NextMLP
+prompt: 191 tokens
+  pos=0 t=0.0s
+  pos=2000 t=49.2s
+  pos=4000 t=99.8s
+  pos=6000 t=151.4s
+  pos=8000 t=202.7s
+  pos=10000 t=254.6s
+  pos=12000 t=307.7s
+finished decode in 308.6s
+
+||delta|| late-layer ramp:
+   pos  L22  L23  L24  L25  L26  L27  L28  L29  L30  L31
+  4000   9.25  10.19   9.19   7.88   9.75   9.81  13.88  13.31  17.25  34.50
+  6000   9.44  11.38   8.12   7.81   8.81  23.50  13.81  16.12  24.38  62.25
+  8000  12.94  10.12   7.47   9.50   8.50  14.19  13.12  11.12  16.88  31.00
+ 12000   5.69   9.19   5.31   5.56   6.53  19.25  10.44  15.94  24.38  37.50
+ 12031   5.69   9.12   5.34   5.56   6.44  19.00  10.38  15.88  24.12  37.75
+
+Architecture: layer_type per target
+  L22: GatedDelta
+  L23: FullAttn
+  L24: GatedDelta
+  L25: GatedDelta
+  L26: GatedDelta
+  L27: FullAttn
+  L28: GatedDelta
+  L29: GatedDelta
+  L30: GatedDelta
+  L31: FullAttn
+
+In-cycle ||delta|| trajectory L22→L31 (at pos 12000):
+  L22 [SSM]:    5.69
+  L23 [Attn]:    9.19
+  L24 [SSM]:    5.31
+  L25 [SSM]:    5.56
+  L26 [SSM]:    6.53
+  L27 [Attn]:   19.25
+  L28 [SSM]:   10.44
+  L29 [SSM]:   15.94
+  L30 [SSM]:   24.38
+  L31 [Attn]:   37.50
+
+L30 -> L31 jump factor: 1.54x
+H_FINAL_LAYER predicts jump > 3x
+H_LATE_RAMP predicts jump ~ 1-1.5x
+VERDICT: intermediate
+
+saved late_layer_ramp_result.json
