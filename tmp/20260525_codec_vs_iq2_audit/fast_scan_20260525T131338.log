@@ -1,0 +1,20 @@
+Reading GGUF metadata + safetensors index...
+  1328 GGUF tensors, 69187 weight_map entries (0.12s)
+
+Scanning L0 gate, all 256 experts, n_subsample=50000...
+  scanned 256 experts in 17.36s = 67.8ms/expert
+
+=== L0 gate, 256 experts ===
+IQ2_XXS rel_L2:    mean=0.3540  std=0.0016  min=0.3497  max=0.3582  n=256
+IQ2_XXS sign-flip: mean=2.672%  max=2.887%  n=256
+IQ2_XXS angle_RMS: mean=27.74°  max=28.59°
+polar p32_m8 rel_L2: mean=0.1204  std=0.0063  n=256
+VQ K=256 rel_L2:   mean=0.0192  std=0.0030  min=0.0134  max=0.0348  n=256
+
+Top 5 IQ2 worst experts: E156(0.3582), E163(0.3582), E32(0.3582), E149(0.3581), E109(0.3577)
+Top 5 VQ worst experts:  E243(0.0348), E20(0.0320), E203(0.0300), E55(0.0294), E93(0.0293)
+
+Saved fast_scan_L0_gate_20260525T041356Z.json
+
+Extrapolation: full DS4 scan (43 × 3 × 256 = 33024 cells) ≈ 37.3 min at 67.8ms/cell
+(Most time is FP4 loading: ~50ms per expert load. To beat that, load FP4 in batches per shard.)
