@@ -22,13 +22,18 @@ to pos 12000 + 200 consecutive token capture. Only variable: precision.
 |-----------|--------|--------------|----------------|------------------|
 | 4bit | **31 tokens** | post-truth meta ("solution is 277. answer is 277. write solution.") | YES ("277") | NO |
 | 8bit | **32 tokens** | prompt-leak + numeric ("write response. solution is 277.") | YES ("277") | NO |
-| bf16 | **~100-200 tokens** | pre-truth interpretation-doubt loop ("If Tanya left road, she's at park...") | NO | NO |
+| bf16 | **90 tokens** (precisely measured) | pre-truth interpretation-doubt loop ("If Tanya left road, she's at park...") | NO | NO |
 
 The bf16 200-token capture: zero "277" occurrences, zero "boxed"
-occurrences. First 300 chars and last 300 chars are structurally
-identical (period >100 tokens, not yet measured to >200). Content
-is pure semantic-interpretation paralysis on "One hour after Tanya
-left."
+occurrences. Token-ID match at L=90: 110/110 = 100%. At L=180: 20/20
+= 100% (= 2×90). No other L<200 produces >50% match. **Cycle period
+is EXACTLY 90 tokens** — about 2.9× longer than 4bit/8bit short cycles.
+
+**Discontinuous jump 8bit → bf16**: 4bit (31) → 8bit (32) is a smooth
++1 token shift. 8bit (32) → bf16 (90) is a **2.8× scale jump**. This
+is not continuous attractor deformation; it's a QUALITATIVE attractor-
+class change. The 8bit/4bit regime is "short-period post-truth manifold";
+the bf16 regime is "long-period pre-truth interpretation manifold."
 
 ## Pre-cycle trajectories all three precisions
 
