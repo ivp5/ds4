@@ -1,0 +1,26 @@
+{
+  "layer": 0,
+  "kind": "down",
+  "k": 256,
+  "max_iter": 10,
+  "seed": 42,
+  "n_pairs": 2097152,
+  "tensor_shape": [
+    256,
+    16,
+    1024
+  ],
+  "rel_l2": 0.018978247418999672,
+  "cos_sim": 0.9998035430908203,
+  "mse": 2.56523151165311e-07,
+  "storage": {
+    "vq_code_bytes": 2097152,
+    "vq_codebook_bytes": 2048,
+    "vq_total_bytes": 2099200,
+    "polar_code_bytes_p32_m8": 4194304,
+    "polar_levels_bytes_m8": 131072,
+    "polar_total_bytes_p32_m8": 4325376,
+    "vq_vs_polar_ratio": 0.4853
+  },
+  "wall_sec": 18.777018785476685
+}
