@@ -130,3 +130,18 @@ If next session opens with "different topic":
 
 The arc is at a clean natural pause; the codec engineering is
 silv-direction-bound from this point forward.
+
+## Late codex shipped this same evening (post-checkpoint)
+
+| Codex shift | Result | Strategic relevance to my codec arc |
+|-------------|--------|--------------------------------------|
+| H1776-H1782 | Row-stream + layer-window LRU | Memory orthogonal to my codec |
+| H1783 | 84% of wall is f32 materialization | Names codec as the next speed organ |
+| H1784 | 15.5× f32 expansion overhead measured | Sets the deletion target |
+| H1786 | MTL4 raw-IQ2 dot kernel: 1024 rows fp32 noise floor, 15.5× expansion AVOIDED, 1.18ms GPU | Direct validation of codec-as-compute-boundary pattern; polar/VQ kernels prove same pattern with learned codebooks |
+| H1787 (running PID 58195) | Parallel raw IQ2 dot canary at 4096 rows | Codex pursuing H1786's "next organ: parallel decode/reduction" |
+
+Total session arc as of H1786 integration: 34 commits.
+
+Each subsequent codex shift was integrated into
+`codex_H1758_H1773_synthesis.md` via addendum (not new memo).
