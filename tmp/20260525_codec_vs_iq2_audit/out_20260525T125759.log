@@ -1,0 +1,40 @@
+=== Step 1: read GGUF metadata ===
+target: blk.0.ffn_gate_exps.weight
+  type=16 dims=[4096, 2048, 256] offset=9308160
+  n_weights total: 2147483648, n_blocks total: 8388608
+  blocks per expert: 32768
+  weights per expert: 8388608
+  IQ2_XXS expert-0 bytes: 2162688 = 32768 blocks × 66 bytes
+=== Step 2: dequantize IQ2_XXS ===
+  iq2_fp32 shape: (8388608,), dtype: float32
+  iq2 stats: mean=3.9854e-04, std=2.5399e-02, range=[-2.0133e-01, 1.3459e-01]
+=== Step 3: load FP4 source ===
+  raw blob shape: (2048, 2048) dtype: uint8
+  raw scale shape: (2048, 128) dtype: uint8
+  FP4 tensor: layers.0.ffn.experts.0.w1.weight, shape: (2048, 4096)
+  FP4 full size: 8388608, ndim: 2
+  fp4_expert0 size: 8388608
+  fp4 stats: mean=4.8121e-06, std=2.4548e-02, range=[-1.8750e-01, 1.2500e-01]
+
+=== IQ2_XXS vs FP4 (L0 gate expert 0) ===
+  rel_L2:       0.3544
+  max_abs:      7.1535e-02
+  mean_abs:     6.8629e-03
+  bytes/pair:   0.5156
+
+=== Polar p32_m8 reading ===
+  polar: rows=1 pairs/row=256 levels=2048
+  rel_L2 polar vs FP4 (first 512 weights): 1.0000
+  bytes/pair polar: 2
+
+=== VQ K=256 reading ===
+Traceback (most recent call last):
+  File "/Users/silv/cl/tlp/montyneg/ivp5_ds4/tmp/20260525_codec_vs_iq2_audit/codec_quality_ab.py", line 325, in <module>
+    main()
+    ~~~~^^
+  File "/Users/silv/cl/tlp/montyneg/ivp5_ds4/tmp/20260525_codec_vs_iq2_audit/codec_quality_ab.py", line 307, in main
+    vq = read_vq_vqb1(vq_path)
+  File "/Users/silv/cl/tlp/montyneg/ivp5_ds4/tmp/20260525_codec_vs_iq2_audit/codec_quality_ab.py", line 153, in read_vq_vqb1
+    reconstructed_pairs = codebook[codes]  # (rows, pairs, 2)
+                          ~~~~~~~~^^^^^^^
+IndexError: index 128 is out of bounds for axis 0 with size 128

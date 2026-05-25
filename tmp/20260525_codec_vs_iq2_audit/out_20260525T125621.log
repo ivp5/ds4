@@ -1,0 +1,11 @@
+=== Step 1: read GGUF metadata ===
+Traceback (most recent call last):
+  File "/Users/silv/cl/tlp/montyneg/ivp5_ds4/tmp/20260525_codec_vs_iq2_audit/codec_quality_ab.py", line 353, in <module>
+    main()
+    ~~~~^^
+  File "/Users/silv/cl/tlp/montyneg/ivp5_ds4/tmp/20260525_codec_vs_iq2_audit/codec_quality_ab.py", line 230, in main
+    meta, tinfo, data_start = _read_gguf_meta(iq2_gguf)
+                              ~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/Users/silv/cl/tlp/montyneg/ivp5_ds4/tmp/20260525_codec_vs_iq2_audit/codec_quality_ab.py", line 33, in _read_gguf_meta
+    f = open(path, "rb")
+NotADirectoryError: [Errno 20] Not a directory: '/Users/silv/cl/tlp/montyneg/ivp5_ds4/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf'

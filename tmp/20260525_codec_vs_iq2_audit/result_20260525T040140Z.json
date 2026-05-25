@@ -1,0 +1,19 @@
+{
+  "layer": 0,
+  "kind": "gate",
+  "expert": 0,
+  "scope_rows": 128,
+  "in_dim": 4096,
+  "iq2_xxs": {
+    "bytes_per_pair": 0.5156,
+    "rel_l2": 0.3543284833431244
+  },
+  "polar_p32_m8": {
+    "bytes_per_pair": 2.0,
+    "rel_l2": 0.12179767340421677
+  },
+  "vq_k256": {
+    "bytes_per_pair": 1.0,
+    "rel_l2": 0.021230297163128853
+  }
+}

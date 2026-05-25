@@ -583,6 +583,79 @@ implements the optimal raw-IQ2-in-kernel-decode pattern.
 A.4 has essentially zero deployable engineering target. DS4 ships
 the answer to H1783's measurement.
 
+### TRIPLE CORRECTION: IQ2_XXS is not source quality (silv 2026-05-25)
+
+silv corrected: "IQ2_XXS is not source quantization - source is at
+fp8 - check it yourself" + "iq2_xxs was antirez chosen quantization,
+but the source is fp8/fp4, so iq_xxs loses data. do proper research
+on what preserves better - vq, polar etc"
+
+Verified at `DeepSeek-V4-Flash/config.json`:
+```json
+"expert_dtype": "fp4",
+"quantization_config": { "fmt": "e4m3", "quant_method": "fp8", ... }
+```
+
+Source = FP4 routed experts + FP8 E4M3 non-expert. IQ2_XXS is
+antirez's downstream ~2-bit re-quantization of FP4 source. The
+"source quality" claim earlier in this memo was false.
+
+### Codec quality A/B (proper, vs FP4 source)
+
+Per `tmp/20260525_codec_vs_iq2_audit/FINDING.md`, on L0 gate
+expert 0, first 128 rows:
+
+| Codec | bytes/pair | rel_L2 vs FP4 source |
+|-------|-----------:|---------------------:|
+| **IQ2_XXS (antirez)** | 0.5156 | **0.3543** |
+| polar p32_m8 | 2.0000 | 0.1218 |
+| **VQ K=256** | 1.0000 | **0.0212** |
+
+**VQ K=256 has 16.71× LOWER codec error than IQ2_XXS at 1.94× the
+storage cost.** Polar p32_m8 has 2.91× lower error at 3.88× storage.
+
+This DECISIVELY refutes my Chesterton-fence framing:
+- The architectural pattern (compressed-as-compute-boundary) IS
+  shipped in DS4 via `kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32`
+- But the DATA going through that kernel is 16.7× more lossy than
+  what VQ K=256 could provide
+- The codec arc's polar/VQ are NOT duplicates of IQ2 — they're
+  higher-quality codec ALTERNATIVES at moderate storage cost
+
+### Reframed deployable picture
+
+**For a memory-constrained M1 Max running DS4 (192 GB unified):**
+- Current path (IQ2_XXS): 86 GB file, rel_L2 0.35 per expert
+- VQ K=256 substitution: ~167 GB file (still fits!), rel_L2 0.02
+- Quality lift: **16.7× lower codec error per expert weight**
+
+The existing `gate_up_down_vq` MTL4 kernel (B-2.3c canary chain,
+shipped this session) can consume VQ K=256 encoded corpus directly.
+The Branch A.2 sub-decision is now well-motivated by quality, not
+just exploration.
+
+### Pareto frontier (per-pair, L0 gate expert 0)
+
+```
+bytes/pair  rel_L2   codec
+---------   ------   -----
+   0.5      0.35     IQ2_XXS  (antirez — worst quality)
+   1.0      0.02     VQ K=256 (16.7× lower error at 1.94× storage)
+   2.0      0.12     polar p32_m8
+```
+
+silv's intuition was correct: VQ K=256 preserves substantially
+better than IQ2_XXS. The deployable lever is now a quality-improving
+codec substitution, not a memory-equivalent replacement.
+
+### Caveats
+
+- Single (layer, expert, kind) tested so far. Cross-layer + cross-
+  kind verification needed before universal "VQ dominates IQ2"
+  claim.
+- AIME hold-rate test (silv runtime) would confirm whether 16.7×
+  lower codec error translates to measurable downstream task lift.
+
 ### H1788 + H1789 close the loop on codex's parallel arc
 
 Codex shipped H1788 (M1 Max Metal4 surface re-survey) + H1789 (raw

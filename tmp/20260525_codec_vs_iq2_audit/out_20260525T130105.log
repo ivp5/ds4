@@ -1,0 +1,45 @@
+=== Step 1: read GGUF metadata ===
+target: blk.0.ffn_gate_exps.weight
+  type=16 dims=[4096, 2048, 256] offset=9308160
+  n_weights total: 2147483648, n_blocks total: 8388608
+  blocks per expert: 32768
+  weights per expert: 8388608
+  IQ2_XXS expert-0 bytes: 2162688 = 32768 blocks × 66 bytes
+=== Step 2: dequantize IQ2_XXS ===
+  iq2_fp32 shape: (8388608,), dtype: float32
+  iq2 stats: mean=3.9854e-04, std=2.5399e-02, range=[-2.0133e-01, 1.3459e-01]
+=== Step 3: load FP4 source ===
+  raw blob shape: (2048, 2048) dtype: uint8
+  raw scale shape: (2048, 128) dtype: uint8
+  FP4 tensor: layers.0.ffn.experts.0.w1.weight, shape: (2048, 4096)
+  FP4 full size: 8388608, ndim: 2
+  fp4_expert0 size: 8388608
+  fp4 stats: mean=4.8121e-06, std=2.4548e-02, range=[-1.8750e-01, 1.2500e-01]
+
+=== IQ2_XXS vs FP4 (L0 gate expert 0) ===
+  rel_L2:       0.3544
+  max_abs:      7.1535e-02
+  mean_abs:     6.8629e-03
+  bytes/pair:   0.5156
+
+  fp4_first128 size: 524288 (512 KB worth)
+  rel_L2 IQ2 vs FP4 (FIRST 128 rows, matching codec corpus scope): 0.3543
+
+=== Polar p32_m8 reading ===
+  polar: n_experts=256 n_rows=128 n_pairs=2048 phase=32 mag=8
+  rel_L2 polar vs FP4 (first 128 rows): 1.9606
+  bytes/pair polar: 2
+
+=== VQ K=256 reading ===
+  vq: n_experts=256 n_rows=128 n_pairs=2048 K=256
+  rel_L2 vq vs FP4 (first 128 rows): 0.0212
+  bytes/pair vq: 1
+
+=== Pareto frontier (L0 gate expert 0, first 128 rows) ===
+  Codec                 bytes/pair    rel_L2
+  --------------------  ----------  --------
+  IQ2_XXS (antirez)         0.5156    0.3543
+  polar p32_m8              2.0000    1.9606
+  VQ K=256                  1.0000    0.0212
+
+Saved result_20260525T040105Z.json

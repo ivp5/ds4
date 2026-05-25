@@ -1,0 +1,13 @@
+=== Step 1: read GGUF metadata ===
+target: blk.0.ffn_gate_exps.weight
+  type=16 dims=[4096, 2048, 256] offset=9308160
+  n_weights total: 2147483648, n_blocks total: 8388608
+  blocks per expert: 32768
+  weights per expert: 8388608
+  IQ2_XXS expert-0 bytes: 2162688 = 32768 blocks × 66 bytes
+=== Step 2: dequantize IQ2_XXS ===
+  iq2_fp32 shape: (8388608,), dtype: float32
+  iq2 stats: mean=3.9854e-04, std=2.5399e-02, range=[-2.0133e-01, 1.3459e-01]
+=== Step 3: load FP4 source ===
+  FP4 load FAILED: ImportError: cannot import name '_open_shard_mmap' from 'polar_encode_mlx' (/Users/silv/cl/tlp/montyneg/ivp5_ds4/analyzers/polar_encode_mlx.py)
+  Will report only IQ2 stats
