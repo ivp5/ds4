@@ -1,0 +1,19 @@
+loading mlx-community/Qwen3.5-4B-MLX-4bit...
+loaded in 1.3s
+n_layers = 32
+L22 type = DecoderLayer
+prompt: 191 tokens
+after prompt: 0 captures (one per prompt-end)
+  pos=0 t=0.0s recent='Let'
+  pos=2000 t=28.8s recent='{1}{v_P + 2} - \\frac'
+  pos=4000 t=59.9s recent='v_P + 9$.\nArrival times are equal'
+  pos=6000 t=94.4s recent=' v_P + 2$.\n$v_J = v_P'
+  pos=8000 t=129.2s recent=' + 9$.\nThis is fixed.\nWhat if'
+  pos=10000 t=164.6s recent='.\nThe reasoning is complete.\nThe answer is '
+  pos=12000 t=200.7s recent='\nI will write the solution.\nThe solution is '
+finished decode in 203.1s
+total captures: 0
+
+L22 norm captures at target positions:
+
+saved l22_norm_during_cycle_result.json

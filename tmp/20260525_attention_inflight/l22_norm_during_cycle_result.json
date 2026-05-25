@@ -1,0 +1,87 @@
+{
+  "model": "mlx-community/Qwen3.5-4B-MLX-4bit",
+  "captures": [
+    {
+      "pos": 2000,
+      "pre": 18.5,
+      "post": 19.0,
+      "post_minus_pre_norm": 0.5,
+      "delta_vec_norm": 9.25
+    },
+    {
+      "pos": 4000,
+      "pre": 21.625,
+      "post": 24.75,
+      "post_minus_pre_norm": 3.125,
+      "delta_vec_norm": 9.25
+    },
+    {
+      "pos": 6000,
+      "pre": 18.875,
+      "post": 20.25,
+      "post_minus_pre_norm": 1.375,
+      "delta_vec_norm": 9.4375
+    },
+    {
+      "pos": 8000,
+      "pre": 20.125,
+      "post": 25.5,
+      "post_minus_pre_norm": 5.375,
+      "delta_vec_norm": 12.9375
+    },
+    {
+      "pos": 10000,
+      "pre": 19.875,
+      "post": 21.375,
+      "post_minus_pre_norm": 1.5,
+      "delta_vec_norm": 6.09375
+    },
+    {
+      "pos": 12000,
+      "pre": 19.5,
+      "post": 20.75,
+      "post_minus_pre_norm": 1.25,
+      "delta_vec_norm": 5.6875
+    },
+    {
+      "pos": 12031,
+      "pre": 19.5,
+      "post": 20.75,
+      "post_minus_pre_norm": 1.25,
+      "delta_vec_norm": 5.6875
+    },
+    {
+      "pos": 12062,
+      "pre": 19.5,
+      "post": 20.75,
+      "post_minus_pre_norm": 1.25,
+      "delta_vec_norm": 5.6875
+    },
+    {
+      "pos": 12093,
+      "pre": 19.5,
+      "post": 20.75,
+      "post_minus_pre_norm": 1.25,
+      "delta_vec_norm": 5.6875
+    },
+    {
+      "pos": 12120,
+      "pre": 20.75,
+      "post": 21.625,
+      "post_minus_pre_norm": 0.875,
+      "delta_vec_norm": 7.25
+    }
+  ],
+  "captured_text_chunks": {
+    "2000": "} - \\frac{1}{v_P + 9}) = 1$\n$\\frac{1}{v_P + 2} - \\frac",
+    "4000": "$, speed $v_P + 2$.\nJose starts at $t=2$, speed $v_P + 9$.\nArrival times are equal",
+    "6000": "\n\nStep 1:\nLet $v_P$ be Patrick's speed.\n$v_T = v_P + 2$.\n$v_J = v_P",
+    "8000": "_T = v_P + 2$.\n$v_J = v_T + 7 = v_P + 9$.\nThis is fixed.\nWhat if",
+    "10000": " 277.\nI will write the solution.\nThe solution is 277.\nThe reasoning is complete.\nThe answer is ",
+    "12000": " 277.\nThe reasoning is complete.\nThe answer is 277.\nI will write the solution.\nThe solution is ",
+    "12031": " 277.\nThe reasoning is complete.\nThe answer is 277.\nI will write the solution.\nThe solution is ",
+    "12062": " 277.\nThe reasoning is complete.\nThe answer is 277.\nI will write the solution.\nThe solution is ",
+    "12093": " 277.\nThe reasoning is complete.\nThe answer is 277.\nI will write the solution.\nThe solution is ",
+    "12120": "\nThe solution is 277.\nThe reasoning is complete.\nThe answer is 277.\nI will write the solution.\n"
+  }
+}

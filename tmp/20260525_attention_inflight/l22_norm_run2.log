@@ -1,0 +1,34 @@
+loading mlx-community/Qwen3.5-4B-MLX-4bit...
+loaded in 1.4s
+n_layers = 32
+L22 type = DecoderLayer
+prompt: 191 tokens
+after prompt: 1 captures (one per prompt-end)
+  pos=0 t=0.0s recent='Let'
+  pos=2000 t=30.2s recent='{1}{v_P + 2} - \\frac'
+  pos=4000 t=64.1s recent='v_P + 9$.\nArrival times are equal'
+  pos=6000 t=101.5s recent=' v_P + 2$.\n$v_J = v_P'
+  pos=8000 t=140.4s recent=' + 9$.\nThis is fixed.\nWhat if'
+  pos=10000 t=179.1s recent='.\nThe reasoning is complete.\nThe answer is '
+  pos=12000 t=217.8s recent='\nI will write the solution.\nThe solution is '
+finished decode in 220.4s
+total captures: 12126
+
+L22 norm captures at target positions:
+  pos= 2000: pre=  18.50  post=  19.00  ||delta||=   9.25
+  pos= 4000: pre=  21.62  post=  24.75  ||delta||=   9.25
+  pos= 6000: pre=  18.88  post=  20.25  ||delta||=   9.44
+  pos= 8000: pre=  20.12  post=  25.50  ||delta||=  12.94
+  pos=10000: pre=  19.88  post=  21.38  ||delta||=   6.09
+  pos=12000: pre=  19.50  post=  20.75  ||delta||=   5.69
+  pos=12031: pre=  19.50  post=  20.75  ||delta||=   5.69
+  pos=12062: pre=  19.50  post=  20.75  ||delta||=   5.69
+  pos=12093: pre=  19.50  post=  20.75  ||delta||=   5.69
+  pos=12120: pre=  20.75  post=  21.62  ||delta||=   7.25
+
+saved l22_norm_during_cycle_result.json
+
+pre-cycle:  delta mean =   +9.39  stdev = 2.42  CV = 0.258
+in-cycle:   delta mean =   +6.00  stdev = 0.70  CV = 0.116
+ratio in/pre: 0.639
+VERDICT: intermediate — neither extreme
