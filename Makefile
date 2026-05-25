@@ -75,7 +75,7 @@ endif
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
 
 ifeq ($(UNAME_S),Darwin)
-all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
+all: ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-logitlens
 
 help:
 	@echo "DS4 build targets:"
@@ -98,6 +98,14 @@ ds4-eval: ds4_eval.o $(CORE_OBJS)
 
 ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
+
+# ds4-logitlens — diagnostic binary for top-K logprob inspection.
+# Used by AIME P10-style "does model have answer in distribution" probes.
+# CRITICAL: accepts --prefill-metal-phases auto AND --cpu-moe per M1
+# STICKY HAZARD doctrine. Build target restored 2026-05-26 after antirez
+# merge orphaned ds4_logitlens.c without removing it from source tree.
+ds4-logitlens: ds4_logitlens.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_logitlens.o $(CORE_OBJS) $(METAL_LDLIBS)
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)

@@ -53,7 +53,7 @@ If N > 48000, KILL within 90 seconds or expect reboot.
 
 ```bash
 # Default — zero-overhead, production
-make ds4 ds4-server ds4-bench ds4-eval ds4-agent
+make ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-logitlens
 
 # JOURNAL=1 — append-only SQLite-WAL forensic journal
 # Adds session/token/routing/event tables with UPDATE/DELETE ABORT triggers
