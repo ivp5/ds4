@@ -647,6 +647,72 @@ For next session opening with "codec arc continuation":
   plane" matches DS4's existing per-expert dispatch via `ids` +
   `iid1` — codex has now independently confirmed the design works
 
+### H1789 reveals the kernel-time trade-off
+
+The H1789 design memo (read 2026-05-25) reports the speed picture
+NOT visible from CODEX_SHIFTS.md alone:
+
+| Path | Resident | Kernel time | Notes |
+|------|----------|-------------|-------|
+| H1776 f32 materialized | 197.4 MB | 1.70 ms | full pre-staging |
+| H1789 raw IQ2 in-kernel | 26.4 MB | 3.91-5.37 ms | 2.3-3.2× slower kernel |
+
+Raw-IQ2 in-kernel decode wins 7.46× on memory + sub-second tile
+staging vs multi-second f32 materialization, BUT loses 2.3-3.2× on
+the kernel itself.
+
+H1789's named next-organ: the route packet has 5184 top-6 accesses
+but only 1396 unique layer/expert tiles. Mean access multiplicity =
+**3.71× per unique tile**. H1789's current kernel decodes per access.
+Decode-once-per-unique-tile would eliminate 3.71× redundant decode
+work.
+
+### Strategic implication for hot-expert pre-dequant (task #455)
+
+The expert_table.c HOT tier (already shipped at 255 LOC; task #459
+[completed]) is designed for exactly this case: pre-dequant
+frequently-routed experts to fp16, skipping IQ2 decode entirely.
+
+H1789's measurement gives the HOT tier concrete expected value:
+- For hot-cached experts: replace IQ2 decode (3.91-5.37 ms) with
+  fp16 load (matches H1776's 1.70 ms — same baseline)
+- For the 80/20 case: if 20% of experts handle 80% of routes, hot-
+  caching them eliminates the decode overhead on the majority of
+  routed work
+- Storage cost: hot expert at fp16 = 2 bytes/pair vs IQ2 ~0.5 bytes/
+  pair = 4× larger, but only for hot subset
+
+This isn't speculative anymore. H1789 measured the decode penalty
+on real route data. The hot-expert pre-dequant tier (`ds4_expert_table.c`
+DS4_EXPERT_TIER_HOT = 1) addresses it directly.
+
+### Production-path consideration (verified)
+
+The DS4 production kernel `kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32`
+ALREADY preloads the IQ2 signed-grid + ksigns tables into threadgroup
+shared memory ONCE per threadgroup (svalues + ssigns at lines
+1033-1043 of moe.metal). This amortizes the GLOBAL grid-table cost
+across all rows the threadgroup processes.
+
+But the PER-ROW per-element decode (read aux32, extract grid_index,
+extract sign, lookup, multiply by scale, accumulate) is still
+per-access work. Whether this matches H1789's 3.91 ms or runs faster
+depends on the simdgroup partitioning + the N_R0_IQ2_XXS row count
+amortizing the per-tile work.
+
+The deployable question that bridges the gap: does DS4 production's
+existing kernel pattern (per-threadgroup grid cache + N_R0
+simdgroup-row amortization) already capture the H1789 decode-cache
+benefit, or is there residual per-access decode cost that the hot-
+expert pre-dequant tier would eliminate?
+
+This is testable without DS4 launches: a microbenchmark of the
+existing kernel on identical 5184-access / 1396-unique-tile route
+geometry would directly measure whether DS4 production already wins
+the 3.71× decode-multiplicity benefit. Codex's H1789 used 864 cases
+× 4 act_rows × 6 top-K = 5184 accesses; the production kernel takes
+similar geometry but with different per-threadgroup amortization.
+
 ### What survives this correction
 
 - The MLX-parallel polar encoder (1.86 OOMs vs numpy) — still useful
