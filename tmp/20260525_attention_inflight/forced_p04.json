@@ -1,0 +1,234 @@
+{
+  "label": "p04_forced",
+  "truth_digit": "7",
+  "prefix_chars": 12000,
+  "total_prompt_tokens": 4992,
+  "per_layer": {
+    "0": {
+      "p_truth": 8.837792506710684e-07,
+      "rank_truth": 588,
+      "top1_id": 90,
+      "top1_token": "{",
+      "top1_prob": 0.9779906272888184
+    },
+    "1": {
+      "p_truth": 4.0332292883249465e-06,
+      "rank_truth": 46139,
+      "top1_id": 90,
+      "top1_token": "{",
+      "top1_prob": 0.27886247634887695
+    },
+    "2": {
+      "p_truth": 9.823280606724438e-07,
+      "rank_truth": 144055,
+      "top1_id": 90,
+      "top1_token": "{",
+      "top1_prob": 0.011465494520962238
+    },
+    "3": {
+      "p_truth": 1.233740249517723e-06,
+      "rank_truth": 165142,
+      "top1_id": 90,
+      "top1_token": "{",
+      "top1_prob": 0.001773018972016871
+    },
+    "4": {
+      "p_truth": 1.5278260434570257e-06,
+      "rank_truth": 139587,
+      "top1_id": 37052,
+      "top1_token": "theses",
+      "top1_prob": 0.0007240396225824952
+    },
+    "5": {
+      "p_truth": 1.380471348966239e-05,
+      "rank_truth": 13287,
+      "top1_id": 254,
+      "top1_token": "\ufffd",
+      "top1_prob": 0.0012013691011816263
+    },
+    "6": {
+      "p_truth": 1.3964364370622206e-05,
+      "rank_truth": 13411,
+      "top1_id": 96397,
+      "top1_token": "\u7387",
+      "top1_prob": 0.0019769950304180384
+    },
+    "7": {
+      "p_truth": 1.4649207514594309e-05,
+      "rank_truth": 11835,
+      "top1_id": 96215,
+      "top1_token": "\u4f9b",
+      "top1_prob": 0.003061472438275814
+    },
+    "8": {
+      "p_truth": 1.945517578860745e-05,
+      "rank_truth": 7935,
+      "top1_id": 74730,
+      "top1_token": " rigor",
+      "top1_prob": 0.0007344838813878596
+    },
+    "9": {
+      "p_truth": 4.106908363610273e-06,
+      "rank_truth": 61464,
+      "top1_id": 151882,
+      "top1_token": "\u0627\u0646\u0627\u062a",
+      "top1_prob": 0.001239320612512529
+    },
+    "10": {
+      "p_truth": 4.812969564227387e-06,
+      "rank_truth": 53024,
+      "top1_id": 149884,
+      "top1_token": "\u062d\u064a",
+      "top1_prob": 0.0009507477516308427
+    },
+    "11": {
+      "p_truth": 1.3354633665585425e-05,
+      "rank_truth": 13818,
+      "top1_id": 1324,
+      "top1_token": " number",
+      "top1_prob": 0.002066694898530841
+    },
+    "12": {
+      "p_truth": 2.4219309125328436e-05,
+      "rank_truth": 5387,
+      "top1_id": 1767,
+      "top1_token": "count",
+      "top1_prob": 0.007732534781098366
+    },
+    "13": {
+      "p_truth": 9.708694960863795e-06,
+      "rank_truth": 21614,
+      "top1_id": 1698,
+      "top1_token": " count",
+      "top1_prob": 0.0023747729137539864
+    },
+    "14": {
+      "p_truth": 3.415948594920337e-05,
+      "rank_truth": 3529,
+      "top1_id": 102740,
+      "top1_token": "\u7684\u7b54\u6848",
+      "top1_prob": 0.0014336762251332402
+    },
+    "15": {
+      "p_truth": 4.208544851280749e-05,
+      "rank_truth": 2555,
+      "top1_id": 102740,
+      "top1_token": "\u7684\u7b54\u6848",
+      "top1_prob": 0.0019069904228672385
+    },
+    "16": {
+      "p_truth": 4.817871740669943e-06,
+      "rank_truth": 42041,
+      "top1_id": 196669,
+      "top1_token": "anzas",
+      "top1_prob": 0.003812724957242608
+    },
+    "17": {
+      "p_truth": 2.9653960154973902e-05,
+      "rank_truth": 5048,
+      "top1_id": 220,
+      "top1_token": " ",
+      "top1_prob": 0.003436911152675748
+    },
+    "18": {
+      "p_truth": 5.6770153605611995e-05,
+      "rank_truth": 2138,
+      "top1_id": 220,
+      "top1_token": " ",
+      "top1_prob": 0.0032268629875034094
+    },
+    "19": {
+      "p_truth": 5.526310360437492e-06,
+      "rank_truth": 30575,
+      "top1_id": 1698,
+      "top1_token": " count",
+      "top1_prob": 0.021274864673614502
+    },
+    "20": {
+      "p_truth": 1.5996615729818586e-06,
+      "rank_truth": 82390,
+      "top1_id": 103102,
+      "top1_token": "\u9edb",
+      "top1_prob": 0.006434908136725426
+    },
+    "21": {
+      "p_truth": 5.162239176570438e-06,
+      "rank_truth": 31902,
+      "top1_id": 4356,
+      "top1_token": " Count",
+      "top1_prob": 0.026668338105082512
+    },
+    "22": {
+      "p_truth": 3.44590353051899e-06,
+      "rank_truth": 47287,
+      "top1_id": 1698,
+      "top1_token": " count",
+      "top1_prob": 0.03285440430045128
+    },
+    "23": {
+      "p_truth": 3.23029889841564e-05,
+      "rank_truth": 2126,
+      "top1_id": 9944,
+      "top1_token": " prime",
+      "top1_prob": 0.2680150866508484
+    },
+    "24": {
+      "p_truth": 5.785746543551795e-05,
+      "rank_truth": 1424,
+      "top1_id": 9944,
+      "top1_token": " prime",
+      "top1_prob": 0.10966300964355469
+    },
+    "25": {
+      "p_truth": 0.00013872215640731156,
+      "rank_truth": 464,
+      "top1_id": 9944,
+      "top1_token": " prime",
+      "top1_prob": 0.02008202113211155
+    },
+    "26": {
+      "p_truth": 0.0010453673312440515,
+      "rank_truth": 18,
+      "top1_id": 9944,
+      "top1_token": " prime",
+      "top1_prob": 0.014116236008703709
+    },
+    "27": {
+      "p_truth": 0.0006580958142876625,
+      "rank_truth": 16,
+      "top1_id": 67579,
+      "top1_token": " seventy",
+      "top1_prob": 0.004019319545477629
+    },
+    "28": {
+      "p_truth": 0.006945811677724123,
+      "rank_truth": 2,
+      "top1_id": 2414,
+      "top1_token": " something",
+      "top1_prob": 0.010226168669760227
+    },
+    "29": {
+      "p_truth": 0.0856420248746872,
+      "rank_truth": 0,
+      "top1_id": 22,
+      "top1_token": "7",
+      "top1_prob": 0.0856420248746872
+    },
+    "30": {
+      "p_truth": 0.7599620223045349,
+      "rank_truth": 0,
+      "top1_id": 22,
+      "top1_token": "7",
+      "top1_prob": 0.7599620223045349
+    },
+    "31": {
+      "p_truth": 0.20009934902191162,
+      "rank_truth": 2,
+      "top1_id": 21,
+      "top1_token": "6",
+      "top1_prob": 0.25210878252983093
+    }
+  },
+  "digit_top1_count": 2,
+  "final3_agreement": 2
+}

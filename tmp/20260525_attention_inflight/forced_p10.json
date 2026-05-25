@@ -1,0 +1,234 @@
+{
+  "label": "p10_forced",
+  "truth_digit": "1",
+  "prefix_chars": 12000,
+  "total_prompt_tokens": 6262,
+  "per_layer": {
+    "0": {
+      "p_truth": 1.9974402221123455e-06,
+      "rank_truth": 147,
+      "top1_id": 90,
+      "top1_token": "{",
+      "top1_prob": 0.9774898886680603
+    },
+    "1": {
+      "p_truth": 6.6182942646264564e-06,
+      "rank_truth": 22621,
+      "top1_id": 90,
+      "top1_token": "{",
+      "top1_prob": 0.28767651319503784
+    },
+    "2": {
+      "p_truth": 1.0082992957904935e-05,
+      "rank_truth": 20427,
+      "top1_id": 90,
+      "top1_token": "{",
+      "top1_prob": 0.008188481442630291
+    },
+    "3": {
+      "p_truth": 8.643088222015649e-06,
+      "rank_truth": 25958,
+      "top1_id": 90,
+      "top1_token": "{",
+      "top1_prob": 0.001363670569844544
+    },
+    "4": {
+      "p_truth": 5.0942180678248405e-05,
+      "rank_truth": 1118,
+      "top1_id": 254,
+      "top1_token": "\ufffd",
+      "top1_prob": 0.0007740283035673201
+    },
+    "5": {
+      "p_truth": 5.751354183303192e-05,
+      "rank_truth": 959,
+      "top1_id": 254,
+      "top1_token": "\ufffd",
+      "top1_prob": 0.003297031857073307
+    },
+    "6": {
+      "p_truth": 4.176228685537353e-05,
+      "rank_truth": 2221,
+      "top1_id": 1424,
+      "top1_token": "\u0430",
+      "top1_prob": 0.001731407013721764
+    },
+    "7": {
+      "p_truth": 1.3592604773293715e-05,
+      "rank_truth": 13988,
+      "top1_id": 9814,
+      "top1_token": "agger",
+      "top1_prob": 0.0013976815389469266
+    },
+    "8": {
+      "p_truth": 1.0007202035922091e-05,
+      "rank_truth": 21432,
+      "top1_id": 149689,
+      "top1_token": "\u0626\u0629",
+      "top1_prob": 0.001152841723524034
+    },
+    "9": {
+      "p_truth": 1.6352654711226933e-05,
+      "rank_truth": 10350,
+      "top1_id": 97602,
+      "top1_token": "\u6717",
+      "top1_prob": 0.0012913225218653679
+    },
+    "10": {
+      "p_truth": 2.221737122454215e-05,
+      "rank_truth": 6135,
+      "top1_id": 254,
+      "top1_token": "\ufffd",
+      "top1_prob": 0.0004985601990483701
+    },
+    "11": {
+      "p_truth": 2.465334182488732e-05,
+      "rank_truth": 5163,
+      "top1_id": 178772,
+      "top1_token": " eder",
+      "top1_prob": 0.0026499673258513212
+    },
+    "12": {
+      "p_truth": 5.577836054726504e-05,
+      "rank_truth": 1219,
+      "top1_id": 23424,
+      "top1_token": " computed",
+      "top1_prob": 0.0016629688907414675
+    },
+    "13": {
+      "p_truth": 1.016446367430035e-05,
+      "rank_truth": 20822,
+      "top1_id": 32265,
+      "top1_token": "enen",
+      "top1_prob": 0.0013304773019626737
+    },
+    "14": {
+      "p_truth": 1.921920193126425e-05,
+      "rank_truth": 8682,
+      "top1_id": 103715,
+      "top1_token": "\u57fa\u4e8e",
+      "top1_prob": 0.0014587173936888576
+    },
+    "15": {
+      "p_truth": 4.549494406091981e-06,
+      "rank_truth": 49802,
+      "top1_id": 96714,
+      "top1_token": "\u56f4",
+      "top1_prob": 0.00167731917463243
+    },
+    "16": {
+      "p_truth": 2.877733891182288e-07,
+      "rank_truth": 201109,
+      "top1_id": 219512,
+      "top1_token": "\u0627\u0641\u0644\u0629",
+      "top1_prob": 0.002509556943550706
+    },
+    "17": {
+      "p_truth": 1.8738318203759263e-06,
+      "rank_truth": 93368,
+      "top1_id": 170593,
+      "top1_token": "\u0646\u0627\u0621",
+      "top1_prob": 0.002777405781671405
+    },
+    "18": {
+      "p_truth": 3.7370436984929256e-06,
+      "rank_truth": 47121,
+      "top1_id": 2414,
+      "top1_token": " something",
+      "top1_prob": 0.007570347748696804
+    },
+    "19": {
+      "p_truth": 1.2517378991105943e-06,
+      "rank_truth": 108477,
+      "top1_id": 96714,
+      "top1_token": "\u56f4",
+      "top1_prob": 0.0031192770693451166
+    },
+    "20": {
+      "p_truth": 5.85855241297395e-06,
+      "rank_truth": 33481,
+      "top1_id": 98013,
+      "top1_token": "\u9762\u79ef",
+      "top1_prob": 0.005872259847819805
+    },
+    "21": {
+      "p_truth": 3.3003752832883038e-06,
+      "rank_truth": 58572,
+      "top1_id": 2414,
+      "top1_token": " something",
+      "top1_prob": 0.0028083373326808214
+    },
+    "22": {
+      "p_truth": 3.835998541035224e-06,
+      "rank_truth": 52765,
+      "top1_id": 224752,
+      "top1_token": "\uff1f\uff09",
+      "top1_prob": 0.002211502054706216
+    },
+    "23": {
+      "p_truth": 2.455281537550036e-05,
+      "rank_truth": 6158,
+      "top1_id": 581,
+      "top1_token": "ans",
+      "top1_prob": 0.0016690222546458244
+    },
+    "24": {
+      "p_truth": 4.108580469619483e-06,
+      "rank_truth": 51576,
+      "top1_id": 2414,
+      "top1_token": " something",
+      "top1_prob": 0.0025418924633413553
+    },
+    "25": {
+      "p_truth": 2.9336879379116e-05,
+      "rank_truth": 4571,
+      "top1_id": 98013,
+      "top1_token": "\u9762\u79ef",
+      "top1_prob": 0.0021488636266440153
+    },
+    "26": {
+      "p_truth": 0.0003593445580918342,
+      "rank_truth": 59,
+      "top1_id": 650,
+      "top1_token": " ab",
+      "top1_prob": 0.002065209671854973
+    },
+    "27": {
+      "p_truth": 7.853300485294312e-05,
+      "rank_truth": 895,
+      "top1_id": 11687,
+      "top1_token": " Area",
+      "top1_prob": 0.007169548887759447
+    },
+    "28": {
+      "p_truth": 1.712418998067733e-05,
+      "rank_truth": 9361,
+      "top1_id": 2414,
+      "top1_token": " something",
+      "top1_prob": 0.025928592309355736
+    },
+    "29": {
+      "p_truth": 0.00013735581887885928,
+      "rank_truth": 470,
+      "top1_id": 32228,
+      "top1_token": "something",
+      "top1_prob": 0.01521043200045824
+    },
+    "30": {
+      "p_truth": 0.02968919835984707,
+      "rank_truth": 2,
+      "top1_id": 16414,
+      "top1_token": " }.",
+      "top1_prob": 0.46873238682746887
+    },
+    "31": {
+      "p_truth": 0.3520631492137909,
+      "rank_truth": 0,
+      "top1_id": 16,
+      "top1_token": "1",
+      "top1_prob": 0.3520631492137909
+    }
+  },
+  "digit_top1_count": 1,
+  "final3_agreement": 1
+}
