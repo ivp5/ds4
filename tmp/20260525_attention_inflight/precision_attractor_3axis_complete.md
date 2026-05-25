@@ -58,14 +58,22 @@ the bf16 regime is "long-period pre-truth interpretation manifold."
 - Truth appears in cycle but accompanied by prompt-leak
 - Rescue: forced-commit before prompt-leak position
 
-**bf16**: clean derivation → INTERPRETATION DOUBT → semantic paralysis cycle
-- Failure mode: PRE-TRUTH semantic loop
-- Truth NEVER reaches the cycle
-- Rescue: forced-commit at any truncation will likely fail (no truth in residual)
+**bf16**: clean derivation EARLIER → drifts past truth → semantic paralysis cycle
+- Failure mode: post-truth interpretation-doubt loop (NOT pre-truth as initially claimed)
+- Truth IS derived around pos 4000 (verified: `(18/5)(14/5)=252/25` → m=252, n=25, m+n=277)
+- Cycle vocabulary lacks truth because cycle entry is ~8K tokens PAST derivation
+- Rescue: forced-commit at 60% prefix WORKS (AMD result: 7/10 cells incl P01→277)
+
+**Self-refutation 2026-05-25**: prior version of this memo claimed bf16
+"never derives truth." Refuted by checking M1 bf16 CoT at pos 4000 AND
+by AMD bf16 forced-extract showing 7/10 rescue success at 60% prefix.
+Detail at REFUTED_cycle_vocabulary_disjoint_class_B_claim.md.
 
 **The no-commit pathology is ARCHITECTURAL, not quantization-induced.**
 The structural fact (no `\boxed{}` emission) is precision-invariant.
 The FAILURE MODE differs by precision but the COMMIT FAILURE is identical.
+All three precisions ARE rescuable — they just need precision-tuned
+prefix positions because they derive truth at different points in CoT.
 
 ## Implications for production deployment
 
