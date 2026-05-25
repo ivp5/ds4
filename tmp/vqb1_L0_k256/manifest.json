@@ -1,0 +1,36 @@
+{
+  "encoder": "vq2d_encode_vqb1.py",
+  "model_dir": "/Users/silv/cl/tlp/montyneg/ds4/gguf/DeepSeek-V4-Flash",
+  "k": 256,
+  "rows_per_expert": 128,
+  "max_iter": 12,
+  "seed": 42,
+  "n_files": 3,
+  "elapsed_seconds": 72.66204404830933,
+  "rel_l2_mean": 0.019227851803104084,
+  "cos_sim_mean": 1.0008582671483357,
+  "total_bytes": 167778400,
+  "files": [
+    {
+      "layer": 0,
+      "kind": "gate",
+      "rel_l2": 0.019241243600845337,
+      "cos_sim": 1.0012907981872559,
+      "file_size": 67110944
+    },
+    {
+      "layer": 0,
+      "kind": "up",
+      "rel_l2": 0.018979856744408607,
+      "cos_sim": 1.001294493675232,
+      "file_size": 67110944
+    },
+    {
+      "layer": 0,
+      "kind": "down",
+      "rel_l2": 0.019462455064058304,
+      "cos_sim": 0.9999895095825195,
+      "file_size": 33556512
+    }
+  ]
+}
