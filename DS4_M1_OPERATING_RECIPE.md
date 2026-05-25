@@ -137,13 +137,19 @@ The trim50 file fits comfortably in 64GB but the dropped 10 layers
 problems (shifts #292-294 bisect work). Use for non-math chat; not for
 AIME / numerical reasoning.
 
-## Pillars — honest status (2026-05-25 audit)
+## ICB record→replay status (2026-05-26 audit + DELETION of dead facade)
 
-**The `ds4_pillars.c` facade is DEAD CODE** — declared in `ds4_pillars.h`
-with `ds4_icb_init/execute/record_decode/...` API, but zero call sites in
-ds4.c / ds4_metal.m / ds4_server.c. The header advertises three pillars;
-the source file declares 14 functions; none are called from the main
-inference path.
+The dead `ds4_pillars.c` facade (219 LOC, 14 declared functions, zero
+call sites) was DELETED 2026-05-26 per shift #189 doctrine ("delete what
+doesn't earn its keep"; #192 "any customer pull elevates back to mod.ts;
+until then the cut stands"). Files moved to `~/.Trash/`:
+- `ds4_pillars.c.<ts>.bak`
+- `ds4_pillars.h.<ts>.bak`
+
+Reversible via `mv` if a future pillar-orchestration need emerges.
+
+Build verified clean both modes (default + JOURNAL=1). ds4-bench
+shrunk 840KB → 837KB.
 
 **The REAL ICB record→replay mechanisms live IN-PLACE in `ds4_metal.m`**
 as four independent opt-in pipelines:

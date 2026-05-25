@@ -12,7 +12,6 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "ds4_journal.h"
-#include "ds4_pillars.h"
 
 #include <sys/sysctl.h>
 
