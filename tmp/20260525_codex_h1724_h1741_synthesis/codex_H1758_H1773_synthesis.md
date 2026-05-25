@@ -205,6 +205,60 @@ through a two-buffer ring (one buffer fills while other dispatches)
 is engineering work that someone (codex or silv or me with
 direction) would land next.
 
+### H1783 IMMEDIATE REFUTATION of the two-buffer-ring framing
+
+H1783 (12:00 UTC, same thread, ~5 min after H1782) instrumented
+H1781/H1782 by stage and refuted the ring-buffer next step:
+
+- Pairs wall 8.6s = **tile build 7.2s (84%)** + file writes 0.1s
+  + CPU ref 0.1s + native wall 0.5s + GPU feedback 3.2ms
+- Triples wall 6.8s = **tile build 5.7s (84%)** + writes 0.07s
+  + CPU 0.14s + native 0.3s + GPU 3.2ms
+
+**Shift quote**: "Overlap alone cannot help much because row
+decode/materialization is ~84% of wall and GPU work is
+milliseconds. The real next organ is **avoiding f32 tile
+materialization: compact IQ2 routed-row packets, hot-window caches,
+or GPU-side IQ2 decode**."
+
+### My codec arc IS H1783's named speed organ
+
+"Compact IQ2 routed-row packets" describes the codec arc precisely:
+- Polar p32_m8: 2 bytes/pair packet (mag + phase uint8) replacing
+  4-byte f32 per pair → 2× bandwidth reduction at codec stage
+- VQ K=256: 1 byte/pair packet (codebook code uint8) replacing 4-byte
+  f32 → 4× bandwidth reduction
+- Per-(layer, kind) codebook: small global metadata
+- Per-route consumption: matches H1782's pattern statement
+
+This is not just "enabler substrate" for inference speedup. H1783
+explicitly identifies the codec arc's category as the next speed
+organ. The codec body (when shipped) directly addresses the 84%
+of wall time codex measured as tile build/dequant/materialization.
+
+The 8.6s pair wall → if codec reduces tile materialization by 2×
+(polar) or 4× (VQ), pair wall drops to ~5.0s or ~2.7s. The 1.5-3×
+wall speedup from codec deployment IS the H1782/H1783 next-organ
+contribution.
+
+### Revised composition table
+
+```
+Layer              codex contribution         my session
+                                              contribution
+-----------------  -------------------------  -----------------
+Disk → resident    H1776 row-streamed seek    polar/VQ encoder
+Resident set       H1778 layer-window LRU     codec compression
+                   (5.84× memory)             (3.2× compression)
+Window execution   H1779-H1782 reusable       codec consumption
+                   process + buffer set       per-route packet
+Tile materialization  ←── H1783 NEW BOTTLENECK ──→  CODEC IS
+                                              THE NEXT ORGAN
+```
+
+The codec arc's strategic position just escalated from "enabler"
+to "named-next-speed-lever" by codex H1783's profile.
+
 ## Addendum: H1775 — MTL4 non-divisible dispatch silently corrupts
 
 H1775 shipped right after H1774. MTL4 consumed the H1774 raw route
