@@ -491,6 +491,19 @@ int main(int argc, char **argv) {
         }
 
         const double gen_t0 = bench_now_sec();
+        /* Streaming progress per silv shift #295: no silent long-running.
+         * Emit inst+avg t/s at the smaller of {16 tokens, 2 seconds} cadence.
+         * Disabled by setting DS4_BENCH_QUIET=1 (e.g. for CSV-only piped output). */
+        const int stream_quiet = getenv("DS4_BENCH_QUIET") != NULL;
+        const int stream_token_step = 16;
+        const double stream_time_step = 2.0;
+        double stream_last_t = gen_t0;
+        int    stream_last_i = 0;
+        if (!stream_quiet) {
+            fprintf(stderr, "ds4-bench: gen-start frontier=%d target=%d\n",
+                    frontier, cfg.gen_tokens);
+            fflush(stderr);
+        }
         for (int i = 0; i < cfg.gen_tokens; i++) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
@@ -508,8 +521,33 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            /* Stream cadence — fixed-work-unit OR fixed-time, whichever fires first */
+            const int generated = i + 1;
+            const double now = bench_now_sec();
+            const int    token_due = (generated - stream_last_i) >= stream_token_step;
+            const int    time_due  = (now - stream_last_t) >= stream_time_step;
+            if (!stream_quiet && (token_due || time_due) && generated < cfg.gen_tokens) {
+                const double inst_tps = (generated - stream_last_i) /
+                                        ((now - stream_last_t) > 1e-9 ? (now - stream_last_t) : 1.0);
+                const double avg_tps  = generated / ((now - gen_t0) > 1e-9 ? (now - gen_t0) : 1.0);
+                const double pct      = 100.0 * (double)generated / (double)cfg.gen_tokens;
+                fprintf(stderr,
+                        "ds4-bench:   gen %4d/%d (%.1f%%) inst=%5.2f t/s avg=%5.2f t/s elapsed=%5.1fs\n",
+                        generated, cfg.gen_tokens, pct, inst_tps, avg_tps, now - gen_t0);
+                fflush(stderr);
+                stream_last_t = now;
+                stream_last_i = generated;
+            }
         }
         const double gen_t1 = bench_now_sec();
+        if (!stream_quiet && rc == 0) {
+            const double total_sec = gen_t1 - gen_t0;
+            const double final_tps = cfg.gen_tokens / (total_sec > 1e-9 ? total_sec : 1.0);
+            fprintf(stderr,
+                    "ds4-bench: gen-end   frontier=%d generated=%d wall=%.2fs avg=%.2f t/s\n",
+                    frontier, cfg.gen_tokens, total_sec, final_tps);
+            fflush(stderr);
+        }
         if (rc != 0) break;
 
         if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
