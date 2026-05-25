@@ -379,6 +379,65 @@ polar/VQ kernels as a third codec path in the same B-2.3c stub
 dispatch infrastructure — same wiring, different kernel, choice of
 quality/storage point per-layer or per-experiment.
 
+### H1787 parallelized H1786 — raw IQ2 IS now compute organ
+
+Codex shipped H1787 around 04:20 UTC. Changed H1786's serial-per-row
+decode to one 256-thread group per raw IQ2 row, each thread decoding
+16 dimensions, threadgroup reduction emitting the dot.
+
+Validation:
+- 1024 rows: H1786 1.18 ms → H1787 0.18 ms = **6.41× speedup**
+- 4096 rows: 0.65 ms GPU, 71.8 MB resident, max abs error 2.16e-7
+  (same fp32 noise floor)
+- Raw IQ2 4.32 MB vs f32 equivalent 67.1 MB (15.5× expansion avoided
+  empirically at 4096-row scale)
+
+Shift quote: "The raw compressed row is now a viable compute organ,
+not only a storage organ. The next rewrite should delete f32
+gate_rows_f32/up_rows_f32 from the route-packet executor and compute
+actual gate/up MoE contributions from raw IQ2 packets."
+
+### Strategic re-positioning of the codec arc against H1787
+
+H1787 substantially shifts the competitive picture between codec
+options. The honest accounting:
+
+| Codec | Storage | rel_L2 | GPU @ 4096 rows | Engineering |
+|-------|---------|--------|-----------------|-------------|
+| Raw IQ2 (H1787) | ~0.5 byte/pair | 0 | 0.65 ms | Zero re-encoding |
+| VQ K=256 | 1 byte/pair | 0.02 | TBD | Codebook training |
+| Polar p32_m8 | 2 byte/pair | 0.12 | TBD (H1735) | Codebook training |
+
+Where raw IQ2 cleanly wins:
+- **Storage efficiency**: 0.5 vs 1 vs 2 byte/pair
+- **Quality**: source-quantization, no second-order codec loss
+- **Engineering**: uses existing IQ2_XXS file, zero encode time
+- **Compute**: now demonstrated at production scale
+
+Where learned codecs might still win (untested):
+- Per-(layer, kind) codebook adaptability vs raw IQ2's global grid
+- Distributions where K-means in R² recovers structure raw IQ2 loses
+- Decode-table size (256-entry codebook vs IQ2 signed-grid 0.262 MB)
+
+**Honest re-position**: codex H1787 demonstrates the codec-as-compute-
+organ architectural pattern at production scale with the source
+quantization. My learned-codec arc was the first to ship this pattern
+in this session, but raw IQ2 wins the substrate axis. The codec arc's
+remaining strategic value:
+
+1. **Architectural validation**: H1735 polar kernel + gate_up_down_vq
+   were independent proofs of the pattern; H1787 confirms
+2. **B-2.3c dispatch infrastructure**: hot-path gate is codec-agnostic;
+   reusable for raw-IQ2 as third path
+3. **VQ K=256 fallback**: for tensors where raw IQ2 underperforms
+   (none confirmed yet; needs cell-level comparison)
+
+**New sub-decision option A.4** (for silv): wire H1787's raw-IQ2
+kernel into the B-2.3c stub instead of polar/VQ. Storage cost = 0
+(uses existing IQ2_XXS file); engineering cost = porting H1787 kernel
++ integrating into ds4.c hot-path; risk = low (source quality is
+baseline); estimated effort = 200-300 LOC.
+
 ## Addendum: H1775 — MTL4 non-divisible dispatch silently corrupts
 
 H1775 shipped right after H1774. MTL4 consumed the H1774 raw route

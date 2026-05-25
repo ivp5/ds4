@@ -110,11 +110,13 @@ Polar arc + B-2.3c stub shipped; body needs silv sub-decision:
 | **A.1** | Full-row polar corpus | 275 GB | Encode 37 min + dispatcher 300 LOC + silv runtime | medium |
 | **A.2** | Full-row VQ corpus | 138 GB | MLX VQ encoder port 150 LOC + encode 6 min + dispatcher 300 LOC + silv runtime | medium |
 | **A.3** | Hybrid polar+FP4 dispatch | 14 GB (current) | Combine logic 500 LOC + silv runtime | medium-high |
+| **A.4** (NEW post-H1787) | Wire codex raw-IQ2 H1787 kernel into B-2.3c stub | 0 (existing file) | Port H1787 + dispatcher 200-300 LOC + silv runtime | low |
 | **B** | Pivot to non-codec queued work | — | varies | low |
 | **C** | Defer to later session | — | — | none |
 
 Disk approval needed for A.1 / A.2. A.3 doesn't need disk but
-delivers no speedup (only A/B scientific validation).
+delivers no speedup (only A/B scientific validation). **A.4 emerged
+from codex H1787 — it's now the lowest-risk lowest-storage path.**
 
 ## Inheritance state for next session
 
@@ -139,7 +141,7 @@ silv-direction-bound from this point forward.
 | H1783 | 84% of wall is f32 materialization | Names codec as the next speed organ |
 | H1784 | 15.5× f32 expansion overhead measured | Sets the deletion target |
 | H1786 | MTL4 raw-IQ2 dot kernel: 1024 rows fp32 noise floor, 15.5× expansion AVOIDED, 1.18ms GPU | Direct validation of codec-as-compute-boundary pattern; polar/VQ kernels prove same pattern with learned codebooks |
-| H1787 (running PID 58195) | Parallel raw IQ2 dot canary at 4096 rows | Codex pursuing H1786's "next organ: parallel decode/reduction" |
+| H1787 | Parallel raw IQ2 dot: 1024 rows 0.18 ms (6.41× over H1786), 4096 rows 0.65 ms | Raw IQ2 now production-scale compute organ; surfaces new sub-decision A.4 (wire H1787 kernel into B-2.3c stub instead of polar/VQ) |
 
 Total session arc as of H1786 integration: 34 commits.
 
