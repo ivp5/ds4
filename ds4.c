@@ -20082,6 +20082,26 @@ void ds4_engine_summary(ds4_engine *e) {
  model_summary(&e->model);
 }
 
+/* silv-merge: stub for antirez PRO API. Non-PRO DS4 = DeepSeek-V4-Flash, variant 0. */
+const char *ds4_engine_model_name(ds4_engine *e) {
+ (void)e;
+ return "DeepSeek-V4-Flash";
+}
+
+int ds4_engine_model_id(ds4_engine *e) {
+ (void)e;
+ return 0;
+}
+
+const char *ds4_mpp_mode_name(ds4_mpp_mode m) {
+ switch (m) {
+ case DS4_MPP_AUTO: return "auto";
+ case DS4_MPP_ON: return "on";
+ case DS4_MPP_OFF: return "off";
+ default: return "?";
+ }
+}
+
 void ds4_engine_close(ds4_engine *e) {
  if (!e) return;
  ds4_polar_pool_close(&e->polar_pool);  /* #563 Phase B-1: release mmap'd PLR2 */

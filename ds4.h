@@ -23,6 +23,17 @@ typedef enum {
     DS4_BACKEND_CPU,
 } ds4_backend;
 
+/* Metal Pre-Prefill (MPP) mode — silv-local; controls Metal tensor
+ * pre-prefill scheduling. AUTO selects per workload; ON forces; OFF
+ * disables. Referenced in ds4_server.c + ds4_bench.c + tests/ds4_test.c
+ * but the typedef was missing from pre-merge HEAD — added during
+ * antirez/main merge fix-up. */
+typedef enum {
+    DS4_MPP_AUTO,
+    DS4_MPP_ON,
+    DS4_MPP_OFF,
+} ds4_mpp_mode;
+
 typedef enum {
     DS4_THINK_NONE,
     DS4_THINK_HIGH,
@@ -87,6 +98,7 @@ typedef struct {
      *    0  = disabled
      *  1..DS4_N_LAYER = explicit phase count */
     int  prefill_metal_phases;
+    ds4_mpp_mode mpp_mode;  /* silv-local Metal Pre-Prefill mode; default DS4_MPP_AUTO */
     bool inspect_only;
 } ds4_engine_options;
 
@@ -116,6 +128,7 @@ int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
+const char *ds4_mpp_mode_name(ds4_mpp_mode m);
 /* Stable id for cache compatibility.  0 is the original Flash shape, so old
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */

@@ -14263,9 +14263,11 @@ int ds4_gpu_routed_moe_one_tensor(
  uint32_t out_dim,
  const ds4_gpu_tensor *selected,
  const ds4_gpu_tensor *weights,
+ uint32_t n_total_expert,
  uint32_t n_expert,
  float clamp,
  const ds4_gpu_tensor *x) {
+ (void)n_total_expert; /* PRO param; silv non-PRO body uses fixed DS4_N_EXPERT */
  if (!g_initialized && !ds4_gpu_init()) return 0;
  if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
  n_expert == 0 || n_expert > 6) {
@@ -14841,12 +14843,14 @@ int ds4_gpu_routed_moe_batch_tensor(
  uint32_t out_dim,
  const ds4_gpu_tensor *selected,
  const ds4_gpu_tensor *weights,
+ uint32_t n_total_expert,
  uint32_t n_expert,
  float clamp,
  const ds4_gpu_tensor *x,
  uint32_t layer_index,
  uint32_t n_tokens,
  bool *mid_is_f16) {
+ (void)n_total_expert;
  if (!g_initialized && !ds4_gpu_init()) return 0;
  if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
  n_tokens == 0 || n_expert == 0 || n_expert > 6) {
@@ -17686,6 +17690,7 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
  uint32_t out_dim,
  const ds4_gpu_tensor *selected,
  const ds4_gpu_tensor *weights,
+ uint32_t n_total_expert,
  uint32_t n_expert,
  float clamp,
  const ds4_gpu_tensor *x,
@@ -17693,6 +17698,7 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
  uint32_t n_tokens,
  bool *mid_is_f16,
  bool *mtl4_path_taken) {
+ (void)n_total_expert;
  /* Preflight: all conditions must hold or fall back to legacy. */
  const int env_ok = ds4_mtl4_moe_env_enabled();
  const int shape_ok = (n_expert == 6 && n_tokens <= DS4_MTL4_MOE_MAX_T);
@@ -17705,7 +17711,7 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
  gate_offset, up_offset, down_offset, gate_type, down_type,
  gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
  expert_in_dim, expert_mid_dim, out_dim,
- selected, weights, n_expert, clamp, x,
+ selected, weights, n_total_expert, n_expert, clamp, x,
  layer_index, n_tokens, mid_is_f16);
  }
 
@@ -17719,7 +17725,7 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
  gate_offset, up_offset, down_offset, gate_type, down_type,
  gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
  expert_in_dim, expert_mid_dim, out_dim,
- selected, weights, n_expert, clamp, x,
+ selected, weights, n_total_expert, n_expert, clamp, x,
  layer_index, n_tokens, mid_is_f16);
  }
 
@@ -17730,7 +17736,7 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
  gate_offset, up_offset, down_offset, gate_type, down_type,
  gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
  expert_in_dim, expert_mid_dim, out_dim,
- selected, weights, n_expert, clamp, x,
+ selected, weights, n_total_expert, n_expert, clamp, x,
  layer_index, n_tokens, mid_is_f16);
  }
 
@@ -17753,7 +17759,7 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
  gate_offset, up_offset, down_offset, gate_type, down_type,
  gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
  expert_in_dim, expert_mid_dim, out_dim,
- selected, weights, n_expert, clamp, x,
+ selected, weights, n_total_expert, n_expert, clamp, x,
  layer_index, n_tokens, mid_is_f16);
  }
 
@@ -17778,7 +17784,7 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
  gate_offset, up_offset, down_offset, gate_type, down_type,
  gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
  expert_in_dim, expert_mid_dim, out_dim,
- selected, weights, n_expert, clamp, x,
+ selected, weights, n_total_expert, n_expert, clamp, x,
  layer_index, n_tokens, mid_is_f16);
  }
 
@@ -17812,7 +17818,7 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
  gate_offset, up_offset, down_offset, gate_type, down_type,
  gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
  expert_in_dim, expert_mid_dim, out_dim,
- selected, weights, n_expert, clamp, x,
+ selected, weights, n_total_expert, n_expert, clamp, x,
  layer_index, n_tokens, mid_is_f16);
  }
 
@@ -17832,7 +17838,7 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
  gate_offset, up_offset, down_offset, gate_type, down_type,
  gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
  expert_in_dim, expert_mid_dim, out_dim,
- selected, weights, n_expert, clamp, x,
+ selected, weights, n_total_expert, n_expert, clamp, x,
  layer_index, n_tokens, mid_is_f16);
  }
  const uint8_t *expert_bytes = (const uint8_t *)model_map + gate_offset + (uint64_t)expert_id * gate_expert_bytes;
@@ -17872,7 +17878,7 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
  gate_offset, up_offset, down_offset, gate_type, down_type,
  gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
  expert_in_dim, expert_mid_dim, out_dim,
- selected, weights, n_expert, clamp, x,
+ selected, weights, n_total_expert, n_expert, clamp, x,
  layer_index, n_tokens, mid_is_f16);
  }
 
@@ -17929,7 +17935,7 @@ int ds4_gpu_routed_moe_batch_tensor_mtl4(
  gate_offset, up_offset, down_offset, gate_type, down_type,
  gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
  expert_in_dim, expert_mid_dim, out_dim,
- selected, weights, n_expert, clamp, x,
+ selected, weights, n_total_expert, n_expert, clamp, x,
  layer_index, n_tokens, mid_is_f16);
 }
 
