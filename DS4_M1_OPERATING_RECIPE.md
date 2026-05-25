@@ -137,24 +137,60 @@ The trim50 file fits comfortably in 64GB but the dropped 10 layers
 problems (shifts #292-294 bisect work). Use for non-math chat; not for
 AIME / numerical reasoning.
 
-## Pillars — scaffolded, env-gated, NOT YET WIRED into main inference
+## Pillars — honest status (2026-05-25 audit)
 
-```c
-// ds4_pillars.h — three speedup ladders, env-gated
-DS4_ICB_ACTIVE=1   // Pillar A — ICB record→replay (record once, dispatch many)
-DS4_HOT_EXPERT_ACTIVE=1 + DS4_HOT_EXPERT_MANIFEST=path
-                   // Pillar B — F16 cache for hot experts (margin gate per H1703)
-DS4_SPEC_ACTIVE=1  // Pillar C — Spec-decode propose+verify (retired for MTP per shift #293)
+**The `ds4_pillars.c` facade is DEAD CODE** — declared in `ds4_pillars.h`
+with `ds4_icb_init/execute/record_decode/...` API, but zero call sites in
+ds4.c / ds4_metal.m / ds4_server.c. The header advertises three pillars;
+the source file declares 14 functions; none are called from the main
+inference path.
+
+**The REAL ICB record→replay mechanisms live IN-PLACE in `ds4_metal.m`**
+as four independent opt-in pipelines:
+
+| ICB Pipeline | Env var | Status | Location |
+|--------------|---------|--------|----------|
+| route_remap (43 layers × per-token) | `DS4_ICB_ACTIVE` | wired in-place | ds4_metal.m:14717 |
+| topk_mask (2-kernel) | `DS4_ICB_TOPK_MASK` | opt-in, "measurement pending" | ds4_metal.m:5554 |
+| softplus_sqrt | `DS4_ICB_SOFTPLUS` | opt-in, "measurement pending" | ds4_metal.m:12642 |
+| route_weights_one | `DS4_ICB_WEIGHTS_ONE` | opt-in, "caller pays useResource cost" | ds4_metal.m:14590 |
+| route_finalize_one (Phase 5) | (none?) | check ds4_metal.m | — |
+
+**Fusion kernels (not ICB but related)**:
+
+| Fusion | Disable env var (default-ON) |
+|--------|------------------------------|
+| router_select_fusion | `DS4_METAL_DISABLE_ROUTER_SELECT_FUSION` |
+| routed_pair_swiglu_fusion | `DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION` |
+
+**Hot-expert F16 cache (was Pillar B)**: `ds4_hot_expert_init` has zero
+call sites in main inference. Bitmap + manifest loader sits unused.
+Pre-dequant pool NOT allocated. Margin gate per H1703 NOT wired (task #544).
+
+**Spec-decode (was Pillar C)**: retired per shift #293 (MTP net loss).
+
+**Engineering honesty**: 6 ICB phases were SHIPPED into ds4_metal.m
+in-place, not into the ds4_pillars.c facade. The facade was a
+documentation-shape proposal that was overtaken by direct in-place
+wiring in ds4_metal.m. ds4_pillars.c is harmless (no perf cost; just
+takes up build time + 8244 lines of declarations).
+
+**Operating recipe** for the ACTUAL ICB pipelines:
+```bash
+# Baseline (no ICB)
+./ds4-bench --prefill-metal-phases auto --model ds4flash.gguf ...
+
+# Enable route_remap ICB (43 layers × per-token replay)
+DS4_ICB_ACTIVE=1 ./ds4-bench --prefill-metal-phases auto ...
+
+# Enable all four ICB pipelines (caller pays useResource cost on some)
+DS4_ICB_ACTIVE=1 DS4_ICB_TOPK_MASK=1 DS4_ICB_SOFTPLUS=1 \
+DS4_ICB_WEIGHTS_ONE=1 ./ds4-bench --prefill-metal-phases auto ...
 ```
 
-**Status per pillar**:
-- **A (ICB)**: 6 phases shipped, record→replay self-tested, but the
-  cache slot validates and re-records on every layer per token —
-  the projected 15% gen lift hasn't been measured against current
-  1.83 t/s baseline.
-- **B (Hot-expert F16)**: bitmap + manifest loader shipped. Pre-dequant
-  pool NOT yet allocated. Margin gate per H1703 NOT YET wired (task #544).
-- **C (Spec-decode)**: retired in favor of MTP retirement per shift #293.
+**Measurement pending across all four** — no shipped numbers showing
+they net-improve gen rate over the 1.83 t/s baseline. Would need
+A/B comparison: same prompt, same flags except ICB env vars.
 
 **MTL4 status** (per ds4_pillars.h doc):
 - COMPUTE path productive on M1 Max (polar_dot canary: 83 ns/packet
