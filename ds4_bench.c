@@ -38,6 +38,15 @@ typedef struct {
     const char *dump_frontier_logits_dir;
     bool warm_weights;
     bool quality;
+    /* M1 STICKY HAZARD safety flags (CLAUDE.md doctrine).
+     * cpu_moe=true runs ALL routed MoE on CPU (Metal fits).
+     * prefill_metal_phases=-1 means auto (resolve from iogpu.wired_limit_mb);
+     * prefill_metal_phases=N means explicit phase count.
+     * One of these MUST be set on M1 for DS4-Flash (86.7 GB IQ2_XXS).
+     * Default 0 = unsafe path — left for backward-compat with non-DS4 models. */
+    bool cpu_moe;
+    int n_cpu_moe_layers;
+    int prefill_metal_phases;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -72,6 +81,15 @@ static void usage(FILE *fp) {
         "  -mt MODE, --mt MODE    Metal Tensor route mode: auto, on, or off.\n"
         "      Legacy alias: --mpp MODE.\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
+        "\n"
+        "M1 SAFETY (mandatory for DS4-Flash 86.7 GB IQ2_XXS on Metal):\n"
+        "  --prefill-metal-phases auto|N\n"
+        "      Phase-split Metal residency so weights don't exceed wired_limit_mb.\n"
+        "      'auto' resolves N from iogpu.wired_limit_mb. MANDATORY on M1 for\n"
+        "      DS4-Flash unless --cpu-moe is set.\n"
+        "  --cpu-moe              Run ALL routed MoE on CPU (Metal fits without).\n"
+        "  --n-cpu-moe N          Run routed MoE for N layers on CPU.\n"
+        "      Mutually exclusive with --prefill-metal-phases.\n"
         "\n"
         "Sweep:\n"
         "  --ctx-start N          First measured frontier. Default: 2048\n"
@@ -235,6 +253,22 @@ static bench_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = DS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--cpu-moe")) {
+            /* CLAUDE.md DS4 STICKY HAZARD safety flag — run ALL routed MoE on CPU. */
+            c.cpu_moe = true;
+        } else if (!strcmp(arg, "--n-cpu-moe")) {
+            c.n_cpu_moe_layers = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--prefill-metal-phases")) {
+            /* CLAUDE.md DS4 STICKY HAZARD safety flag — phase-split Metal residency.
+             * "auto" resolves N from iogpu.wired_limit_mb at runtime.
+             * MANDATORY on M1 for DS4-Flash 86.7 GB IQ2_XXS (panics 2026-05-19,
+             * 2026-05-23 were both from launches lacking this flag). */
+            const char *s = need_arg(&i, argc, argv, arg);
+            if (!strcmp(s, "auto")) {
+                c.prefill_metal_phases = -1;
+            } else {
+                c.prefill_metal_phases = parse_int(s, arg);
+            }
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
         } else if (!strcmp(arg, "-mt") || !strcmp(arg, "--mt") || !strcmp(arg, "--mpp")) {
@@ -410,6 +444,13 @@ int main(int argc, char **argv) {
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .mpp_mode = cfg.mpp_mode,
+        /* M1 STICKY HAZARD safety: pass parsed safety flags through to engine.
+         * Default 0 / false = backward-compat with non-DS4 models on non-M1.
+         * On M1 DS4-Flash launches MUST set one of these or expect kernel
+         * panic from exceeding 48-60GB Metal wired cap with 86.7GB model. */
+        .cpu_moe = cfg.cpu_moe,
+        .n_cpu_moe_layers = cfg.n_cpu_moe_layers,
+        .prefill_metal_phases = cfg.prefill_metal_phases,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
