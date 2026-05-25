@@ -1,0 +1,43 @@
+loading mlx-community/Qwen3.5-4B-MLX-4bit...
+loaded in 1.4s
+L0: DecoderLayer
+L4: DecoderLayer
+L10: DecoderLayer
+L22: DecoderLayer
+L25: DecoderLayer
+L26: DecoderLayer
+L31: DecoderLayer
+prompt: 191 tokens
+  pos=0 t=0.0s recent='Let'
+  pos=2000 t=65.8s recent='}{v_P + 2} - \\frac'
+  pos=4000 t=131.2s recent=' + 9$.\nArrival times are equal'
+  pos=6000 t=197.2s recent=' + 2$.\n$v_J = v_P'
+  pos=8000 t=262.8s recent='9$.\nThis is fixed.\nWhat if'
+  pos=10000 t=327.8s recent='The reasoning is complete.\nThe answer is '
+  pos=12000 t=390.4s recent=' will write the solution.\nThe solution is '
+finished decode in 394.3s
+
+||delta|| per layer × position:
+   pos  L 0  L 4  L10  L22  L25  L26  L31
+  2000   2.42   1.08   2.38   9.25   8.69   9.69  32.50
+  4000   2.12   1.41   1.83   9.25   7.88   9.75  34.50
+  6000   2.56   1.88   2.28   9.44   7.81   8.81  62.25
+  8000   2.25   1.89   2.17  12.94   9.50   8.50  31.00
+ 10000   2.36   1.28   2.81   6.09   5.47   6.56  35.75
+ 12000   2.30   1.21   2.56   5.69   5.56   6.53  37.50
+ 12031   2.30   1.20   2.56   5.69   5.56   6.44  37.75
+ 12062   2.30   1.20   2.56   5.69   5.59   6.47  37.75
+ 12093   2.30   1.20   2.53   5.69   5.56   6.44  37.75
+ 12120   1.94   1.14   2.64   7.25   5.44   8.06  35.50
+
+Cycle-period determinism per layer (positions 12000/12031/12062/12093):
+ layer    12000    12031    12062    12093  determinism
+  L 0       2.30     2.30     2.30     2.30  EXACT
+  L 4       1.21     1.20     1.20     1.20  max_diff=0.008
+  L10       2.56     2.56     2.56     2.53  max_diff=0.031
+  L22       5.69     5.69     5.69     5.69  EXACT
+  L25       5.56     5.56     5.59     5.56  max_diff=0.031
+  L26       6.53     6.44     6.47     6.44  max_diff=0.094
+  L31      37.50    37.75    37.75    37.75  max_diff=0.250
+
+saved multi_layer_norm_during_cycle_result.json
