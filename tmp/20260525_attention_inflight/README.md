@@ -25,17 +25,41 @@ This is the **read-first** entry. Everything else is supporting detail.
 | Garbage | distributed accumulator — individual layers project to noise; Σ projects to truth |
 | Per-token compute | 95% need L28-31 (uniform; no early-exit speedup) |
 
-## Temporal attractor (cross-precision)
+## Temporal attractor (cross-precision) — 3-AXIS COMPLETE
 
-| precision | cycle period | content | pre-cycle |
-|-----------|--------------|---------|-----------|
-| 4bit | **31 tokens** | 4-sentence rotation ("The solution is 277. The reasoning is complete. The answer is 277. I will write the solution.") | clean derivation → truth@pos 8000 → meta-comm → cycle@pos 12000 |
-| 8bit | **32 tokens** | 2-sentence rotation ("I will write the response. The solution is 277.") | derivation → hesitation → prompt-LEAK@pos 10000 → cycle@pos 12000 |
-| bf16 | (running) | TBD | TBD |
+| precision | cycle period | content | truth-in-cycle | boxed-in-cycle |
+|-----------|--------------|---------|----------------|----------------|
+| 4bit | **31 tokens** | 4-sentence rotation ("The solution is 277. The answer is 277. I will write the solution.") | YES (277) | NO |
+| 8bit | **32 tokens** | prompt-leak + numeric ("I will write the response. The solution is 277.") | YES (277) | NO |
+| bf16 | **90 tokens** | pre-truth interpretation paralysis ("If Tanya left road, she's at park. If at park, she has arrived. So must mean departure. Wait, could be interpreted as...") | **NO** | NO |
 
-**Precision-attractor bifurcation CONFIRMED**: same model, same prompt,
-different precision → different attractor. Codex H1853 prediction
-validated. Inferguard rescue cap_window structure shifts by precision.
+**Precision-attractor bifurcation CONFIRMED at 3 axes**:
+- Period: 4bit=31 → 8bit=32 (continuous +1) → bf16=90 (**discontinuous 2.8× jump**)
+- Scale: short-cycle regime (4bit/8bit) vs long-cycle regime (bf16)
+- Cognitive stage: POST-truth manifold (4bit/8bit have truth in cycle) vs PRE-truth manifold (bf16 never derives truth)
+
+**ARCHITECTURAL FINDING**: no-commit pathology is precision-INVARIANT
+(`\boxed{}` absent in all 3 cycle vocabularies). Higher precision doesn't
+escape; it actually MAKES IT WORSE on P01 — bf16 traps in interpretation
+paralysis before truth derivation completes. Inferguard rescue is
+structurally necessary at all precisions, with precision-tuned cap_window.
+
+## Layer-class codec taxonomy — 4 REGIMES (codex H1855-H1861)
+
+| layer | tensor winner | margin behavior | classification |
+|-------|---------------|-----------------|----------------|
+| **L22** | H1853 max-q | wins | **positive transfer, safe** |
+| **L25** | (max-q tensor) | **LOSES** | negative transfer (tensor lies) |
+| **L35** | H1853 max-q + case | **LOSES 5.55×** | partial transfer (case wins, margin loses) |
+| **L42** | **H1830 BASE** | gains but watchlist flips don't | base-wins (max-q regresses; positive-but-not-safe) |
+
+Codex's final live unit (H1861, after reading my precision_attractor memo):
+`(model, layer, hidden profile, routed FFN delta, readout margin band, precision/codec)`
+
+Production codec deployment requires per-layer, per-precision empirical
+validation — global "use max-quality VQB2" REFUTED. The Cartesian
+product (4 layer classes × 3 precisions = 12 cells) is the new minimum
+test surface.
 
 ## TL;DR (the load-bearing findings)
 
