@@ -132,3 +132,80 @@ narratives — the row-coverage caveat memo (commit a1ca099) flagged
 the storage concern; this memo turns it into a forced decision.
 
 Commit: this memo + brief note on the task list.
+
+## ADDENDUM 2026-05-25 evening — H1682 Amdahl correction (sharpens OOM framing)
+
+silv's prior architecture-review session (03:00 UTC, before my codec
+arc started) named the H1682 Amdahl correction:
+
+> "2-3 OOM speedup CANNOT come from swapping the matmul executor
+> alone. MTL4 ML is the dense-organ lever, not the organism. Path
+> forward requires graph deletion (fewer tokens via MTP/spec-decode,
+> fewer layers/expert calls via skip, fewer host round trips)."
+
+This sharpens the session's OOM scorecard honestly:
+
+| Component | OOM | Type |
+|-----------|-----|------|
+| Encoder MLX speedup | 1.86 | ONE-TIME tooling (not inference) |
+| Codec accuracy (VQ K=256) | 1.10 | QUALITY at substrate (not speed) |
+| "Combined 2.96 OOMs" | — | misleading aggregate per H1682 |
+
+Neither component delivers H1682's "2-3 OOM inference speedup" on
+its own:
+- Encoder speedup is **one-time tooling** (run once per corpus)
+- Codec accuracy is **quality**, not speed (substitution at same
+  compute cost gives same speed)
+- Inference speed gains from the codec would only come INDIRECTLY
+  via lower memory pressure enabling other wins (chunk-streaming,
+  cache fitting, layer skip viability, etc.)
+
+The codex H1773 chunk512 streaming gives 8.61× resident memory
+reduction at 1.173× slowdown — that's the actual memory-axis win
+that PAIRS with my codec quality. My codec contributes to the
+memory frontier (4.3 GB VQ vs 14 GB polar p32_m8 vs 85 GB FP4)
+which enables H1773's streaming patterns to fit more in residency.
+
+## Sharpened honest claim
+
+My session delivered:
+- **Codec QUALITY improvement** (1.10 OOMs, VQ K=256)
+- **Encoder TOOLING speedup** (1.86 OOMs, MLX-parallel encoder)
+
+Both as enablers for the H1682-compliant deletion-based 2-3 OOM
+inference frontier — NOT as standalone inference-speed contributors.
+
+The complete deployment frontier (per silv's H1682 + codex H1773 +
+my codec arc) is:
+
+```
+Layer                    Owner          Contribution
+-------------------      -----------    -----------------------
+Graph deletion           silv / codex   2-3 OOM inference speedup
+  MTP/spec-decode                        (the H1682-compliant lever)
+  Layer/expert skip                      
+  Host round-trip cut                    
+Memory streaming         codex H1773    7-8× resident reduction
+  Chunk512 hidden                        (enables fitting under
+  Bitpacked phase                         resource caps)
+Substrate codec          my session     6× lower codec error +
+  VQ K=256 (recommended)                 50% smaller weights
+  Polar p32_m8 (deployable)              (enables tighter memory
+Encoder tooling          my session      profile)
+  MLX-parallel                          1.86 OOM faster corpus
+                                         rebuild (one-time)
+Engineering gate         my session     B-2.3c stub wired
+                                        (body needs silv decision)
+Rescue layer             silv           AIME hold-rate restoration
+  inferguard.aime_rescue                 (codec near-miss catches)
+```
+
+Each layer is necessary but not sufficient. silv's full 2-3 OOM
+deployment requires combining at least the graph-deletion lever
+(H1682) with the memory streaming (H1773) and the codec quality
+(my session). The codec body shipping is a prerequisite for
+combining at the resident-memory layer.
+
+silv decision remains: A.1/A.2/A.3 for codec body. The deeper
+strategic frame is now H1682-aware: codec deployment is necessary
+substrate for the inference-speedup frontier, not the speedup itself.
