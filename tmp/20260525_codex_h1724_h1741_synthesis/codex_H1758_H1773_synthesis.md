@@ -128,7 +128,38 @@ The codex arc is shipping fast; staying caught up on synthesis is
 itself valuable session work that doesn't depend on silv runtime or
 disk approval.
 
-## Addendum: H1774 — tinygrad route packet transplant (newest)
+## Addendum: H1775 — MTL4 non-divisible dispatch silently corrupts (NEWEST)
+
+H1775 shipped right after H1774. MTL4 consumed the H1774 raw route
+packet directly and emitted host-exact checksums over 864 cases:
+u32_exact=true, f32_max_abs=0, resident 229,376 bytes, GPU 16.9µs.
+
+**First clean rerun exposed a real bug**: non-divisible dispatch
+wrote extra threads past the valid case count and corrupted float
+outputs. Fix: case-count buffer + `gid >= cases` guard inside the
+kernel.
+
+**Shift: block size is not harmless scaffolding.** Packet consumers
+need validity guards OR exact dispatch dimensions; otherwise a
+speed-looking kernel silently corrupts state.
+
+**Direct relevance to B-2.3c body**: when the polar dispatcher body
+lands (after silv resolves A.1/A.2/A.3), it will dispatch the H1735
+kernel with `route_pairs = n_tokens × DS4_N_EXPERT_USED = n_tokens × 6`.
+For n_tokens=10, that's 60 route_pairs. If the kernel's threadgroup
+geometry doesn't exactly match (e.g., dispatches 64 threadgroups
+because of alignment), threadgroups 60-63 would corrupt output.
+
+Mitigation must ship with the body:
+- Either pass `cases` (or `n_tokens × 6`) as a kernel param + add
+  `if (tg.x >= cases) return;` guard at threadgroup start
+- OR use precisely-sized dispatch with `MTLSizeMake(n_tokens * 6, 1, 1)`
+
+The current H1735 canary uses `route_pairs=1` so this bug class
+hasn't triggered. The dispatcher body must add the guard from day
+one.
+
+## Addendum: H1774 — tinygrad route packet transplant
 
 H1774 (just shipped) emitted a deployable DS4 MoE route packet on the
 live METAL path: top20 ids/logits, top6 weights, entropy, kth-margin,
