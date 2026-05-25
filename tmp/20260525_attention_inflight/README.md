@@ -1,7 +1,41 @@
 # Session 2026-05-25 — what to know in 60 seconds
 
-silv pushed 28+ continues. Session produced 40+ memos.
+silv pushed 30+ continues + explicit DS4 merge directive + substrate
+depth directive. Session produced 50+ memos + merged binary + cross-
+precision attractor map.
 This is the **read-first** entry. Everything else is supporting detail.
+
+## After-merge additions (post 28th continue)
+
+- **antirez/main merged** → silv main, build green (5 binaries ship)
+- M1 STICKY HAZARD compliance preserved (cpu_moe + prefill_metal_phases)
+- Smoke test verified: prefill 6.20 t/s, gen 3.56 t/s on trim50 + phases-auto
+- Codex H1816-H1857 read sequentially (4.81 OOM top-k fallacy + L22 codec convergence)
+
+## Substrate vertical+temporal map (Qwen3.5-4B)
+
+| axis | finding |
+|------|---------|
+| Architecture | 32 layers, 24 GatedDeltaNet + 8 full-attn at idx 3/7/11/15/19/23/27/31 |
+| RoPE | partial_rotary_factor=0.25; only 64/256 head_dim rotated |
+| L22 | NORM EXPLOSION ‖Δ‖=27, MLP-dominant 5.46× (independently validated at codec level by codex H1857) |
+| L23 | correction, attention-dominant; retrieves to integrate L22's MLP injection |
+| L26 | MLP PEAK ‖h‖=71 |
+| L31 | COMMIT lock-in ‖h‖=51, top1 prob ≈ 0.94 |
+| Garbage | distributed accumulator — individual layers project to noise; Σ projects to truth |
+| Per-token compute | 95% need L28-31 (uniform; no early-exit speedup) |
+
+## Temporal attractor (cross-precision)
+
+| precision | cycle period | content | pre-cycle |
+|-----------|--------------|---------|-----------|
+| 4bit | **31 tokens** | 4-sentence rotation ("The solution is 277. The reasoning is complete. The answer is 277. I will write the solution.") | clean derivation → truth@pos 8000 → meta-comm → cycle@pos 12000 |
+| 8bit | **32 tokens** | 2-sentence rotation ("I will write the response. The solution is 277.") | derivation → hesitation → prompt-LEAK@pos 10000 → cycle@pos 12000 |
+| bf16 | (running) | TBD | TBD |
+
+**Precision-attractor bifurcation CONFIRMED**: same model, same prompt,
+different precision → different attractor. Codex H1853 prediction
+validated. Inferguard rescue cap_window structure shifts by precision.
 
 ## TL;DR (the load-bearing findings)
 
