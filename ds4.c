@@ -11533,14 +11533,28 @@ static bool metal_graph_encode_decode_layer(
   * ds4_metal_vqb2_fp16_dispatch (Metal-side complex-pair FP16 kernel
   * via DS4_VQB2_FP16_PATH=legacy|mtl4|icb).
   *
-  * CODEC CAVEAT — the existing FP16 kernel is polar-codec: reads weights
-  * as [n_rows][n_pairs][2] complex pairs, expects input formatted as
-  * n_rows complex pairs (re,im). DS4 routed FFN uses vanilla matvec,
-  * NOT complex-pair multiplication. Until codec alignment ships (next
-  * iteration: either change hot-store encoding to vanilla row-major
-  * FP16, or add a Metal kernel that consumes polar pairs from a vanilla
-  * input via re-interpretation), this path produces numerically WRONG
-  * output. Default off; opt-in for codec-aligned testing. */
+  * TWO CAVEATS (both must resolve before this path produces correct + fast):
+  *
+  * (1) CODEC mismatch: existing FP16 kernel is polar-codec — reads
+  *     weights as [n_rows][n_pairs][2] complex pairs, expects input
+  *     formatted as n_rows complex pairs (re,im). DS4 routed FFN is
+  *     vanilla matvec, NOT complex-pair multiplication.
+  *
+  * (2) GPU↔CPU SYNC: this hook reads tensor_contents() of GPU tensors
+  *     (router_selected, router_weights, ffn_norm) mid-batch. Those
+  *     tensors were written by kernels queued earlier in the SAME
+  *     batch (g_batch_cb still pending). On M1 unified memory the
+  *     CPU sees stale data until the batch commits + waits. The
+  *     CPU-MoE branch (line 11463) calls ds4_gpu_end_commands() FIRST
+  *     to sync; this Metal-MoE branch does not. To make this hook
+  *     produce correct values today, either (a) add ds4_gpu_end_commands()
+  *     before the reads (slow — kills GPU batching benefit), or (b)
+  *     refactor ds4_metal_vqb2_fp16_dispatch to take GPU tensor
+  *     handles and dispatch via the shared batch (proper fix).
+  *
+  * Until (1)+(2) resolve, this path produces numerically wrong output.
+  * Wiring is in place so the next-iteration kernel + dispatcher refactor
+  * have a stable hook site. Default off; opt-in for staging only. */
  static int hot_metal_env_checked = 0;
  static int hot_metal_enabled = 0;
  if (!hot_metal_env_checked) {
