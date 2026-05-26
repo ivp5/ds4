@@ -1144,6 +1144,139 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     (void)tiitg;
 }
 
+
+/* silv 2026-05-27 — Codec alignment for predequant FP16 hot-store.
+ *
+ * Mirror of kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32 but operates on
+ * VANILLA ROW-MAJOR FP16 weights (no IQ2_XXS dequant). Used when the
+ * hot-store has pre-decoded FP16 tiles for the selected experts.
+ *
+ * Layout:
+ *   src0_gate, src0_up: device half * — [n_experts, n_out_rows, n_in_cols] row-major
+ *   src1:               device float * — [n_tokens, n_in_cols] activation
+ *   dst_gate, dst_up:   device float * — [n_tokens, n_out_rows]
+ *   dst_mid:            device float * — [n_tokens × N_EXPERT_USED, n_out_rows]
+ *
+ * args.nb01 = bytes per row of one expert's gate (= n_in_cols * sizeof(half))
+ * args.nb02 = bytes per expert tile (= n_out_rows * n_in_cols * sizeof(half))
+ * args.ne00 = n_in_cols
+ *
+ * One simdgroup processes N_R0 output rows × all n_in_cols sequentially.
+ * tiisg slices the n_in_cols dimension into 32 chunks per row.
+ */
+#ifndef N_R0_FP16
+#define N_R0_FP16 4
+#endif
+
+kernel void kernel_mul_mv_id_fp16_pair_swiglu_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx  = tgpig.z % args.nei0;
+    tgpig.z = 0;
+
+    /* Early-exit on route_weight == 0 (matches IQ2_XXS kernel). */
+    {
+        device const float *rw_check =
+            (device const float *)(weights + (uint64_t)idx * act.weight_stride);
+        if (rw_check[0] == 0.0f) {
+            return;
+        }
+    }
+
+    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+
+    const int n_in = args.ne00;
+    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_FP16;
+
+    /* Pointer to this expert's weight tiles (row-major, half precision). */
+    device const half *Wg = (device const half *)(src0_gate + (uint64_t)i02 * args.nb02);
+    device const half *Wu = (device const half *)(src0_up   + (uint64_t)i02 * args.nb02);
+    /* Activation row for this token. */
+    device const float *y =
+        (device const float *)(src1 + i11 * args.nb11 + i12 * args.nb12);
+
+    /* Per-row dot accumulators. */
+    float sumg[N_R0_FP16] = {0.f};
+    float sumu[N_R0_FP16] = {0.f};
+
+    /* Each lane in the simdgroup handles 1/32 of the in-dim. */
+    /* Stride 32 across in_dim cols, accumulate, then simd_sum. */
+    const int lanes = 32;
+    for (int col = tiisg; col < n_in; col += lanes) {
+        const float yv = y[col];
+        for (int row = 0; row < N_R0_FP16; row++) {
+            const int g_row = first_row + row;
+            if (g_row >= args.ne0) break;
+            /* Row-major: W[g_row, col] = base + g_row * n_in + col */
+            const uint64_t off = (uint64_t)g_row * (uint64_t)n_in + (uint64_t)col;
+            sumg[row] += yv * (float)Wg[off];
+            sumu[row] += yv * (float)Wu[off];
+        }
+    }
+
+    device float *dst_gate_f32 =
+        (device float *)dst_gate + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
+    device float *dst_up_f32 =
+        (device float *)dst_up + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
+    device float *dst_mid_f32 =
+        (device float *)(dst_mid + (uint64_t)idx * act.mid_row_stride);
+    device const float *route_w =
+        (device const float *)(weights + (uint64_t)idx * act.weight_stride);
+
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+    for (int row = 0; row < N_R0_FP16 && first_row + row < args.ne0; ++row) {
+        const float sum_gate = simd_sum(sumg[row]);
+        const float sum_up   = simd_sum(sumu[row]);
+        if (tiisg == 0) {
+            const uint out_row = first_row + row;
+            const float gate = sum_gate;  /* no 0.25× factor — FP16 has no implicit codec scale */
+            const float up = sum_up;
+            float g = gate, u = up;
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            dst_gate_f32[out_row] = gate;
+            dst_up_f32[out_row] = up;
+            const float silu = g / (1.0f + exp(-g));
+            dst_mid_f32[out_row] = silu * u * route_weight;
+        }
+    }
+
+    (void)tiitg; (void)shmem;
+}
+
+
+/* silv 2026-05-27 — simdgroup_multiply matmul on FP16: NOT applicable to
+ * single-token gen (matvec). simdgroup_matrix is mat×mat (8×8 × 8×8 → 8×8).
+ * For single-token gen, scalar dot in kernel_mul_mv_id_fp16_pair_swiglu_f32
+ * above is the correct primitive. simdgroup_multiply gives ~8× speedup
+ * only when token-batch ≥ 8 (i.e., PREFILL with batched activations).
+ *
+ * For DS4 trim50 Metal gen (batch=1), the FP16 kernel above is the
+ * deployable form. Prefill could benefit from simdgroup_matrix at
+ * batch ≥ 8 — a separate kernel for batched MoE routed-FFN dispatch,
+ * not implemented this turn (engineering scoped to follow-up).
+ */
+
 kernel void kernel_mul_mv_id_q4_K_pair_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0_gate,

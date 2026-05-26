@@ -76,6 +76,8 @@ static id<MTLComputePipelineState> g_bin_div_row_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
+/* silv 2026-05-27 — codec-aligned vanilla FP16 pair_swiglu (gated by DS4_HOT_FP16_KERNEL). */
+static id<MTLComputePipelineState> g_moe_mul_mv_id_fp16_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q2_k_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q2_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pipeline;
@@ -3688,6 +3690,29 @@ int ds4_gpu_init(void) {
  g_queue = nil;
  g_device = nil;
  return 0;
+ }
+
+ /* silv 2026-05-27 — codec alignment: vanilla row-major FP16 pair_swiglu kernel.
+  * Mirror of IQ2_XXS pair_swiglu, but reads FP16 row-major (no codec dequant).
+  * Used when hot-store has pre-decoded FP16 tiles for the selected experts.
+  * Best-effort: fail soft if compile fails (Metal source might not have the
+  * kernel yet, e.g. on older binaries). */
+ error = nil;
+ fn = [library newFunctionWithName:@"kernel_mul_mv_id_fp16_pair_swiglu_f32"
+ constantValues:moe_mv_id_constants
+ error:&error];
+ if (fn) {
+ g_moe_mul_mv_id_fp16_pair_swiglu_pipeline =
+ [g_device newComputePipelineStateWithFunction:fn error:&error];
+ if (!g_moe_mul_mv_id_fp16_pair_swiglu_pipeline) {
+ fprintf(stderr, "ds4: kernel_mul_mv_id_fp16_pair_swiglu_f32 pipeline failed: %s "
+                 "(non-fatal; IQ2_XXS path will still run)\n",
+ [[error localizedDescription] UTF8String]);
+ g_moe_mul_mv_id_fp16_pair_swiglu_pipeline = nil;
+ }
+ } else {
+ /* Kernel not present in this build; silent — FP16 path will be a no-op. */
+ g_moe_mul_mv_id_fp16_pair_swiglu_pipeline = nil;
  }
 
  error = nil;
