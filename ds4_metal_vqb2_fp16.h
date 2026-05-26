@@ -103,6 +103,13 @@ int ds4_metal_vqb2_fp16_dispatch_mtl4(struct ds4_hot_expert_store *store,
  * snapshots to get per-window deltas. */
 void ds4_metal_vqb2_fp16_icb_stats(uint64_t *hits, uint64_t *misses, uint64_t *evicts);
 
+/* silv 2026-05-27 — accessor for the hot-store MTLBuffer (wrapping the
+ * FP16 heap via newBufferWithBytesNoCopy). Returns NULL if bind_store
+ * has not been called yet. Used by ds4_metal.m to dispatch the simdgroup
+ * mat-mat kernel against the hot-store. Returned as void* to keep this
+ * header ObjC-free; actual type is id<MTLBuffer> in ObjC TUs. */
+void *ds4_metal_vqb2_fp16_get_hot_buffer(void);
+
 /* GPU-handle variant — silv 2026-05-26 directive.
  *
  * The CPU-pointer dispatch surface above (legacy/icb/mtl4) creates

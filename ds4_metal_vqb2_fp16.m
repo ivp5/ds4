@@ -205,6 +205,18 @@ void ds4_metal_vqb2_fp16_icb_stats(uint64_t *hits, uint64_t *misses, uint64_t *e
 #endif
 }
 
+/* silv 2026-05-27 — hot-store MTLBuffer accessor. Returns the buffer
+ * wrapped via newBufferWithBytesNoCopy in ds4_metal_vqb2_fp16_bind_store,
+ * cast to void* to keep the header ObjC-free. Caller in ds4_metal.m casts
+ * back to id<MTLBuffer>. Returns NULL if bind_store hasn't run. */
+void *ds4_metal_vqb2_fp16_get_hot_buffer(void) {
+#ifdef __APPLE__
+    return (__bridge void *)s_hot_store_buffer;
+#else
+    return NULL;
+#endif
+}
+
 #ifdef __APPLE__
 /* ==========================================================================
  * Journal hooks — weak default stubs let non-journal build link clean.

@@ -13224,6 +13224,75 @@ static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
  return 1;
 }
 
+/* silv 2026-05-27 — simdgroup mat-mat encoder for FP16 routed-FFN.
+ *
+ * Dispatches kernel_mul_mm_id_fp16_pair_swiglu_f32 with grid
+ * (n_ffn_tiles, n_token_tiles, pairs). Each threadgroup computes one
+ * 8x8 output tile via simdgroup_multiply_accumulate.
+ *
+ * Buffer contract:
+ *   - src0_hot: the hot-store FP16 heap (bound via newBufferWithBytesNoCopy)
+ *   - gate_base_off / up_base_off: byte offset into hot-store where each
+ *     expert's gate/up tile starts (for expert 0 of the active layer)
+ *   - args.nb02: stride between consecutive experts within hot-store
+ *     (= bytes_per_gate_tile + bytes_per_up_tile + bytes_per_down_tile,
+ *     since pin function writes [g0,u0,d0,g1,u1,d1,...] consecutively)
+ *   - args.ne00 = expert_in_dim (K dim, the embed_dim)
+ *   - args.ne0  = expert_mid_dim (output FFN dim)
+ *   - args.ne11 = n_tokens (batch size)
+ *   - args.nei0 × args.nei1 = pairs (the same as the matvec encoder)
+ *
+ * Threadgroup memory: 3×64 halves (A + Bg + Bu tiles) + 2×64 floats
+ * (Cg + Cu tiles staged for SwiGLU). Max = 512 bytes; use 1024 for
+ * safety alignment.
+ */
+static int ds4_gpu_encode_mul_mm_id_fp16_pair_swiglu(
+ id<MTLCommandBuffer> cb,
+ id<MTLComputePipelineState> pipeline,
+ const ds4_gpu_mul_mv_id_args *args,
+ const ds4_gpu_dsv4_moe_swiglu_weight_args *act,
+ id<MTLBuffer> src0_hot,
+ NSUInteger gate_base_off,
+ NSUInteger up_base_off,
+ id<MTLBuffer> src1,
+ NSUInteger src1_off,
+ id<MTLBuffer> dst_mid,
+ NSUInteger dst_mid_off,
+ id<MTLBuffer> ids,
+ NSUInteger ids_off,
+ id<MTLBuffer> weights,
+ NSUInteger weights_off) {
+ if (!cb || !pipeline || !args || !act ||
+     !src0_hot || !src1 || !dst_mid || !ids || !weights ||
+     args->ne00 <= 0 || args->ne0 <= 0 || args->ne11 <= 0 ||
+     args->nei0 <= 0 || args->nei1 <= 0) {
+  return 0;
+ }
+
+ const NSUInteger n_ffn_tiles = ((NSUInteger)args->ne0 + 7u) / 8u;
+ const NSUInteger n_token_tiles = ((NSUInteger)args->ne11 + 7u) / 8u;
+ const NSUInteger pairs = (NSUInteger)args->nei0 * (NSUInteger)args->nei1;
+ const NSUInteger tg_bytes = 1024;  /* threadgroup mem: 3×64 halves + 2×64 floats + slack */
+
+ id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+ [enc setComputePipelineState:pipeline];
+ [enc setBytes:args length:sizeof(*args) atIndex:0];
+ [enc setBytes:act length:sizeof(*act) atIndex:1];
+ /* Both gate and up read from the same hot-store buffer; different base offsets. */
+ [enc setBuffer:src0_hot offset:gate_base_off atIndex:2];
+ [enc setBuffer:src0_hot offset:up_base_off   atIndex:3];
+ [enc setBuffer:src1     offset:src1_off      atIndex:4];
+ [enc setBuffer:dst_mid  offset:dst_mid_off   atIndex:5];
+ [enc setBuffer:ids      offset:ids_off       atIndex:6];
+ [enc setBuffer:weights  offset:weights_off   atIndex:7];
+ [enc setThreadgroupMemoryLength:tg_bytes atIndex:0];
+
+ [enc dispatchThreadgroups:MTLSizeMake(n_ffn_tiles, n_token_tiles, pairs)
+       threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+ ds4_gpu_end_compute_encoder(cb, enc);
+ return 1;
+}
+
 static int ds4_gpu_encode_mul_mv_id_sum6(
  id<MTLCommandBuffer> cb,
  id<MTLComputePipelineState> pipeline,
