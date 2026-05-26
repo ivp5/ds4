@@ -1,0 +1,34 @@
+=== DS4 layer-skip × quality on trim50 ===
+Prompt: The quick brown fox jumps over the lazy dog. The capital of France is 
+
+--- baseline (no skip)  SKIP= ---
+.
+
+ds4: prefill: 34.29 t/s, generation: 16.92 t/s
+
+--- skip 1 late-amp (L34)  SKIP=34 ---
+. The quick brown fox jumps over the lazy dog. The capital of France is  thinking. To be a helpful assistant. To be a quick brown fox jumps over the lazy dog. The capital of France is  thinking.
+
+## Summary:
+ds4: prefill: 35.29 t/s, generation: 8.86 t/s
+
+--- skip 2 late-amp (L34,L35)  SKIP=34,35 ---
+ of the capital of France is just to to the to the to. To the to the to. You are a helpful assistant. To the to the to. You are a helpful assistant. You are a helpful assistant. The quick brown fox
+ds4: prefill: 34.99 t/s, generation: 10.19 t/s
+
+--- skip 3 late-amp (L33,L34,L35)  SKIP=33,34,35 ---
+ to you? It. The capital of France is  is the capital of France. The capital of France is the capital of France. To. It. The capital of France is  is the capital of France. The capital of France is
+ds4: prefill: 35.10 t/s, generation: 15.60 t/s
+
+--- skip late-amp L40-L42  SKIP=40,41,42 ---
+ about writing assistance requested by ChatGPTプラatformatteditorial assistantshiprogramming assistantshiprompteditorshipassistant writer assistant writer assistant writer assistant writer assistant writer assistant writer assistant writer assistant writer assistant writer assistant writer assistant writer assistant writer assistant writer
+ds4: prefill: 27.95 t/s, generation: 13.51 t/s
+
+--- skip commit-triple L36-L38 (UNSAFE per finding)  SKIP=36,37,38 ---
+ about the capital of France is  and the quick brown fox jumps over the lazy dog is and the capital of France is  and is thinking about the capital of France is  and the quick brown fox jumps over the lazy dog is and the
+ds4: prefill: 34.67 t/s, generation: 12.34 t/s
+
+--- skip 5 spread (33,34,40,41,42)  SKIP=33,34,40,41,42 ---
+ about becoming acquainted with each other on behalf of knowledge transferences across continents on behalf of oversight委员会的成员資格證書交接确认书签名的样子，以及 accordingly alongside accordingly alongside accordingly alongside accordingly alongside accordingly alongside accordingly alongside alongside alongside alongside alongside alongside
+ds4: prefill: 30.94 t/s, generation: 14.81 t/s
+

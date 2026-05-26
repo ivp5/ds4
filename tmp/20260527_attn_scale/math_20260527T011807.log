@@ -1,0 +1,117 @@
+
+###################
+PROMPT: What is 2+2? Answer with just the number: 
+###################
+
+--- scale=1.0 ---
+ds4: DS4_ATTN_SCALE_MULT=1.000 — attention temperature default (× of default 1/sqrt(head_dim))
+ "What is 2+2?" with "just the number" to answer with "the number" to "the
+
+--- scale=0.98 ---
+ds4: DS4_ATTN_SCALE_MULT=0.980 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+: "What is 2+2? Answer with just the number": a simple answer.
+
+Why 2+2
+
+--- scale=0.95 ---
+ds4: DS4_ATTN_SCALE_MULT=0.950 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+: You are a helpful assistant to provide the answer for the question. To answer the question, you need to be helpful
+
+--- scale=0.9 ---
+ds4: DS4_ATTN_SCALE_MULT=0.900 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+: to answer with just the number.
+
+What is 2+2? Answer with just the number: "to answer
+
+--- scale=0.8 ---
+
+Now, 2 is 2. It is 2.
+
+2 is a number of 2. It is
+
+--- scale=0.7 ---
+ds4: DS4_ATTN_SCALE_MULT=0.700 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+ "What is 2+2?" What is 2? Answer with just the number: "What is 2
+
+--- scale=0.5 ---
+ds4: DS4_ATTN_SCALE_MULT=0.500 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+ to a number.
+
+ answer is number? number?  number? is a number is answer? is number? number is
+
+###################
+PROMPT: Compute 15 * 7. Show only the result: 
+###################
+
+--- scale=1.0 ---
+ds4: DS4_ATTN_SCALE_MULT=1.000 — attention temperature default (× of default 1/sqrt(head_dim))
+ that it's not a result for "Compute 15 * 7. Show only the result"
+
+## "Compute 
+
+--- scale=0.98 ---
+ds4: DS4_ATTN_SCALE_MULT=0.980 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+ like 15 * 7. Compute 15 * 7. Show only the result. I am a helper assistant
+
+--- scale=0.95 ---
+ds4: DS4_ATTN_SCALE_MULT=0.950 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+ "the result" is 15.7, and 7? Actually 15 is 7? Yes the answer
+
+--- scale=0.9 ---
+ds4: DS4_ATTN_SCALE_MULT=0.900 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+.
+
+
+--- scale=0.8 ---
+ds4: DS4_ATTN_SCALE_MULT=0.800 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+ that 15 7 is 7? To compute 15 * 7. Show only the result. You are
+
+--- scale=0.7 ---
+ds4: DS4_ATTN_SCALE_MULT=0.700 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+ to compute 15 * 7. You are a helpful assistant. You are a helpful assistant. You are a helpful
+
+--- scale=0.5 ---
+ds4: DS4_ATTN_SCALE_MULT=0.500 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+ that. What? This. The. The.
+
+ The. The. The. The. The. The. The.
+
+###################
+PROMPT: Solve: 100 - 37 = 
+###################
+
+--- scale=1.0 ---
+ds4: DS4_ATTN_SCALE_MULT=1.000 — attention temperature default (× of default 1/sqrt(head_dim))
+: Solve: 100 - 37 = 
+
+--- scale=0.98 ---
+
+The prompt: Solve: 100 - 37 = thinking
+
+I
+
+--- scale=0.95 ---
+ds4: DS4_ATTN_SCALE_MULT=0.950 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+, given the problem "solve: 100 - 37" meaning to find a solution to a given problem.
+
+The
+
+--- scale=0.9 ---
+ds4: DS4_ATTN_SCALE_MULT=0.900 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+: "I think" = 1. "I think" is a helper. "I think" is a helper
+
+--- scale=0.8 ---
+
+Given a problem, you want a solution.
+
+To solve: 
+
+--- scale=0.7 ---
+ds4: DS4_ATTN_SCALE_MULT=0.700 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+  - Solve: 100 - 37 = 37 to be "37" = 37 to be "37
+
+--- scale=0.5 ---
+
+To be.  to be
+
+Solve: 100 - 37 =

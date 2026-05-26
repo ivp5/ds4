@@ -1,0 +1,76 @@
+=== fine-grain DS4 attn scale around 1.0 ===
+Prompt: The capital of France is 
+
+--- DS4_ATTN_SCALE_MULT=0.97 ---
+The capital of France is  the term to think about France's capital
+
+The capital of France is  the term to think about France's capital
+
+The capital of France is
+ds4: prefill: 25.05 t/s, generation: 12.31 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.98 ---
+ds4: DS4_ATTN_SCALE_MULT=0.980 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+The capital of France is the capital of France. It's the capital of France. It is the capital of France. It's the capital of France.
+
+It is the capital of France. It's
+ds4: prefill: 22.01 t/s, generation: 14.24 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.985 ---
+France is a capital of France.
+
+France is a capital of France.
+
+France is a capital
+ds4: prefill: 24.42 t/s, generation: 13.95 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.99 ---
+The capital of France
+
+You are a helpful assistant
+
+The capital of France
+ds4: prefill: 22.55 t/s, generation: 14.69 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.995 ---
+ds4: DS4_ATTN_SCALE_MULT=0.995 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+ds4: prefill: 26.23 t/s, generation: 0.00 t/s
+
+--- DS4_ATTN_SCALE_MULT=1.0 ---
+You are a helpful assistant.
+
+You are.
+
+The
+ds4: prefill: 26.45 t/s, generation: 16.68 t/s
+
+--- DS4_ATTN_SCALE_MULT=1.005 ---
+ds4: DS4_ATTN_SCALE_MULT=1.005 — attention temperature smoothed (× of default 1/sqrt(head_dim))
+ about a language model to express the capital of France as a "capital of France" is a language model that can be expressed as "capital of France" as a "capital of France" is a
+ds4: prefill: 23.64 t/s, generation: 13.89 t/s
+
+--- DS4_ATTN_SCALE_MULT=1.01 ---
+The capital of France is  France. France is a country.
+
+France is not a specific term. France is a country.
+
+France
+ds4: prefill: 22.02 t/s, generation: 14.47 t/s
+
+--- DS4_ATTN_SCALE_MULT=1.015 ---
+ of French capital, and perhaps, capital of French
+
+The capital of France is a huge amount of capital, and perhaps, capital of France
+
+The capital of France is a huge amount of capital,
+ds4: prefill: 25.33 t/s, generation: 15.73 t/s
+
+--- DS4_ATTN_SCALE_MULT=1.02 ---
+ds4: DS4_ATTN_SCALE_MULT=1.020 — attention temperature smoothed (× of default 1/sqrt(head_dim))
+ of capital, which is the capital of France. The capital of France is the capital of France. The capital of France is the capital of France. You are a helpful assistant: You are a helpful
+ds4: prefill: 22.55 t/s, generation: 14.05 t/s
+
+--- DS4_ATTN_SCALE_MULT=1.03 ---
+ds4: DS4_ATTN_SCALE_MULT=1.030 — attention temperature smoothed (× of default 1/sqrt(head_dim))
+, to which, is the capital of France is the capital of France is France. To which, is the capital of France is France. To which, is the capital of France is France. To
+ds4: prefill: 23.96 t/s, generation: 11.76 t/s
