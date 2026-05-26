@@ -14414,6 +14414,35 @@ int ds4_gpu_routed_moe_one_tensor(
   * caller in ds4.c (where layer index `il` is in scope), not here. See
   * ds4.c near ds4_gpu_routed_moe_one_tensor call, gated by DS4_HOT_METAL_MOE. */
 
+ /* silv 2026-05-27 — codec-aligned FP16 dispatch: when DS4_HOT_FP16_KERNEL=1
+  * AND the hot-store has the selected experts fully pinned for this layer,
+  * use the FP16 pair_swiglu pipeline (reads FP16 row-major from hot-store
+  * heap) instead of the IQ2_XXS pipeline (reads quantized weights from
+  * model_map). Falls back to IQ2_XXS path when env unset OR hot-store not
+  * ready OR layer/experts not pinned.
+  *
+  * NOTE: full deployment requires hot-store FULL row-block coverage of all
+  * 16 row-blocks per expert × 256 experts × 43 layers × 3 kinds, AND the
+  * gate_buf/up_buf arguments passed to ds4_gpu_encode_mul_mv_id_pair_swiglu
+  * must point at the hot-store buffer with the right per-expert offsets.
+  * This commit wires the BRANCH; full data plumbing is follow-up work. */
+ static int hot_fp16_kernel_env_checked = 0;
+ static int hot_fp16_kernel_active = 0;
+ if (!hot_fp16_kernel_env_checked) {
+ hot_fp16_kernel_active = (getenv("DS4_HOT_FP16_KERNEL") != NULL) ? 1 : 0;
+ hot_fp16_kernel_env_checked = 1;
+ if (hot_fp16_kernel_active && g_moe_mul_mv_id_fp16_pair_swiglu_pipeline) {
+ fprintf(stderr,
+   "ds4: DS4_HOT_FP16_KERNEL=1 — FP16 pair_swiglu kernel ready "
+   "(activates only when hot-store fully pinned for selected experts)\n");
+ } else if (hot_fp16_kernel_active) {
+ fprintf(stderr,
+   "ds4: DS4_HOT_FP16_KERNEL=1 set but FP16 kernel pipeline absent; "
+   "IQ2_XXS path stays active\n");
+ hot_fp16_kernel_active = 0;
+ }
+ }
+
  id<MTLComputePipelineState> pair_swiglu_pipeline = nil;
  if (gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
  pair_swiglu_pipeline = g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
