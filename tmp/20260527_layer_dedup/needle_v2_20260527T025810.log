@@ -1,0 +1,47 @@
+TS=20260527T025810  Needle='8217'
+
+=== FRONT (needle at pos ~5) ===
+ds4: Metal model views created in 49.225 ms, residency requested in 678.614 ms, warmup 2.532 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.043 ms, warmup -0.000 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to find the account number. The user said "IMPORTANT FACT: the account number is 8217." Then later they asked "What is the account number? The number is". So the answer is 8217.
+ds4: prefill: 5.04 t/s, generation: 1.98 t/s
+
+=== MIDDLE (needle at pos ~55) ===
+ds4: Metal model views created in 65.116 ms, residency requested in 544.531 ms, warmup 0.987 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.028 ms, warmup 0.000 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to find the account number. The user said "IMPORTANT FACT: the account number is 8217." Then later asked "What is the account number? The number is". So the answer is 8217.
+ds4: prefill: 4.77 t/s, generation: 1.96 t/s
+
+=== END (needle at pos ~110) ===
+ds4: Metal model views created in 59.595 ms, residency requested in 566.806 ms, warmup 0.668 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.022 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to find the account number from the text. The user says: "IMPORTANT FACT: the account number is 8217. What is the account number? The number is" So the account number is 8217.
+ds4: prefill: 4.77 t/s, generation: 1.94 t/s
+
+=== SHORT (no filler) ===
+ds4: Metal residency requested in 0.020 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to answer the question: "IMPORTANT FACT: the account number is 8217. What is the account number? The number is" So the answer is simply 8217.
+The account number is 8217
+ds4: prefill: 0.90 t/s, generation: 2.02 t/s
+
+=== NO-NEEDLE control ===
+ds4: Metal model views created in 67.754 ms, residency requested in 601.899 ms, warmup 0.576 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.022 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to find the account number mentioned in the text. The user's message ends with "What is the account number? The number is" and then nothing else. But the text provided is about Roman aqueducts and modern bridges.
+ds4: prefill: 4.37 t/s, generation: 1.75 t/s
+

@@ -6039,6 +6039,38 @@ static float sigmoid_stable(float x) {
  }
 }
 
+/* DS4_KV_MASK_RANGE="lo-hi": at gen-time attention, treat cache rows
+ * lo..hi (inclusive) as if they don't exist (score = -INFINITY → softmax
+ * weight ≈ 0). Tests middle-cache-position disposability — silv 2026-05-27.
+ * Init-on-first-use, cached. */
+static int ds4_kv_mask_init = 0;
+static int ds4_kv_mask_lo = -1, ds4_kv_mask_hi = -1;
+
+static void ds4_kv_mask_init_from_env(void) {
+ ds4_kv_mask_lo = -1; ds4_kv_mask_hi = -1;
+ const char *e = getenv("DS4_KV_MASK_RANGE");
+ if (e && e[0]) {
+  char *dash = strchr((char*)e, '-');
+  if (dash) {
+   ds4_kv_mask_lo = atoi(e);
+   ds4_kv_mask_hi = atoi(dash + 1);
+   if (ds4_kv_mask_lo < 0 || ds4_kv_mask_hi < ds4_kv_mask_lo) {
+    ds4_kv_mask_lo = -1; ds4_kv_mask_hi = -1;
+   } else {
+    fprintf(stderr, "ds4: DS4_KV_MASK_RANGE active: rows %d-%d masked (softmax→0)\n",
+            ds4_kv_mask_lo, ds4_kv_mask_hi);
+   }
+  }
+ }
+ ds4_kv_mask_init = 1;
+}
+
+static inline bool ds4_kv_row_masked(uint32_t r) {
+ if (!ds4_kv_mask_init) ds4_kv_mask_init_from_env();
+ if (ds4_kv_mask_lo < 0) return false;
+ return (int)r >= ds4_kv_mask_lo && (int)r <= ds4_kv_mask_hi;
+}
+
 /* Sink-aware attention over a set of KV rows. The learned sink logit is part
  * of the softmax denominator but contributes no value vector. */
 static void layer_attention_rows_one(
@@ -6060,6 +6092,7 @@ static void layer_attention_rows_one(
  for (uint32_t r = 0; r < n_kv; r++) {
  const float *kv = kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
  score[r] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
+ if (ds4_kv_row_masked(r)) score[r] = -1e30f;
  if (score[r] > max_score) max_score = score[r];
  }
 
@@ -7921,6 +7954,7 @@ static void layer_attention_mixed_one(
  for (uint32_t r = 0; r < n_raw; r++, idx++) {
  const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
  score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
+ if (ds4_kv_row_masked(r)) score[idx] = -1e30f;
  if (score[idx] > max_score) max_score = score[idx];
  }
  for (uint32_t r = 0; r < n_comp; r++, idx++) {
@@ -7984,6 +8018,7 @@ static void layer_attention_mixed_one_decode_scratch(
  for (uint32_t r = 0; r < n_raw; r++, idx++) {
  const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
  score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
+ if (ds4_kv_row_masked(r)) score[idx] = -1e30f;
  if (score[idx] > max_score) max_score = score[idx];
  }
  for (uint32_t r = 0; r < n_comp; r++, idx++) {

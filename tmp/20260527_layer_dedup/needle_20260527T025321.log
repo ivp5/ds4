@@ -1,0 +1,37 @@
+TS=20260527T025321  Needle='8217'  Question expects '8217'
+
+=== FRONT placement ===
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to find the account number. The user said "IMPORTANT: my account number is
+ds4: prefill: 5.08 t/s, generation: 1.56 t/s
+
+=== MIDDLE placement ===
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to extract the account number from the text. The user said: "IMPORTANT:
+ds4: prefill: 4.63 t/s, generation: 1.49 t/s
+
+=== END placement ===
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to recall the account number from the text. The user says: "IMPORTANT:
+ds4: prefill: 4.59 t/s, generation: 1.59 t/s
+
+=== SHORT baseline (no filler) ===
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to answer with just the account number. The user says "my account number is 821
+ds4: prefill: 0.90 t/s, generation: 1.41 t/s
+
+=== CONTROL no-needle (should fail to recall 8217) ===
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to answer with just the account number. The user asked: "What was my account number
+ds4: prefill: 4.34 t/s, generation: 1.58 t/s
+
