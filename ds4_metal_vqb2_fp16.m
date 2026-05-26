@@ -179,6 +179,7 @@ void ds4_metal_vqb2_fp16_set_profile(bool enabled) {
 #ifdef __APPLE__
 static id<MTLDevice> s_device = nil;
 static id<MTLLibrary> s_library = nil;
+static id<MTLCommandQueue> s_command_queue = nil;
 static id<MTLComputePipelineState> s_pipeline_gate_up = nil;
 static id<MTLComputePipelineState> s_pipeline_swiglu = nil;
 static id<MTLComputePipelineState> s_pipeline_down = nil;
@@ -186,6 +187,31 @@ static bool s_initialized = false;
 static id<MTLBuffer> s_hot_store_buffer = nil;   /* MTLBuffer wrapping the FP16 heap */
 static const void *s_bound_heap_ptr = NULL;
 static size_t s_bound_heap_bytes = 0;
+
+/* Per-expert scratch buffers (shared across experts within a dispatch).
+ * gate_out / up_out / mid are each [n_pairs × 4] bytes; for DS4-Flash
+ * n_pairs=2048 → 8 KB each, 24 KB total. Allocated once at init under
+ * MTLResourceStorageModeShared (zero-copy on Apple Silicon). */
+static id<MTLBuffer> s_scratch_gate_out = nil;
+static id<MTLBuffer> s_scratch_up_out = nil;
+static id<MTLBuffer> s_scratch_mid = nil;
+
+/* DS4-Flash routed-FFN dimensions per (layer, expert). Hardcoded for now
+ * (matches CPU dispatch in ds4_expert_table.c:305+). Future iteration:
+ * read from store->n_rows[layer] / store->n_pairs[layer][kind] after the
+ * row-block guard patch (codex H1909) lands. */
+#define DS4_VQB2_FP16_N_ROWS   128u
+#define DS4_VQB2_FP16_N_PAIRS  2048u   /* gate/up */
+#define DS4_VQB2_FP16_N_DOWN   1024u   /* down n_pairs */
+#define DS4_VQB2_FP16_SCRATCH_BYTES (DS4_VQB2_FP16_N_PAIRS * sizeof(float))
+#define DS4_VQB2_FP16_CLAMP    1.0e4f
+
+/* Per-expert tile sizes (must match the VQB2 reader's FP16 layout). */
+#define DS4_VQB2_FP16_GATE_BYTES \
+    ((size_t)DS4_VQB2_FP16_N_ROWS * DS4_VQB2_FP16_N_PAIRS * 2u * sizeof(_Float16))
+#define DS4_VQB2_FP16_UP_BYTES   DS4_VQB2_FP16_GATE_BYTES
+#define DS4_VQB2_FP16_DOWN_BYTES \
+    ((size_t)DS4_VQB2_FP16_N_ROWS * DS4_VQB2_FP16_N_DOWN  * 2u * sizeof(_Float16))
 
 /* MTL4 surface — codex H1723/H1788/H1779 modern path.
  *
@@ -243,9 +269,31 @@ int ds4_metal_vqb2_fp16_init(void) {
             return -1;
         }
 
+        /* Command queue for direct (non-MTL4) dispatch. One queue per process is
+         * sufficient — we only ever encode 1 cmd buffer per dispatch call. */
+        s_command_queue = [s_device newCommandQueue];
+        if (!s_command_queue) {
+            fprintf(stderr, "ds4_metal_vqb2_fp16_init: command queue alloc failed\n");
+            return -1;
+        }
+
+        /* Pre-allocate scratch buffers (shared across experts in a dispatch).
+         * Storage mode shared is zero-copy on Apple Silicon unified memory. */
+        s_scratch_gate_out = [s_device newBufferWithLength:DS4_VQB2_FP16_SCRATCH_BYTES
+                                                  options:MTLResourceStorageModeShared];
+        s_scratch_up_out   = [s_device newBufferWithLength:DS4_VQB2_FP16_SCRATCH_BYTES
+                                                  options:MTLResourceStorageModeShared];
+        s_scratch_mid      = [s_device newBufferWithLength:DS4_VQB2_FP16_SCRATCH_BYTES
+                                                  options:MTLResourceStorageModeShared];
+        if (!s_scratch_gate_out || !s_scratch_up_out || !s_scratch_mid) {
+            fprintf(stderr, "ds4_metal_vqb2_fp16_init: scratch buffer alloc failed\n");
+            return -1;
+        }
+
         s_initialized = true;
         fprintf(stderr,
-            "ds4_metal_vqb2_fp16_init: 3 pipelines compiled (gate_up, swiglu, down)\n");
+            "ds4_metal_vqb2_fp16_init: 3 pipelines + queue + 3×%zu B scratch ready\n",
+            (size_t)DS4_VQB2_FP16_SCRATCH_BYTES);
         return 0;
     }
 }
@@ -381,6 +429,29 @@ int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *store) {
     }
 }
 
+/* Forward decls — accessors live in ds4_expert_table.c. We re-declare here
+ * to avoid pulling the full struct definition into Metal compilation
+ * units (the struct lives behind a typedef in ds4_expert_table.h, but
+ * we'd rather keep this file's #include surface minimal). */
+extern const void *ds4_hot_get_gate_fp16(const struct ds4_hot_expert_store *,
+                                         uint32_t layer, uint32_t expert);
+extern const void *ds4_hot_get_up_fp16(const struct ds4_hot_expert_store *,
+                                       uint32_t layer, uint32_t expert);
+extern const void *ds4_hot_get_down_fp16(const struct ds4_hot_expert_store *,
+                                         uint32_t layer, uint32_t expert);
+
+/* Convert an absolute pointer (returned by ds4_hot_get_*_fp16) into a byte
+ * offset into the bound MTLBuffer. Returns SIZE_MAX on out-of-range. */
+static size_t vqb2_fp16_offset_for(const void *tile_ptr) {
+    if (!tile_ptr || !s_bound_heap_ptr) return SIZE_MAX;
+    const uintptr_t base = (uintptr_t)s_bound_heap_ptr;
+    const uintptr_t tile = (uintptr_t)tile_ptr;
+    if (tile < base) return SIZE_MAX;
+    const uintptr_t off = tile - base;
+    if (off >= (uintptr_t)s_bound_heap_bytes) return SIZE_MAX;
+    return (size_t)off;
+}
+
 int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
                                  uint32_t layer,
                                  uint32_t n_tokens,
@@ -388,44 +459,134 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
                                  const float *expert_weights,
                                  const void *input_fp32,
                                  void *output_fp32) {
-    (void)store; (void)layer; (void)n_tokens;
-    (void)selected_exps; (void)expert_weights;
-    (void)input_fp32; (void)output_fp32;
+    if (!s_initialized) return -1;
+    if (!store || !selected_exps || !expert_weights ||
+        !input_fp32 || !output_fp32) return -1;
+    if (n_tokens != 1) return -2;  /* multi-token batch unimplemented — caller falls back */
+    if (!s_hot_store_buffer) {
+        /* Caller forgot to bind the store. Try a lazy bind. */
+        if (ds4_metal_vqb2_fp16_bind_store(store) != 0) return -1;
+        if (!s_hot_store_buffer) return -1;
+    }
 
-    /* SKELETON STUB.
-     *
-     * Full implementation needs:
-     *   1. Pre-allocated per-layer MTLBuffers for gate_out, up_out, mid,
-     *      down_out (or use scratch buffers from the encoded graph).
-     *   2. For each of N_EXPERT_USED selected experts:
-     *      a. Look up FP16 tile pointers via ds4_hot_get_{gate,up,down}_fp16
-     *         (these point into the host-resident FP16 heap).
-     *      b. Copy tile contents into Metal-resident MTLBuffer
-     *         (memcpy into shared-memory MTLBuffer; or pre-resident if
-     *         the FP16 heap was allocated as MTLBuffer at engine init).
-     *      c. Encode kernel_vqb2_fp16_gate_up dispatch (input × tile).
-     *      d. Encode kernel_vqb2_fp16_swiglu (gate × up → mid).
-     *      e. Encode kernel_vqb2_fp16_down (mid × tile → output_acc).
-     *      f. Multiply by expert_weights[e] (folded into swiglu kernel
-     *         via the `expert_w` constant arg).
-     *   3. Sync, return success.
-     *
-     * Performance critical: (b) is the bottleneck. If the FP16 heap is
-     * pre-allocated as a Metal-resident MTLBuffer (storageModeShared
-     * works fine on M1 unified memory), step (b) is zero-cost. That's
-     * the "no CPU-MoE round-trip" condition for 20-30 t/s.
-     *
-     * The current ds4_hot_expert_store uses malloc'd heap, NOT MTLBuffer.
-     * The first integration step is to either:
-     *   (a) Allocate the FP16 heap as MTLBuffer with storageModeShared
-     *       so Metal can read it directly (zero-copy), OR
-     *   (b) Wrap the existing malloc'd heap with newBufferWithBytesNoCopy
-     *       at engine init.
-     *
-     * (b) is the cheaper change. (a) is cleaner but requires
-     * ds4_hot_expert_store changes.
-     */
-    return -1;  /* fallback: caller uses IQ2_XXS dispatch */
+    /* Caller-pointer wrap pattern: input is read-only; output is read+write
+     * (down kernel uses +=). Both are FP32. On Apple Silicon unified memory
+     * newBufferWithBytesNoCopy on a malloc'd region is zero-copy under
+     * MTLResourceStorageModeShared. Length is rounded up to the page (16 KB
+     * on M1) under the hood; the underlying alloc must be page-multiple in
+     * the FP32 layout (n_rows × 2 = 256 floats = 1 KB ≪ 16 KB — must be
+     * page-aligned + bounded by something at least page-sized). Caller is
+     * responsible for that; we pad the wrap length to page-size to avoid
+     * MTLBuffer-creation noise. The kernel only touches the first
+     * (n_rows × 2) elements. */
+    const size_t io_logical_bytes  = (size_t)DS4_VQB2_FP16_N_ROWS * 2u * sizeof(float);
+    const size_t io_wrapped_bytes  = (io_logical_bytes + 16383u) & ~((size_t)16383u);  /* 16 KB */
+
+    @autoreleasepool {
+        id<MTLBuffer> in_buf =
+            [s_device newBufferWithBytesNoCopy:(void *)input_fp32
+                                        length:io_wrapped_bytes
+                                       options:MTLResourceStorageModeShared
+                                   deallocator:nil];
+        id<MTLBuffer> out_buf =
+            [s_device newBufferWithBytesNoCopy:output_fp32
+                                        length:io_wrapped_bytes
+                                       options:MTLResourceStorageModeShared
+                                   deallocator:nil];
+        if (!in_buf || !out_buf) {
+            fprintf(stderr, "ds4_metal_vqb2_fp16_dispatch: I/O buffer wrap failed\n");
+            return -2;
+        }
+
+        id<MTLCommandBuffer> cmd = [s_command_queue commandBuffer];
+        if (!cmd) return -2;
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!enc) return -2;
+
+        const uint32_t n_rows  = DS4_VQB2_FP16_N_ROWS;
+        const uint32_t n_pairs = DS4_VQB2_FP16_N_PAIRS;
+        const uint32_t n_down  = DS4_VQB2_FP16_N_DOWN;
+        const float   clamp   = DS4_VQB2_FP16_CLAMP;
+
+        /* Threadgroup sizing: pipeline-reported max threads, capped to n_pairs
+         * for the gate/up/swiglu kernels (one thread per output pair) or
+         * n_rows for down (one thread per output row). 128 is a good default
+         * on M1 P-cores (matches SIMD-group width 32 × 4). */
+        const NSUInteger tg_pairs = MIN((NSUInteger)128, (NSUInteger)n_pairs);
+        const NSUInteger tg_rows  = MIN((NSUInteger)128, (NSUInteger)n_rows);
+        const NSUInteger grid_pairs = ((n_pairs + tg_pairs - 1) / tg_pairs) * tg_pairs;
+        const NSUInteger grid_rows  = ((n_rows  + tg_rows  - 1) / tg_rows ) * tg_rows;
+        const NSUInteger grid_down  = ((n_down  + tg_pairs - 1) / tg_pairs) * tg_pairs;
+
+        for (uint32_t s = 0; s < 6; s++) {  /* DS4 routed n_selected = 6 */
+            const int32_t exp_id = selected_exps[s];
+            if (exp_id < 0) continue;
+
+            const void *gate_ptr = ds4_hot_get_gate_fp16(store, layer, (uint32_t)exp_id);
+            const void *up_ptr   = ds4_hot_get_up_fp16  (store, layer, (uint32_t)exp_id);
+            const void *down_ptr = ds4_hot_get_down_fp16(store, layer, (uint32_t)exp_id);
+            const size_t gate_off = vqb2_fp16_offset_for(gate_ptr);
+            const size_t up_off   = vqb2_fp16_offset_for(up_ptr);
+            const size_t down_off = vqb2_fp16_offset_for(down_ptr);
+            if (gate_off == SIZE_MAX || up_off == SIZE_MAX || down_off == SIZE_MAX) {
+                [enc endEncoding];
+                return -1;  /* not all selected experts pinned — caller falls back */
+            }
+
+            /* ---- gate matvec: kernel_vqb2_fp16_gate_up(gate_tile, input, gate_out) ---- */
+            [enc setComputePipelineState:s_pipeline_gate_up];
+            [enc setBuffer:s_hot_store_buffer offset:(NSUInteger)gate_off atIndex:0];
+            [enc setBuffer:in_buf             offset:0                    atIndex:1];
+            [enc setBuffer:s_scratch_gate_out offset:0                    atIndex:2];
+            [enc setBytes:&n_rows  length:sizeof(uint32_t) atIndex:3];
+            [enc setBytes:&n_pairs length:sizeof(uint32_t) atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(grid_pairs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_pairs, 1, 1)];
+
+            /* ---- up matvec: same kernel, different tile ---- */
+            [enc setBuffer:s_hot_store_buffer offset:(NSUInteger)up_off   atIndex:0];
+            [enc setBuffer:in_buf             offset:0                    atIndex:1];
+            [enc setBuffer:s_scratch_up_out   offset:0                    atIndex:2];
+            [enc setBytes:&n_rows  length:sizeof(uint32_t) atIndex:3];
+            [enc setBytes:&n_pairs length:sizeof(uint32_t) atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(grid_pairs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_pairs, 1, 1)];
+
+            /* ---- SwiGLU + expert_w fuse ---- */
+            const float expert_w = expert_weights[s];
+            [enc setComputePipelineState:s_pipeline_swiglu];
+            [enc setBuffer:s_scratch_gate_out offset:0 atIndex:0];
+            [enc setBuffer:s_scratch_up_out   offset:0 atIndex:1];
+            [enc setBuffer:s_scratch_mid      offset:0 atIndex:2];
+            [enc setBytes:&n_pairs  length:sizeof(uint32_t) atIndex:3];
+            [enc setBytes:&clamp    length:sizeof(float)    atIndex:4];
+            [enc setBytes:&expert_w length:sizeof(float)    atIndex:5];
+            [enc dispatchThreads:MTLSizeMake(grid_pairs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_pairs, 1, 1)];
+
+            /* ---- down matvec: kernel_vqb2_fp16_down(down_tile, mid, output) ---- */
+            [enc setComputePipelineState:s_pipeline_down];
+            [enc setBuffer:s_hot_store_buffer offset:(NSUInteger)down_off atIndex:0];
+            [enc setBuffer:s_scratch_mid      offset:0                    atIndex:1];
+            [enc setBuffer:out_buf            offset:0                    atIndex:2];
+            [enc setBytes:&n_rows length:sizeof(uint32_t) atIndex:3];
+            [enc setBytes:&n_down length:sizeof(uint32_t) atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(grid_rows, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_rows, 1, 1)];
+            (void)grid_down;  /* n_down used only inside the kernel for the inner loop bound */
+        }
+
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        if (cmd.error) {
+            fprintf(stderr, "ds4_metal_vqb2_fp16_dispatch: cmd.error = %s\n",
+                    [[cmd.error localizedDescription] UTF8String]);
+            return -2;
+        }
+        return 0;
+    }
 }
 
 #else

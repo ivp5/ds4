@@ -143,7 +143,13 @@ ds4_hot_expert_store *ds4_hot_expert_store_alloc(uint64_t budget_bytes) {
     store->gate_offset = (int64_t *)malloc(offsets_bytes);
     store->up_offset   = (int64_t *)malloc(offsets_bytes);
     store->down_offset = (int64_t *)malloc(offsets_bytes);
-    if (!store->gate_offset || !store->up_offset || !store->down_offset) {
+    const size_t row_blocks_bytes = (size_t)DS4_N_LAYER * DS4_N_EXPERT * sizeof(uint64_t);
+    store->gate_row_blocks = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
+    store->up_row_blocks   = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
+    store->down_row_blocks = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
+    (void)row_blocks_bytes;
+    if (!store->gate_offset || !store->up_offset || !store->down_offset ||
+        !store->gate_row_blocks || !store->up_row_blocks || !store->down_row_blocks) {
         ds4_hot_expert_store_free(store);
         return NULL;
     }
@@ -165,6 +171,9 @@ void ds4_hot_expert_store_free(ds4_hot_expert_store *store) {
     if (store->gate_offset) free(store->gate_offset);
     if (store->up_offset)   free(store->up_offset);
     if (store->down_offset) free(store->down_offset);
+    if (store->gate_row_blocks) free(store->gate_row_blocks);
+    if (store->up_row_blocks)   free(store->up_row_blocks);
+    if (store->down_row_blocks) free(store->down_row_blocks);
     if (store->fp16_heap)   free(store->fp16_heap);
     free(store);
 }
@@ -291,6 +300,10 @@ int ds4_hot_layer_all_pinned(const ds4_hot_expert_store *store,
         if (store->gate_offset[idx] < 0) return 0;
         if (store->up_offset[idx]   < 0) return 0;
         if (store->down_offset[idx] < 0) return 0;
+        if (!store->gate_row_blocks || !store->up_row_blocks || !store->down_row_blocks) return 0;
+        if ((store->gate_row_blocks[idx] & DS4_VQB2_GATE_UP_FULL_ROW_MASK) != DS4_VQB2_GATE_UP_FULL_ROW_MASK) return 0;
+        if ((store->up_row_blocks[idx]   & DS4_VQB2_GATE_UP_FULL_ROW_MASK) != DS4_VQB2_GATE_UP_FULL_ROW_MASK) return 0;
+        if ((store->down_row_blocks[idx] & DS4_VQB2_DOWN_FULL_ROW_MASK)    != DS4_VQB2_DOWN_FULL_ROW_MASK) return 0;
     }
     return 1;
 }
@@ -673,8 +686,16 @@ int ds4_hot_pin_expert_from_vqb2(ds4_hot_expert_store *store,
         case 1: offsets = store->up_offset;   break;
         case 2: offsets = store->down_offset; break;
     }
+    const uint64_t idx = (uint64_t)layer * DS4_N_EXPERT + expert;
     if (offsets) {
-        offsets[layer * DS4_N_EXPERT + expert] = (int64_t)off;
+        offsets[idx] = (int64_t)off;
+    }
+    /* Current VQB2 format carries no row_start, and the encoder slices
+     * full[:rows_per_expert], so this packet is row block 0 only. */
+    switch (kind) {
+        case 0: if (store->gate_row_blocks) store->gate_row_blocks[idx] |= 1ULL; break;
+        case 1: if (store->up_row_blocks)   store->up_row_blocks[idx]   |= 1ULL; break;
+        case 2: if (store->down_row_blocks) store->down_row_blocks[idx] |= 1ULL; break;
     }
     store->n_pinned++;
     return 0;

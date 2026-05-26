@@ -136,6 +136,12 @@ typedef struct ds4_hot_expert_store {
     int64_t *gate_offset;      /* DS4_N_LAYER × DS4_N_EXPERT entries */
     int64_t *up_offset;
     int64_t *down_offset;
+    /* Per-(layer, expert) row-block coverage bitmasks. Current VQB2 packets
+     * encode the first 128-row block only; a complete hot replacement must
+     * have all row blocks for each kind, not merely a nonnegative offset. */
+    uint64_t *gate_row_blocks;
+    uint64_t *up_row_blocks;
+    uint64_t *down_row_blocks;
     /* The FP16 heap. NULL if no experts pinned. */
     void *fp16_heap;
     uint64_t heap_bytes;
@@ -200,6 +206,12 @@ const void *ds4_hot_get_down_fp16(const ds4_hot_expert_store *store,
  *   0  = success
  *  -1  = out of budget, bad indices, or file/dequant error
  */
+#define DS4_VQB2_ROW_BLOCK_ROWS 128ULL
+#define DS4_VQB2_GATE_UP_FULL_ROW_BLOCKS 16ULL
+#define DS4_VQB2_DOWN_FULL_ROW_BLOCKS 32ULL
+#define DS4_VQB2_GATE_UP_FULL_ROW_MASK ((1ULL << DS4_VQB2_GATE_UP_FULL_ROW_BLOCKS) - 1ULL)
+#define DS4_VQB2_DOWN_FULL_ROW_MASK ((1ULL << DS4_VQB2_DOWN_FULL_ROW_BLOCKS) - 1ULL)
+
 struct ds4_vqb2_file;  /* opaque forward decl */
 int ds4_hot_pin_expert_from_vqb2(ds4_hot_expert_store *store,
                                  uint32_t layer,
