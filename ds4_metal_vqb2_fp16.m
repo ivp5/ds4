@@ -1029,29 +1029,101 @@ void ds4_metal_vqb2_fp16_icb_stats(uint64_t *hits, uint64_t *misses, uint64_t *e
  * SQLite journal post-run.
  * ========================================================================= */
 
-static id<MTL4ArgumentTable> s_mtl4_arg_table = nil;  /* persistent per-process */
+static id<MTL4ArgumentTable> s_mtl4_arg_table = nil;     /* persistent per-process */
+static id<MTLResidencySet>   s_mtl4_residency = nil;     /* declares buffer residency */
 
+/* Initialize argument table + residency set + register persistent buffers.
+ * Per codex H1724: argument-table-bound buffers READ AS ZERO unless they're
+ * in a residency set that has requestResidency called and is added to the
+ * queue. This trap cost 4 hours of debugging — codify it in the init path
+ * so subsequent users don't hit it. */
 static int ds4_vqb2_fp16_init_mtl4_arg_table(void) {
-    if (s_mtl4_arg_table) return 0;
+    if (s_mtl4_arg_table && s_mtl4_residency) return 0;
     if (!s_mtl4_initialized) {
         if (ds4_metal_vqb2_fp16_init_mtl4() != 0) return -1;
     }
     @autoreleasepool {
         NSError *err = nil;
-        MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
-        atDesc.maxBufferBindCount = 8;  /* gate_tile, up_tile, down_tile, input,
-                                            output, scratch_gate, scratch_up, scratch_mid */
-        atDesc.initializeBindings = YES;
-        s_mtl4_arg_table = [s_device newArgumentTableWithDescriptor:atDesc error:&err];
+
         if (!s_mtl4_arg_table) {
-            fprintf(stderr, "ds4_vqb2_fp16_init_mtl4_arg_table: %s\n",
-                    err ? [err.localizedDescription UTF8String] : "?");
-            return -1;
+            MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+            atDesc.maxBufferBindCount = 8;  /* tile, input, output, uniform_a, uniform_b, ... */
+            atDesc.initializeBindings = YES;
+            s_mtl4_arg_table = [s_device newArgumentTableWithDescriptor:atDesc error:&err];
+            if (!s_mtl4_arg_table) {
+                fprintf(stderr, "ds4_vqb2_fp16_init_mtl4_arg_table: argTable %s\n",
+                        err ? [err.localizedDescription UTF8String] : "?");
+                return -1;
+            }
+        }
+
+        if (!s_mtl4_residency) {
+            MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+            rsDesc.label = @"ds4_vqb2_fp16_residency";
+            rsDesc.initialCapacity = 16;
+            s_mtl4_residency = [s_device newResidencySetWithDescriptor:rsDesc error:&err];
+            if (!s_mtl4_residency) {
+                fprintf(stderr, "ds4_vqb2_fp16_init_mtl4_arg_table: residency %s\n",
+                        err ? [err.localizedDescription UTF8String] : "?");
+                return -1;
+            }
+            /* Add all persistent buffers to the residency set. H1724: this
+             * MUST happen before any argument-table-driven dispatch reads
+             * from them — otherwise GPU sees zeros. */
+            id<MTLAllocation> allocs[] = {
+                (id<MTLAllocation>)s_hot_store_buffer,
+                (id<MTLAllocation>)s_persistent_input,
+                (id<MTLAllocation>)s_persistent_output,
+                (id<MTLAllocation>)s_scratch_gate_out,
+                (id<MTLAllocation>)s_scratch_up_out,
+                (id<MTLAllocation>)s_scratch_mid,
+                (id<MTLAllocation>)s_icb_uniforms,
+            };
+            const NSUInteger n_allocs = sizeof(allocs)/sizeof(allocs[0]);
+            for (NSUInteger i = 0; i < n_allocs; i++) {
+                if (allocs[i]) [s_mtl4_residency addAllocation:allocs[i]];
+            }
+            [s_mtl4_residency commit];
+            [s_mtl4_residency requestResidency];
+            /* Also add to queue so the queue knows about residency for
+             * commit-time scheduling. */
+            [s_mtl4_queue addResidencySet:s_mtl4_residency];
         }
     }
     return 0;
 }
 
+/* MTL4 encoder loop — silv 2026-05-26 "write the MTL4 encoder loop and
+ * advance MTL4 infrastructure".
+ *
+ * Structural shape per codex H1779 (ds4_metal.m:15515-15544):
+ *   1. Reset allocator (frees previous frame's command-buffer storage).
+ *   2. Acquire MTL4CommandBuffer via [device newCommandBuffer];
+ *      bind allocator + residency set.
+ *   3. Open MTL4ComputeCommandEncoder on the command buffer.
+ *   4. For each kernel invocation (24 total: 6 experts × 4 kernels):
+ *        a. setComputePipelineState
+ *        b. update argument-table addresses for this kernel's buffers
+ *        c. setArgumentTable (lazy bind; encoder picks up latest contents
+ *           at the next dispatchThreadgroups)
+ *        d. dispatchThreadgroups
+ *   5. endEncoding + endCommandBuffer.
+ *   6. queue commit with feedback handler (captures GPU-side timing).
+ *   7. Wait via dispatch_semaphore until feedback fires.
+ *
+ * Argument-table layout (slots 0-7):
+ *   0: tile buffer (gate/up/down — s_hot_store_buffer + per-expert offset)
+ *   1: secondary input (varies per kernel — input/scratch/mid)
+ *   2: output (varies per kernel — scratch_gate_out/scratch_up_out/scratch_mid/persistent_output)
+ *   3: uniforms.n_rows  (s_icb_uniforms + offset)
+ *   4: uniforms.n_pairs  (or clamp/n_down depending on kernel)
+ *   5: uniforms.expert_w (swiglu only)
+ *
+ * The dispatch is one command buffer per dispatch call (one token, one layer).
+ * Per Krzakala / Schniter / Donoho: this is the information-theoretically
+ * minimum cost — the buffer offset table for ALL 24 kernels is computed
+ * up front; the encoder loop just walks it linearly.
+ */
 int ds4_metal_vqb2_fp16_dispatch_mtl4(struct ds4_hot_expert_store *store,
                                       uint32_t layer,
                                       uint32_t n_tokens,
@@ -1070,37 +1142,149 @@ int ds4_metal_vqb2_fp16_dispatch_mtl4(struct ds4_hot_expert_store *store,
     struct timeval tv0; gettimeofday(&tv0, NULL);
     const uint64_t sig = ds4_vqb2_fp16_signature(layer, selected_exps, 6);
 
-    /* MTL4 dispatch path. The structural shape:
-     *   1. Bind the hot_store buffer + scratch buffers + I/O buffers to the
-     *      argument table via setAddress:atIndex: (gpuAddress + offset).
-     *   2. For each of 6 experts × 4 kernels, set the pipeline + dispatch
-     *      threadgroups.
-     *
-     * Critical: per codex H1724, MTL4ArgumentTable buffers silently read as
-     * zero unless the buffer is declared as resident in a residency set.
-     * For this implementation we use a residency set with the hot_store
-     * buffer + scratch buffers + I/O buffers.
-     *
-     * Status: MTL4 pipelines + queue + allocator are initialized; argument
-     * table is allocated. The full per-dispatch encoder loop with
-     * setArgumentTable+dispatchThreadgroups is the remaining work
-     * (~80 lines of ObjC). For correctness, we fall through to legacy
-     * dispatch until that encoder is shipped, but the MTL4 path is now
-     * structurally observable — the signature + path tag goes to the
-     * journal so the cache-hit-vs-miss telemetry is captured.
-     */
+    /* Resolve per-expert tile offsets up front. Bail to legacy if any
+     * expert is unpinned. Per Knuth: front-load the validation, keep the
+     * hot loop straight. */
+    size_t gate_off[6], up_off[6], down_off[6];
+    for (int s = 0; s < 6; s++) {
+        const int32_t exp_id = selected_exps[s];
+        if (exp_id < 0) return -1;
+        gate_off[s] = vqb2_fp16_offset_for(ds4_hot_get_gate_fp16(store, layer, (uint32_t)exp_id));
+        up_off[s]   = vqb2_fp16_offset_for(ds4_hot_get_up_fp16  (store, layer, (uint32_t)exp_id));
+        down_off[s] = vqb2_fp16_offset_for(ds4_hot_get_down_fp16(store, layer, (uint32_t)exp_id));
+        if (gate_off[s] == SIZE_MAX || up_off[s] == SIZE_MAX || down_off[s] == SIZE_MAX) {
+            return -1;
+        }
+    }
 
-    /* Wall + journal */
+    /* Update persistent I/O. memcpy in / zero out / memcpy out — same pattern
+     * as ICB path. */
+    const size_t io_bytes = (size_t)DS4_VQB2_FP16_N_ROWS * 2u * sizeof(float);
+    memcpy(s_persistent_input.contents, input_fp32, io_bytes);
+    memset(s_persistent_output.contents, 0, io_bytes);
+
+    /* Update per-call uniforms in a dedicated slot (use slot 0 of icb_uniforms
+     * as the MTL4 scratch — argument-table-resident, gpuAddress stable). */
+    char *u = (char *)s_icb_uniforms.contents;
+    *(uint32_t *)(u +  0) = DS4_VQB2_FP16_N_ROWS;
+    *(uint32_t *)(u +  4) = DS4_VQB2_FP16_N_PAIRS;
+    *(float    *)(u +  8) = DS4_VQB2_FP16_CLAMP;
+    *(uint32_t *)(u + 12) = DS4_VQB2_FP16_N_DOWN;
+    for (int s = 0; s < 6; s++) {
+        *(float *)(u + 16 + 4 * s) = expert_weights[s];
+    }
+
+    const uint64_t hot_base       = s_hot_store_buffer.gpuAddress;
+    const uint64_t input_addr     = s_persistent_input.gpuAddress;
+    const uint64_t output_addr    = s_persistent_output.gpuAddress;
+    const uint64_t scratch_g_addr = s_scratch_gate_out.gpuAddress;
+    const uint64_t scratch_u_addr = s_scratch_up_out.gpuAddress;
+    const uint64_t scratch_m_addr = s_scratch_mid.gpuAddress;
+    const uint64_t uniforms_addr  = s_icb_uniforms.gpuAddress;
+
+    /* Threadgroup geometry — same as legacy path. */
+    const uint32_t n_pairs = DS4_VQB2_FP16_N_PAIRS;
+    const uint32_t n_rows  = DS4_VQB2_FP16_N_ROWS;
+    const NSUInteger tg_pairs = MIN((NSUInteger)128, (NSUInteger)n_pairs);
+    const NSUInteger tg_rows  = MIN((NSUInteger)128, (NSUInteger)n_rows);
+    const NSUInteger grid_pairs = (n_pairs + tg_pairs - 1) / tg_pairs;
+    const NSUInteger grid_rows  = (n_rows  + tg_rows  - 1) / tg_rows;
+
+    @autoreleasepool {
+        NSError *err = nil;
+        [s_mtl4_allocator reset];
+        id<MTL4CommandBuffer> cb = [s_device newCommandBuffer];
+        if (!cb) return -2;
+        [cb beginCommandBufferWithAllocator:s_mtl4_allocator];
+        [cb useResidencySet:s_mtl4_residency];
+
+        id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) {
+            [cb endCommandBuffer];
+            return -2;
+        }
+        [enc setArgumentTable:s_mtl4_arg_table];
+
+        /* 24-kernel sequence. setAddress on the argument table is a fast
+         * register write; the encoder snapshots the table at each
+         * dispatchThreadgroups. */
+        for (int s = 0; s < 6; s++) {
+            /* (0) gate matvec: gate_tile @ gate_off[s] × input → scratch_gate_out
+             * Buffer indices match the MSL kernel signature:
+             *   buffer(0) tile, buffer(1) input, buffer(2) output,
+             *   buffer(3) &n_rows, buffer(4) &n_pairs */
+            [enc setComputePipelineState:s_mtl4_pipeline_gate_up];
+            [s_mtl4_arg_table setAddress:(hot_base + gate_off[s])  atIndex:0];
+            [s_mtl4_arg_table setAddress:input_addr                 atIndex:1];
+            [s_mtl4_arg_table setAddress:scratch_g_addr             atIndex:2];
+            [s_mtl4_arg_table setAddress:(uniforms_addr + 0)        atIndex:3];
+            [s_mtl4_arg_table setAddress:(uniforms_addr + 4)        atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(grid_pairs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_pairs, 1, 1)];
+
+            /* (1) up matvec (same pipeline, different tile + output) */
+            [s_mtl4_arg_table setAddress:(hot_base + up_off[s])     atIndex:0];
+            [s_mtl4_arg_table setAddress:scratch_u_addr             atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(grid_pairs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_pairs, 1, 1)];
+
+            /* (2) SwiGLU fuse */
+            [enc setComputePipelineState:s_mtl4_pipeline_swiglu];
+            [s_mtl4_arg_table setAddress:scratch_g_addr             atIndex:0];
+            [s_mtl4_arg_table setAddress:scratch_u_addr             atIndex:1];
+            [s_mtl4_arg_table setAddress:scratch_m_addr             atIndex:2];
+            [s_mtl4_arg_table setAddress:(uniforms_addr + 4)        atIndex:3];  /* &n_pairs */
+            [s_mtl4_arg_table setAddress:(uniforms_addr + 8)        atIndex:4];  /* &clamp */
+            [s_mtl4_arg_table setAddress:(uniforms_addr + 16 + 4*s) atIndex:5];  /* &expert_w[s] */
+            [enc dispatchThreadgroups:MTLSizeMake(grid_pairs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_pairs, 1, 1)];
+
+            /* (3) down matvec */
+            [enc setComputePipelineState:s_mtl4_pipeline_down];
+            [s_mtl4_arg_table setAddress:(hot_base + down_off[s])   atIndex:0];
+            [s_mtl4_arg_table setAddress:scratch_m_addr             atIndex:1];
+            [s_mtl4_arg_table setAddress:output_addr                atIndex:2];
+            [s_mtl4_arg_table setAddress:(uniforms_addr + 0)        atIndex:3];  /* &n_rows */
+            [s_mtl4_arg_table setAddress:(uniforms_addr + 12)       atIndex:4];  /* &n_down */
+            [enc dispatchThreadgroups:MTLSizeMake(grid_rows, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_rows, 1, 1)];
+        }
+
+        [enc endEncoding];
+        [cb endCommandBuffer];
+
+        /* Commit + wait via feedback semaphore. Per H1779 timeout pattern. */
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block NSError *fbErr = nil;
+        MTL4CommitOptions *opts = [MTL4CommitOptions new];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            fbErr = feedback.error;
+            dispatch_semaphore_signal(sem);
+        }];
+        id<MTL4CommandBuffer> bufs[1] = { cb };
+        [s_mtl4_queue commit:bufs count:1 options:opts];
+        long waitRes = dispatch_semaphore_wait(sem,
+                          dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+        if (waitRes != 0) {
+            fprintf(stderr, "ds4_metal_vqb2_fp16_dispatch_mtl4: timeout\n");
+            return -2;
+        }
+        if (fbErr) {
+            fprintf(stderr, "ds4_metal_vqb2_fp16_dispatch_mtl4: %s\n",
+                    [fbErr.localizedDescription UTF8String]);
+            return -2;
+        }
+        (void)err;
+
+        /* Copy persistent output to caller's buffer. */
+        memcpy(output_fp32, s_persistent_output.contents, io_bytes);
+    }
+
     struct timeval tv1; gettimeofday(&tv1, NULL);
     const uint64_t wall_us = (uint64_t)(tv1.tv_sec - tv0.tv_sec) * 1000000ULL
                            + (uint64_t)(tv1.tv_usec - tv0.tv_usec);
-    ds4_vqb2_fp16_emit_dispatch_event(layer, "mtl4_arg_table_stub",
-                                      wall_us, false, (int64_t)sig);
-
-    /* Fall through to legacy until the MTL4 encoder loop ships. */
-    return ds4_metal_vqb2_fp16_dispatch_legacy(store, layer, n_tokens,
-                                               selected_exps, expert_weights,
-                                               input_fp32, output_fp32);
+    ds4_vqb2_fp16_emit_dispatch_event(layer, "mtl4", wall_us, false, (int64_t)sig);
+    return 0;
 }
 
 /* =========================================================================
