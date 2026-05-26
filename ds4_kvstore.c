@@ -12,7 +12,6 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
-#include <float.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -40,6 +39,17 @@
 /* Disk-hit counts are evidence that a checkpoint was useful, but only while
  * the workload still resembles the one that produced those hits. */
 #define KV_CACHE_MIN_EFFECTIVE_HITS 0.01
+/* A continued checkpoint that is a strict prefix of the incoming store is a
+ * routine waypoint on the same path. Keep recent hits meaningful, but make
+ * never-hit or stale waypoints cheap victims while pre-evicting for the new
+ * store. */
+#define KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR 0.05
+#define KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR 0.45
+/* Cold/evict/shutdown checkpoints are intentional anchors, not just automatic
+ * waypoints in a single growing conversation. Give them a soft prior so they
+ * survive comparable continued entries, while still allowing pressure and poor
+ * density to evict them. */
+#define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
 
 typedef struct {
     char *ptr;
@@ -485,18 +495,41 @@ bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
     return ok;
 }
 
-double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
-                                        const ds4_tokens *live,
-                                        const char *protected_sha,
-                                        uint64_t now) {
+static bool kv_cache_incoming_supersedes_continued(
+        const ds4_kvstore_entry *e,
+        const ds4_kvstore_eviction_context *incoming) {
+    if (!e || !incoming || !incoming->text) return false;
+    if (e->reason != DS4_KVSTORE_REASON_CONTINUED) return false;
+    if (e->text_bytes == 0 || e->text_bytes > SIZE_MAX) return false;
+    if ((size_t)e->text_bytes >= incoming->text_len) return false;
+    if (e->model_id != incoming->model_id) return false;
+    if (incoming->reject_different_quant &&
+        e->quant_bits != incoming->quant_bits)
+        return false;
+    /* A smaller-context checkpoint can be loaded by a larger context, but not
+     * the reverse.  The incoming checkpoint dominates this one only if it is at
+     * least as widely reusable. */
+    if (incoming->ctx_size > e->ctx_size) return false;
+
+    char prefix_sha[41];
+    ds4_kvstore_sha1_bytes_hex(incoming->text, (size_t)e->text_bytes,
+                               prefix_sha);
+    return !strcmp(prefix_sha, e->sha);
+}
+
+static bool kv_cache_reason_is_anchor(uint8_t reason) {
+    return reason == DS4_KVSTORE_REASON_COLD ||
+           reason == DS4_KVSTORE_REASON_EVICT ||
+           reason == DS4_KVSTORE_REASON_SHUTDOWN;
+}
+
+double ds4_kvstore_entry_eviction_score(
+        const ds4_kvstore_entry *e,
+        const ds4_tokens *live,
+        uint64_t now,
+        const ds4_kvstore_eviction_context *incoming) {
     if (!e || e->file_size == 0) return 0.0;
     (void)live;
-    if (protected_sha && !strcmp(e->sha, protected_sha)) {
-        /* The store path calls eviction immediately after renaming the new
-         * checkpoint into place. Without a protected score, a full cache can
-         * choose that brand-new zero-hit file as the cheapest deletion. */
-        return DBL_MAX;
-    }
     double effective_hits = (double)e->hits;
     uint64_t used_at = e->last_used ? e->last_used : e->created_at;
     if (used_at == 0) {
@@ -506,33 +539,38 @@ double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
         effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
     }
-    return (effective_hits + 1.0) * (double)e->tokens / (double)e->file_size;
+    double score = (effective_hits + 1.0) *
+                   (double)e->tokens / (double)e->file_size;
+    if (kv_cache_reason_is_anchor(e->reason))
+        score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
+    if (kv_cache_incoming_supersedes_continued(e, incoming)) {
+        double h = effective_hits > 0.0 ?
+            effective_hits / (effective_hits + 1.0) : 0.0;
+        score *= KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR +
+                 KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR * h;
+    }
+    return score;
 }
 
 void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
-                       const char *protected_sha) {
+                       uint64_t extra_bytes,
+                       const ds4_kvstore_eviction_context *incoming) {
     if (!kc->enabled || kc->budget_bytes == 0) return;
+    if (extra_bytes > kc->budget_bytes) return;
     kv_cache_refresh(kc);
     const uint64_t now = (uint64_t)time(NULL);
     uint64_t total = 0;
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
-    if (protected_sha) {
-        uint64_t protected_size = 0;
-        for (int i = 0; i < kc->len; i++) {
-            if (!strcmp(kc->entry[i].sha, protected_sha)) {
-                protected_size = kc->entry[i].file_size;
-                break;
-            }
-        }
-        if (protected_size > kc->budget_bytes) protected_sha = NULL;
-    }
-    while (total > kc->budget_bytes && kc->len > 0) {
+    const uint64_t target = kc->budget_bytes - extra_bytes;
+    while (total > target && kc->len > 0) {
         int victim = 0;
         double victim_score =
-            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, protected_sha, now);
+            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
+                                             incoming);
         for (int i = 1; i < kc->len; i++) {
             double score =
-                ds4_kvstore_entry_eviction_score(&kc->entry[i], live, protected_sha, now);
+                ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
+                                                 incoming);
             if (score < victim_score ||
                 (score == victim_score &&
                  kc->entry[i].last_used < kc->entry[victim].last_used))
@@ -584,7 +622,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->budget_bytes = budget_mb * 1024ull * 1024ull;
     kc->reject_different_quant = reject_different_quant;
     kc->opt = opt;
-    ds4_kvstore_evict(kc, NULL, NULL);
+    ds4_kvstore_evict(kc, NULL, 0, NULL);
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
             "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
             kv_log_name(kc),
@@ -971,6 +1009,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     char sha[41];
     ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
     char *path = ds4_kvstore_path_for_sha(kc, sha);
+    const uint8_t reason_code = ds4_kvstore_reason_code(reason);
 
     if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
                                      model_id,
@@ -981,6 +1020,16 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         ds4_tokens_free(&store_tokens);
         return true;
     }
+
+    ds4_kvstore_eviction_context incoming = {
+        .text = text,
+        .text_len = text_len,
+        .model_id = (uint8_t)model_id,
+        .quant_bits = (uint8_t)quant_bits,
+        .ctx_size = (uint32_t)ds4_session_ctx(session),
+        .reject_different_quant = kc->reject_different_quant,
+    };
+    ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
 
     kv_buf tmpb = {0};
     kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
@@ -1004,7 +1053,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     uint8_t ext_flags = trailer_est_bytes > 0 && hooks ? hooks->ext_flag : 0;
     if (text_override) ext_flags |= cache_text_ext;
     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
-                            ds4_kvstore_reason_code(reason), ext_flags,
+                            reason_code, ext_flags,
                             (uint32_t)store_tokens.len, 0,
                             (uint32_t)ds4_session_ctx(session),
                             now, now, payload_bytes);
@@ -1074,7 +1123,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                 save_ms);
-        ds4_kvstore_evict(kc, live_tokens, sha);
     }
     free(tmp);
     free(text);
