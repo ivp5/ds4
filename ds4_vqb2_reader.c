@@ -129,7 +129,7 @@ void ds4_vqb2_close(ds4_vqb2_file *f) {
  *
  * Endianness: little-bit-endian within bytes (LSB of byte 0 is bit 0 of
  * the first code). Matches Python `numpy.packbits(..., bitorder='little')`
- * convention used by codex encoder.
+ * encoder convention.
  */
 static inline uint32_t vqb2_extract_code(const uint8_t *codes,
                                          uint64_t linear_pair,

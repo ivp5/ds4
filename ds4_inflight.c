@@ -1,24 +1,12 @@
-/* ds4_inflight.c — session 2026-05-26 adaptive primitives, spaghetti
+/* ds4_inflight.c — adaptive primitives for in-flight loop detection,
+ * harm comparison, and sparse-repair search.
  *
- * silv 2026-05-26: "refactor into spaghetti code with minimal functions
- * (unless those save disproportionate amount of codelines/complexity)
- * and all functions and variables having self-explanatory names"
+ * Consolidated module replacing the 5-file split: ds4_cache_lock_detector,
+ * ds4_signed_watchlist, ds4_bounded_packet_search, ds4_codec_k_dispatcher.
  *
- * Replaces the over-factored 5-file split:
- *   ds4_cache_lock_detector.{h,c}   216+111  -> loop_detector below
- *   ds4_signed_watchlist.h           161    -> watched_rank + harm-check below
- *   ds4_bounded_packet_search.c      154    -> search_for_sparse_repair below
- *   ds4_codec_k_dispatcher.h         145    -> classify_token_difficulty inline
- *
- * Original files preserved per append-only doctrine; this file is the
- * consolidated spaghetti form. Switch the Makefile when silv pulls.
- *
- * Geohotz (minimum-viable) + Knuth (provable bounds) + Carmack (data-
- * oriented) on the wheel; Tao + Donoho + Pearl consulted on naming.
- *
- * Statics at top. Types in one block. Three functions worth their scope
+ * Layout: statics at top, types in one block, three primary functions
  * (event handler, autocorrelation lookup, bounded search). Hot paths
- * inlined.
+ * inlined. Self-explanatory names.
  */
 
 #include <stdbool.h>
@@ -135,13 +123,9 @@ static inline uint64_t hash_a_sequence_of_tokens(const int32_t *tokens, uint32_t
  * APPEND-ONLY JSONL JOURNAL — opt-in via DS4_INFLIGHT_JOURNAL env var
  * ==================================================================== */
 
-/* silv 2026-05-26: "keep detailed journal of all transactions in append-
- * only mode for further analysis afterwards."
- *
- * Design: append one JSON line per detector event. File path from env
- * var DS4_INFLIGHT_JOURNAL. When unset, every journal_* call is a
- * no-op (zero overhead in production). FD opened lazily on first
- * event, kept open until process exit. Append-only semantics:
+/* Append-only event journal. One JSON line per detector event. File path
+ * from env var DS4_INFLIGHT_JOURNAL; unset = zero-overhead no-op. FD
+ * opened lazily on first event, kept open until process exit. Semantics:
  * O_WRONLY|O_CREAT|O_APPEND. No fsync per event (kernel flushes on
  * close/exit); add `--sync` mode later if a caller needs durability. */
 #include <stdio.h>
@@ -386,16 +370,15 @@ int32_t guess_next_token_assuming_loop_continues(const loop_detector *d) {
     return predicted;
 }
 
-/* does_this_codec_harm_more_than_baseline — codex H1899 signed
- * watchlist trigger. Per-rank comparison; returns true if the
- * candidate codec pushed ANY watched rank up MORE than the baseline
- * codec did. The "MORE" condition (not "differently") is what makes
- * this signed.
+/* does_this_codec_harm_more_than_baseline — signed watchlist trigger.
+ * Per-rank comparison; returns true if the candidate codec pushed ANY
+ * watched rank up MORE than the baseline codec did. The "MORE" condition
+ * (not "differently") is what makes this signed.
  *
  * Pre-commit refute: should miss harm cases when watchlist depth < 8
- * because codex H1899 measured on 13-deep watchlists. REFUTED at depth=3
- * recalls 52.63% of depth=13 cases. Caller MUST supply ≥8-deep watchlist
- * for production use. */
+ * because the reference 23/23 recall was measured at depth 13. REFUTED at
+ * depth=3 (recalls only 52.63% of depth=13 cases). Caller MUST supply
+ * how_many_ranks ≥ 8 for production use. */
 harm_comparison_result does_this_codec_harm_more_than_baseline(
         const watched_rank *ranks, uint32_t how_many_ranks) {
     harm_comparison_result result;
@@ -429,19 +412,18 @@ harm_comparison_result does_this_codec_harm_more_than_baseline(
     return result;
 }
 
-/* search_for_sparse_repair_when_codec_harms — codex H1898 bounded
- * singleton→pair search. Walks: (1) baseline (all-candidate, mask=0)
- * to see if anything's broken, (2) direct-all (codex H1895 sanity:
- * sometimes worse than baseline due to pair antagonism!), (3) each
- * single edge promoted, (4) rank-ordered pairs of edges promoted
+/* search_for_sparse_repair_when_codec_harms — bounded singleton→pair search.
+ * Walks: (1) baseline (all-candidate, mask=0) to see if anything's broken,
+ * (2) direct-all (can be WORSE than baseline due to pair antagonism!),
+ * (3) each single edge promoted, (4) rank-ordered pairs of edges promoted
  * (in increasing order of individual harm).
  *
  * Worst-case bound: 2 (refs) + n_edges + n_edges*(n_edges-1)/2 evals.
- * For n=6: 2+6+15 = 23. Codex measured mean 3.67/case on 12 real cases.
+ * For n=6: 2+6+15 = 23. Measured mean: 3.67/case on 12 real cases.
  *
- * Returns true if a zero-harm mask was found, false if best-found
- * still harms (caller then either accepts the candidate codec
- * wholesale, escalates to direct-all, or refuses the dispatch). */
+ * Returns true if a zero-harm mask was found, false if best-found still
+ * harms (caller then either accepts the candidate codec wholesale,
+ * escalates to direct-all, or refuses the dispatch). */
 bool search_for_sparse_repair_when_codec_harms(
         uint32_t n_edges,
         evaluate_codec_subset_harm_fn evaluate,
@@ -466,8 +448,8 @@ bool search_for_sparse_repair_when_codec_harms(
         return true;
     }
 
-    /* Step 2: direct-all (codex H1895 case L22 trim50 C88 shows this
-     * can be WORSE than sparse subsets due to pair antagonism). */
+    /* Step 2: direct-all sanity (can be WORSE than sparse subsets due to
+     * pair antagonism — refute the "more baseline always helps" intuition). */
     uint32_t mask_with_all_edges_baseline = (n_edges >= 32) ? UINT32_MAX : ((1u << n_edges) - 1u);
     float harm_when_all_edges_are_baseline = 0.0f;
     if (evaluate(mask_with_all_edges_baseline, userdata, &harm_when_all_edges_are_baseline) != 0) return false;

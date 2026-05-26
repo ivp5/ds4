@@ -1,16 +1,17 @@
 /* ds4_metal_vqb2_fp16.m — Metal FP16 routed-FFN dispatch.
  *
- *   3 backends (legacy / ICB Phase 7 / MTL4 argument-table), selected at
- *   runtime via env DS4_VQB2_FP16_PATH = legacy|icb|mtl4.
+ *   3 backends (legacy / ICB record-replay / MTL4 argument-table), selected
+ *   at runtime via env DS4_VQB2_FP16_PATH = legacy|icb|mtl4.
  *   Hot store FP16 heap wraps zero-copy as MTLBuffer on Apple Silicon.
  *   ICB cache is per-layer 8-slot LRU keyed by sorted-expert hash.
  *   Journal events emit through ds4_journal (weak default stubs).
  *
- * silv preference: all variables defined statically at top; minimal
- * functions; self-explanatory names; spaghetti style.
+ * Convention: all variables defined statically at top; minimal functions;
+ * self-explanatory names.
  *
- * STICKY HAZARD (CLAUDE.md): every DS4 binary using this MUST launch with
- * --prefill-metal-phases auto (or --cpu-moe). Two kernel panics on file.
+ * SAFETY: every DS4 binary using this MUST launch with
+ * --prefill-metal-phases auto (or --cpu-moe). The IQ2_XXS model exceeds
+ * the M1 Max wired-memory cap (~48 GB) without phase-split prefill.
  */
 #include "ds4_metal_vqb2_fp16.h"
 #include "ds4_expert_table.h"
@@ -111,7 +112,7 @@ static const char *msl_source =
 
 #ifdef __APPLE__
 /* ==========================================================================
- * STATICS — all named, all defined at top per silv preference.
+ * STATICS — all named, all defined at top.
  * State lives here, functions just touch it.
  * ========================================================================== */
 
@@ -137,7 +138,7 @@ static id<MTLBuffer>               s_scratch_mid         = nil;
 static id<MTLBuffer>               s_persistent_input    = nil;
 static id<MTLBuffer>               s_persistent_output   = nil;
 
-/* MTL4 surface (codex H1723 / H1779 modern path) */
+/* MTL4 surface (modern path: argument tables + residency sets) */
 static id<MTL4Compiler>            s_mtl4_compiler       = nil;
 static id<MTLLibrary>              s_mtl4_library        = nil;
 static id<MTLComputePipelineState> s_mtl4_pipeline_gate_up = nil;
@@ -417,9 +418,9 @@ int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *store) {
 }
 
 /* Lazy MTL4 arg-table + residency-set init.
- * codex H1724: argument-table buffers READ AS ZERO unless declared in a
- * residency set with requestResidency + addResidencySet to queue.
- * Codified here so subsequent users don't hit the 4-hour debug. */
+ * Buffers bound via MTL4 argument tables READ AS ZERO unless declared in a
+ * residency set with requestResidency + addResidencySet to queue. Codified
+ * here in the init path so callers get the right state by construction. */
 static int init_mtl4_arg_table(void) {
     if (s_mtl4_arg_table && s_mtl4_residency) return 0;
     if (!s_mtl4_initialized && ds4_metal_vqb2_fp16_init_mtl4() != 0) return -1;
@@ -713,7 +714,7 @@ int ds4_metal_vqb2_fp16_dispatch_icb(struct ds4_hot_expert_store *store,
 /* ==========================================================================
  * BACKEND 3 — MTL4 argument-table dispatch.
  * Per-dispatch: setAddress on persistent argTable + dispatchThreadgroups.
- * Residency set declared at init (H1724 trap codified).
+ * Residency set declared at init (so arg-table reads aren't silently zero).
  * ========================================================================== */
 int ds4_metal_vqb2_fp16_dispatch_mtl4(struct ds4_hot_expert_store *store,
                                       uint32_t layer, uint32_t n_tokens,

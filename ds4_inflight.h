@@ -1,8 +1,7 @@
-/* ds4_inflight.h — public declarations for ds4_inflight.c spaghetti.
+/* ds4_inflight.h — public declarations for ds4_inflight.c.
  *
- * silv 2026-05-26 consolidation. Replaces ds4_cache_lock_detector.{h,c},
- * ds4_signed_watchlist.h, ds4_bounded_packet_search.c,
- * ds4_codec_k_dispatcher.h. Self-explanatory names per directive.
+ * Consolidated module replacing ds4_cache_lock_detector, ds4_signed_watchlist,
+ * ds4_bounded_packet_search, ds4_codec_k_dispatcher. Self-explanatory names.
  */
 #ifndef DS4_INFLIGHT_H
 #define DS4_INFLIGHT_H
@@ -20,13 +19,8 @@ extern "C" {
 #define LOOP_REPEAT_FACTOR_TO_DECLARE_STUCK            3.0f
 #define NGRAM_HASH_TABLE_SIZE                          512
 
-/* TRIPWIRES (silv 2026-05-26 6-failure-modes audit, F4/F5/F6):
- *   - F4: catches symbol collision early; if another TU shadows our
- *     symbol names, link error is loud and immediate (no inoculation
- *     needed at C level; tripwire is the build itself).
- *   - F5: catches struct-size drift across reorders or platforms. If
- *     someone adds a field or platform alignment changes, build fails.
- *   - F6: catches C89 compiler builds that lack inline+stdbool. */
+/* Tripwires: link error on symbol shadowing (loud + immediate); static
+ * assertion below catches pre-C99 builds that lack inline+stdbool. */
 #if defined(__STDC_VERSION__)
 _Static_assert(__STDC_VERSION__ >= 199901L,
                "ds4_inflight requires C99 or later for stdbool/inline");
@@ -76,9 +70,8 @@ bool watch_token_emerging_from_model(loop_detector *d, int32_t token);
 int32_t guess_next_token_assuming_loop_continues(const loop_detector *d);
 /* DEPTH WARNING: at uniformly-distributed harm-rank scale (10K trials), this
  * function recalls only 10% of true harms at how_many_ranks=3, 20% at 5,
- * 40% at 8, 60% at 13. Codex H1899's 23/23 documented recall was on 13-deep
- * watchlists. Caller MUST supply how_many_ranks >= 8 for production use;
- * >= 13 to match codex's reference recall. */
+ * 40% at 8, 60% at 13. Caller MUST supply how_many_ranks >= 8 for production
+ * use; >= 13 for the reference 23/23 recall measurement. */
 harm_comparison_result does_this_codec_harm_more_than_baseline(
         const watched_rank *ranks, uint32_t how_many_ranks);
 bool search_for_sparse_repair_when_codec_harms(

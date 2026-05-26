@@ -1,16 +1,15 @@
 /* DS4 expert-table — runtime per-(layer, expert) tier classification.
  *
- * : implements the unified substrate spec from
- * audits/expert_table_design_20260523.md. Storage + loader + router-intercept
- * helper. Integration into ds4.c documented in ds4_expert_table.h.
+ * Storage + loader + router-intercept helper.
+ * Integration into ds4.c documented in ds4_expert_table.h.
  *
- * Per CLAUDE.md STICKY HAZARD: any DS4 launch using this code must include
+ * SAFETY: any DS4 launch using this code must include
  * --prefill-metal-phases auto. The mask infrastructure does NOT change the
  * wired-memory cap; it changes WHICH experts are dispatched.
  */
 
 #include "ds4_expert_table.h"
-#include "ds4_vqb2_reader.h"  /* silv 2026-05-26: VQB2 → FP16 populator */
+#include "ds4_vqb2_reader.h"  /* VQB2 → FP16 populator */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,7 +124,7 @@ void ds4_apply_expert_mask_to_selection(uint32_t layer, float *selection) {
 }
 
 /* =========================================================================
- * HOT EXPERT PRE-DEQUANT (silv 2026-05-26: advance further)
+ * HOT EXPERT PRE-DEQUANT
  *
  * Storage + diagnostic counters. The dispatch wiring lives in ds4.c (which
  * has access to the IQ2_XXS dequant helpers and the CPU-MoE inner loop).
@@ -201,8 +200,8 @@ int ds4_hot_pin_expert(ds4_hot_expert_store *store,
                 (unsigned long long)store->budget_bytes);
         return -1;
     }
-    /* TODO(silv-approval): wire actual IQ2_XXS → FP16 dequant from ds4.c.
-     * Until then, return -1 so callers know the pin didn't succeed. */
+    /* TODO: wire actual IQ2_XXS → FP16 dequant from ds4.c. Until then,
+     * return -1 so callers know the pin didn't succeed. */
     return -1;
 }
 
@@ -270,7 +269,7 @@ void ds4_hot_reset_stats(void) {
 }
 
 /* =========================================================================
- * Global active hot-store + dispatch helpers (silv 2026-05-26).
+ * Global active hot-store + dispatch helpers.
  * ========================================================================= */
 
 static ds4_hot_expert_store *g_active_hot_store = NULL;
@@ -430,7 +429,7 @@ int ds4_hot_dispatch_layer_cpu(const ds4_hot_expert_store *store,
 }
 
 /* =========================================================================
- * VQB2 → FP16 populator (silv 2026-05-26 "not iq2_xxs" path)
+ * VQB2 → FP16 populator
  *
  * Apple M1 P-cores have native FP16 support (ARMv8.2-a+fp16). The compiler
  * exposes _Float16 as a built-in scalar type when -mcpu=native is on.
@@ -475,7 +474,7 @@ int ds4_vqb2_corpus_load(ds4_hot_expert_store *store, const char *corpus_dir) {
 }
 
 /* =========================================================================
- * Candidate-keyed VQB2 loader (codex H1884 patch verbatim).
+ * Candidate-keyed VQB2 loader.
  *
  * Manifest CSV format:
  *   candidate,layer,kind,k,path
@@ -702,7 +701,7 @@ int ds4_hot_pin_expert_from_vqb2(ds4_hot_expert_store *store,
 }
 
 /* =========================================================================
- * Recursive corpus directory walker (silv 2026-05-26)
+ * Recursive corpus directory walker
  *
  * Opens every `*.vqb2` file under corpus_dir, reads its header to route by
  * (layer, kind_id), and pins all experts via ds4_hot_pin_expert_from_vqb2.

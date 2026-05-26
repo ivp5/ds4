@@ -1,23 +1,16 @@
-/* ds4_metal_vqb2_fp16.h — Metal FP16 routed-FFN dispatch (silv 2026-05-26).
+/* ds4_metal_vqb2_fp16.h — Metal FP16 routed-FFN dispatch.
  *
- * Per the architecture validated this session (VQB2_PATH_FOUND.md):
- *   VQB2 on disk (~5-15 GB) → load-time dequant → FP16 hot store (~29 GB)
- *   → Metal FP16 matvec dispatch on routed experts → 20-30 t/s target.
+ * Path:
+ *   VQB2 packets on disk (~5-15 GB) → load-time dequant → FP16 hot store
+ *   (~29 GB) → Metal FP16 matvec dispatch on routed experts.
  *
- * Per codex H1884:
- *   Hot store is populated via ds4_vqb2_candidate_manifest_load (already
- *   shipped). Dispatch looks up tiles via ds4_hot_get_{gate,up,down}_fp16.
+ * Hot store populated via ds4_vqb2_candidate_manifest_load. Dispatch looks
+ * up FP16 tiles via ds4_hot_get_{gate,up,down}_fp16. Falls back to the
+ * IQ2_XXS path when the hot store doesn't cover a (layer, expert) tile.
  *
- * Per codex H1666:
- *   MTL4 ML is a dense-organ route, not a universal backend. The routed
- *   FFN is per-token-sparse (6 active of 256 experts). Use standard MTLCompute
- *   with FP16 matvec kernels rather than MTL4 ML.
- *
- * THIS FILE: declarations + Metal kernel source + dispatch shape. The
- * `ds4_metal_vqb2_fp16_dispatch` function is the integration point that
- * `metal_graph_encode_decode_layer` (ds4.c:10823) calls when the hot store
- * has a tile for (layer, expert) — falling back to the IQ2_XXS path
- * otherwise. Integration wiring is the NEXT engineering step.
+ * Routed FFN is per-token-sparse (6 active of 256 experts). We use standard
+ * MTLCompute with FP16 matvec kernels by default; the MTL4Compute path
+ * (argument tables + residency sets) is selectable via env DS4_VQB2_FP16_PATH.
  */
 #ifndef DS4_METAL_VQB2_FP16_H
 #define DS4_METAL_VQB2_FP16_H
@@ -37,27 +30,17 @@ extern "C" {
  * Idempotent. Returns 0 on success, non-zero on failure. */
 int ds4_metal_vqb2_fp16_init(void);
 
-/* MTL4Compute path init (silv 2026-05-26 correction + codex H1723/H1779).
- * Uses modern MTL4Compiler + MTL4CommandQueue + MTL4CommandAllocator +
- * MTL4ArgumentTable. Required for the modern dispatch path.
- * Calls ds4_metal_vqb2_fp16_init internally to reuse device + MSL source.
- * Idempotent. Returns 0 on success, non-zero on failure.
- */
+/* MTL4Compute path init: MTL4Compiler + MTL4CommandQueue +
+ * MTL4CommandAllocator + MTL4ArgumentTable. Calls ds4_metal_vqb2_fp16_init
+ * internally to reuse the device + MSL source. Idempotent. */
 int ds4_metal_vqb2_fp16_init_mtl4(void);
 
-/* Bind a hot store as Metal-resident MTLBuffer (zero-copy on M1 unified
- * memory via newBufferWithBytesNoCopy). The Metal kernels read FP16 tiles
- * directly from this buffer using the store's offset tables.
+/* Bind a hot store as Metal-resident MTLBuffer via newBufferWithBytesNoCopy.
+ * On Apple Silicon unified memory with storageModeShared this is zero-copy:
+ * no GPU-side mirror, no transfer cost. Store remains heap owner; Metal
+ * just borrows (deallocator callback left empty).
  *
- * Must be called AFTER store is populated (ds4_vqb2_candidate_manifest_load).
- * Idempotent: re-calling rebinds. Returns 0 on success, -1 on Metal alloc
- * failure or NULL store.
- *
- * Per codex H1717: Apple Silicon unified memory means storageModeShared
- * MTLBuffer wrapping a malloc'd heap is zero-copy — no GPU-side mirror,
- * no transfer cost. The deallocator callback is left empty so the store
- * remains the owner of the heap (Metal just borrows).
- */
+ * Must be called AFTER store is populated. Idempotent. Returns 0 / -1. */
 int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *store);
 
 /* Per-layer dispatch: route through (hot_store, layer, expert_ids[K], weights[K])
@@ -97,10 +80,9 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
  * captures dispatch time of gate/up/swiglu/down per expert. */
 void ds4_metal_vqb2_fp16_set_profile(bool enabled);
 
-/* Backend variants — silv 2026-05-26 "go for full record-replay AND MTL4
- * argument-table caching". Caller normally uses ds4_metal_vqb2_fp16_dispatch
- * which routes by env var DS4_VQB2_FP16_PATH=legacy|icb|mtl4. The three
- * backends are also exposed for benchmarking / A/B comparison. */
+/* Backend variants exposed for benchmarking / A/B. Top-level dispatcher
+ * ds4_metal_vqb2_fp16_dispatch selects one via env DS4_VQB2_FP16_PATH=
+ * legacy|icb|mtl4. */
 int ds4_metal_vqb2_fp16_dispatch_legacy(struct ds4_hot_expert_store *store,
                                         uint32_t layer, uint32_t n_tokens,
                                         const int32_t *selected_exps,
@@ -118,7 +100,7 @@ int ds4_metal_vqb2_fp16_dispatch_mtl4(struct ds4_hot_expert_store *store,
                                       const void *input_fp32, void *output_fp32);
 
 /* ICB cache telemetry. hits/misses/evicts are monotonic counters; subtract
- * snapshots to get per-window deltas. Per Vitalik: all state observable. */
+ * snapshots to get per-window deltas. */
 void ds4_metal_vqb2_fp16_icb_stats(uint64_t *hits, uint64_t *misses, uint64_t *evicts);
 
 #ifdef __cplusplus

@@ -34,7 +34,7 @@
  *
  * One file per (layer, kind). Codebook shared across all experts within tile.
  *
- * Mirror of vq2d_encode_vqb2 output (codex H1824-H1826).
+ * Mirror of the vq2d_encode_vqb2 encoder output format.
  */
 #ifndef DS4_VQB2_READER_H
 #define DS4_VQB2_READER_H

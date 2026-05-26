@@ -7,8 +7,9 @@
  *
  * Loaded from CSV manifests at engine open. See ds4/masks/.
  *
- * CLAUDE.md STICKY HAZARD: any DS4 launch using this code MUST include
- * --prefill-metal-phases auto (or --cpu-moe). Two kernel panics on file.
+ * SAFETY: any DS4 launch using this code MUST include
+ * --prefill-metal-phases auto (or --cpu-moe). The IQ2_XXS model exceeds
+ * the M1 Max wired-memory cap (~48 GB) without phase-split prefill.
  */
 #ifndef DS4_EXPERT_TABLE_H
 #define DS4_EXPERT_TABLE_H
@@ -70,8 +71,8 @@ typedef struct ds4_hot_expert_store {
     int64_t  *gate_offset;
     int64_t  *up_offset;
     int64_t  *down_offset;
-    /* H1909 row-block coverage bitmasks. Current VQB2 packets encode row
-     * block 0 only; full hot replacement needs all 16 (gate/up) / 32 (down). */
+    /* Row-block coverage bitmasks. Current VQB2 packets encode row block 0
+     * only; full hot replacement needs all 16 (gate/up) / 32 (down). */
     uint64_t *gate_row_blocks;
     uint64_t *up_row_blocks;
     uint64_t *down_row_blocks;
@@ -100,7 +101,7 @@ const void *ds4_hot_get_gate_fp16(const ds4_hot_expert_store *store, uint32_t la
 const void *ds4_hot_get_up_fp16  (const ds4_hot_expert_store *store, uint32_t layer, uint32_t expert);
 const void *ds4_hot_get_down_fp16(const ds4_hot_expert_store *store, uint32_t layer, uint32_t expert);
 
-/* H1909 row-block constants. Full row mask must equal these for hot-path. */
+/* Row-block constants. Full row mask must equal these for hot-path. */
 #define DS4_VQB2_ROW_BLOCK_ROWS          128ULL
 #define DS4_VQB2_GATE_UP_FULL_ROW_BLOCKS 16ULL
 #define DS4_VQB2_DOWN_FULL_ROW_BLOCKS    32ULL
@@ -115,11 +116,11 @@ int ds4_hot_pin_expert_from_vqb2(ds4_hot_expert_store *store,
                                  const struct ds4_vqb2_file *vqb2, uint32_t expert);
 
 /* Walk a directory recursively; pin every .vqb2 found. Diagnostic only —
- * H1883: multiple K values per (layer, kind) cause silent overwrites. Use
+ * Hazard: multiple K values per (layer, kind) cause silent overwrites. Use
  * ds4_vqb2_candidate_manifest_load() for runtime paths. */
 int ds4_vqb2_corpus_load(ds4_hot_expert_store *store, const char *corpus_dir);
 
-/* Candidate-keyed loader (codex H1884). Manifest: candidate,layer,kind,k,path.
+/* Candidate-keyed loader. Manifest format: candidate,layer,kind,k,path.
  * Validates header vs row; rejects K-aliases for same (layer, kind). */
 int ds4_vqb2_candidate_manifest_load(ds4_hot_expert_store *store,
                                      const char *manifest_csv,

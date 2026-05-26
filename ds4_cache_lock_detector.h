@@ -1,10 +1,10 @@
 /* ds4_cache_lock_detector.h — legacy compat shim over ds4_inflight.h.
  *
- * silv 2026-05-26 spaghetti consolidation: the implementation moved to
- * ds4_inflight.c with self-explanatory names. This header maps the
- * legacy API (ds4_cache_lock_*) onto the new (watch_token_emerging_from_model
- * + guess_next_token_assuming_loop_continues) so ds4.c gen-loop call
- * sites compile unchanged. New code should use ds4_inflight.h directly.
+ * The implementation moved to ds4_inflight.c with self-explanatory names.
+ * This header maps the legacy API (ds4_cache_lock_*) onto the new
+ * (watch_token_emerging_from_model + guess_next_token_assuming_loop_continues)
+ * so existing call sites compile unchanged. New code should use
+ * ds4_inflight.h directly.
  */
 #ifndef DS4_CACHE_LOCK_DETECTOR_H
 #define DS4_CACHE_LOCK_DETECTOR_H
@@ -33,11 +33,10 @@ typedef struct {
     uint16_t top_count;
 } ds4_cache_lock_state;
 
-/* INOCULATION F1: compat shim silently drops args. Warn loudly if caller
- * passes non-default values; they're being ignored by the spaghetti.
- * INOCULATION F2: even with default n, autocorrelation uses ALL lags for
- * prediction; n only affects lock-onset detection's n-gram length. Half-
- * migrated. */
+/* The compat shim silently drops tuning args. Warn loudly if caller passes
+ * non-default values so the discrepancy is visible at runtime. Note also
+ * that even with default n, autocorrelation prediction uses ALL lags;
+ * n only affects the lock-onset detection n-gram length. */
 static inline ds4_cache_lock_detector *ds4_cache_lock_alloc(
         uint32_t window_size, uint32_t n, float threshold) {
     if (window_size != DS4_CACHE_LOCK_WINDOW_DEFAULT
@@ -72,17 +71,16 @@ static inline int32_t ds4_cache_lock_predict_next(const ds4_cache_lock_detector 
     return guess_next_token_assuming_loop_continues(d);
 }
 
-/* INOCULATION F3 — TRIPWIRE: state-mapping depends on loop_detector field
- * names below. If you rename these in ds4_inflight.h, update here too.
+/* TRIPWIRE: state-mapping depends on loop_detector field names below.
+ * If those are renamed in ds4_inflight.h, update here too.
  * Mapping:
  *   ds4_cache_lock_state.locked         <- model_is_stuck_in_a_loop
  *   ds4_cache_lock_state.n_distinct     <- how_many_distinct_ngrams_currently
  *   ds4_cache_lock_state.n_total        <- how_many_ngram_occurrences_total
  *   ds4_cache_lock_state.repeat_factor  <- computed = n_total / n_distinct
- *   ds4_cache_lock_state.top_ngram_hash <- DEPRECATED 2026-05-26: source
- *     fields cut as stale-cache (silv cache-coherence directive); kept
- *     in struct ABI for legacy compat but reported as 0.
- *   ds4_cache_lock_state.top_count      <- DEPRECATED 2026-05-26: same. */
+ *   ds4_cache_lock_state.top_ngram_hash <- DEPRECATED: source fields cut as
+ *     stale-cache. Kept in struct ABI for legacy compat but reported as 0.
+ *   ds4_cache_lock_state.top_count      <- DEPRECATED: same. */
 static inline void ds4_cache_lock_get_state(const ds4_cache_lock_detector *d,
                                              ds4_cache_lock_state *out) {
     if (!d || !out) return;
