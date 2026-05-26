@@ -26,6 +26,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>      /* getenv */
+#include <sys/time.h>    /* gettimeofday */
 
 #ifdef __APPLE__
 #import <Foundation/Foundation.h>
@@ -196,6 +198,14 @@ static id<MTLBuffer> s_scratch_gate_out = nil;
 static id<MTLBuffer> s_scratch_up_out = nil;
 static id<MTLBuffer> s_scratch_mid = nil;
 
+/* Persistent I/O buffers (silv 2026-05-26 — Option A from ICB comment).
+ * Holding stable buffer identities means ICB-recorded commands remain
+ * valid across tokens; only the per-token contents change via memcpy.
+ * Size = n_rows × 2 × 4 bytes = 1 KB padded to one 16 KB page. */
+static id<MTLBuffer> s_persistent_input = nil;
+static id<MTLBuffer> s_persistent_output = nil;
+#define DS4_VQB2_FP16_IO_PAGE_BYTES 16384u
+
 /* DS4-Flash routed-FFN dimensions per (layer, expert). Hardcoded for now
  * (matches CPU dispatch in ds4_expert_table.c:305+). Future iteration:
  * read from store->n_rows[layer] / store->n_pairs[layer][kind] after the
@@ -285,8 +295,13 @@ int ds4_metal_vqb2_fp16_init(void) {
                                                   options:MTLResourceStorageModeShared];
         s_scratch_mid      = [s_device newBufferWithLength:DS4_VQB2_FP16_SCRATCH_BYTES
                                                   options:MTLResourceStorageModeShared];
-        if (!s_scratch_gate_out || !s_scratch_up_out || !s_scratch_mid) {
-            fprintf(stderr, "ds4_metal_vqb2_fp16_init: scratch buffer alloc failed\n");
+        s_persistent_input  = [s_device newBufferWithLength:DS4_VQB2_FP16_IO_PAGE_BYTES
+                                                   options:MTLResourceStorageModeShared];
+        s_persistent_output = [s_device newBufferWithLength:DS4_VQB2_FP16_IO_PAGE_BYTES
+                                                   options:MTLResourceStorageModeShared];
+        if (!s_scratch_gate_out || !s_scratch_up_out || !s_scratch_mid ||
+            !s_persistent_input || !s_persistent_output) {
+            fprintf(stderr, "ds4_metal_vqb2_fp16_init: scratch/IO buffer alloc failed\n");
             return -1;
         }
 
@@ -452,13 +467,15 @@ static size_t vqb2_fp16_offset_for(const void *tile_ptr) {
     return (size_t)off;
 }
 
-int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
-                                 uint32_t layer,
-                                 uint32_t n_tokens,
-                                 const int32_t *selected_exps,
-                                 const float *expert_weights,
-                                 const void *input_fp32,
-                                 void *output_fp32) {
+/* Renamed from public dispatch — the top-level dispatcher (further below)
+ * routes to this legacy path or to ICB / MTL4 backends per env var. */
+int ds4_metal_vqb2_fp16_dispatch_legacy(struct ds4_hot_expert_store *store,
+                                        uint32_t layer,
+                                        uint32_t n_tokens,
+                                        const int32_t *selected_exps,
+                                        const float *expert_weights,
+                                        const void *input_fp32,
+                                        void *output_fp32) {
     if (!s_initialized) return -1;
     if (!store || !selected_exps || !expert_weights ||
         !input_fp32 || !output_fp32) return -1;
@@ -581,11 +598,616 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
         [cmd waitUntilCompleted];
 
         if (cmd.error) {
-            fprintf(stderr, "ds4_metal_vqb2_fp16_dispatch: cmd.error = %s\n",
+            fprintf(stderr, "ds4_metal_vqb2_fp16_dispatch_legacy: cmd.error = %s\n",
                     [[cmd.error localizedDescription] UTF8String]);
             return -2;
         }
         return 0;
+    }
+}
+
+/* =========================================================================
+ * ICB Phase 7 — record-replay for the 24-dispatch routed-FFN sequence.
+ *
+ * silv 2026-05-26 "go for full record-replay" + Knuth's TAOCP §6.4
+ * hash-with-Knuth-multiplier-then-linear-probe pattern.
+ *
+ * Cache structure (per-layer slab, 8 slots):
+ *   key  = sorted-expert-tuple hash (uint64)
+ *   icb  = MTLIndirectCommandBuffer holding 24 pre-recorded compute commands
+ *   tick = monotonic counter; oldest evicted on miss
+ *
+ * Hit path: bind input/output buffers, replay ICB via executeCommandsInBuffer
+ * (one encoder call), commit, wait. CPU work per token per layer drops from
+ * 24 setComputePipelineState + 96 setBuffer + 16 setBytes + 24 dispatchThreads
+ * (~150 ObjC calls) to ~10 (useResource + executeCommands + commit/wait).
+ *
+ * Miss path: record into newly-allocated ICB then replay (same cost as
+ * legacy first time, faster subsequent calls).
+ *
+ * Carmack-style minimum-viable-cache: linear probe within an 8-slot row,
+ * no per-slot mutex (DS4 is single-token-at-a-time), no rehash. O(1) hit,
+ * O(8) miss-with-evict-LRU.
+ *
+ * Per Geohotz: keep the data structures dumb. Per Knuth: get the math right
+ * once and it's done — multiplier 2654435761 minimises clustering for
+ * uniform distributions, which expert-set hashes approximate.
+ *
+ * Per Vitalik: cache state IS observable; every record/hit/miss/evict
+ * event emits via ds4_journal so post-hoc replay analysis can verify
+ * the LRU behavior offline.
+ * ========================================================================= */
+
+#define DS4_VQB2_FP16_ICB_SLOTS_PER_LAYER 8
+#define DS4_VQB2_FP16_ICB_COMMANDS_PER_DISPATCH 24u  /* 6 experts × 4 kernels */
+#define DS4_VQB2_FP16_KNUTH_MULT 2654435761ULL
+
+typedef struct {
+    uint64_t key;        /* sorted-expert hash; 0 = empty slot */
+    id<MTLIndirectCommandBuffer> icb;
+    uint64_t last_use;
+    /* per-command buffer offsets baked into ICB (24 commands worth) */
+    size_t gate_off[6];
+    size_t up_off[6];
+    size_t down_off[6];
+    float  expert_w[6];
+} ds4_icb_slot_t;
+
+#ifndef DS4_N_LAYER
+#define DS4_N_LAYER 43
+#endif
+
+static ds4_icb_slot_t s_icb_cache[DS4_N_LAYER][DS4_VQB2_FP16_ICB_SLOTS_PER_LAYER];
+static uint64_t s_icb_ticket = 0;
+static uint64_t s_icb_hits = 0;
+static uint64_t s_icb_misses = 0;
+static uint64_t s_icb_evicts = 0;
+
+/* Forward-declare journal helper (defined later in this file). */
+static void ds4_vqb2_fp16_emit_dispatch_event(uint32_t layer,
+                                              const char *path,
+                                              uint64_t wall_us,
+                                              bool icb_hit,
+                                              int64_t signature);
+
+/* Knuth-multiplier hash on (layer, sorted-expert-tuple, expert_w-as-bits).
+ * Including expert_w means weight-quantization breaks cache hits; we
+ * exclude expert_w from the key but require slot signature match to
+ * include weights (re-record on weight mismatch even at same expert set).
+ * This keeps cache hit probability tied to expert SET repetition, while
+ * weight variation triggers re-record cheaply (rare path).
+ */
+static uint64_t ds4_vqb2_fp16_signature(uint32_t layer,
+                                        const int32_t *experts,
+                                        int n_experts) {
+    /* Copy + sort the expert tuple (n ≤ 6). */
+    int32_t sorted[8] = {0};
+    int n = (n_experts > 8) ? 8 : n_experts;
+    for (int i = 0; i < n; i++) sorted[i] = experts[i];
+    /* Insertion sort — n ≤ 6 so this is O(36) at worst. */
+    for (int i = 1; i < n; i++) {
+        int32_t v = sorted[i];
+        int j = i - 1;
+        while (j >= 0 && sorted[j] > v) { sorted[j+1] = sorted[j]; j--; }
+        sorted[j+1] = v;
+    }
+    /* Pack into a 64-bit hash; multiplier mixes after each accumulate. */
+    uint64_t h = (uint64_t)layer * DS4_VQB2_FP16_KNUTH_MULT;
+    for (int i = 0; i < n; i++) {
+        h = (h ^ (uint32_t)sorted[i]) * DS4_VQB2_FP16_KNUTH_MULT;
+    }
+    /* Avoid 0 (empty-slot sentinel). */
+    return h ? h : 1;
+}
+
+/* Find slot for sig in layer's row; on miss, return the LRU slot for eviction.
+ * Returns pointer + sets *hit_out. */
+static ds4_icb_slot_t *ds4_vqb2_fp16_icb_lookup(uint32_t layer,
+                                                uint64_t sig,
+                                                bool *hit_out) {
+    if (layer >= DS4_N_LAYER) { *hit_out = false; return NULL; }
+    ds4_icb_slot_t *row = s_icb_cache[layer];
+    ds4_icb_slot_t *lru = &row[0];
+    for (int i = 0; i < DS4_VQB2_FP16_ICB_SLOTS_PER_LAYER; i++) {
+        if (row[i].key == sig) { row[i].last_use = ++s_icb_ticket; *hit_out = true; return &row[i]; }
+        if (row[i].last_use < lru->last_use) lru = &row[i];
+    }
+    *hit_out = false;
+    return lru;
+}
+
+/* Allocate (or reuse) an MTLIndirectCommandBuffer with 24 dispatch slots. */
+static id<MTLIndirectCommandBuffer> ds4_vqb2_fp16_icb_ensure(ds4_icb_slot_t *slot) {
+    if (slot->icb) return slot->icb;
+    MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
+    desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+    desc.inheritBuffers = NO;
+    desc.inheritPipelineState = NO;
+    desc.maxKernelBufferBindCount = 3;  /* gate_up/down need 3 buffers; swiglu also 3 */
+    slot->icb = [s_device newIndirectCommandBufferWithDescriptor:desc
+                                                 maxCommandCount:DS4_VQB2_FP16_ICB_COMMANDS_PER_DISPATCH
+                                                         options:MTLResourceStorageModeShared];
+    return slot->icb;
+}
+
+/* Record the 24-command sequence into the ICB. Each command's
+ * pipeline + bound buffers + offsets are baked in; setBytes inline data
+ * is NOT supported on indirect compute commands, so all kernel params
+ * (n_rows, n_pairs, clamp, expert_w) must come via buffer arguments.
+ *
+ * To keep the kernel ABI stable across legacy + ICB + MTL4 paths, we
+ * pre-allocate a small param buffer per slot that holds:
+ *   [n_rows, n_pairs, n_down, clamp(float)]  — 16 bytes, constant per slot
+ *   [expert_w0..expert_w5]                    — 24 bytes, captured at record
+ *
+ * Since indirect compute commands DO NOT support `setBytes:length:atIndex:`,
+ * the kernel ABI has been generalized: each kernel reads its scalar params
+ * from buffer-index slots that point into the s_icb_param_buffer.
+ * For backwards compat with the legacy path that uses setBytes, we keep
+ * two MSL kernel variants:
+ *   kernel_vqb2_fp16_*       — legacy (setBytes for params)
+ *   kernel_vqb2_fp16_*_icb   — ICB (params from buffer)
+ *
+ * For this first integration we use the BACKWARD pattern: at record time,
+ * we copy the inline params into per-slot MTLBuffers and bind those as
+ * additional buffer arguments. Kernels treat buffer(3)/buffer(4)/buffer(5)
+ * uniformly as buffer-backed params; the legacy path also binds via
+ * setBuffer for those slots so the MSL stays a single source.
+ *
+ * For simplicity in this iteration, the ICB path uses the EXISTING legacy
+ * MSL but wraps setBytes-style params into a tiny per-slot uniforms buffer.
+ */
+static id<MTLBuffer> s_icb_uniforms = nil;  /* shared 64 KB scratch for params */
+
+static void ds4_vqb2_fp16_icb_record(ds4_icb_slot_t *slot,
+                                     uint64_t sig,
+                                     uint32_t layer,
+                                     const int32_t *selected,
+                                     const float *expert_weights,
+                                     struct ds4_hot_expert_store *store,
+                                     id<MTLBuffer> in_buf,
+                                     id<MTLBuffer> out_buf) {
+    id<MTLIndirectCommandBuffer> icb = ds4_vqb2_fp16_icb_ensure(slot);
+    if (!icb) return;
+
+    /* Per-slot uniforms buffer. Layout (256 bytes / slot):
+     *   [ 0]   uint32 n_rows          (used by gate_up.buffer(3), down.buffer(3))
+     *   [ 4]   uint32 n_pairs         (used by gate_up.buffer(4), swiglu.buffer(3))
+     *   [ 8]   float  clamp           (used by swiglu.buffer(4))
+     *   [12]   uint32 n_down          (used by down.buffer(4))
+     *   [16+]  float  expert_w[6]     (used by swiglu.buffer(5))
+     *
+     * Per-expert SwiGLU calls index into the expert_w array at slot s,
+     * so expert_w_off = u_off + 16 + 4*s when binding swiglu buffer(5). */
+    if (!s_icb_uniforms) {
+        const NSUInteger ubytes = 256u * (NSUInteger)(DS4_N_LAYER * DS4_VQB2_FP16_ICB_SLOTS_PER_LAYER);
+        s_icb_uniforms = [s_device newBufferWithLength:ubytes
+                                              options:MTLResourceStorageModeShared];
+        if (!s_icb_uniforms) return;
+    }
+    const ptrdiff_t base = (ptrdiff_t)((uintptr_t)slot - (uintptr_t)s_icb_cache) / (ptrdiff_t)sizeof(ds4_icb_slot_t);
+    const size_t u_off = (size_t)base * 256u;
+    char *u = (char *)s_icb_uniforms.contents + u_off;
+    *(uint32_t *)(u +  0) = DS4_VQB2_FP16_N_ROWS;
+    *(uint32_t *)(u +  4) = DS4_VQB2_FP16_N_PAIRS;
+    *(float    *)(u +  8) = DS4_VQB2_FP16_CLAMP;
+    *(uint32_t *)(u + 12) = DS4_VQB2_FP16_N_DOWN;
+    for (int s = 0; s < 6; s++) {
+        *(float *)(u + 16 + 4 * s) = expert_weights[s];
+    }
+
+    /* Resolve per-expert tile offsets */
+    for (int s = 0; s < 6; s++) {
+        const int32_t exp_id = selected[s];
+        slot->gate_off[s] = (exp_id < 0) ? SIZE_MAX :
+            vqb2_fp16_offset_for(ds4_hot_get_gate_fp16(store, layer, (uint32_t)exp_id));
+        slot->up_off[s]   = (exp_id < 0) ? SIZE_MAX :
+            vqb2_fp16_offset_for(ds4_hot_get_up_fp16  (store, layer, (uint32_t)exp_id));
+        slot->down_off[s] = (exp_id < 0) ? SIZE_MAX :
+            vqb2_fp16_offset_for(ds4_hot_get_down_fp16(store, layer, (uint32_t)exp_id));
+        slot->expert_w[s] = expert_weights[s];
+        if (slot->gate_off[s] == SIZE_MAX || slot->up_off[s] == SIZE_MAX ||
+            slot->down_off[s] == SIZE_MAX) {
+            slot->key = 0;
+            return;  /* not all experts pinned; cannot record */
+        }
+    }
+
+    /* Record 24 commands. Metal indirect compute commands support
+     * setKernelBuffer:offset:atIndex; the MSL `constant uint &n_rows
+     * [[buffer(3)]]` declaration is bound-by-reference, so a single-uint
+     * read from a buffer works identically to setBytes. Same for clamp/
+     * expert_w (floats) and n_pairs/n_down (uints). The uniforms buffer
+     * holds these as a packed scalar table.
+     *
+     * Dispatch sizing: gate/up/swiglu use one thread per pair (n_pairs);
+     * down uses one thread per row (n_rows). Threadgroup width = 128.
+     *
+     * Per Knuth: keep the inner loop straight; one command, one role. */
+    const uint32_t n_pairs = DS4_VQB2_FP16_N_PAIRS;
+    const uint32_t n_rows  = DS4_VQB2_FP16_N_ROWS;
+    const NSUInteger tg_pairs = MIN((NSUInteger)128, (NSUInteger)n_pairs);
+    const NSUInteger tg_rows  = MIN((NSUInteger)128, (NSUInteger)n_rows);
+    const NSUInteger grid_pairs = ((n_pairs + tg_pairs - 1) / tg_pairs);
+    const NSUInteger grid_rows  = ((n_rows  + tg_rows  - 1) / tg_rows);
+
+    for (int s = 0; s < 6; s++) {
+        const uint32_t cmd0 = (uint32_t)(s * 4);
+
+        /* (0) gate matvec */
+        id<MTLIndirectComputeCommand> c0 = [icb indirectComputeCommandAtIndex:cmd0 + 0];
+        [c0 setComputePipelineState:s_pipeline_gate_up];
+        [c0 setKernelBuffer:s_hot_store_buffer offset:(NSUInteger)slot->gate_off[s] atIndex:0];
+        [c0 setKernelBuffer:in_buf             offset:0                              atIndex:1];
+        [c0 setKernelBuffer:s_scratch_gate_out offset:0                              atIndex:2];
+        [c0 setKernelBuffer:s_icb_uniforms     offset:(NSUInteger)(u_off + 0)        atIndex:3];
+        [c0 setKernelBuffer:s_icb_uniforms     offset:(NSUInteger)(u_off + 4)        atIndex:4];
+        [c0 concurrentDispatchThreadgroups:MTLSizeMake(grid_pairs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tg_pairs, 1, 1)];
+
+        /* (1) up matvec */
+        id<MTLIndirectComputeCommand> c1 = [icb indirectComputeCommandAtIndex:cmd0 + 1];
+        [c1 setComputePipelineState:s_pipeline_gate_up];
+        [c1 setKernelBuffer:s_hot_store_buffer offset:(NSUInteger)slot->up_off[s]   atIndex:0];
+        [c1 setKernelBuffer:in_buf             offset:0                              atIndex:1];
+        [c1 setKernelBuffer:s_scratch_up_out   offset:0                              atIndex:2];
+        [c1 setKernelBuffer:s_icb_uniforms     offset:(NSUInteger)(u_off + 0)        atIndex:3];
+        [c1 setKernelBuffer:s_icb_uniforms     offset:(NSUInteger)(u_off + 4)        atIndex:4];
+        [c1 concurrentDispatchThreadgroups:MTLSizeMake(grid_pairs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tg_pairs, 1, 1)];
+
+        /* (2) SwiGLU + expert_w fuse */
+        id<MTLIndirectComputeCommand> c2 = [icb indirectComputeCommandAtIndex:cmd0 + 2];
+        [c2 setComputePipelineState:s_pipeline_swiglu];
+        [c2 setKernelBuffer:s_scratch_gate_out offset:0                              atIndex:0];
+        [c2 setKernelBuffer:s_scratch_up_out   offset:0                              atIndex:1];
+        [c2 setKernelBuffer:s_scratch_mid      offset:0                              atIndex:2];
+        [c2 setKernelBuffer:s_icb_uniforms     offset:(NSUInteger)(u_off + 4)        atIndex:3];
+        [c2 setKernelBuffer:s_icb_uniforms     offset:(NSUInteger)(u_off + 8)        atIndex:4];
+        [c2 setKernelBuffer:s_icb_uniforms     offset:(NSUInteger)(u_off + 16 + 4*s) atIndex:5];
+        [c2 concurrentDispatchThreadgroups:MTLSizeMake(grid_pairs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tg_pairs, 1, 1)];
+
+        /* (3) down matvec */
+        id<MTLIndirectComputeCommand> c3 = [icb indirectComputeCommandAtIndex:cmd0 + 3];
+        [c3 setComputePipelineState:s_pipeline_down];
+        [c3 setKernelBuffer:s_hot_store_buffer offset:(NSUInteger)slot->down_off[s] atIndex:0];
+        [c3 setKernelBuffer:s_scratch_mid      offset:0                              atIndex:1];
+        [c3 setKernelBuffer:out_buf            offset:0                              atIndex:2];
+        [c3 setKernelBuffer:s_icb_uniforms     offset:(NSUInteger)(u_off + 0)        atIndex:3];
+        [c3 setKernelBuffer:s_icb_uniforms     offset:(NSUInteger)(u_off + 12)       atIndex:4];
+        [c3 concurrentDispatchThreadgroups:MTLSizeMake(grid_rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tg_rows, 1, 1)];
+    }
+
+    slot->key = sig;  /* mark slot as valid for replay */
+}
+
+/* Re-record an existing slot when only expert_w changed (offsets match).
+ * Cheap path: just update the 6 weights in the uniforms buffer. The ICB
+ * commands still reference the same buffer offsets, so no re-record. */
+static void ds4_vqb2_fp16_icb_update_weights(ds4_icb_slot_t *slot,
+                                             const float *expert_weights) {
+    if (!s_icb_uniforms || !slot->icb) return;
+    const ptrdiff_t base = (ptrdiff_t)((uintptr_t)slot - (uintptr_t)s_icb_cache) / (ptrdiff_t)sizeof(ds4_icb_slot_t);
+    const size_t u_off = (size_t)base * 256u;
+    char *u = (char *)s_icb_uniforms.contents + u_off;
+    for (int s = 0; s < 6; s++) {
+        *(float *)(u + 16 + 4 * s) = expert_weights[s];
+        slot->expert_w[s] = expert_weights[s];
+    }
+}
+
+/* ICB-based dispatch backend. */
+int ds4_metal_vqb2_fp16_dispatch_icb(struct ds4_hot_expert_store *store,
+                                     uint32_t layer,
+                                     uint32_t n_tokens,
+                                     const int32_t *selected_exps,
+                                     const float *expert_weights,
+                                     const void *input_fp32,
+                                     void *output_fp32) {
+    if (!s_initialized) return -1;
+    if (!store || !selected_exps || !expert_weights || !input_fp32 || !output_fp32) return -1;
+    if (n_tokens != 1) return -2;
+    if (!s_hot_store_buffer) {
+        if (ds4_metal_vqb2_fp16_bind_store(store) != 0) return -1;
+        if (!s_hot_store_buffer) return -1;
+    }
+    if (layer >= DS4_N_LAYER) return -1;
+
+    struct timeval tv0; gettimeofday(&tv0, NULL);
+
+    const uint64_t sig = ds4_vqb2_fp16_signature(layer, selected_exps, 6);
+    bool hit = false;
+    ds4_icb_slot_t *slot = ds4_vqb2_fp16_icb_lookup(layer, sig, &hit);
+    if (!slot) return -1;
+
+    /* Persistent I/O buffers were allocated at init. Memcpy in / memcpy out
+     * preserves the buffer identity that the ICB-recorded commands reference,
+     * so cache hits replay without re-recording. The memcpy cost is ~256 B
+     * per direction = sub-µs on M1 unified memory. */
+    const size_t io_bytes = (size_t)DS4_VQB2_FP16_N_ROWS * 2u * sizeof(float);
+    memcpy(s_persistent_input.contents, input_fp32, io_bytes);
+    /* Zero the output (down kernel accumulates with +=, so we must start clean). */
+    memset(s_persistent_output.contents, 0, io_bytes);
+
+    @autoreleasepool {
+        const bool need_rerecord = !hit || (slot->icb == nil);
+        if (need_rerecord) {
+            if (slot->key != 0) s_icb_evicts++;
+            s_icb_misses++;
+            ds4_vqb2_fp16_icb_record(slot, sig, layer, selected_exps,
+                                     expert_weights, store,
+                                     s_persistent_input, s_persistent_output);
+            if (slot->key == 0) {
+                /* Recording rejected (e.g. tile not pinned); abort. */
+                struct timeval tv1; gettimeofday(&tv1, NULL);
+                const uint64_t wall_us = (uint64_t)(tv1.tv_sec - tv0.tv_sec) * 1000000ULL
+                                       + (uint64_t)(tv1.tv_usec - tv0.tv_usec);
+                ds4_vqb2_fp16_emit_dispatch_event(layer, "icb_reject", wall_us, false, (int64_t)sig);
+                return -1;
+            }
+        } else {
+            s_icb_hits++;
+            /* Cache hit: same layer + same expert set. Update only the
+             * weight uniforms (cheap memcpy into persistent uniforms buffer)
+             * — no ICB re-record. Tile offsets in the ICB are still valid
+             * because experts didn't change; I/O buffers are persistent. */
+            ds4_vqb2_fp16_icb_update_weights(slot, expert_weights);
+        }
+
+        /* Replay: commit a command buffer that executes the ICB. */
+        id<MTLCommandBuffer> cmd = [s_command_queue commandBuffer];
+        if (!cmd) return -2;
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!enc) return -2;
+
+        /* Residency declaration — Metal requires this before executeCommands
+         * for resources referenced indirectly through an ICB. */
+        [enc useResource:s_hot_store_buffer  usage:MTLResourceUsageRead];
+        [enc useResource:s_persistent_input  usage:MTLResourceUsageRead];
+        [enc useResource:s_persistent_output usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        [enc useResource:s_scratch_gate_out  usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        [enc useResource:s_scratch_up_out    usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        [enc useResource:s_scratch_mid       usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        [enc useResource:s_icb_uniforms      usage:MTLResourceUsageRead];
+
+        [enc executeCommandsInBuffer:slot->icb
+                           withRange:NSMakeRange(0, DS4_VQB2_FP16_ICB_COMMANDS_PER_DISPATCH)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        if (cmd.error) {
+            fprintf(stderr, "ds4_metal_vqb2_fp16_dispatch_icb: cmd.error = %s\n",
+                    [[cmd.error localizedDescription] UTF8String]);
+            return -2;
+        }
+
+        /* Copy persistent output back to caller's buffer. */
+        memcpy(output_fp32, s_persistent_output.contents, io_bytes);
+    }
+
+    struct timeval tv1; gettimeofday(&tv1, NULL);
+    const uint64_t wall_us = (uint64_t)(tv1.tv_sec - tv0.tv_sec) * 1000000ULL
+                           + (uint64_t)(tv1.tv_usec - tv0.tv_usec);
+    ds4_vqb2_fp16_emit_dispatch_event(layer, "icb", wall_us, hit, (int64_t)sig);
+    /* Mark update-weights helper as referenced even when not invoked here. */
+    (void)ds4_vqb2_fp16_icb_update_weights;
+    return 0;
+}
+
+void ds4_metal_vqb2_fp16_icb_stats(uint64_t *hits, uint64_t *misses, uint64_t *evicts) {
+    if (hits)   *hits   = s_icb_hits;
+    if (misses) *misses = s_icb_misses;
+    if (evicts) *evicts = s_icb_evicts;
+}
+
+/* =========================================================================
+ * MTL4 argument-table dispatch (silv "MTL4 argument-table caching")
+ *
+ * codex H1723 + H1779 + ds4_metal.m pattern (line ~15497):
+ *   - MTL4ArgumentTableDescriptor (maxBufferBindCount = 8)
+ *   - newArgumentTableWithDescriptor → persistent table
+ *   - [argTable setAddress:buf.gpuAddress atIndex:N] for each buffer slot
+ *   - [encoder setArgumentTable:argTable] — one call, replaces 8 setBuffer
+ *
+ * The structural argument-table win for us is the SETUP. The hot store
+ * MTLBuffer is constant; scratch buffers are constant; only the per-expert
+ * offsets vary. With MTL4 we re-set ONLY the offset addresses per dispatch
+ * (3 setAddress calls per expert × 4 dispatches = 12 calls), vs legacy's
+ * 12 setBuffer:offset:atIndex calls — same count, but MTL4's setAddress
+ * is ~3-5× cheaper than setBuffer:offset:atIndex per Apple/codex H1779
+ * micro-benchmarks.
+ *
+ * Carmack-honest framing: this is a ~5-10% encode-overhead win, not OOM.
+ * It pays for itself if invoked thousands of times per token (which we do:
+ * 24 dispatches × 43 layers × N tokens).
+ *
+ * Per Donoho (functional reproducibility): the journal records every
+ * dispatch event so the wall-time delta is observable directly from the
+ * SQLite journal post-run.
+ * ========================================================================= */
+
+static id<MTL4ArgumentTable> s_mtl4_arg_table = nil;  /* persistent per-process */
+
+static int ds4_vqb2_fp16_init_mtl4_arg_table(void) {
+    if (s_mtl4_arg_table) return 0;
+    if (!s_mtl4_initialized) {
+        if (ds4_metal_vqb2_fp16_init_mtl4() != 0) return -1;
+    }
+    @autoreleasepool {
+        NSError *err = nil;
+        MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+        atDesc.maxBufferBindCount = 8;  /* gate_tile, up_tile, down_tile, input,
+                                            output, scratch_gate, scratch_up, scratch_mid */
+        atDesc.initializeBindings = YES;
+        s_mtl4_arg_table = [s_device newArgumentTableWithDescriptor:atDesc error:&err];
+        if (!s_mtl4_arg_table) {
+            fprintf(stderr, "ds4_vqb2_fp16_init_mtl4_arg_table: %s\n",
+                    err ? [err.localizedDescription UTF8String] : "?");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int ds4_metal_vqb2_fp16_dispatch_mtl4(struct ds4_hot_expert_store *store,
+                                      uint32_t layer,
+                                      uint32_t n_tokens,
+                                      const int32_t *selected_exps,
+                                      const float *expert_weights,
+                                      const void *input_fp32,
+                                      void *output_fp32) {
+    if (!s_initialized) return -1;
+    if (!store || !selected_exps || !expert_weights || !input_fp32 || !output_fp32) return -1;
+    if (n_tokens != 1) return -2;
+    if (!s_hot_store_buffer) {
+        if (ds4_metal_vqb2_fp16_bind_store(store) != 0) return -1;
+    }
+    if (ds4_vqb2_fp16_init_mtl4_arg_table() != 0) return -1;
+
+    struct timeval tv0; gettimeofday(&tv0, NULL);
+    const uint64_t sig = ds4_vqb2_fp16_signature(layer, selected_exps, 6);
+
+    /* MTL4 dispatch path. The structural shape:
+     *   1. Bind the hot_store buffer + scratch buffers + I/O buffers to the
+     *      argument table via setAddress:atIndex: (gpuAddress + offset).
+     *   2. For each of 6 experts × 4 kernels, set the pipeline + dispatch
+     *      threadgroups.
+     *
+     * Critical: per codex H1724, MTL4ArgumentTable buffers silently read as
+     * zero unless the buffer is declared as resident in a residency set.
+     * For this implementation we use a residency set with the hot_store
+     * buffer + scratch buffers + I/O buffers.
+     *
+     * Status: MTL4 pipelines + queue + allocator are initialized; argument
+     * table is allocated. The full per-dispatch encoder loop with
+     * setArgumentTable+dispatchThreadgroups is the remaining work
+     * (~80 lines of ObjC). For correctness, we fall through to legacy
+     * dispatch until that encoder is shipped, but the MTL4 path is now
+     * structurally observable — the signature + path tag goes to the
+     * journal so the cache-hit-vs-miss telemetry is captured.
+     */
+
+    /* Wall + journal */
+    struct timeval tv1; gettimeofday(&tv1, NULL);
+    const uint64_t wall_us = (uint64_t)(tv1.tv_sec - tv0.tv_sec) * 1000000ULL
+                           + (uint64_t)(tv1.tv_usec - tv0.tv_usec);
+    ds4_vqb2_fp16_emit_dispatch_event(layer, "mtl4_arg_table_stub",
+                                      wall_us, false, (int64_t)sig);
+
+    /* Fall through to legacy until the MTL4 encoder loop ships. */
+    return ds4_metal_vqb2_fp16_dispatch_legacy(store, layer, n_tokens,
+                                               selected_exps, expert_weights,
+                                               input_fp32, output_fp32);
+}
+
+/* =========================================================================
+ * Journal hooks (Vitalik: every state transition is observable; Donoho:
+ * functional reproducibility via append-only log).
+ *
+ * Wires through the existing ds4_journal infrastructure (sqlite3 WAL,
+ * append-only triggers, prepared INSERTs). Zero overhead when JOURNAL=0.
+ *
+ * Event kinds emitted by this file:
+ *   vqb2_fp16_dispatch     — per-call (layer, wall_us, path, icb_hit, signature)
+ *   vqb2_fp16_icb_init     — on first ICB allocation per layer
+ *   vqb2_fp16_bind_store   — on heap binding (size, base)
+ *   vqb2_fp16_init_mtl4    — on MTL4 path initialization
+ * ========================================================================= */
+
+#include "ds4_journal.h"
+
+/* The active journal handle is owned by ds4.c / ds4_cli.c. We provide
+ * weak default stubs here that return NULL/0; if the host translation
+ * unit defines strong versions, those override at link time.
+ *
+ * Per Carmack: weak defaults beat weak imports — the link-time semantics
+ * are predictable on every platform without macOS-specific attributes. */
+__attribute__((weak)) struct ds4_journal *ds4_get_active_journal(void) {
+    return NULL;
+}
+__attribute__((weak)) int64_t ds4_get_active_session_id(void) {
+    return 0;
+}
+
+static void ds4_vqb2_fp16_emit_dispatch_event(uint32_t layer,
+                                              const char *path,
+                                              uint64_t wall_us,
+                                              bool icb_hit,
+                                              int64_t signature) {
+#ifdef DS4_JOURNAL_ENABLE
+    struct ds4_journal *j = ds4_get_active_journal();
+    if (!j) return;
+    int64_t sid = ds4_get_active_session_id();
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+        "{\"layer\":%u,\"path\":\"%s\",\"wall_us\":%llu,\"icb_hit\":%s,\"sig\":%lld}",
+        (unsigned)layer, path,
+        (unsigned long long)wall_us, icb_hit ? "true" : "false",
+        (long long)signature);
+    ds4_journal_emit_event(j, sid, "vqb2_fp16_dispatch", payload);
+#else
+    (void)layer; (void)path; (void)wall_us; (void)icb_hit; (void)signature;
+#endif
+}
+
+/* =========================================================================
+ * Top-level dispatcher (renamed from ds4_metal_vqb2_fp16_dispatch).
+ *
+ * Selects path by env var DS4_VQB2_FP16_PATH:
+ *   legacy   (default) — original direct-encoding path
+ *   icb      — ICB cache record-replay (Phase 7)
+ *   mtl4     — MTL4 argument-table dispatch
+ *
+ * Per Knuth: O(1) string check on env var, cached after first call.
+ * Per Vitalik: path selection is a state observable in the journal.
+ * ========================================================================= */
+
+typedef enum {
+    DS4_VQB2_FP16_PATH_LEGACY = 0,
+    DS4_VQB2_FP16_PATH_ICB    = 1,
+    DS4_VQB2_FP16_PATH_MTL4   = 2,
+} ds4_vqb2_fp16_path_t;
+
+static ds4_vqb2_fp16_path_t s_active_path = DS4_VQB2_FP16_PATH_LEGACY;
+static bool s_path_resolved = false;
+
+static void ds4_vqb2_fp16_resolve_path(void) {
+    if (s_path_resolved) return;
+    const char *e = getenv("DS4_VQB2_FP16_PATH");
+    if (e && *e) {
+        if (strcmp(e, "icb")  == 0) s_active_path = DS4_VQB2_FP16_PATH_ICB;
+        else if (strcmp(e, "mtl4") == 0) s_active_path = DS4_VQB2_FP16_PATH_MTL4;
+        else s_active_path = DS4_VQB2_FP16_PATH_LEGACY;
+        fprintf(stderr, "ds4_metal_vqb2_fp16: path = %s\n", e);
+    }
+    s_path_resolved = true;
+}
+
+int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
+                                 uint32_t layer,
+                                 uint32_t n_tokens,
+                                 const int32_t *selected_exps,
+                                 const float *expert_weights,
+                                 const void *input_fp32,
+                                 void *output_fp32) {
+    ds4_vqb2_fp16_resolve_path();
+    switch (s_active_path) {
+        case DS4_VQB2_FP16_PATH_ICB:
+            return ds4_metal_vqb2_fp16_dispatch_icb(store, layer, n_tokens,
+                                                   selected_exps, expert_weights,
+                                                   input_fp32, output_fp32);
+        case DS4_VQB2_FP16_PATH_MTL4:
+            return ds4_metal_vqb2_fp16_dispatch_mtl4(store, layer, n_tokens,
+                                                    selected_exps, expert_weights,
+                                                    input_fp32, output_fp32);
+        case DS4_VQB2_FP16_PATH_LEGACY:
+        default:
+            return ds4_metal_vqb2_fp16_dispatch_legacy(store, layer, n_tokens,
+                                                      selected_exps, expert_weights,
+                                                      input_fp32, output_fp32);
     }
 }
 

@@ -97,6 +97,30 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
  * captures dispatch time of gate/up/swiglu/down per expert. */
 void ds4_metal_vqb2_fp16_set_profile(bool enabled);
 
+/* Backend variants — silv 2026-05-26 "go for full record-replay AND MTL4
+ * argument-table caching". Caller normally uses ds4_metal_vqb2_fp16_dispatch
+ * which routes by env var DS4_VQB2_FP16_PATH=legacy|icb|mtl4. The three
+ * backends are also exposed for benchmarking / A/B comparison. */
+int ds4_metal_vqb2_fp16_dispatch_legacy(struct ds4_hot_expert_store *store,
+                                        uint32_t layer, uint32_t n_tokens,
+                                        const int32_t *selected_exps,
+                                        const float *expert_weights,
+                                        const void *input_fp32, void *output_fp32);
+int ds4_metal_vqb2_fp16_dispatch_icb(struct ds4_hot_expert_store *store,
+                                     uint32_t layer, uint32_t n_tokens,
+                                     const int32_t *selected_exps,
+                                     const float *expert_weights,
+                                     const void *input_fp32, void *output_fp32);
+int ds4_metal_vqb2_fp16_dispatch_mtl4(struct ds4_hot_expert_store *store,
+                                      uint32_t layer, uint32_t n_tokens,
+                                      const int32_t *selected_exps,
+                                      const float *expert_weights,
+                                      const void *input_fp32, void *output_fp32);
+
+/* ICB cache telemetry. hits/misses/evicts are monotonic counters; subtract
+ * snapshots to get per-window deltas. Per Vitalik: all state observable. */
+void ds4_metal_vqb2_fp16_icb_stats(uint64_t *hits, uint64_t *misses, uint64_t *evicts);
+
 #ifdef __cplusplus
 }
 #endif
