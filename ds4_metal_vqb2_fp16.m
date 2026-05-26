@@ -848,6 +848,42 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
     }
 }
 
+/* ==========================================================================
+ * GPU-handle variant — silv 2026-05-26 directive.
+ *
+ * Caller passes ds4_gpu_tensor* handles instead of CPU pointers. Skips the
+ * newBufferWithBytesNoCopy wrap; reads/writes the same MTLBuffers the
+ * engine uses. Caller MUST have called ds4_gpu_end_commands() first so the
+ * input tensors' GPU writes are visible.
+ *
+ * For this iteration the body still routes through the legacy CPU-pointer
+ * dispatcher via tensor_contents (on M1 unified memory: same address). The
+ * surface change moves the responsibility for sync from "inside dispatcher"
+ * (where it doesn't know) to "at caller" (where it does), and prepares for
+ * the next-iteration true-shared-cb integration.
+ * ========================================================================== */
+extern void *ds4_gpu_tensor_contents(struct ds4_gpu_tensor *t);
+
+int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *store,
+                                     uint32_t layer,
+                                     uint32_t n_tokens,
+                                     struct ds4_gpu_tensor *selected,
+                                     struct ds4_gpu_tensor *weights,
+                                     struct ds4_gpu_tensor *input,
+                                     struct ds4_gpu_tensor *output) {
+    if (!store || !selected || !weights || !input || !output) return -1;
+    if (n_tokens != 1) return -2;
+
+    const int32_t *sel = (const int32_t *)ds4_gpu_tensor_contents(selected);
+    const float   *w   = (const float   *)ds4_gpu_tensor_contents(weights);
+    const float   *in  = (const float   *)ds4_gpu_tensor_contents(input);
+    float         *out = (float         *)ds4_gpu_tensor_contents(output);
+    if (!sel || !w || !in || !out) return -1;
+
+    /* Delegate to the path selected by DS4_VQB2_FP16_PATH (legacy by default). */
+    return ds4_metal_vqb2_fp16_dispatch(store, layer, n_tokens, sel, w, in, out);
+}
+
 #else  /* non-Apple build */
 int ds4_metal_vqb2_fp16_init(void)        { return -1; }
 int ds4_metal_vqb2_fp16_init_mtl4(void)   { return -1; }
@@ -867,5 +903,10 @@ int ds4_metal_vqb2_fp16_dispatch_mtl4(struct ds4_hot_expert_store *s, uint32_t l
 int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *s, uint32_t l, uint32_t n,
         const int32_t *e, const float *w, const void *i, void *o) {
     (void)s; (void)l; (void)n; (void)e; (void)w; (void)i; (void)o; return -1;
+}
+int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *s, uint32_t l, uint32_t n,
+        struct ds4_gpu_tensor *sel, struct ds4_gpu_tensor *w,
+        struct ds4_gpu_tensor *in, struct ds4_gpu_tensor *out) {
+    (void)s; (void)l; (void)n; (void)sel; (void)w; (void)in; (void)out; return -1;
 }
 #endif  /* __APPLE__ */

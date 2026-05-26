@@ -103,6 +103,33 @@ int ds4_metal_vqb2_fp16_dispatch_mtl4(struct ds4_hot_expert_store *store,
  * snapshots to get per-window deltas. */
 void ds4_metal_vqb2_fp16_icb_stats(uint64_t *hits, uint64_t *misses, uint64_t *evicts);
 
+/* GPU-handle variant — silv 2026-05-26 directive.
+ *
+ * The CPU-pointer dispatch surface above (legacy/icb/mtl4) creates
+ * newBufferWithBytesNoCopy wrappers around each input/output buffer per
+ * call, and reads tensor_contents() from the caller — which is unsafe
+ * mid-GPU-batch (stale unified-memory data). This variant takes the
+ * ds4_gpu_tensor* handles directly, so the dispatcher accesses the same
+ * underlying MTLBuffers the rest of the engine uses and avoids the wrap.
+ *
+ * Still synchronous: this variant uses its own command queue and waits.
+ * Future iteration: integrate with the shared g_batch_cb to fully amortize
+ * GPU work into the engine batch.
+ *
+ * Caller MUST sync (ds4_gpu_end_commands) before invoking, since the input
+ * tensors were written by kernels in the engine batch.
+ *
+ * Returns: 0 success, -1 missing pinning / not implemented yet, -2 Metal error.
+ */
+struct ds4_gpu_tensor;
+int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *store,
+                                     uint32_t layer,
+                                     uint32_t n_tokens,
+                                     struct ds4_gpu_tensor *selected,
+                                     struct ds4_gpu_tensor *weights,
+                                     struct ds4_gpu_tensor *input,
+                                     struct ds4_gpu_tensor *output);
+
 #ifdef __cplusplus
 }
 #endif

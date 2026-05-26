@@ -11570,24 +11570,30 @@ static bool metal_graph_encode_decode_layer(
  if (hot_metal_enabled) {
  ds4_hot_expert_store *hot = ds4_hot_store_get_active();
  if (hot) {
+ /* Quick pinning check via CPU read — needs sync first or we may
+  * see stale data. End the GPU batch so router_selected's write
+  * has landed, then read it back. */
+ if (ds4_gpu_end_commands() != 0) {
  const int32_t *sel_cpu = (const int32_t *)ds4_gpu_tensor_contents(g->router_selected);
  if (sel_cpu && ds4_hot_layer_all_pinned(hot, il, sel_cpu, DS4_N_EXPERT_USED)) {
- const float *w_cpu = (const float *)ds4_gpu_tensor_contents(g->router_weights);
- const float *x_cpu = (const float *)ds4_gpu_tensor_contents(g->ffn_norm);
- float       *o_cpu = (float       *)ds4_gpu_tensor_contents(g->routed_out);
- if (w_cpu && x_cpu && o_cpu) {
  extern int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *);
- extern int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *,
-                                          uint32_t, uint32_t,
-                                          const int32_t *, const float *,
-                                          const void *, void *);
+ extern int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *,
+                                              uint32_t, uint32_t,
+                                              struct ds4_gpu_tensor *,
+                                              struct ds4_gpu_tensor *,
+                                              struct ds4_gpu_tensor *,
+                                              struct ds4_gpu_tensor *);
  if (ds4_metal_vqb2_fp16_bind_store(hot) == 0) {
- memset(o_cpu, 0, (size_t)DS4_N_EMBD * sizeof(float));
- const int dr = ds4_metal_vqb2_fp16_dispatch(hot, (uint32_t)il, 1u,
-                                              sel_cpu, w_cpu, x_cpu, o_cpu);
+ memset(ds4_gpu_tensor_contents(g->routed_out), 0,
+        (size_t)DS4_N_EMBD * sizeof(float));
+ const int dr = ds4_metal_vqb2_fp16_dispatch_gpu(
+   hot, (uint32_t)il, 1u,
+   g->router_selected, g->router_weights,
+   g->ffn_norm, g->routed_out);
  if (dr == 0) dispatched_via_metal_hot = 1;
  }
  }
+ if (ok) ok = (ds4_gpu_begin_commands() != 0);  /* restart batch */
  }
  }
  }
