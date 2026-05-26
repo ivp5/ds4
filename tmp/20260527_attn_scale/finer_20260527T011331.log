@@ -1,0 +1,109 @@
+=== DS4 attention scale finer-grained sweep ===
+Prompt: The capital of France is 
+
+--- DS4_ATTN_SCALE_MULT=0.5 ---
+ds4: DS4_ATTN_SCALE_MULT=0.500 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+: the
+
+... The
+
+
+the capital of France is thinking of the. the the the the the the the the the the the the the the the the the the the the the the the the the the the the the the the the the
+ds4: prefill: 23.77 t/s, generation: 15.12 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.6 ---
+ds4: DS4_ATTN_SCALE_MULT=0.600 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+ to the capital of France is  France, you as assistant assistant France is France, France France France France France France France France France France France France France France France France France France France France France France France France France France France France France France France
+ds4: prefill: 24.22 t/s, generation: 14.22 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.7 ---
+The capital of France is thinking
+
+The capital of France is thinking
+
+The capital of France is thinking
+
+The capital of France is thinking
+ds4: prefill: 23.37 t/s, generation: 15.28 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.75 ---
+ds4: DS4_ATTN_SCALE_MULT=0.750 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+ about the capital of France.
+
+The capital of France is. The capital of France is. The capital of France is. The capital of France is. The capital of France is. The capital of France is. The capital of France is.
+ds4: prefill: 24.78 t/s, generation: 12.68 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.8 ---
+ds4: DS4_ATTN_SCALE_MULT=0.800 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+ of something related to the capital of France.
+
+You are a helpful assistant to the capital of France. The capital of France is something related to the capital of France.
+
+You are a helpful assistant to something related to the capital of France. The
+ds4: prefill: 26.27 t/s, generation: 12.32 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.85 ---
+ about the capital of France. What is France, France, France, France. What is France, France, France, France.
+
+The capital of France is France.
+
+What is France, France, France, France.
+
+What is France, France
+ds4: prefill: 23.76 t/s, generation: 12.98 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.9 ---
+ds4: DS4_ATTN_SCALE_MULT=0.900 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+,  but I want to know what that is, and the capital of France is.
+
+In the context, I want to know what that is. To think, the capital of France is. It is the capital of France. To think
+ds4: prefill: 25.15 t/s, generation: 14.17 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.95 ---
+ds4: DS4_ATTN_SCALE_MULT=0.950 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+
+
+- The assistant is thinking about the capital of France is a helpful assistant that thinks about the capital of France is a helpful assistant to the capital of France
+
+- The assistant is thinking about the capital of France is a helpful assistant that thinks
+ds4: prefill: 25.59 t/s, generation: 9.71 t/s
+
+--- DS4_ATTN_SCALE_MULT=1.0 ---
+ds4: DS4_ATTN_SCALE_MULT=1.000 — attention temperature default (× of default 1/sqrt(head_dim))
+
+
+## The capital of France is  (The capital of France is)
+
+You are a helpful assistant that knows that the capital of France is 
+ds4: prefill: 22.51 t/s, generation: 14.42 t/s
+
+--- DS4_ATTN_SCALE_MULT=1.05 ---
+ds4: DS4_ATTN_SCALE_MULT=1.050 — attention temperature smoothed (× of default 1/sqrt(head_dim))
+ about the "capital" of France. The capital of France is a concept that can be used to calculate. The capital of France is a value that is used to calculate something. The capital of France is a concept that is used to calculate
+ds4: prefill: 23.12 t/s, generation: 10.42 t/s
+
+--- DS4_ATTN_SCALE_MULT=1.1 ---
+ds4: DS4_ATTN_SCALE_MULT=1.100 — attention temperature smoothed (× of default 1/sqrt(head_dim))
+ about the capital of France, so you can write about it in the same way as the capital of France. The capital of France is the same as the capital of France.
+
+France is a country in the same way as France. France is
+ds4: prefill: 22.24 t/s, generation: 9.30 t/s
+
+--- DS4_ATTN_SCALE_MULT=1.2 ---
+ds4: DS4_ATTN_SCALE_MULT=1.200 — attention temperature smoothed (× of default 1/sqrt(head_dim))
+ about the capital of France, but I'm not sure what to write about it. To write about it, you must be a capital of France. To write about it, you must write about the capital of France. To write about it
+ds4: prefill: 19.95 t/s, generation: 9.49 t/s
+
+--- DS4_ATTN_SCALE_MULT=1.5 ---
+
+The capital I'm to France is France
+
+France is France's capital
+
+I'm to France's capital is France
+
+ds4: prefill: 19.81 t/s, generation: 7.78 t/s
+
+--- DS4_ATTN_SCALE_MULT=2.0 ---
+ds4: DS4_ATTN_SCALE_MULT=2.000 — attention temperature smoothed (× of default 1/sqrt(head_dim))
+ds4: prefill: 19.81 t/s, generation: 0.00 t/s
