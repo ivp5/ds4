@@ -11468,21 +11468,33 @@ static bool metal_graph_encode_decode_layer(
  float *out = (float *) ds4_gpu_tensor_contents(g->routed_out);
  ok = xs && sel && w && out;
  if (ok) {
- /* silv 2026-05-26: VQB2-FP16 hot-store dispatch (env-gated by
-  * DS4_VQB2_FP16=1). When active + all selected experts pinned,
-  * bypass IQ2_XXS dequant+matmul and use the FP16 hot store. */
- static int vqb2_fp16_env_checked = 0;
- static int vqb2_fp16_enabled = 0;
- if (!vqb2_fp16_env_checked) {
- vqb2_fp16_enabled = (getenv("DS4_VQB2_FP16") != NULL) ? 1 : 0;
- vqb2_fp16_env_checked = 1;
- if (vqb2_fp16_enabled) {
+ /* silv 2026-05-26 — predequant FP16 hot-store dispatch at CPU-MoE site.
+  *
+  * Env flag: DS4_HOT_FP16=1 (alias: DS4_VQB2_FP16 — legacy name kept for
+  * compatibility with existing shell scripts).
+  *
+  * Active path: when the active hot-store has all 6 selected experts for
+  * the current layer fully pinned (FP16 polar-decoded tiles in heap), skip
+  * the IQ2_XXS dequant+matmul and call ds4_hot_dispatch_layer_cpu — which
+  * is fed pre-dequantized FP16 weights directly.
+  *
+  * The Metal-MoE-side hot-store path (gen-on-GPU) lives in
+  * ds4_gpu_routed_moe_batch_tensor, gated separately by DS4_HOT_METAL_MOE.
+  * This branch fires only when gen is on CPU (--prefill-metal-phases or
+  * --cpu-moe sets cpu_moe_layer[il]=true). */
+ static int hot_env_checked = 0;
+ static int hot_enabled = 0;
+ if (!hot_env_checked) {
+ hot_enabled = (getenv("DS4_HOT_FP16") != NULL ||
+                getenv("DS4_VQB2_FP16") != NULL) ? 1 : 0;
+ hot_env_checked = 1;
+ if (hot_enabled) {
  fprintf(stderr,
-   "ds4: DS4_VQB2_FP16=1 — VQB2-FP16 hot-store dispatch engaged\n");
+   "ds4: DS4_HOT_FP16=1 — predequant FP16 hot-store dispatch engaged (CPU-MoE site)\n");
  }
  }
  int dispatched_via_hot = 0;
- if (vqb2_fp16_enabled) {
+ if (hot_enabled) {
  ds4_hot_expert_store *hot = ds4_hot_store_get_active();
  if (hot && ds4_hot_layer_all_pinned(hot, il, sel, DS4_N_EXPERT_USED)) {
  memset(out, 0, (size_t)DS4_N_EMBD * sizeof(float));
@@ -11512,6 +11524,60 @@ static bool metal_graph_encode_decode_layer(
  }
  if (ok) ok = (ds4_gpu_begin_commands() != 0);
  } else if (ok) {
+ /* silv 2026-05-26 — Metal-MoE predequant FP16 hot-store hook (gen path).
+  *
+  * Env flag: DS4_HOT_METAL_MOE=1
+  *
+  * When the active hot-store has all 6 selected experts for layer `il`
+  * pinned (FP16 tiles in heap), redirect dispatch to
+  * ds4_metal_vqb2_fp16_dispatch (Metal-side complex-pair FP16 kernel
+  * via DS4_VQB2_FP16_PATH=legacy|mtl4|icb).
+  *
+  * CODEC CAVEAT — the existing FP16 kernel is polar-codec: reads weights
+  * as [n_rows][n_pairs][2] complex pairs, expects input formatted as
+  * n_rows complex pairs (re,im). DS4 routed FFN uses vanilla matvec,
+  * NOT complex-pair multiplication. Until codec alignment ships (next
+  * iteration: either change hot-store encoding to vanilla row-major
+  * FP16, or add a Metal kernel that consumes polar pairs from a vanilla
+  * input via re-interpretation), this path produces numerically WRONG
+  * output. Default off; opt-in for codec-aligned testing. */
+ static int hot_metal_env_checked = 0;
+ static int hot_metal_enabled = 0;
+ if (!hot_metal_env_checked) {
+ hot_metal_enabled = (getenv("DS4_HOT_METAL_MOE") != NULL) ? 1 : 0;
+ hot_metal_env_checked = 1;
+ if (hot_metal_enabled) {
+ fprintf(stderr,
+   "ds4: DS4_HOT_METAL_MOE=1 — Metal-MoE FP16 hot-store hook engaged "
+   "(WARNING: polar-codec layout mismatch — output may be wrong until codec aligns)\n");
+ }
+ }
+ int dispatched_via_metal_hot = 0;
+ if (hot_metal_enabled) {
+ ds4_hot_expert_store *hot = ds4_hot_store_get_active();
+ if (hot) {
+ const int32_t *sel_cpu = (const int32_t *)ds4_gpu_tensor_contents(g->router_selected);
+ if (sel_cpu && ds4_hot_layer_all_pinned(hot, il, sel_cpu, DS4_N_EXPERT_USED)) {
+ const float *w_cpu = (const float *)ds4_gpu_tensor_contents(g->router_weights);
+ const float *x_cpu = (const float *)ds4_gpu_tensor_contents(g->ffn_norm);
+ float       *o_cpu = (float       *)ds4_gpu_tensor_contents(g->routed_out);
+ if (w_cpu && x_cpu && o_cpu) {
+ extern int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *);
+ extern int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *,
+                                          uint32_t, uint32_t,
+                                          const int32_t *, const float *,
+                                          const void *, void *);
+ if (ds4_metal_vqb2_fp16_bind_store(hot) == 0) {
+ memset(o_cpu, 0, (size_t)DS4_N_EMBD * sizeof(float));
+ const int dr = ds4_metal_vqb2_fp16_dispatch(hot, (uint32_t)il, 1u,
+                                              sel_cpu, w_cpu, x_cpu, o_cpu);
+ if (dr == 0) dispatched_via_metal_hot = 1;
+ }
+ }
+ }
+ }
+ }
+ if (!dispatched_via_metal_hot) {
  ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
  g->routed_gate,
  g->routed_up,
@@ -11530,6 +11596,7 @@ static bool metal_graph_encode_decode_layer(
  (uint32_t)routed_out_dim,
  g->router_selected, g->router_weights,
  DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+ }
  }
  DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
  if (ok) {

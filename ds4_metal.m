@@ -14353,6 +14353,11 @@ int ds4_gpu_routed_moe_one_tensor(
  int ok = 1;
  const bool write_clamped_moe =
  getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL;
+
+ /* silv 2026-05-26: Metal-MoE predequant FP16 hot-store hook lives at the
+  * caller in ds4.c (where layer index `il` is in scope), not here. See
+  * ds4.c near ds4_gpu_routed_moe_one_tensor call, gated by DS4_HOT_METAL_MOE. */
+
  id<MTLComputePipelineState> pair_swiglu_pipeline = nil;
  if (gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
  pair_swiglu_pipeline = g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
