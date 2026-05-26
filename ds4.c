@@ -70,6 +70,8 @@
  * Schema v2 (2026-05-21) captures gating weights alongside selected expert IDs
  * to support the codex research-1213 selector/admission/actuator decomposition. */
 static inline void pe_router_trace_record_cpu(uint32_t il, uint32_t pos, const int *selected, const float *weights);
+/* Forward decl: layer-duplication remap. Defined near ds4_layer_should_skip. */
+static inline uint32_t ds4_layer_dup_remap(uint32_t il);
 #define DS4_ROPE_FREQ_BASE (10000.0f)
 #define DS4_ROPE_SCALE_FACTOR (16.0f)
 #define DS4_ROPE_YARN_BETA_FAST (32.0f)
@@ -8914,7 +8916,8 @@ static void forward_token_raw_swa_cpu_decode_scratch(
  hc_from_plain_embedding(cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
 
  for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
- layer_forward_raw_swa_one(next, model, &weights->layer[il], &cache->layer[il],
+ const uint32_t weight_il = ds4_layer_dup_remap(il);
+ layer_forward_raw_swa_one(next, model, &weights->layer[weight_il], &cache->layer[il],
  cur, il, pos, token,
  steering_dirs,
  steering_attn_scale,
@@ -12658,9 +12661,10 @@ static bool metal_graph_encode_token_raw_swa(
  if (cached_skip_hi >= 0 && (int)il >= cached_skip_lo && (int)il <= cached_skip_hi) skip = true;
  if (skip_layer_mask[il]) skip = true;
  if (!skip) {
+ const uint32_t weight_il = ds4_layer_dup_remap(il);
  ok = metal_graph_encode_decode_layer(g,
  model,
- &weights->layer[il],
+ &weights->layer[weight_il],
  il,
  pos,
  g->layer_raw_cache[il],
@@ -15207,6 +15211,76 @@ static bool ds4_layer_should_skip(uint32_t il) {
  return false;
 }
 
+/* Layer-duplication (amplification test). DS4_LAYER_DUP="34=33,35=33,36=33"
+ * tells the engine: at depth dst, run the weights from layer src. The residual
+ * stream still gets transformed at depth dst — just with a different layer's
+ * parameters. Tests silv's amplification hypothesis: if late layers (e.g.
+ * L33-L36 with weight-cosine 0.92-0.96) are doing similar work, duplicating
+ * one over the others should preserve output. If they're doing distinct work,
+ * duplication breaks output. dst != src required; src must be a real layer
+ * present in the file (do not duplicate over a skipped layer). */
+static int ds4_dup_init = 0;
+static int ds4_dup_source[DS4_N_LAYER];  /* -1 = no remap; else source il */
+
+static void ds4_dup_init_from_env(void) {
+ for (uint32_t k = 0; k < DS4_N_LAYER; k++) ds4_dup_source[k] = -1;
+ const char *e = getenv("DS4_LAYER_DUP");
+ if (e && e[0]) {
+  char buf[1024];
+  strncpy(buf, e, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+  int n_pairs = 0, n_rejected = 0;
+  char *tok = strtok(buf, ",");
+  while (tok) {
+   char *eq = strchr(tok, '=');
+   if (eq) {
+    *eq = '\0';
+    int dst = atoi(tok);
+    int src = atoi(eq + 1);
+    if (dst >= 0 && dst < (int)DS4_N_LAYER &&
+        src >= 0 && src < (int)DS4_N_LAYER && dst != src) {
+     /* Structural compatibility check: DS4 alternates ratio=4 (even) and
+      * ratio=128 (odd) compressor projections; dst must share src's ratio
+      * to keep the MLA paired-compressor invariant satisfied. */
+     uint32_t r_dst = ds4_layer_compress_ratio((uint32_t)dst);
+     uint32_t r_src = ds4_layer_compress_ratio((uint32_t)src);
+     if (r_dst != r_src) {
+      fprintf(stderr,
+              "ds4: DS4_LAYER_DUP REJECTED L%d<-L%d (ratio mismatch %u vs %u)\n",
+              dst, src, r_dst, r_src);
+      n_rejected++;
+     } else {
+      ds4_dup_source[dst] = src;
+      n_pairs++;
+     }
+    }
+   }
+   tok = strtok(NULL, ",");
+  }
+  if (n_pairs > 0) {
+   fprintf(stderr, "ds4: DS4_LAYER_DUP active:");
+   for (uint32_t k = 0; k < DS4_N_LAYER; k++) {
+    if (ds4_dup_source[k] >= 0)
+     fprintf(stderr, " L%u<-L%d", k, ds4_dup_source[k]);
+   }
+   fputc('\n', stderr);
+  }
+  if (n_rejected > 0) {
+   fprintf(stderr, "ds4: DS4_LAYER_DUP %d pairs rejected (use same-parity layers: even<->even, odd<->odd)\n",
+           n_rejected);
+  }
+ }
+ ds4_dup_init = 1;
+}
+
+/* Returns the layer index whose weights should be used at depth il.
+ * Default is il itself; with DS4_LAYER_DUP set, may return the dup source. */
+static inline uint32_t ds4_layer_dup_remap(uint32_t il) {
+ if (!ds4_dup_init) ds4_dup_init_from_env();
+ if (ds4_dup_source[il] >= 0) return (uint32_t)ds4_dup_source[il];
+ return il;
+}
+
 /* antirez/main 2026-05-25 merge: power-throttle subsystem stubbed.
  * The real antirez implementation requires ds4_gpu_graph.power_percent
  * field + per-layer elapsed-time averaging via graph_power_update_avg
@@ -15332,9 +15406,10 @@ static bool metal_graph_prefill_layer_major(
                 }
                 continue;
             }
+            const uint32_t weight_il = ds4_layer_dup_remap(il);
             ok = metal_graph_encode_layer_batch(g,
                                                 model,
-                                                &weights->layer[il],
+                                                &weights->layer[weight_il],
                                                 il,
                                                 start,
                                                 n_tokens);
@@ -15443,12 +15518,13 @@ static bool metal_graph_prefill_layer_major(
             continue;
         }
         double layer_elapsed = 0.0;
+        const uint32_t weight_il = ds4_layer_dup_remap(il);
         if (split_profile) {
             const double t_attn0 = now_sec();
             ok = ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_attention_batch(g,
                                                                   model,
-                                                                  &weights->layer[il],
+                                                                  &weights->layer[weight_il],
                                                                   il,
                                                                   start,
                                                                   n_tokens);
@@ -15460,7 +15536,7 @@ static bool metal_graph_prefill_layer_major(
             if (ok) ok = ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_ffn_batch(g,
                                                             model,
-                                                            &weights->layer[il],
+                                                            &weights->layer[weight_il],
                                                             il,
                                                             start,
                                                             n_tokens);
@@ -15489,7 +15565,7 @@ static bool metal_graph_prefill_layer_major(
             ok = ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_batch(g,
                                                         model,
-                                                        &weights->layer[il],
+                                                        &weights->layer[weight_il],
                                                         il,
                                                         start,
                                                         n_tokens);

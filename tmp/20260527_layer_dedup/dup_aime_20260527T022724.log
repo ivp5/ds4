@@ -1,0 +1,86 @@
+Prompt: Solve step by step. What is 8 times 9 minus 3? Final answer: 
+
+=== BASELINE  DUP= ===
+ds4: Metal residency requested in 0.068 ms, warmup -0.000 ms
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (35.44 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 1/2 (layers 21..42)
+processing 29 input tokens: 29/29 (100.0%)
+ds4: Metal model views created in 0.385 ms, residency requested in 415.040 ms, warmup 0.741 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 28.625 ms, residency requested in 615.618 ms, warmup 1.150 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.034 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to calculate 8 times 9 minus 3. According to order of operations, multiplication comes before subtraction. So 8 times 9 = 72, then minus 3 = 69. So answer is 69.
+8 times 9 is 72, minus 3 is 69.
+
+ds4: prefill: 0.76 t/s, generation: 2.14 t/s
+
+=== amp-even L34<-L36  DUP=34=36 ===
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (35.44 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 1/2 (layers 21..42)
+processing 29 input tokens: 29/29 (100.0%)
+ds4: Metal model views created in 0.030 ms, residency requested in 415.680 ms, warmup 0.685 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 2.649 ms, residency requested in 625.242 ms, warmup 0.743 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.023 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L34<-L36
+We need to compute 8 times 9 minus 3. According to order of operations, multiplication comes before subtraction. So 8 * 9 = 72, then 72 - 3 = 69. So answer is 69. Final answer: 69
+The result is 69.  
+
+8
+ds4: prefill: 0.82 t/s, generation: 2.02 t/s
+
+=== amp-even-wide 34<-36,38<-40  DUP=34=36,38=40 ===
+ds4: Metal residency requested in 0.070 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (35.44 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 1/2 (layers 21..42)
+processing 29 input tokens: 29/29 (100.0%)
+ds4: Metal model views created in 0.069 ms, residency requested in 416.464 ms, warmup 3.663 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 64.767 ms, residency requested in 581.142 ms, warmup 0.424 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.026 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L34<-L36 L38<-L40
+We need to solve 8 times 9 minus 3. According to order of operations, multiplication comes before subtraction. So 8 times 9 = 72, then minus 3 = 69. So answer is 69.
+8 times 9 equals 72, then minus 3 gives 69
+ds4: prefill: 0.76 t/s, generation: 2.01 t/s
+
+=== amp-odd  L33<-L35  DUP=33=35 ===
+ds4: Metal residency requested in 0.078 ms, warmup 0.000 ms
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (35.44 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 1/2 (layers 21..42)
+processing 29 input tokens: 29/29 (100.0%)
+ds4: Metal model views created in 0.186 ms, residency requested in 405.279 ms, warmup 3.533 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 22.458 ms, residency requested in 700.112 ms, warmup 0.817 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.025 ms, warmup 0.000 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L33<-L35
+We need to calculate 8 times 9 minus 3. According to order of operations, multiplication comes before subtraction. So first compute 8 * 9 = 72, then subtract 3: 72 - 3 = 69. So the answer is 69.
+69
+ds4: prefill: 0.80 t/s, generation: 1.99 t/s
+
+=== amp-mix late: 34<-36, 35<-37  DUP=34=36,35=37 ===
+ds4: Metal residency requested in 0.073 ms, warmup -0.000 ms
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (35.44 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 1/2 (layers 21..42)
+processing 29 input tokens: 29/29 (100.0%)
+ds4: Metal model views created in 0.054 ms, residency requested in 411.942 ms, warmup 3.114 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 8.140 ms, residency requested in 586.806 ms, warmup 0.768 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.025 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L34<-L36 L35<-L37
+We need to compute 8 times 9 minus 3. According to order of operations, multiplication comes before subtraction. So 8 * 9 = 72, then 72 - 3 = 69. So answer is 69.Final answer: 69
+8 times 9 is 72.
+ds4: prefill: 0.76 t/s, generation: 1.94 t/s

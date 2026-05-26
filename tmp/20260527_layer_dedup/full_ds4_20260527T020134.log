@@ -1,0 +1,21 @@
+=== FULL untrimmed DS4 layer-dedup sweep ===
+
+###################
+PROMPT: The capital of France is 
+###################
+
+--- baseline  SKIP= ---
+processing 15 input tokens: 15/15 (100.0%)
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to answer the question: "The capital of France is". The user likely expects the completion: "Paris". This is a simple factual question. As
+ds4: prefill: 0.45 t/s, generation: 1.59 t/s
+
+--- skip L34 (amp candidate)  SKIP=34 ---
+processing 15 input tokens: 15/15 (100.0%)
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to answer the user's query: "The capital of France is". The user likely wants the capital of France. The assistant should provide the correct answer
+ds4: prefill: 0.38 t/s, generation: 1.69 t/s
+
+--- skip L34,L35  SKIP=34,35 ---
