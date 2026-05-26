@@ -1,0 +1,38 @@
+Prompt: Solve step by step. What is 17 times 13 plus 8? Final answer:  (truth=17*13+8=221+8=229)
+
+=== BASELINE  no DUP ===
+ds4: Metal residency requested in 0.056 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to compute 17 * 13 + 8. First, 17 * 13 = 221. Then add 8 gives 229. So answer is 229.
+17 * 13 = 221.  
+221 + 8 = 229.  
+
+Final answer: 229
+ds4: prefill: 0.82 t/s, generation: 2.41 t/s
+
+=== pair-4 even  DUP=34=36,32=30,28=26,24=22 ===
+ds4: Metal residency requested in 0.029 ms, warmup 0.000 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L24<-L22 L28<-L26 L32<-L30 L34<-L36
+We need to compute 17 times 13 plus 8. Step by step: 17 * 13 = 229? Let's check: 17*10=170, 17*3=51, sum=221. Yes 17*13=221. Then plus 8 gives 229. So final answer 229.
+17 times 13 equals 221, then plus 8 equals 229.  
+
+**Final answer:** 229
+ds4: prefill: 0.83 t/s, generation: 2.43 t/s
+
+=== pair-mix 4-pairs  DUP=34=36,32=30,35=37,33=31 ===
+ds4: Metal model views created in 0.045 ms, residency requested in 422.034 ms, warmup 0.887 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 47.439 ms, residency requested in 574.333 ms, warmup 1.392 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.028 ms, warmup -0.000 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L32<-L30 L33<-L31 L34<-L36 L35<-L37
+We are asked: "What is 17 times 13 plus 8?" According to the order of operations, multiplication should be done before addition. So first compute 17*13 = 221, then add 8 gives 229. Final answer: 229.
+17 times 13 is 221, plus 8 equals 229. Final answer: 229.
+ds4: prefill: 0.74 t/s, generation: 2.01 t/s
+
