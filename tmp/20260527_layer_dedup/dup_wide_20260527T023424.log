@@ -1,0 +1,63 @@
+Prompt: The capital of France is 
+
+
+=== even-1: L34<-L36  DUP=34=36 ===
+ds4: Metal residency requested in 0.024 ms, warmup -0.000 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L34<-L36
+We need to answer: "The capital of France is ___". The user likely expects "Paris". The assistant should provide the answer.
+The capital of France
+ds4: prefill: 0.39 t/s, generation: 1.73 t/s
+
+=== even-2: L32,L34<-L36  DUP=32=36,34=36 ===
+ds4: Metal model views created in 0.590 ms, residency requested in 654.377 ms, warmup 0.742 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.034 ms, warmup -0.000 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L32<-L36 L34<-L36
+We need to answer: "The capital of France is" and the user expects us to finish the question. The capital of France is Paris. So the response
+ds4: prefill: 0.40 t/s, generation: 1.70 t/s
+
+=== even-3: L30,L32,L34<-L36  DUP=30=36,32=36,34=36 ===
+ds4: Metal model views created in 44.142 ms, residency requested in 614.161 ms, warmup 0.734 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.025 ms, warmup -0.000 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L30<-L36 L32<-L36 L34<-L36
+We are the user, "The capital of France is" --? This is asking for "The capital of France is" to be asked? The user is
+ds4: prefill: 0.44 t/s, generation: 1.76 t/s
+
+=== even-4: L28,L30,L32,L34<-L36  DUP=28=36,30=36,32=36,34=36 ===
+ds4: Metal model views created in 37.983 ms, residency requested in 839.204 ms, warmup 1.301 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.026 ms, warmup 0.000 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L28<-L36 L30<-L36 L32<-L36 L34<-L36
+Weet# 
+ds4: prefill: 0.39 t/s, generation: 1.18 t/s
+
+=== even-5: L26,28,30,32,34<-L36  DUP=26=36,28=36,30=36,32=36,34=36 ===
+ds4: DS4_LAYER_DUP active: L26<-L36 L28<-L36 L30<-L36 L32<-L36 L34<-L36
+We answer question, "eb question? "eb
+
+ening))))<)umenthesis. question? "??hesis)). ")
+
+
+
+ds4: prefill: 0.44 t/s, generation: 1.98 t/s
+
+=== even-6+late-3: 26-34 + 38,40,42<-L36  DUP=26=36,28=36,30=36,32=36,34=36,38=36,40=36,42=36 ===
+ds4: Metal model views created in 72.032 ms, residency requested in 553.530 ms, warmup 0.861 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.035 ms, warmup -0.000 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L26<-L36 L28<-L36 L30<-L36 L32<-L36 L34<-L36 L38<-L36 L40<-L36 L42<-L36
+We結果 gilay Pollyertisphereertona Polpol Polly defaults tables-polpolaeapolograpograp序-pol Instit polish politica-pol出不穷徊eee Wikipédia学一做 reforms序
+ds4: prefill: 0.43 t/s, generation: 1.85 t/s
+

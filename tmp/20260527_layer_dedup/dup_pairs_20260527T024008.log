@@ -1,0 +1,50 @@
+Prompt: The capital of France is 
+
+=== pair-1: L34<-L36  DUP=34=36 ===
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L34<-L36
+We need to respond to the user. The user said: "The capital of France is". This seems like a prompt asking to complete the statement. The assistant
+ds4: prefill: 0.40 t/s, generation: 1.89 t/s
+
+=== pair-2: L34<-L36, L32<-L30  DUP=34=36,32=30 ===
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L32<-L30 L34<-L36
+We need to respond to the user query "The capital of France is". The user is likely expecting to finish the sentence. The capital of France is Paris.
+ds4: prefill: 0.44 t/s, generation: 1.78 t/s
+
+=== pair-3: L34<-L36, L32<-L30, L28<-L26  DUP=34=36,32=30,28=26 ===
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L28<-L26 L32<-L30 L34<-L36
+We need to respond to the user. The user said "The capital of France is". This appears to be an incomplete statement. The likely intention is to complete
+ds4: prefill: 0.44 t/s, generation: 1.93 t/s
+
+=== pair-4: 34<-36, 32<-30, 28<-26, 24<-22  DUP=34=36,32=30,28=26,24=22 ===
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L24<-L22 L28<-L26 L32<-L30 L34<-L36
+We need to answer the question: "The capital of France is ..." The user likely expects to complete the sentence. The capital of France is Paris.
+ds4: prefill: 0.40 t/s, generation: 1.76 t/s
+
+=== pair-mix-4: even+odd 4-pairs  DUP=34=36,32=30,35=37,33=31 ===
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L32<-L30 L33<-L31 L34<-L36 L35<-L37
+We are asked: "The capital of France is" and we need to complete the sentence. The capital of France is Paris. So the response should be "
+ds4: prefill: 0.39 t/s, generation: 1.83 t/s
+
+=== pair-mix-8: even+odd 8-pairs  DUP=34=36,32=30,28=26,24=22,35=37,33=31,29=27,25=23 ===
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: DS4_LAYER_DUP active: L24<-L22 L25<-L23 L28<-L26 L29<-L27 L32<-L30 L33<-L31 L34<-L36 L35<-L37
+We WeWe WeWe WeWe WeWeWeWeWeWeWeWeWeWeWeWeWeWeWeWeWeWeWeWeWeWeWeWeWe
+ds4: prefill: 0.45 t/s, generation: 3.03 t/s
+
