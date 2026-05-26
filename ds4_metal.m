@@ -284,6 +284,37 @@ static int g_initialized;
 static int g_quality_mode;
 static int g_mpp_invalid_env_reported;
 
+/* silv 2026-05-27 — runtime attention scale multiplier.
+ * env DS4_ATTN_SCALE_MULT=0.2 sharpens attention to push model out of
+ * non-convergent loops (per Qwen3.5-4B finding: at 4-bit quant, default
+ * temperature too smooth → loops; ×0.2 sharpens softmax → forces commit).
+ *
+ * Applied to every flash-attn `.scale = 1.0/sqrt(head_dim) * g_ds4_attn_scale_mult`.
+ * Defaults to 1.0 (no change to baseline behavior). */
+static float g_ds4_attn_scale_mult = 1.0f;
+static int   g_ds4_attn_scale_mult_checked = 0;
+
+static float ds4_attn_scale_mult(void) {
+    if (!g_ds4_attn_scale_mult_checked) {
+        const char *e = getenv("DS4_ATTN_SCALE_MULT");
+        if (e && *e) {
+            float v = strtof(e, NULL);
+            if (v > 0.0f && v < 100.0f) {
+                g_ds4_attn_scale_mult = v;
+                fprintf(stderr,
+                    "ds4: DS4_ATTN_SCALE_MULT=%.3f — attention temperature %s "
+                    "(× of default 1/sqrt(head_dim))\n",
+                    v, v < 1.0f ? "sharpened" : (v > 1.0f ? "smoothed" : "default"));
+            } else {
+                fprintf(stderr,
+                    "ds4: DS4_ATTN_SCALE_MULT='%s' invalid (must be > 0 and < 100); using 1.0\n", e);
+            }
+        }
+        g_ds4_attn_scale_mult_checked = 1;
+    }
+    return g_ds4_attn_scale_mult;
+}
+
 static uint64_t ds4_gpu_system_memory_bytes(void) {
  uint64_t bytes = 0;
  size_t len = sizeof(bytes);
@@ -9844,7 +9875,7 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
  .ne1 = (int32_t)n_head,
  .ne2 = 1,
  .ne3 = 1,
- .scale = 1.0f / sqrtf((float)head_dim),
+ .scale = (1.0f / sqrtf((float)head_dim)) * ds4_attn_scale_mult(),
  .max_bias = 0.0f,
  .m0 = 0.0f,
  .m1 = 0.0f,
@@ -10215,7 +10246,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
  .ne1 = (int32_t)n_head,
  .ne2 = (int32_t)n_tokens,
  .ne3 = 1,
- .scale = 1.0f / sqrtf((float)head_dim),
+ .scale = (1.0f / sqrtf((float)head_dim)) * ds4_attn_scale_mult(),
  .max_bias = 0.0f,
  .m0 = 0.0f,
  .m1 = 0.0f,
@@ -10469,7 +10500,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
  .ne1 = (int32_t)n_head,
  .ne2 = (int32_t)n_tokens,
  .ne3 = 1,
- .scale = 1.0f / sqrtf((float)head_dim),
+ .scale = (1.0f / sqrtf((float)head_dim)) * ds4_attn_scale_mult(),
  .max_bias = 0.0f,
  .m0 = 0.0f,
  .m1 = 0.0f,
@@ -10764,7 +10795,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
  .ne1 = (int32_t)n_head,
  .ne2 = (int32_t)n_tokens,
  .ne3 = 1,
- .scale = 1.0f / sqrtf((float)head_dim),
+ .scale = (1.0f / sqrtf((float)head_dim)) * ds4_attn_scale_mult(),
  .max_bias = 0.0f,
  .m0 = 0.0f,
  .m1 = 0.0f,
@@ -10984,7 +11015,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
  .ne1 = (int32_t)n_head,
  .ne2 = (int32_t)n_tokens,
  .ne3 = 1,
- .scale = 1.0f / sqrtf((float)head_dim),
+ .scale = (1.0f / sqrtf((float)head_dim)) * ds4_attn_scale_mult(),
  .max_bias = 0.0f,
  .m0 = 0.0f,
  .m1 = 0.0f,
@@ -11248,7 +11279,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
  .ne1 = (int32_t)n_head,
  .ne2 = 1,
  .ne3 = 1,
- .scale = 1.0f / sqrtf((float)head_dim),
+ .scale = (1.0f / sqrtf((float)head_dim)) * ds4_attn_scale_mult(),
  .max_bias = 0.0f,
  .m0 = 0.0f,
  .m1 = 0.0f,
@@ -11499,7 +11530,7 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
  .ne1 = (int32_t)n_head,
  .ne2 = (int32_t)n_tokens,
  .ne3 = 1,
- .scale = 1.0f / sqrtf((float)head_dim),
+ .scale = (1.0f / sqrtf((float)head_dim)) * ds4_attn_scale_mult(),
  .max_bias = 0.0f,
  .m0 = 0.0f,
  .m1 = 0.0f,
@@ -11792,7 +11823,7 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
  .ne1 = (int32_t)n_head,
  .ne2 = (int32_t)n_tokens,
  .ne3 = 1,
- .scale = 1.0f / sqrtf((float)head_dim),
+ .scale = (1.0f / sqrtf((float)head_dim)) * ds4_attn_scale_mult(),
  .max_bias = 0.0f,
  .m0 = 0.0f,
  .m1 = 0.0f,
@@ -12132,7 +12163,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
  .topk_token_stride = (uint64_t)top_k * sizeof(int32_t),
  .dst_token_stride = (uint64_t)n_head * row_bytes,
  .dst_head_stride = row_bytes,
- .scale = 1.0f / sqrtf((float)head_dim),
+ .scale = (1.0f / sqrtf((float)head_dim)) * ds4_attn_scale_mult(),
  };
 
  int owned = 0;

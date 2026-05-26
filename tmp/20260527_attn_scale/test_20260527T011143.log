@@ -1,0 +1,46 @@
+=== DS4 attention scale × quality on trim50 ===
+
+--- DS4_ATTN_SCALE_MULT=1.0 ---
+ds4: DS4_ATTN_SCALE_MULT=1.000 — attention temperature default (× of default 1/sqrt(head_dim))
+ about a text that is not the capital of France, but I think it is the capital of France.
+
+You are a helpful assistant that is the capital of France. I think it is the capital of France.
+
+You are a helpful assistant that is not the capital of France. I think it is the capital of France.
+
+ds4: prefill: 16.44 t/s, generation: 15.52 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.5 ---
+
+You.
+
+You.
+
+You.
+
+You.
+
+ds4: prefill: 24.68 t/s, generation: 12.95 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.2 ---
+ds4: DS4_ATTN_SCALE_MULT=0.200 — attention temperature sharpened (× of default 1/sqrt(head_dim))
+ is, assistant. if
+
+……. You are a. 
+ (?!!!?? ??? ???. 
+.??? ?
+
+ ??? ???? ??? . ... !.??? ??? ??? . ??? ??? ! ???. ???. ??? ??? ??? . ??? ...??? ??? ??? ! ??? ??? ??? ... ... ??? ... . ??? ??? ???
+ds4: prefill: 24.98 t/s, generation: 12.78 t/s
+
+--- DS4_ATTN_SCALE_MULT=0.1 ---
+ . .?.
+
+ .? ... ?
+
+ ? ?
+
+ . . . . ? . . . . ? ...
+
+ . . . . . ... . . . ... . ... ... . . . . . . . . ... . . . . . ... . .
+ds4: prefill: 24.61 t/s, generation: 13.16 t/s
