@@ -36,6 +36,10 @@
 #endif
 #include <stdarg.h>
 #include <time.h>
+
+/* ds4_expert_table.h included BELOW the DS4_N_LAYER/DS4_N_EXPERT enum
+ * definitions (~line 102), so we suppress its dim macros via this guard. */
+#define DS4_EXPERT_TABLE_USES_EXTERNAL_DIMS 1
 #include <unistd.h>
 
 #include "ds4.h"
@@ -120,6 +124,17 @@ enum {
  DS4_N_HC = 4,
  DS4_N_HC_SINKHORN_ITER = 20,
 };
+
+/* silv 2026-05-26: HOT-dispatch counter wiring. Included AFTER the enum
+ * so DS4_N_LAYER / DS4_N_EXPERT are integer constants, not macros. */
+#include "ds4_expert_table.h"
+
+/* silv 2026-05-26: spaghetti consolidation. Loop detector + signed
+ * watchlist + sparse repair search live in ds4_inflight.{h,c}. The
+ * .h includes legacy ds4_cache_lock_detector compat aliases so ds4.c
+ * gen-loops compile unchanged. */
+#include "ds4_inflight.h"
+#include "ds4_cache_lock_detector.h"
 
 static int g_ds4_lock_fd = -1;
 
@@ -11453,6 +11468,31 @@ static bool metal_graph_encode_decode_layer(
  float *out = (float *) ds4_gpu_tensor_contents(g->routed_out);
  ok = xs && sel && w && out;
  if (ok) {
+ /* silv 2026-05-26: VQB2-FP16 hot-store dispatch (env-gated by
+  * DS4_VQB2_FP16=1). When active + all selected experts pinned,
+  * bypass IQ2_XXS dequant+matmul and use the FP16 hot store. */
+ static int vqb2_fp16_env_checked = 0;
+ static int vqb2_fp16_enabled = 0;
+ if (!vqb2_fp16_env_checked) {
+ vqb2_fp16_enabled = (getenv("DS4_VQB2_FP16") != NULL) ? 1 : 0;
+ vqb2_fp16_env_checked = 1;
+ if (vqb2_fp16_enabled) {
+ fprintf(stderr,
+   "ds4: DS4_VQB2_FP16=1 — VQB2-FP16 hot-store dispatch engaged\n");
+ }
+ }
+ int dispatched_via_hot = 0;
+ if (vqb2_fp16_enabled) {
+ ds4_hot_expert_store *hot = ds4_hot_store_get_active();
+ if (hot && ds4_hot_layer_all_pinned(hot, il, sel, DS4_N_EXPERT_USED)) {
+ memset(out, 0, (size_t)DS4_N_EMBD * sizeof(float));
+ const int dr = ds4_hot_dispatch_layer_cpu(hot, il, sel, w,
+                                            DS4_N_EXPERT_USED,
+                                            xs, out, DS4_N_EMBD);
+ if (dr == 0) dispatched_via_hot = 1;
+ }
+ }
+ if (!dispatched_via_hot) {
  cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer,
  xs, sel, w, out,
  1, DS4_SWIGLU_CLAMP_EXP,
@@ -11460,6 +11500,14 @@ static bool metal_graph_encode_decode_layer(
  g->cpu_moe_xq,
  g->cpu_moe_midq,
  g->cpu_moe_pair_ids);
+ }
+ /* silv 2026-05-26 HOT-dispatch counters: count selected experts at this
+  * layer. Zero-overhead when expert_table uninitialized; no behavior change. */
+ for (uint32_t hot_i = 0; hot_i < DS4_N_EXPERT_USED; hot_i++) {
+ if (sel[hot_i] >= 0) {
+ ds4_hot_count_dispatch(il, (uint32_t)sel[hot_i]);
+ }
+ }
  }
  }
  if (ok) ok = (ds4_gpu_begin_commands() != 0);
@@ -17480,6 +17528,21 @@ static int generate_raw_swa_cpu(
  int n_decode_eval = 0;
  const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
  const double t_decode0 = now_sec();
+ /* A.1b: Cache-lock detector (opt-in via DS4_CACHE_LOCK=1). */
+ ds4_cache_lock_detector *cache_lock = NULL;
+ int cache_lock_fired_step = -1;
+ if (getenv("DS4_CACHE_LOCK") != NULL) {
+ cache_lock = ds4_cache_lock_alloc(
+ DS4_CACHE_LOCK_WINDOW_DEFAULT,
+ DS4_CACHE_LOCK_N_DEFAULT,
+ DS4_CACHE_LOCK_THRESHOLD_DEFAULT);
+ if (cache_lock) {
+ fprintf(stderr, "ds4: cache-lock detector enabled (window=%d n=%d threshold=%.1f)\n",
+ DS4_CACHE_LOCK_WINDOW_DEFAULT,
+ DS4_CACHE_LOCK_N_DEFAULT,
+ (double)DS4_CACHE_LOCK_THRESHOLD_DEFAULT);
+ }
+ }
  for (int i = 0; i < n_predict && pos < ctx_size; i++) {
  if (trace_top) {
  char label[64];
@@ -17492,6 +17555,19 @@ static int generate_raw_swa_cpu(
 
  if (emit) emit(emit_ud, token);
  n_generated++;
+
+ /* A.1b/A.1c: Push token to cache-lock detector; if LOCK fires, predict-skip. */
+ if (cache_lock) {
+ const int was_locked = (cache_lock_fired_step >= 0);
+ const int locked = ds4_cache_lock_push(cache_lock, (int32_t)token);
+ if (locked && !was_locked) {
+ cache_lock_fired_step = i;
+ ds4_cache_lock_state st;
+ ds4_cache_lock_get_state(cache_lock, &st);
+ fprintf(stderr, "ds4: CACHE_LOCK fired at step %d (repeat_factor=%.2f top_count=%u)\n",
+ i, (double)st.repeat_factor, (unsigned)st.top_count);
+ }
+ }
 
  if (i == n_predict - 1 || pos + 1 >= ctx_size) {
  pos++;
@@ -17517,6 +17593,13 @@ static int generate_raw_swa_cpu(
  }
  n_decode_eval++;
  pos++;
+ }
+ if (cache_lock) {
+ if (cache_lock_fired_step >= 0) {
+ fprintf(stderr, "ds4: cache-lock fired at step %d (out of %d generated)\n",
+ cache_lock_fired_step, n_generated);
+ }
+ ds4_cache_lock_free(cache_lock);
  }
  const double t_decode1 = now_sec();
  if (done) done(emit_ud);
@@ -17617,6 +17700,32 @@ static int generate_metal_graph_raw_swa(
  int n_generated = 0;
  int n_decode_eval = 0;
  const double t_decode0 = now_sec();
+ /* A.1b: Cache-lock detector (opt-in via DS4_CACHE_LOCK=1).
+  * A.1c: When LOCK fires + DS4_CACHE_LOCK_SKIP=N (default 0), bypass
+  * model eval and emit predicted tokens. UNSAFE: predictions diverge
+  * from model continuation when pattern wasn't actually periodic. */
+ ds4_cache_lock_detector *cache_lock = NULL;
+ int cache_lock_fired_step = -1;
+ int cache_lock_skip_budget = 0;
+ int cache_lock_skip_max = 0;
+ int cache_lock_skipped_total = 0;
+ if (getenv("DS4_CACHE_LOCK") != NULL) {
+ cache_lock = ds4_cache_lock_alloc(
+ DS4_CACHE_LOCK_WINDOW_DEFAULT,
+ DS4_CACHE_LOCK_N_DEFAULT,
+ DS4_CACHE_LOCK_THRESHOLD_DEFAULT);
+ if (cache_lock) {
+ const char *skip_env = getenv("DS4_CACHE_LOCK_SKIP");
+ cache_lock_skip_max = skip_env ? atoi(skip_env) : 0;
+ if (cache_lock_skip_max < 0) cache_lock_skip_max = 0;
+ if (cache_lock_skip_max > 100) cache_lock_skip_max = 100;
+ fprintf(stderr, "ds4: cache-lock detector enabled (window=%d n=%d threshold=%.1f skip_max=%d)\n",
+ DS4_CACHE_LOCK_WINDOW_DEFAULT,
+ DS4_CACHE_LOCK_N_DEFAULT,
+ (double)DS4_CACHE_LOCK_THRESHOLD_DEFAULT,
+ cache_lock_skip_max);
+ }
+ }
  for (int i = 0; i < n_predict && pos < ctx_size; i++) {
  if (trace_top) {
  char label[64];
@@ -17630,9 +17739,40 @@ static int generate_metal_graph_raw_swa(
  if (emit) emit(emit_ud, token);
  n_generated++;
 
+ /* A.1b/A.1c: Push token to detector; if LOCK, predict-skip with budget. */
+ int skip_this_step = 0;
+ if (cache_lock) {
+ const int was_locked = (cache_lock_fired_step >= 0);
+ const int locked = ds4_cache_lock_push(cache_lock, (int32_t)token);
+ if (locked && !was_locked) {
+ cache_lock_fired_step = i;
+ cache_lock_skip_budget = cache_lock_skip_max;
+ ds4_cache_lock_state st;
+ ds4_cache_lock_get_state(cache_lock, &st);
+ fprintf(stderr, "ds4: CACHE_LOCK fired at step %d (gpu) repeat_factor=%.2f top_count=%u skip_budget=%d\n",
+ i, (double)st.repeat_factor, (unsigned)st.top_count, cache_lock_skip_budget);
+ }
+ if (locked && cache_lock_skip_budget > 0) {
+ const int32_t pred = ds4_cache_lock_predict_next(cache_lock);
+ if (pred >= 0 && pred < (int32_t)DS4_N_VOCAB) {
+ memset(logits, 0, (size_t)DS4_N_VOCAB * sizeof(float));
+ logits[pred] = 1.0f;
+ skip_this_step = 1;
+ cache_lock_skip_budget--;
+ cache_lock_skipped_total++;
+ }
+ }
+ }
+
  if (i == n_predict - 1 || pos + 1 >= ctx_size) {
  pos++;
  break;
+ }
+
+ if (skip_this_step) {
+ /* A.1c: model eval bypassed; pos advances, n_decode_eval does NOT. */
+ pos++;
+ continue;
  }
 
  const double t_eval0 = token_timing ? now_sec() : 0.0;
@@ -17649,6 +17789,13 @@ static int generate_metal_graph_raw_swa(
  }
  n_decode_eval++;
  pos++;
+ }
+ if (cache_lock) {
+ if (cache_lock_fired_step >= 0) {
+ fprintf(stderr, "ds4: cache-lock fired at step %d (gpu, %d generated, %d skipped via A.1c)\n",
+ cache_lock_fired_step, n_generated, cache_lock_skipped_total);
+ }
+ ds4_cache_lock_free(cache_lock);
  }
  const double t_decode1 = now_sec();
  if (done) done(emit_ud);

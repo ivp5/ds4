@@ -1,4 +1,7 @@
 #include "ds4.h"
+/* silv 2026-05-26: HOT dispatch diagnostics. ds4_bench.c sees DS4_N_LAYER /
+ * DS4_N_EXPERT as the header's #defines (no enum in scope here). */
+#include "ds4_expert_table.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -47,6 +50,12 @@ typedef struct {
     bool cpu_moe;
     int n_cpu_moe_layers;
     int prefill_metal_phases;
+    /* silv 2026-05-26: VQB2 hot-store load at engine init.
+     * Per codex H1884: candidate manifest is the runtime contract,
+     * not directory traversal (H1883 alias hazard). */
+    const char *vqb2_manifest;
+    const char *vqb2_candidate;
+    uint64_t vqb2_budget_mb;   /* hot-store budget in MB, 0 = default 32 GB */
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -275,6 +284,14 @@ static bench_config parse_options(int argc, char **argv) {
             c.mpp_mode = parse_mpp_mode(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--vqb2-manifest")) {
+            /* silv 2026-05-26 / codex H1884: load VQB2 hot-store from a
+             * candidate-keyed manifest CSV. Required with --vqb2-candidate. */
+            c.vqb2_manifest = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--vqb2-candidate")) {
+            c.vqb2_candidate = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--vqb2-budget-mb")) {
+            c.vqb2_budget_mb = (uint64_t)parse_int(need_arg(&i, argc, argv, arg), arg);
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr);
@@ -456,6 +473,56 @@ int main(int argc, char **argv) {
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
     log_context_memory(cfg.backend, cfg.ctx_alloc);
 
+    /* silv 2026-05-26: VQB2 candidate-keyed hot-store load.
+     * Per codex H1884, runtime contract is `(candidate, layer, kind, k)` —
+     * NOT directory traversal (H1883 alias hazard). Loaded into the global
+     * hot-store; subsequent ds4.c dispatch can check via ds4_hot_get_*.
+     * The store is currently INERT — wire to dispatch path lives in a
+     * separate change. This flag just validates load-time correctness. */
+    static ds4_hot_expert_store *g_bench_hot_store = NULL;
+    if (cfg.vqb2_manifest && cfg.vqb2_candidate) {
+        const uint64_t budget = cfg.vqb2_budget_mb > 0
+            ? cfg.vqb2_budget_mb * (1ull << 20)
+            : (32ull << 30); /* 32 GB default for full corpus FP16 */
+        fprintf(stderr,
+            "ds4-bench: VQB2 hot-store init — manifest=%s candidate=%s budget=%llu MB\n",
+            cfg.vqb2_manifest, cfg.vqb2_candidate,
+            (unsigned long long)(budget >> 20));
+        g_bench_hot_store = ds4_hot_expert_store_alloc(budget);
+        if (!g_bench_hot_store) {
+            fprintf(stderr, "ds4-bench: hot-store alloc failed\n");
+            ds4_engine_close(engine);
+            return 1;
+        }
+        const double t0 = bench_now_sec();
+        const int pinned = ds4_vqb2_candidate_manifest_load(
+            g_bench_hot_store, cfg.vqb2_manifest, cfg.vqb2_candidate);
+        const double t1 = bench_now_sec();
+        if (pinned < 0) {
+            fprintf(stderr, "ds4-bench: VQB2 candidate manifest load failed\n");
+            ds4_hot_expert_store_free(g_bench_hot_store);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        fprintf(stderr, "ds4-bench: VQB2 hot-store loaded %d tiles in %.2fs\n",
+                pinned, t1 - t0);
+        ds4_hot_expert_store_print(g_bench_hot_store);
+        /* silv 2026-05-26: publish as active so ds4.c dispatch can check
+         * via ds4_hot_store_get_active() at the MoE call site. */
+        ds4_hot_store_set_active(g_bench_hot_store);
+        /* silv 2026-05-26: bind FP16 heap as MTLBuffer via
+         * newBufferWithBytesNoCopy (zero-copy on Apple Silicon unified
+         * memory). Required before Metal kernel dispatch lands.
+         * Currently CPU-path dispatch is the implementation; the
+         * binding is a no-cost prep for the Metal kernel work. */
+        extern int ds4_metal_vqb2_fp16_init(void);
+        extern int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *);
+        if (cfg.backend != DS4_BACKEND_CPU) {
+            (void)ds4_metal_vqb2_fp16_init();
+            (void)ds4_metal_vqb2_fp16_bind_store(g_bench_hot_store);
+        }
+    }
+
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};
     if (cfg.chat_prompt_path) {
@@ -587,6 +654,10 @@ int main(int argc, char **argv) {
             fprintf(stderr,
                     "ds4-bench: gen-end   frontier=%d generated=%d wall=%.2fs avg=%.2f t/s\n",
                     frontier, cfg.gen_tokens, total_sec, final_tps);
+            /* silv 2026-05-26: HOT dispatch diagnostic. Reports per-tier
+             * routing distribution so future hot-expert pre-dequant work
+             * can size its budget against observed dispatch density. */
+            ds4_hot_print_stats();
             fflush(stderr);
         }
         if (rc != 0) break;
