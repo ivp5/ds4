@@ -18,6 +18,7 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_polar_reader.h"
+#include "ds4_expert_table.h"  /* ds4_hot_store_get_active, ds4_hot_expert_store */
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -14468,6 +14469,33 @@ int ds4_gpu_routed_moe_one_tensor(
  } else if (gate_type == DS4_METAL_TENSOR_Q4_K) {
  pair_swiglu_pipeline = g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline;
  }
+
+ /* silv 2026-05-27 — mat-mat detection at prefill batch ≥ 8. The
+  * kernel_mul_mm_id_fp16_pair_swiglu_f32 simdgroup path requires:
+  *   (a) DS4_HOT_FP16_KERNEL=1
+  *   (b) hot-store fully pinned for the active expert set
+  *   (c) pair_rows >= 8 (mat-mat tile size)
+  *
+  * When all 3 hold, the mat-mat pipeline is selected. The encoder
+  * function ds4_gpu_encode_mul_mm_id_pair_swiglu (TBD) builds the grid
+  * (n_ffn/8, 1, n_groups) with per-group expert-id sorting and dispatches
+  * with the hot-store FP16 heap + per-(layer,expert) offsets.
+  *
+  * Until the encoder lands, the matvec path stays selected; this block
+  * just logs the readiness on first eligible call. */
+ static int matmul_ready_logged = 0;
+ if (hot_fp16_kernel_active &&
+     g_moe_mul_mm_id_fp16_pair_swiglu_pipeline != nil &&
+     pair_rows >= 8) {
+  ds4_hot_expert_store *active_store = ds4_hot_store_get_active();
+  if (active_store && !matmul_ready_logged) {
+   fprintf(stderr,
+           "ds4: simdgroup mat-mat pipeline READY (pair_rows=%llu, "
+           "hot_pinned=%u experts). Encoder TBD — falling through to matvec.\n",
+           (unsigned long long)pair_rows, active_store->n_pinned);
+   matmul_ready_logged = 1;
+  }
+ }
  const bool fuse_pair_swiglu =
  !g_quality_mode &&
  !write_clamped_moe &&
@@ -15040,6 +15068,39 @@ int ds4_gpu_routed_moe_batch_tensor(
  down_row_bytes, down_expert_bytes,
  n_expert, n_expert, n_tokens, down_nr0);
  const bool use_mm_id = n_tokens >= 32u && ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
+
+ /* silv 2026-05-27 — prefill mat-mat FP16 dispatch readiness check.
+  * The simdgroup kernel kernel_mul_mm_id_fp16_pair_swiglu_f32 (registered
+  * via g_moe_mul_mm_id_fp16_pair_swiglu_pipeline) is now compiled-in
+  * and ready. To dispatch via it instead of the existing IQ2_XXS mat-mat
+  * path, the conditions are:
+  *   (a) DS4_HOT_FP16_KERNEL=1 (set by caller)
+  *   (b) hot-store has the active experts pinned (ds4_hot_layer_all_pinned)
+  *   (c) n_tokens >= 8 (mat-mat tile size — looser than IQ2 use_mm_id=32)
+  *   (d) gate_type is IQ2_XXS (the only codec hot-store currently dequants)
+  *
+  * Logs once on the first eligible call. Actual dispatch wire to follow
+  * (needs: hot-store weight pointers + per-expert offset table → new
+  * ds4_gpu_encode_mul_mm_id_fp16_pair_swiglu function). */
+ {
+  static int prefill_matmul_ready_logged = 0;
+  extern id<MTLComputePipelineState> g_moe_mul_mm_id_fp16_pair_swiglu_pipeline;
+  if (!prefill_matmul_ready_logged &&
+      getenv("DS4_HOT_FP16_KERNEL") != NULL &&
+      g_moe_mul_mm_id_fp16_pair_swiglu_pipeline != nil &&
+      n_tokens >= 8u &&
+      gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
+   ds4_hot_expert_store *hot = ds4_hot_store_get_active();
+   if (hot && hot->n_pinned > 0) {
+    fprintf(stderr,
+            "ds4: prefill simdgroup mat-mat READY at n_tokens=%u, "
+            "%u hot-store experts pinned. Encoder TBD — IQ2 mat-mat path runs.\n",
+            n_tokens, hot->n_pinned);
+    prefill_matmul_ready_logged = 1;
+   }
+  }
+ }
+
  /*
  * MTP verification is neither normal decode nor large prefill: the
  * target model must verify a tiny suffix (usually 2 tokens) in one

@@ -1,0 +1,79 @@
+ds4: --prefill-metal-phases auto: resolved N=2 (total=72.56 GiB, cap=60.00 GiB, headroom=14.00 GiB, per-phase budget=46.00 GiB)
+ds4: cpu-moe: layers 0..42 run their routed MoE on the CPU (first 43 of 43)
+ds4: Metal device Apple M1 Max, 64.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal expert inverse table uploaded (44032 bytes, 43*256 int32)
+ds4: Metal model views created in 0.016 ms, residency requested in 0.288 ms, warmup 0.846 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.318 ms, residency requested in 206.868 ms, warmup 0.882 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.032 ms, warmup 0.296 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: metal backend initialized for graph diagnostics
+ds4: DS4_HOT_PIN_LAYERS=34 → pinning 1 layers, budget=16.1 GB
+ds4_hot_pin_layer L34: pinning 256 experts × 3 tiles = 12.88 GB
+  L34: pinned 1/256 (0.02s)
+  L34: pinned 2/256 (0.04s)
+  L34: pinned 3/256 (0.06s)
+  L34: pinned 4/256 (0.08s)
+  L34: pinned 8/256 (0.16s)
+  L34: pinned 16/256 (0.32s)
+  L34: pinned 24/256 (0.48s)
+  L34: pinned 32/256 (0.64s)
+  L34: pinned 40/256 (0.80s)
+  L34: pinned 48/256 (0.96s)
+  L34: pinned 56/256 (1.12s)
+  L34: pinned 64/256 (1.28s)
+  L34: pinned 72/256 (1.44s)
+  L34: pinned 80/256 (1.59s)
+  L34: pinned 88/256 (1.76s)
+  L34: pinned 96/256 (1.92s)
+  L34: pinned 104/256 (2.10s)
+  L34: pinned 112/256 (2.36s)
+  L34: pinned 120/256 (2.52s)
+  L34: pinned 128/256 (3.44s)
+  L34: pinned 136/256 (3.69s)
+  L34: pinned 144/256 (4.09s)
+  L34: pinned 152/256 (4.30s)
+  L34: pinned 160/256 (4.54s)
+  L34: pinned 168/256 (4.85s)
+  L34: pinned 176/256 (5.02s)
+  L34: pinned 184/256 (5.20s)
+  L34: pinned 192/256 (5.38s)
+  L34: pinned 200/256 (5.56s)
+  L34: pinned 208/256 (5.76s)
+  L34: pinned 216/256 (5.94s)
+  L34: pinned 224/256 (6.12s)
+  L34: pinned 232/256 (6.34s)
+  L34: pinned 240/256 (6.55s)
+  L34: pinned 248/256 (6.73s)
+  L34: pinned 256/256 (6.91s)
+  L34: 256 experts pinned in 6.91s (37.04 experts/s)
+ds4: hot-store: 1 layers pinned, 12.88 GB heap
+ds4_hot_store_set_active: 256 tiles, heap 12884.9 MB ready for dispatch
+ds4_vqb2_fp16_init: 3 pipelines + queue + 3×8192B scratch + 2×16384B I/O
+bind_store: 12884.9 MB FP16 heap bound
+ds4: context buffers 579.64 MiB (ctx=32768, backend=metal, prefill_chunk=2048, raw_kv_rows=2304, compressed_kv_rows=8194)
+processing 21 input tokens: 0/21 (0.0%)
+ds4: Metal model views created in 1.965 ms, residency requested in 15708.496 ms, warmup 2.778 ms (mapped 36296.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.510 ms, residency requested in 3297.400 ms, warmup 1.645 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.032 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (37.12 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 0/2 (layers 0..20)
+ds4: prefill simdgroup mat-mat READY at n_tokens=21, 256 hot-store experts pinned. Encoder TBD — IQ2 mat-mat path runs.
+processing 21 input tokens: 21/21 (100.0%)
+ds4: Metal model views created in 0.033 ms, residency requested in 374.523 ms, warmup 0.351 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 9.538 ms, residency requested in 20711.010 ms, warmup 44.772 ms (mapped 46400.80 MiB from offset 36301.95 MiB)
+ds4: Metal residency requested in 0.076 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (35.44 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 1/2 (layers 21..42)
+processing 21 input tokens: 21/21 (100.0%)
+ds4: Metal model views created in 0.044 ms, residency requested in 395.511 ms, warmup 2.101 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 64.886 ms, residency requested in 527.393 ms, warmup 0.696 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.025 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: prefill: 0.49 t/s, generation: 1.24 t/s
