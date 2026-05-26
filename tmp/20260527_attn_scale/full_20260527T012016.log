@@ -1,0 +1,94 @@
+=== FULL untrimmed DS4 attention scale sweep ===
+Model: /Users/silv/cl/tlp/montyneg/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+
+###################
+PROMPT: The capital of France is 
+###################
+
+--- scale=1.0 ---
+processing 15 input tokens: 15/15 (100.0%)
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to answer: "The capital of France is" with the correct city. The capital of France is Paris.
+ds4: prefill: 0.42 t/s, generation: 1.69 t/s
+
+--- scale=0.95 ---
+processing 15 input tokens: 15/15 (100.0%)
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to answer: "The capital of France is" and then provide the correct answer. The user likely wants the
+ds4: prefill: 0.47 t/s, generation: 1.61 t/s
+
+--- scale=0.9 ---
+processing 15 input tokens: 15/15 (100.0%)
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We are asked: "The capital of France is". This appears to be a simple question about the capital of France.
+ds4: prefill: 0.43 t/s, generation: 1.52 t/s
+
+--- scale=0.8 ---
+processing 15 input tokens: 15/15 (100.0%)
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We are asked: "The capital of France is". The user likely expects the answer. The capital of France is Paris
+ds4: prefill: 0.41 t/s, generation: 1.50 t/s
+
+--- scale=0.5 ---
+processing 15 input tokens: 15/15 (100.0%)
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to answer the question: "The capital of France is ...". The user's statement is incomplete: "The
+ds4: prefill: 0.43 t/s, generation: 1.62 t/s
+
+--- scale=0.2 ---
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ is: I. I am AI: :. The:.
+
+? :? :. :. :. . .
+ds4: prefill: 0.40 t/s, generation: 2.28 t/s
+
+###################
+PROMPT: What is 2+2? Answer with just the number: 
+###################
+
+--- scale=1.0 ---
+processing 23 input tokens: 23/23 (100.0%)
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to answer "What is 2+2?" with just the number. So the answer is 4.
+ds4: prefill: 0.61 t/s, generation: 1.58 t/s
+
+--- scale=0.95 ---
+processing 23 input tokens: 23/23 (100.0%)
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to answer "What is 2+2?" with just the number. The answer is 4.
+ds4: prefill: 0.66 t/s, generation: 1.56 t/s
+
+--- scale=0.9 ---
+processing 23 input tokens: 23/23 (100.0%)
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to answer the question "What is 2+2?" with just the number. The answer is 4
+ds4: prefill: 0.60 t/s, generation: 1.60 t/s
+
+--- scale=0.8 ---
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to answer 2+2. The answer is 4. So just the number 4.
+4
+ds4: prefill: 0.59 t/s, generation: 1.63 t/s
+
+--- scale=0.5 ---
+processing 23 input tokens: 23/23 (100.0%)
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+We need to answer "What is 2+2?" and then answer with just the number. So the answer is
+ds4: prefill: 0.59 t/s, generation: 1.60 t/s
+
+--- scale=0.2 ---
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+? you
+
+Hello? Hello?
+ds4: prefill: 0.66 t/s, generation: 1.52 t/s
