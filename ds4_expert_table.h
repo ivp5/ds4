@@ -141,6 +141,18 @@ int ds4_hot_pin_layer_iq2xxs_full(
     const void *weights,
     uint32_t layer);
 
+/* silv 2026-05-27 — pair-AVG pin: stores (L_dst + L_src) / 2 averaged tiles
+ * at layer_dst's hot-store slot. Both layers must share compress_ratio
+ * (same parity). Saves 50% storage vs pinning both, with predicted-preserve
+ * capability per the pair-AVG matrix-norm finding (rel_err 0.71 < DUP 1.41).
+ * Returns 0 success, -1 budget exceeded, -2 parity mismatch. */
+int ds4_hot_pin_layer_pair_avg(
+    ds4_hot_expert_store *store,
+    const void *model,
+    const void *weights,
+    uint32_t layer_dst,
+    uint32_t layer_src);
+
 /* ============================================================================
  * Global active hot-store. Set once at engine init; read O(1) during dispatch.
  * NULL = no hot store; dispatch falls back to IQ2_XXS path.

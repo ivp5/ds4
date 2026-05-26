@@ -4375,6 +4375,140 @@ int ds4_hot_pin_layer_iq2xxs_full(
     return 0;
 }
 
+/* silv 2026-05-27 — pair-AVG hot-store pin: stores (L_dst + L_src) / 2
+ * tiles at layer_dst's slot. Tests the pair-AVG substitution finding
+ * (Q4 from synthesis: avg matrix at √(1/2) rel_err = 0.707 is half the
+ * noise of DUP at √2 = 1.41). Both layers must share parity (same
+ * compress_ratio) to keep MLA invariants — caller must verify.
+ *
+ * Memory pattern: dequant L_dst → FP32 scratch; dequant L_src → FP32 scratch;
+ * average to FP16 → hot-store at L_dst's slot. L_src is NOT separately
+ * pinned. Saves 50% storage vs pinning both layers, with predicted-preserve
+ * capability per DUP-tolerance curve (avg-substitute < DUP-substitute in
+ * matrix-norm). Returns 0 success, -1 budget exceeded, -2 parity mismatch.
+ */
+int ds4_hot_pin_layer_pair_avg(
+    ds4_hot_expert_store *store,
+    const void *model_v,
+    const void *weights_v,
+    uint32_t layer_dst,
+    uint32_t layer_src) {
+    const ds4_model *model = (const ds4_model *)model_v;
+    const ds4_weights *weights = (const ds4_weights *)weights_v;
+    if (!store || !model || !weights) return -1;
+    if (layer_dst >= DS4_N_LAYER || layer_src >= DS4_N_LAYER) return -1;
+    if (ds4_layer_compress_ratio(layer_dst) != ds4_layer_compress_ratio(layer_src)) {
+        fprintf(stderr, "ds4_hot_pin_layer_pair_avg: parity mismatch L%u (ratio=%u) "
+                "vs L%u (ratio=%u)\n",
+                layer_dst, ds4_layer_compress_ratio(layer_dst),
+                layer_src, ds4_layer_compress_ratio(layer_src));
+        return -2;
+    }
+    const ds4_layer_weights *L_dst = &weights->layer[layer_dst];
+    const ds4_layer_weights *L_src = &weights->layer[layer_src];
+    if (!L_dst->ffn_gate_exps || !L_src->ffn_gate_exps) return -1;
+    if (L_dst->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS) return -1;
+
+    const uint32_t n_experts = (uint32_t)L_dst->ffn_gate_exps->dim[2];
+    uint64_t in_g, out_g, rb_g, in_u, out_u, rb_u, in_d, out_d, rb_d;
+    (void)tensor_expert_bytes(model, L_dst->ffn_gate_exps, 0, &in_g, &out_g, &rb_g);
+    (void)tensor_expert_bytes(model, L_dst->ffn_up_exps,   0, &in_u, &out_u, &rb_u);
+    (void)tensor_expert_bytes(model, L_dst->ffn_down_exps, 0, &in_d, &out_d, &rb_d);
+    const uint64_t bytes_g = out_g * in_g * 2;
+    const uint64_t bytes_u = out_u * in_u * 2;
+    const uint64_t bytes_d = out_d * in_d * 2;
+    const uint64_t total = (bytes_g + bytes_u + bytes_d) * n_experts;
+    if (store->heap_bytes + total > store->budget_bytes) {
+        fprintf(stderr, "ds4_hot_pin_layer_pair_avg: budget exceeded (%.2f GB needed)\n",
+                total / 1e9);
+        return -1;
+    }
+
+    /* Scratch buffers for dequant (one row at a time to keep memory bounded) */
+    const uint64_t max_in = (in_g > in_d) ? in_g : in_d;
+    uint16_t *tmp_dst = (uint16_t *)xmalloc(max_in * sizeof(uint16_t));
+    uint16_t *tmp_src = (uint16_t *)xmalloc(max_in * sizeof(uint16_t));
+
+    fprintf(stderr, "ds4_hot_pin_layer_pair_avg: L%u <- (L%u + L%u) / 2, %u experts, %.2f GB\n",
+            layer_dst, layer_dst, layer_src, n_experts, total / 1e9);
+    const double t0 = now_sec();
+
+    for (uint32_t e = 0; e < n_experts; e++) {
+        const uint8_t *gate_d = tensor_expert_bytes(model, L_dst->ffn_gate_exps, e, &in_g, &out_g, &rb_g);
+        const uint8_t *up_d   = tensor_expert_bytes(model, L_dst->ffn_up_exps,   e, &in_u, &out_u, &rb_u);
+        const uint8_t *down_d = tensor_expert_bytes(model, L_dst->ffn_down_exps, e, &in_d, &out_d, &rb_d);
+        const uint8_t *gate_s = tensor_expert_bytes(model, L_src->ffn_gate_exps, e, &in_g, &out_g, &rb_g);
+        const uint8_t *up_s   = tensor_expert_bytes(model, L_src->ffn_up_exps,   e, &in_u, &out_u, &rb_u);
+        const uint8_t *down_s = tensor_expert_bytes(model, L_src->ffn_down_exps, e, &in_d, &out_d, &rb_d);
+
+        const uint64_t off_g = store->heap_bytes;
+        const uint64_t off_u = off_g + bytes_g;
+        const uint64_t off_d = off_u + bytes_u;
+
+        uint16_t *out_g_ptr = (uint16_t *)((char *)store->fp16_heap + off_g);
+        uint16_t *out_u_ptr = (uint16_t *)((char *)store->fp16_heap + off_u);
+        uint16_t *out_d_ptr = (uint16_t *)((char *)store->fp16_heap + off_d);
+
+        /* For each row: dequant both layers' rows, average in FP32, write FP16. */
+        for (uint64_t r = 0; r < out_g; r++) {
+            ds4_iq2_xxs_dequantize_row_to_fp16(
+                (const block_iq2_xxs *)(gate_d + r * rb_g), tmp_dst, in_g);
+            ds4_iq2_xxs_dequantize_row_to_fp16(
+                (const block_iq2_xxs *)(gate_s + r * rb_g), tmp_src, in_g);
+            uint16_t *dst = out_g_ptr + r * in_g;
+            for (uint64_t k = 0; k < in_g; k++) {
+                const float a = f16_to_f32(tmp_dst[k]);
+                const float b = f16_to_f32(tmp_src[k]);
+                dst[k] = f32_to_f16((a + b) * 0.5f);
+            }
+        }
+        for (uint64_t r = 0; r < out_u; r++) {
+            ds4_iq2_xxs_dequantize_row_to_fp16(
+                (const block_iq2_xxs *)(up_d + r * rb_u), tmp_dst, in_u);
+            ds4_iq2_xxs_dequantize_row_to_fp16(
+                (const block_iq2_xxs *)(up_s + r * rb_u), tmp_src, in_u);
+            uint16_t *dst = out_u_ptr + r * in_u;
+            for (uint64_t k = 0; k < in_u; k++) {
+                const float a = f16_to_f32(tmp_dst[k]);
+                const float b = f16_to_f32(tmp_src[k]);
+                dst[k] = f32_to_f16((a + b) * 0.5f);
+            }
+        }
+        for (uint64_t r = 0; r < out_d; r++) {
+            ds4_iq2_xxs_dequantize_row_to_fp16(
+                (const block_iq2_xxs *)(down_d + r * rb_d), tmp_dst, in_d);
+            ds4_iq2_xxs_dequantize_row_to_fp16(
+                (const block_iq2_xxs *)(down_s + r * rb_d), tmp_src, in_d);
+            uint16_t *dst = out_d_ptr + r * in_d;
+            for (uint64_t k = 0; k < in_d; k++) {
+                const float a = f16_to_f32(tmp_dst[k]);
+                const float b = f16_to_f32(tmp_src[k]);
+                dst[k] = f32_to_f16((a + b) * 0.5f);
+            }
+        }
+
+        /* Record offsets at layer_dst's slot — layer_src is NOT pinned separately. */
+        store->gate_offset[layer_dst * DS4_N_EXPERT + e] = (int64_t)off_g;
+        store->up_offset  [layer_dst * DS4_N_EXPERT + e] = (int64_t)off_u;
+        store->down_offset[layer_dst * DS4_N_EXPERT + e] = (int64_t)off_d;
+        store->gate_row_blocks[layer_dst * DS4_N_EXPERT + e] = DS4_VQB2_GATE_UP_FULL_ROW_MASK;
+        store->up_row_blocks  [layer_dst * DS4_N_EXPERT + e] = DS4_VQB2_GATE_UP_FULL_ROW_MASK;
+        store->down_row_blocks[layer_dst * DS4_N_EXPERT + e] = DS4_VQB2_DOWN_FULL_ROW_MASK;
+        store->heap_bytes += bytes_g + bytes_u + bytes_d;
+        store->n_pinned++;
+        if ((e & 7) == 7) {
+            fprintf(stderr, "  L%u pair-avg: %u/%u (%.2fs)\n",
+                    layer_dst, e + 1, n_experts, now_sec() - t0);
+        }
+    }
+    fprintf(stderr, "  L%u pair-avg: done in %.2fs (%.2f experts/s)\n",
+            layer_dst, now_sec() - t0,
+            (double)n_experts / (now_sec() - t0 + 0.001));
+    free(tmp_dst);
+    free(tmp_src);
+    return 0;
+}
+
 typedef struct {
  float *out0;
  float *out1;
@@ -20594,27 +20728,38 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
   * (routed experts live in the separate mmap), else e->model. */
  {
   const char *layers_env = getenv("DS4_HOT_PIN_LAYERS");
-  if (layers_env && layers_env[0]) {
-   /* Parse layer list */
+  const char *pair_env_outer = getenv("DS4_HOT_PAIR_AVG");
+  if ((layers_env && layers_env[0]) || (pair_env_outer && pair_env_outer[0])) {
+   /* Parse layer list (may be empty if only pair-avg is set) */
    int requested[DS4_N_LAYER];
    int n_req = 0;
-   char lbuf[256];
-   strncpy(lbuf, layers_env, sizeof(lbuf) - 1);
-   lbuf[sizeof(lbuf) - 1] = '\0';
-   char *tok = strtok(lbuf, ",");
-   while (tok && n_req < (int)DS4_N_LAYER) {
-    int L = atoi(tok);
-    if (L >= 0 && L < (int)DS4_N_LAYER) requested[n_req++] = L;
-    tok = strtok(NULL, ",");
+   if (layers_env && layers_env[0]) {
+    char lbuf[256];
+    strncpy(lbuf, layers_env, sizeof(lbuf) - 1);
+    lbuf[sizeof(lbuf) - 1] = '\0';
+    char *tok = strtok(lbuf, ",");
+    while (tok && n_req < (int)DS4_N_LAYER) {
+     int L = atoi(tok);
+     if (L >= 0 && L < (int)DS4_N_LAYER) requested[n_req++] = L;
+     tok = strtok(NULL, ",");
+    }
    }
-   if (n_req > 0) {
+   /* Count pair-AVG requests too — they consume the same per-layer budget. */
+   int n_pair = 0;
+   const char *pair_env_count = getenv("DS4_HOT_PAIR_AVG");
+   if (pair_env_count && pair_env_count[0]) {
+    const char *p = pair_env_count;
+    while (*p) { if (*p == ',') n_pair++; ++p; }
+    n_pair++;
+   }
+   if (n_req > 0 || n_pair > 0) {
     /* Budget: per-layer = 256 experts × 3 tiles × ~17 MB FP16 ≈ 13 GB.
      * Smoke test showed 12.88 GB actual per layer; round up to 14 GB +
      * 1 GB cushion per request. Caller is responsible for not OOMing
      * the system: 4 layers × 14 GB = 56 GB, fits on M1 Max 64 GB. */
-    const uint64_t budget = (uint64_t)n_req * ((uint64_t)14ULL << 30) + ((uint64_t)1ULL << 30);
-    fprintf(stderr, "ds4: DS4_HOT_PIN_LAYERS=%s → pinning %d layers, budget=%.1f GB\n",
-            layers_env, n_req, budget / 1e9);
+    const uint64_t budget = (uint64_t)(n_req + n_pair) * ((uint64_t)14ULL << 30) + ((uint64_t)1ULL << 30);
+    fprintf(stderr, "ds4: DS4_HOT_PIN_LAYERS=%s pairs=%d → budget=%.1f GB\n",
+            layers_env ? layers_env : "(none)", n_pair, budget / 1e9);
     ds4_hot_expert_store *store = ds4_hot_expert_store_alloc(budget);
     if (store) {
      /* Routed experts live in cpu_model when cpu_moe path is enabled
@@ -20630,6 +20775,35 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
        break;
       }
      }
+     /* silv 2026-05-27: also handle DS4_HOT_PAIR_AVG="dst1=src1,dst2=src2"
+      * for pair-AVG hot-store entries. dst is the layer whose slot holds
+      * the averaged matrix; src is the partner being merged in. Both must
+      * share parity (same compress_ratio). */
+     const char *pair_env = getenv("DS4_HOT_PAIR_AVG");
+     if (pair_env && pair_env[0]) {
+      const ds4_model *src_model = e->cpu_model_ready ? &e->cpu_model : &e->model;
+      char pbuf[512];
+      strncpy(pbuf, pair_env, sizeof(pbuf) - 1);
+      pbuf[sizeof(pbuf) - 1] = '\0';
+      char *ptok = strtok(pbuf, ",");
+      while (ptok) {
+       char *eq = strchr(ptok, '=');
+       if (eq) {
+        *eq = '\0';
+        int dst = atoi(ptok);
+        int src = atoi(eq + 1);
+        if (dst >= 0 && src >= 0 &&
+            dst < (int)DS4_N_LAYER && src < (int)DS4_N_LAYER) {
+         if (ds4_hot_pin_layer_pair_avg(store, src_model, &e->weights,
+                                        (uint32_t)dst, (uint32_t)src) == 0) {
+          n_pinned++;
+         }
+        }
+       }
+       ptok = strtok(NULL, ",");
+      }
+     }
+
      if (n_pinned > 0) {
       fprintf(stderr, "ds4: hot-store: %d layers pinned, %.2f GB heap\n",
               n_pinned, store->heap_bytes / 1e9);
