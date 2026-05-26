@@ -6904,6 +6904,37 @@ static void layer_routed_moe_one_prealloc(
  effective_k,
  clamp);
 
+ /* silv 2026-05-27 — input-conditioned expert decode.
+  * DS4_DUMP_EXPERT_MID=path captures per-(token, layer) the post-SwiGLU
+  * intermediate vectors for ALL effective_k selected experts BEFORE
+  * down_proj accumulation. Schema (binary, one record per call):
+  *   uint32 token, uint32 il, uint32 effective_k, uint32 down_in_dim
+  *   int32  selected[effective_k]
+  *   float  expert_weight[effective_k]
+  *   float  mid_all[effective_k * down_in_dim]
+  * Python reader can project each expert's mid through ffn_down_exps[e]
+  * @ lm_head to see what tokens THAT expert pushes on THIS specific input.
+  * Disambiguates weight-level mean-direction probe ambiguity. */
+ {
+  static FILE *fp = NULL;
+  static int env_checked = 0;
+  if (!env_checked) {
+   env_checked = 1;
+   const char *p = getenv("DS4_DUMP_EXPERT_MID");
+   if (p && p[0]) {
+    fp = fopen(p, "wb");
+    if (fp) fprintf(stderr, "DS4_DUMP_EXPERT_MID: capturing expert intermediates to %s\n", p);
+   }
+  }
+  if (fp) {
+   uint32_t hdr[4] = { (uint32_t)token, (uint32_t)il, (uint32_t)effective_k, (uint32_t)down_in_dim };
+   fwrite(hdr, sizeof(uint32_t), 4, fp);
+   fwrite(selected, sizeof(int32_t), (size_t)effective_k, fp);
+   fwrite(expert_weight, sizeof(float), (size_t)effective_k, fp);
+   fwrite(mid_all, sizeof(float), (size_t)effective_k * down_in_dim, fp);
+  }
+ }
+
  for (int i = 0; i < effective_k; i++) {
  ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
  midq + (uint64_t)i * (down_in_dim / QK_K),
