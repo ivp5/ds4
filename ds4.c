@@ -4254,9 +4254,11 @@ static const uint8_t *tensor_expert_bytes(
  * or layer not routed-MoE. */
 int ds4_hot_pin_layer_iq2xxs_full(
     ds4_hot_expert_store *store,
-    const ds4_model *model,
-    const ds4_weights *weights,
+    const void *model_v,
+    const void *weights_v,
     uint32_t layer) {
+    const ds4_model *model = (const ds4_model *)model_v;
+    const ds4_weights *weights = (const ds4_weights *)weights_v;
     if (!store || !model || !weights) return -1;
     if (layer >= DS4_N_LAYER) return -1;
     const ds4_layer_weights *L = &weights->layer[layer];
@@ -4268,7 +4270,19 @@ int ds4_hot_pin_layer_iq2xxs_full(
         return -1;
     }
 
-    const uint32_t n_experts = (uint32_t)L->ffn_gate_exps->dim[2];
+    uint32_t n_experts = (uint32_t)L->ffn_gate_exps->dim[2];
+    /* DEV: limit experts per layer for testing — scalar dequant is slow
+     * without NEON SIMD. Production would parallelize across experts or
+     * vectorize the inner loop. */
+    const char *cap_env = getenv("DS4_HOT_PIN_EXPERTS_MAX");
+    if (cap_env && cap_env[0]) {
+        uint32_t cap = (uint32_t)atoi(cap_env);
+        if (cap > 0 && cap < n_experts) {
+            fprintf(stderr, "ds4_hot_pin_layer L%u: capping experts at %u (DS4_HOT_PIN_EXPERTS_MAX)\n",
+                    layer, cap);
+            n_experts = cap;
+        }
+    }
     uint64_t in_g, out_g, rb_g, in_u, out_u, rb_u, in_d, out_d, rb_d;
     (void)tensor_expert_bytes(model, L->ffn_gate_exps, 0, &in_g, &out_g, &rb_g);
     (void)tensor_expert_bytes(model, L->ffn_up_exps,   0, &in_u, &out_u, &rb_u);
@@ -4327,13 +4341,15 @@ int ds4_hot_pin_layer_iq2xxs_full(
         store->heap_bytes += bytes_g + bytes_u + bytes_d;
         store->n_pinned++;
 
-        if ((e & 31) == 31) {
-            fprintf(stderr, "  L%u: %u/%u (%.1fs)\r",
+        if ((e & 7) == 7 || e < 4) {
+            fprintf(stderr, "  L%u: pinned %u/%u (%.2fs)\n",
                     layer, e + 1, n_experts, now_sec() - t0);
             fflush(stderr);
         }
     }
-    fprintf(stderr, "  L%u: %u experts pinned in %.1fs\n", layer, n_experts, now_sec() - t0);
+    fprintf(stderr, "  L%u: %u experts pinned in %.2fs (%.2f experts/s)\n",
+            layer, n_experts, now_sec() - t0,
+            (double)n_experts / (now_sec() - t0 + 0.001));
     return 0;
 }
 
@@ -20545,6 +20561,71 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  return 1;
  }
 #endif
+
+ /* extern decl matches the one near line 11744 — needed at this scope */
+ extern int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *);
+
+ /* silv 2026-05-27: env-triggered hot-store pin. DS4_HOT_PIN_LAYERS="L1,L2,..."
+  * comma-separated layer indices. Allocates a hot-store sized for the total
+  * pinned tiles + sets it active. ~6.4 GB per layer (256 experts × 3 tiles
+  * × ~8 MB FP16). The model used is e->cpu_model when cpu_moe is set
+  * (routed experts live in the separate mmap), else e->model. */
+ {
+  const char *layers_env = getenv("DS4_HOT_PIN_LAYERS");
+  if (layers_env && layers_env[0]) {
+   /* Parse layer list */
+   int requested[DS4_N_LAYER];
+   int n_req = 0;
+   char lbuf[256];
+   strncpy(lbuf, layers_env, sizeof(lbuf) - 1);
+   lbuf[sizeof(lbuf) - 1] = '\0';
+   char *tok = strtok(lbuf, ",");
+   while (tok && n_req < (int)DS4_N_LAYER) {
+    int L = atoi(tok);
+    if (L >= 0 && L < (int)DS4_N_LAYER) requested[n_req++] = L;
+    tok = strtok(NULL, ",");
+   }
+   if (n_req > 0) {
+    /* Budget: per-layer = 256 experts × 3 tiles × ~17 MB FP16 ≈ 13 GB.
+     * Smoke test showed 12.88 GB actual per layer; round up to 14 GB +
+     * 1 GB cushion per request. Caller is responsible for not OOMing
+     * the system: 4 layers × 14 GB = 56 GB, fits on M1 Max 64 GB. */
+    const uint64_t budget = (uint64_t)n_req * ((uint64_t)14ULL << 30) + ((uint64_t)1ULL << 30);
+    fprintf(stderr, "ds4: DS4_HOT_PIN_LAYERS=%s → pinning %d layers, budget=%.1f GB\n",
+            layers_env, n_req, budget / 1e9);
+    ds4_hot_expert_store *store = ds4_hot_expert_store_alloc(budget);
+    if (store) {
+     /* Routed experts live in cpu_model when cpu_moe path is enabled
+      * (--cpu-moe or --prefill-metal-phases); otherwise in e->model. */
+     const ds4_model *src_model = e->cpu_model_ready ? &e->cpu_model : &e->model;
+     int n_pinned = 0;
+     for (int i = 0; i < n_req; i++) {
+      if (ds4_hot_pin_layer_iq2xxs_full(store, src_model, &e->weights,
+                                         (uint32_t)requested[i]) == 0) {
+       n_pinned++;
+      } else {
+       fprintf(stderr, "ds4: DS4_HOT_PIN_LAYERS L%d failed\n", requested[i]);
+       break;
+      }
+     }
+     if (n_pinned > 0) {
+      fprintf(stderr, "ds4: hot-store: %d layers pinned, %.2f GB heap\n",
+              n_pinned, store->heap_bytes / 1e9);
+      ds4_hot_store_set_active(store);
+      /* Bind heap as Metal-resident MTLBuffer (zero-copy on unified mem)
+       * so the FP16 kernel can dispatch against it. */
+      if (ds4_metal_vqb2_fp16_bind_store(store) != 0) {
+       fprintf(stderr, "ds4: hot-store Metal bind failed (CPU dispatch still ok)\n");
+      }
+     } else {
+      ds4_hot_expert_store_free(store);
+     }
+    } else {
+     fprintf(stderr, "ds4: hot-store alloc failed (budget %.1f GB)\n", budget / 1e9);
+    }
+   }
+  }
+ }
 
  *out = e;
  return 0;

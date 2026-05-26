@@ -132,13 +132,13 @@ void ds4_hot_expert_store_print(const ds4_hot_expert_store *store);
  * from the IQ2_XXS mmap. silv 2026-05-27 hot-store full-coverage encoder
  * priority. Each layer ≈ 6.4 GB heap (256 experts × 3 tiles × ~8 MB FP16).
  * Defined in ds4.c (uses the iq2_xxs grid + tensor_expert_bytes helpers).
+ * Model + weights are passed as void* since the typedefs are anonymous in
+ * ds4.c and not exposed here; ds4.c casts back at the function entry.
  * Returns 0 on success, -1 on budget exceeded or non-IQ2_XXS layer. */
-struct ds4_model;
-struct ds4_weights;
 int ds4_hot_pin_layer_iq2xxs_full(
     ds4_hot_expert_store *store,
-    const struct ds4_model *model,
-    const struct ds4_weights *weights,
+    const void *model,
+    const void *weights,
     uint32_t layer);
 
 /* ============================================================================
