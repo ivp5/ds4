@@ -9054,6 +9054,14 @@ static void layer_attention_raw_swa_batch(
  free(attn_cur);
 }
 
+/* Forward declarations for sub-attn/mlp residual capture (#528).
+ * Definitions are below near the basic residual dump functions. */
+static void ds4_residual_split_init(void);
+static void ds4_residual_split_dump(
+ uint32_t pos, uint32_t il,
+ const float *inp_hc, const float *after_attn_hc, const float *out_hc,
+ uint64_t n);
+
 /* Full transformer layer for one decode token: attention sublayer followed by
  * FFN sublayer, both operating on the HC state. */
 static void layer_forward_raw_swa_one(
@@ -9203,6 +9211,13 @@ static void layer_forward_raw_swa_one(
  steering_dirs, steering_ffn_scale, scratch);
  if (profile) t_ffn = now_sec() - t0;
 
+ /* silv 2026-05-27 — emit sub-layer (attn, mlp) deltas for #528.
+  * inp_hc → scratch->after_attn_hc is the ATTN contribution.
+  * scratch->after_attn_hc → out_hc is the MLP/FFN contribution. */
+ ds4_residual_split_init();
+ ds4_residual_split_dump(pos, il, inp_hc, scratch->after_attn_hc, out_hc,
+   (uint64_t)n_hc * DS4_N_EMBD);
+
  if (profile) {
  fprintf(stderr,
  "ds4: decode detail layer %u attn hc=%.3f q=%.3f kv=%.3f rope=%.3f compress=%.3f indexer=%.3f attn_rows=%.3f inv_rope=%.3f out=%.3f post=%.3f ffn=%.3f total=%.3f ms\n",
@@ -9232,6 +9247,110 @@ static void output_logits_one_decode_scratch(
 
 /* CPU decode for one token through all 43 layers. The caller owns scratch and
  * cache lifetimes so no per-token allocations are needed. */
+/* silv 2026-05-27 — DS4 per-layer residual probe.
+ * Env DS4_DUMP_RESIDUAL=path opens a CSV; on each layer of each gen
+ * token, emits: pos, il, x_norm, out_norm, delta_norm, cos_x_delta,
+ * growth. Same signal as the Qwen3.5-4B MLX probe but on DS4's MLA
+ * + ratio-4/128 hybrid layer architecture. Captures the layer-function
+ * signature codex H1961-H1964 documented at L09/L22/L35/L42 directly.
+ */
+static FILE *g_residual_dump_fp = NULL;
+static int g_residual_dump_init = 0;
+
+static void ds4_residual_dump_init(void) {
+ if (g_residual_dump_init) return;
+ g_residual_dump_init = 1;
+ const char *path = getenv("DS4_DUMP_RESIDUAL");
+ if (!path || !path[0]) return;
+ g_residual_dump_fp = fopen(path, "w");
+ if (!g_residual_dump_fp) {
+  fprintf(stderr, "DS4_DUMP_RESIDUAL: failed to open %s\n", path);
+  return;
+ }
+ fprintf(g_residual_dump_fp, "pos,il,x_norm,out_norm,delta_norm,cos_x_delta,growth\n");
+ fflush(g_residual_dump_fp);
+ fprintf(stderr, "DS4_DUMP_RESIDUAL: capturing residual trajectories to %s\n", path);
+}
+
+static void ds4_residual_dump_layer(
+ uint32_t pos, uint32_t il,
+ const float *cur, const float *next, uint64_t n) {
+ if (!g_residual_dump_fp) return;
+ /* Compute on the last "row" of the n_hc-stacked tensor (n_hc × DS4_N_EMBD).
+  * The relevant slot for last-position decoding is index 0; the hc_post
+  * combine matrix mixes the rest. Capture the full state for accuracy. */
+ double x_norm2 = 0, out_norm2 = 0, delta_norm2 = 0, dot_x_delta = 0;
+ for (uint64_t i = 0; i < n; i++) {
+  const float xi = cur[i];
+  const float oi = next[i];
+  const float di = oi - xi;
+  x_norm2 += (double)xi * (double)xi;
+  out_norm2 += (double)oi * (double)oi;
+  delta_norm2 += (double)di * (double)di;
+  dot_x_delta += (double)xi * (double)di;
+ }
+ const double x_norm = sqrt(x_norm2);
+ const double out_norm = sqrt(out_norm2);
+ const double delta_norm = sqrt(delta_norm2);
+ const double cos_x_delta = (x_norm > 1e-12 && delta_norm > 1e-12) ?
+   dot_x_delta / (x_norm * delta_norm) : 0.0;
+ const double growth = x_norm > 1e-12 ? out_norm / x_norm : 0.0;
+ fprintf(g_residual_dump_fp, "%u,%u,%.6e,%.6e,%.6e,%.6f,%.6f\n",
+   pos, il, x_norm, out_norm, delta_norm, cos_x_delta, growth);
+}
+
+/* silv 2026-05-27 — DS4 sub-attn/mlp split capture (#528).
+ * Emits 3 deltas per layer: attn_delta, mlp_delta, and cos(attn, mlp).
+ * Routed to same CSV with extended schema. Header is the union of basic
+ * + split fields; split fields are 0 when split-capture didn't fire.
+ */
+static FILE *g_residual_split_fp = NULL;
+static int g_residual_split_init = 0;
+
+static void ds4_residual_split_init(void) {
+ if (g_residual_split_init) return;
+ g_residual_split_init = 1;
+ const char *path = getenv("DS4_DUMP_RESIDUAL_SPLIT");
+ if (!path || !path[0]) return;
+ g_residual_split_fp = fopen(path, "w");
+ if (!g_residual_split_fp) {
+  fprintf(stderr, "DS4_DUMP_RESIDUAL_SPLIT: failed to open %s\n", path);
+  return;
+ }
+ fprintf(g_residual_split_fp,
+   "pos,il,attn_delta_norm,mlp_delta_norm,cos_x_attn,cos_x_mlp,cos_attn_mlp\n");
+ fflush(g_residual_split_fp);
+ fprintf(stderr,
+   "DS4_DUMP_RESIDUAL_SPLIT: capturing per-layer attn/mlp deltas to %s\n", path);
+}
+
+static void ds4_residual_split_dump(
+ uint32_t pos, uint32_t il,
+ const float *inp_hc, const float *after_attn_hc, const float *out_hc,
+ uint64_t n) {
+ if (!g_residual_split_fp) return;
+ double a2 = 0, m2 = 0, dot_xa = 0, dot_xm = 0, dot_am = 0, x2 = 0;
+ for (uint64_t i = 0; i < n; i++) {
+  const float xi = inp_hc[i];
+  const float ai = after_attn_hc[i] - inp_hc[i];      /* attn contribution */
+  const float mi = out_hc[i] - after_attn_hc[i];      /* mlp contribution */
+  x2 += (double)xi * (double)xi;
+  a2 += (double)ai * (double)ai;
+  m2 += (double)mi * (double)mi;
+  dot_xa += (double)xi * (double)ai;
+  dot_xm += (double)xi * (double)mi;
+  dot_am += (double)ai * (double)mi;
+ }
+ const double x_n = sqrt(x2);
+ const double a_n = sqrt(a2);
+ const double m_n = sqrt(m2);
+ const double cos_xa = (x_n > 1e-12 && a_n > 1e-12) ? dot_xa / (x_n * a_n) : 0.0;
+ const double cos_xm = (x_n > 1e-12 && m_n > 1e-12) ? dot_xm / (x_n * m_n) : 0.0;
+ const double cos_am = (a_n > 1e-12 && m_n > 1e-12) ? dot_am / (a_n * m_n) : 0.0;
+ fprintf(g_residual_split_fp, "%u,%u,%.6e,%.6e,%.6f,%.6f,%.6f\n",
+   pos, il, a_n, m_n, cos_xa, cos_xm, cos_am);
+}
+
 static void forward_token_raw_swa_cpu_decode_scratch(
  float * logits,
  const ds4_model * model,
@@ -9243,8 +9362,10 @@ static void forward_token_raw_swa_cpu_decode_scratch(
  float steering_attn_scale,
  float steering_ffn_scale,
  ds4_cpu_decode_scratch * scratch) {
+ ds4_residual_dump_init();
  float *cur = scratch->cur;
  float *next = scratch->next;
+ const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
 
  embed_token_f16(model, weights, token, scratch->plain);
  hc_from_plain_embedding(cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
@@ -9257,6 +9378,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
  steering_attn_scale,
  steering_ffn_scale,
  scratch);
+ ds4_residual_dump_layer(pos, il, cur, next, hc_dim);
  float *tmp = cur;
  cur = next;
  next = tmp;
