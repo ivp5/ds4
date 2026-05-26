@@ -1010,6 +1010,24 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
 
     tgpig.z = 0;
 
+    /* silv 2026-05-27 — early-exit on route_weight == 0.
+     * When the router fused REMAP path zeros out a trimmed-expert weight,
+     * skip the entire dequant + matmul pipeline for this slot. Saves the
+     * dominant per-expert compute when trim50's dead experts get selected.
+     *
+     * Safe BEFORE the threadgroup_barrier (lines below): the early-exit
+     * sees a uniform route_weight across threads (idx is constant within
+     * a threadgroup) so ALL threads return together — no barrier hang.
+     *
+     * Reading route_weight = weights[idx * weight_stride]. */
+    {
+        device const float *rw_check =
+            (device const float *)(weights + (uint64_t)idx * act.weight_stride);
+        if (rw_check[0] == 0.0f) {
+            return;
+        }
+    }
+
     const int32_t i02 = ((device const int32_t *) (ids + iid1 * args.nbi1))[idx];
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;
