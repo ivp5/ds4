@@ -1265,17 +1265,145 @@ kernel void kernel_mul_mv_id_fp16_pair_swiglu_f32(
 }
 
 
-/* silv 2026-05-27 — simdgroup_multiply matmul on FP16: NOT applicable to
- * single-token gen (matvec). simdgroup_matrix is mat×mat (8×8 × 8×8 → 8×8).
- * For single-token gen, scalar dot in kernel_mul_mv_id_fp16_pair_swiglu_f32
- * above is the correct primitive. simdgroup_multiply gives ~8× speedup
- * only when token-batch ≥ 8 (i.e., PREFILL with batched activations).
+/* silv 2026-05-27 — simdgroup_matrix mat-mat kernel for FP16 routed-FFN
+ * at PREFILL where n_tokens ≥ 8. Multiplies 8 token-rows × 8 output-rows
+ * via simdgroup_multiply_accumulate. Each threadgroup computes one 8×8
+ * output tile of one expert. Caller is responsible for batching tokens
+ * by selected expert (sort by ids first) — within a threadgroup all 8
+ * tokens are assumed to route to the same expert via shared ids.
  *
- * For DS4 trim50 Metal gen (batch=1), the FP16 kernel above is the
- * deployable form. Prefill could benefit from simdgroup_matrix at
- * batch ≥ 8 — a separate kernel for batched MoE routed-FFN dispatch,
- * not implemented this turn (engineering scoped to follow-up).
+ * Memory layout assumption: src0_gate and src0_up are FP16 row-major hot
+ * store entries (e02 selects expert), src1 is FP32 token-major activation
+ * rows. Output dst_mid_f32 is n_tokens × n_ffn FP32.
+ *
+ * Speedup target: ~4-8× over per-token matvec at prefill batch≥8.
+ * Dispatch grid: (n_ffn/8, n_tokens/8, n_experts_selected).
  */
+kernel void kernel_mul_mm_id_fp16_pair_swiglu_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)tiitg; (void)tiisg; (void)sgitg;
+    /* tgpig: (out_col_tile, token_tile, batch_id) */
+    const uint out_col_tile = tgpig.x;
+    const uint token_tile = tgpig.y;
+    const int  iid1 = (int)(tgpig.z / args.nei0);
+    const int  idx  = (int)(tgpig.z % args.nei0);
+
+    /* Early-exit on route_weight == 0. */
+    {
+        device const float *rw_check =
+            (device const float *)(weights + (uint64_t)idx * act.weight_stride);
+        if (rw_check[0] == 0.0f) return;
+    }
+
+    /* Resolve expert ID + activation row. */
+    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
+    const int n_in = args.ne00;          /* K dim (input embed) */
+    const int n_out = args.ne0;          /* N dim (output ffn) */
+    const uint out_col_start = out_col_tile * 8;
+    const uint token_start = token_tile * 8;
+    if ((int)out_col_start >= n_out) return;
+
+    /* Pointer to this expert's weight tiles (row-major FP16). */
+    device const half *Wg = (device const half *)(src0_gate + (uint64_t)i02 * args.nb02);
+    device const half *Wu = (device const half *)(src0_up   + (uint64_t)i02 * args.nb02);
+    /* Activation rows for this token batch. src1 has stride args.nb11 per token. */
+    device const float *Y = (device const float *)src1;
+
+    /* Accumulators: 8×8 output tile for gate and up. */
+    simdgroup_float8x8 acc_gate = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 acc_up   = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    /* Threadgroup-shared scratch for the input row tile (n_tokens × 8 K-elements,
+     * staged via FP32→FP16). Sized for one 8×8 tile, multiple tiles re-use. */
+    threadgroup half *ts_A = (threadgroup half *)shmem;          /* 64 halves */
+    threadgroup half *ts_B = ts_A + 64;                          /* gate tile */
+    threadgroup half *ts_Bu = ts_B + 64;                         /* up tile */
+
+    for (int k = 0; k < n_in; k += 8) {
+        /* Stage A tile: 8 rows × 8 K-elements from Y, FP32→FP16. */
+        if (tiitg < 64) {
+            const uint trow = tiitg / 8;       /* 0..7 */
+            const uint tcol = tiitg % 8;       /* 0..7 */
+            const uint tok = token_start + trow;
+            const int kk = k + (int)tcol;
+            float v = 0.0f;
+            if ((int)tok < args.ne11 && kk < n_in) {
+                v = Y[(uint64_t)tok * (uint64_t)n_in + (uint64_t)kk];
+            }
+            ts_A[trow * 8 + tcol] = (half)v;
+        }
+        /* Stage B tiles (gate, up): 8 K-rows × 8 output-cols. Note row-major:
+         * W is (n_out × n_in), so we read W[out_col_start..out_col_start+8, k..k+8]
+         * as 8 output-rows × 8 K-columns then transpose to put K on the row axis. */
+        if (tiitg < 64) {
+            const uint trow = tiitg / 8;       /* K direction in B tile (0..7) */
+            const uint tcol = tiitg % 8;       /* output-col direction (0..7) */
+            const uint out_col = out_col_start + tcol;
+            const int kk = k + (int)trow;
+            half vg = 0.h, vu = 0.h;
+            if ((int)out_col < n_out && kk < n_in) {
+                const uint64_t off = (uint64_t)out_col * (uint64_t)n_in + (uint64_t)kk;
+                vg = Wg[off];
+                vu = Wu[off];
+            }
+            ts_B[trow * 8 + tcol]  = vg;
+            ts_Bu[trow * 8 + tcol] = vu;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Load + accumulate. simdgroup_load reads row-major from threadgroup mem. */
+        simdgroup_half8x8 mA, mBg, mBu;
+        simdgroup_load(mA, ts_A, 8, 0, false);
+        simdgroup_load(mBg, ts_B, 8, 0, false);
+        simdgroup_load(mBu, ts_Bu, 8, 0, false);
+        simdgroup_multiply_accumulate(acc_gate, mA, mBg, acc_gate);
+        simdgroup_multiply_accumulate(acc_up,   mA, mBu, acc_up);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* Store the 8×8 result to threadgroup mem, then per-lane SwiGLU+scale+output. */
+    threadgroup float *ts_Cg = (threadgroup float *)shmem;
+    threadgroup float *ts_Cu = ts_Cg + 64;
+    simdgroup_store(acc_gate, ts_Cg, 8, 0, false);
+    simdgroup_store(acc_up,   ts_Cu, 8, 0, false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* SwiGLU + route_weight + store. Each lane handles one cell of the tile. */
+    if (tiitg < 64) {
+        const uint trow = tiitg / 8;
+        const uint tcol = tiitg % 8;
+        const uint tok = token_start + trow;
+        const uint out_col = out_col_start + tcol;
+        if ((int)tok < args.ne11 && (int)out_col < n_out) {
+            float g = ts_Cg[trow * 8 + tcol];
+            float u = ts_Cu[trow * 8 + tcol];
+            const float c = act.clamp_value;
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            device const float *route_w =
+                (device const float *)(weights + (uint64_t)idx * act.weight_stride);
+            device float *dst_mid_f32 =
+                (device float *)(dst_mid + (uint64_t)idx * act.mid_row_stride);
+            dst_mid_f32[(uint64_t)tok * (uint64_t)n_out + (uint64_t)out_col] =
+                silu * u * route_w[0];
+        }
+    }
+}
 
 kernel void kernel_mul_mv_id_q4_K_pair_f32(
         constant ds4_metal_args_mul_mv_id & args,

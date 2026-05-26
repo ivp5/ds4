@@ -2087,6 +2087,44 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
 #endif
 }
 
+/* Dequant IQ2_XXS row → FP16. Mirror of the dot-product loop but writes
+ * each element as FP16 instead of accumulating. Used by the hot-store
+ * pin path. Defined here (next to the dot product) so it stays in sync
+ * with any future changes to the IQ2 quantization. */
+static void ds4_iq2_xxs_dequantize_row_to_fp16(
+    const block_iq2_xxs *row_data,
+    uint16_t *out_fp16,
+    uint64_t in_dim) {
+    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    const uint64_t nb = in_dim / QK_K;
+
+    for (uint64_t i = 0; i < nb; i++) {
+        const block_iq2_xxs *blk = &row_data[i];
+        const float d = f16_to_f32(blk->d);
+        uint32_t aux32[2];
+        const uint8_t *aux8 = (const uint8_t *)aux32;
+        const uint16_t *q2 = blk->qs;
+        uint16_t *out = out_fp16 + i * QK_K;
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            memcpy(aux32, q2, 2 * sizeof(uint32_t));
+            q2 += 4;
+            const uint32_t ls = 2 * (aux32[1] >> 28) + 1;
+            const float bscale = d * (float)ls * 0.125f;
+
+            /* 32 elements per ib32, 4 sub-iterations of 8 elements each */
+            for (int l = 0; l < 4; l++) {
+                const uint32_t sign_idx = (aux32[1] >> (7 * l)) & 127;
+                const int8_t *grid = iq2xxs_signed_grid[aux8[l]][sign_idx];
+                uint16_t *dst = out + ib32 * 32 + l * 8;
+                for (int j = 0; j < 8; j++) {
+                    dst[j] = f32_to_f16(bscale * (float)grid[j]);
+                }
+            }
+        }
+    }
+}
+
 /* TBL-kernel variant: uses vqtbl4q_s8 to apply sign patterns via in-register
  * table lookup instead of vld1_s8 + vmulq_s8. Theoretically saves the multiply
  * step and may improve ILP by interleaving table loads.
@@ -4208,6 +4246,95 @@ static const uint8_t *tensor_expert_bytes(
 
  const uint64_t expert_bytes = *out_dim * *row_bytes;
  return (const uint8_t *)tensor_data(m, w) + (uint64_t)expert * expert_bytes;
+}
+
+/* Public: pin every routed expert of one layer to the hot-store as FP16.
+ * Dequants gate, up, down tiles from IQ2_XXS mmap via the row-dequant helper.
+ * For DS4 a single layer ≈ 6.4 GB heap. Returns 0 success, -1 budget exceeded
+ * or layer not routed-MoE. */
+int ds4_hot_pin_layer_iq2xxs_full(
+    ds4_hot_expert_store *store,
+    const ds4_model *model,
+    const ds4_weights *weights,
+    uint32_t layer) {
+    if (!store || !model || !weights) return -1;
+    if (layer >= DS4_N_LAYER) return -1;
+    const ds4_layer_weights *L = &weights->layer[layer];
+    if (!L->ffn_gate_exps || !L->ffn_up_exps || !L->ffn_down_exps) return -1;
+
+    if (L->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS) {
+        fprintf(stderr, "ds4_hot_pin_layer: L%u is not IQ2_XXS (type=%d)\n",
+                layer, (int)L->ffn_gate_exps->type);
+        return -1;
+    }
+
+    const uint32_t n_experts = (uint32_t)L->ffn_gate_exps->dim[2];
+    uint64_t in_g, out_g, rb_g, in_u, out_u, rb_u, in_d, out_d, rb_d;
+    (void)tensor_expert_bytes(model, L->ffn_gate_exps, 0, &in_g, &out_g, &rb_g);
+    (void)tensor_expert_bytes(model, L->ffn_up_exps,   0, &in_u, &out_u, &rb_u);
+    (void)tensor_expert_bytes(model, L->ffn_down_exps, 0, &in_d, &out_d, &rb_d);
+    const uint64_t bytes_g = out_g * in_g * 2;
+    const uint64_t bytes_u = out_u * in_u * 2;
+    const uint64_t bytes_d = out_d * in_d * 2;
+    const uint64_t total = (bytes_g + bytes_u + bytes_d) * n_experts;
+    if (store->heap_bytes + total > store->budget_bytes) {
+        fprintf(stderr, "ds4_hot_pin_layer L%u: need %.2f GB, free %.2f GB\n",
+                layer, total / 1e9,
+                (double)(store->budget_bytes - store->heap_bytes) / 1e9);
+        return -1;
+    }
+
+    fprintf(stderr, "ds4_hot_pin_layer L%u: pinning %u experts × 3 tiles = %.2f GB\n",
+            layer, n_experts, total / 1e9);
+    const double t0 = now_sec();
+
+    for (uint32_t e = 0; e < n_experts; e++) {
+        const uint8_t *gate_iq2 = tensor_expert_bytes(model, L->ffn_gate_exps, e, &in_g, &out_g, &rb_g);
+        const uint8_t *up_iq2   = tensor_expert_bytes(model, L->ffn_up_exps,   e, &in_u, &out_u, &rb_u);
+        const uint8_t *down_iq2 = tensor_expert_bytes(model, L->ffn_down_exps, e, &in_d, &out_d, &rb_d);
+
+        const uint64_t off_g = store->heap_bytes;
+        const uint64_t off_u = off_g + bytes_g;
+        const uint64_t off_d = off_u + bytes_u;
+
+        uint16_t *dst_g = (uint16_t *)((char *)store->fp16_heap + off_g);
+        uint16_t *dst_u = (uint16_t *)((char *)store->fp16_heap + off_u);
+        uint16_t *dst_d = (uint16_t *)((char *)store->fp16_heap + off_d);
+
+        for (uint64_t r = 0; r < out_g; r++) {
+            ds4_iq2_xxs_dequantize_row_to_fp16(
+                (const block_iq2_xxs *)(gate_iq2 + r * rb_g),
+                dst_g + r * in_g, in_g);
+        }
+        for (uint64_t r = 0; r < out_u; r++) {
+            ds4_iq2_xxs_dequantize_row_to_fp16(
+                (const block_iq2_xxs *)(up_iq2 + r * rb_u),
+                dst_u + r * in_u, in_u);
+        }
+        for (uint64_t r = 0; r < out_d; r++) {
+            ds4_iq2_xxs_dequantize_row_to_fp16(
+                (const block_iq2_xxs *)(down_iq2 + r * rb_d),
+                dst_d + r * in_d, in_d);
+        }
+
+        store->gate_offset[layer * DS4_N_EXPERT + e] = (int64_t)off_g;
+        store->up_offset  [layer * DS4_N_EXPERT + e] = (int64_t)off_u;
+        store->down_offset[layer * DS4_N_EXPERT + e] = (int64_t)off_d;
+        store->gate_row_blocks[layer * DS4_N_EXPERT + e] = DS4_VQB2_GATE_UP_FULL_ROW_MASK;
+        store->up_row_blocks  [layer * DS4_N_EXPERT + e] = DS4_VQB2_GATE_UP_FULL_ROW_MASK;
+        store->down_row_blocks[layer * DS4_N_EXPERT + e] = DS4_VQB2_DOWN_FULL_ROW_MASK;
+
+        store->heap_bytes += bytes_g + bytes_u + bytes_d;
+        store->n_pinned++;
+
+        if ((e & 31) == 31) {
+            fprintf(stderr, "  L%u: %u/%u (%.1fs)\r",
+                    layer, e + 1, n_experts, now_sec() - t0);
+            fflush(stderr);
+        }
+    }
+    fprintf(stderr, "  L%u: %u experts pinned in %.1fs\n", layer, n_experts, now_sec() - t0);
+    return 0;
 }
 
 typedef struct {
