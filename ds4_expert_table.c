@@ -158,7 +158,16 @@ ds4_hot_expert_store *ds4_hot_expert_store_alloc(uint64_t budget_bytes) {
         store->up_offset[i]   = -1;
         store->down_offset[i] = -1;
     }
-    store->fp16_heap = NULL;
+    /* silv 2026-05-27: allocate the heap upfront so pin functions can write
+     * to (heap + offset) safely. Previously NULL — caused segfault when
+     * pin function tried to dequant into the heap. */
+    store->fp16_heap = malloc((size_t)budget_bytes);
+    if (!store->fp16_heap) {
+        fprintf(stderr, "ds4_hot_expert_store_alloc: heap malloc %.2f GB failed\n",
+                budget_bytes / 1e9);
+        ds4_hot_expert_store_free(store);
+        return NULL;
+    }
     store->heap_bytes = 0;
     store->budget_bytes = budget_bytes;
     store->n_pinned = 0;
