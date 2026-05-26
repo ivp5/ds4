@@ -1,36 +1,19 @@
 #ifndef DS4_MOE_ROUTE_LOG_H
 #define DS4_MOE_ROUTE_LOG_H
 
-/*
- * ds4_moe_route_log — env-gated JSONL route-key logger for DS4 MoE FFN calls.
+/* ds4_moe_route_log — env-gated JSONL route-key logger for DS4 MoE FFN calls.
  *
- * Mirrors codex's H1681 olmoe.py route-key logger pattern (see
- * /Users/silv/cl/tlp_codex/research/llm_fallacy_deconstruction/framework_deconstruction/H1681_TINYGRAD_OLMOE_ROUTE_LOGGER_PATCH_20260525.md)
- * applied to DS4. Goal: emit a SHAPE-level record per MoE FFN call without
- * materializing tensors, so codex's H1679 multishape ledger can be queried
- * read-only against live DS4 traffic.
+ * Emits one SHAPE-level record per MoE call without materializing tensors.
+ * Each record contains: x_shape [n_tokens, expert_in_dim], total_experts
+ * (256), active_experts (6), hidden, out, tokens_per_expert, consumer_cols,
+ * objective, layer.
  *
- * Each entry records only shape/route metadata:
- *   - x_shape          : [n_tokens, expert_in_dim]
- *   - total_experts    : DS4 pool size (256)
- *   - active_experts   : DS4 top-k = DS4_N_EXPERT_USED = 6
- *   - hidden           : expert_in_dim
- *   - out              : expert_mid_dim (gate/up output) — caller picks orientation
- *   - tokens_per_expert: derived from n_tokens / active (approximate)
- *   - consumer_cols    : approximated from downstream attention proj dim
- *   - objective        : "speed" | "latency" (from env)
- *   - layer            : layer index (additional vs OLMoE since DS4 is 43-layer)
- *
- * Env vars (mirror H1681 conventions):
+ * Env vars:
  *   DS4_MOE_ROUTE_LOG           = /path/to/file.jsonl  (enable)
  *   DS4_MOE_ROUTE_OBJECTIVE     = speed | latency      (default speed)
  *   DS4_MOE_ROUTE_CONSUMER_COLS = 32                   (default heuristic)
  *
- * Cost when enabled: 1 fprintf per MoE call = ~43 lines per token forward.
- * Negligible vs MoE compute.
- *
- * Cost when disabled: ds4_moe_route_log_enabled() returns false immediately,
- * no fprintf, no syscalls. Safe to leave in hot paths.
+ * Cost when disabled: enabled() returns false immediately; no syscalls.
  */
 
 #include <stdbool.h>
