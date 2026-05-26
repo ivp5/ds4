@@ -2113,6 +2113,27 @@ static void ds4_iq2_xxs_dequantize_row_to_fp16(
             const float bscale = d * (float)ls * 0.125f;
 
             /* 32 elements per ib32, 4 sub-iterations of 8 elements each */
+#if defined(__ARM_NEON)
+            const float32x4_t bscale4 = vdupq_n_f32(bscale);
+            for (int l = 0; l < 4; l++) {
+                const uint32_t sign_idx = (aux32[1] >> (7 * l)) & 127;
+                const int8_t *grid = iq2xxs_signed_grid[aux8[l]][sign_idx];
+                uint16_t *dst = out + ib32 * 32 + l * 8;
+                /* Load 8 int8 → widen to int16x8 → split into two int32x4
+                 * → cvt to float32x4 → multiply by bscale → cvt to float16. */
+                const int8x8_t g8 = vld1_s8(grid);
+                const int16x8_t g16 = vmovl_s8(g8);
+                const int32x4_t g32lo = vmovl_s16(vget_low_s16(g16));
+                const int32x4_t g32hi = vmovl_s16(vget_high_s16(g16));
+                const float32x4_t flo = vmulq_f32(vcvtq_f32_s32(g32lo), bscale4);
+                const float32x4_t fhi = vmulq_f32(vcvtq_f32_s32(g32hi), bscale4);
+                const float16x4_t hlo = vcvt_f16_f32(flo);
+                const float16x4_t hhi = vcvt_f16_f32(fhi);
+                /* Combine into float16x8 then store as 8 × uint16 (FP16 bits) */
+                const float16x8_t h8 = vcombine_f16(hlo, hhi);
+                vst1q_u16(dst, vreinterpretq_u16_f16(h8));
+            }
+#else
             for (int l = 0; l < 4; l++) {
                 const uint32_t sign_idx = (aux32[1] >> (7 * l)) & 127;
                 const int8_t *grid = iq2xxs_signed_grid[aux8[l]][sign_idx];
@@ -2121,6 +2142,7 @@ static void ds4_iq2_xxs_dequantize_row_to_fp16(
                     dst[j] = f32_to_f16(bscale * (float)grid[j]);
                 }
             }
+#endif
         }
     }
 }
