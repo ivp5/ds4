@@ -4575,6 +4575,14 @@ typedef struct {
  uint64_t gate_row_bytes[DS4_N_EXPERT_USED];
  uint64_t up_row_bytes[DS4_N_EXPERT_USED];
  int n_expert;
+ /* silv 2026-05-27 task #652 — organ-skip hook on main CPU MoE path.
+  * Filled by caller (matvec_iq2_xxs_experts_mid_prequant). When the
+  * organ-skip array is set, the per-row dispatch applies honest
+  * per-organ replacement: GATE→1.0, UP→1.0, DOWN→mid=0. See
+  * tmp/20260527_harm_scorer/DESIGN.md "Ablation semantic — REVISED". */
+ uint32_t layer_idx;
+ uint32_t selected_experts[DS4_N_EXPERT_USED];
+ uint8_t  organ_skip_active;  /* fast-path bypass: 0 ⇒ original behavior */
 } matvec_iq2_xxs_mid_ctx;
 
 static void matvec_iq2_xxs_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
@@ -4595,12 +4603,31 @@ static void matvec_iq2_xxs_mid_worker(void *vctx, uint64_t row0, uint64_t row1) 
  if (up > ctx->clamp) up = ctx->clamp;
  if (up < -ctx->clamp) up = -ctx->clamp;
  }
+
+ /* Per-organ honest ablation (#651/#652). Branch-free fast path when
+  * organ_skip_active=0: production binaries that never set DS4_ORGAN_SKIP
+  * pay one bool branch per row. See dispatch_hook_smoke.c for the
+  * smoke that refuted the SwiGLU-collapse hypothesis. */
+ if (ctx->organ_skip_active) {
+ const uint32_t E = ctx->selected_experts[slot];
+ if (ds4_organ_should_skip(ctx->layer_idx, E, DS4_ORGAN_DOWN)) {
+ ctx->mid[idx] = 0.0f; /* whole-expert ablation */
+ continue;
+ }
+ if (ds4_organ_should_skip(ctx->layer_idx, E, DS4_ORGAN_GATE)) gate = 1.0f;
+ if (ds4_organ_should_skip(ctx->layer_idx, E, DS4_ORGAN_UP))   up   = 1.0f;
+ }
+
  ctx->mid[idx] = silu(gate) * up * ctx->expert_weight[slot];
  }
 }
 
 /* Build all selected expert hidden vectors: IQ2_XXS gate/up, clamp, SwiGLU,
- * and router weight. The down projection runs later on the quantized mids. */
+ * and router weight. The down projection runs later on the quantized mids.
+ *
+ * silv 2026-05-27 task #652: added `layer_idx` parameter so the worker can
+ * apply per-(layer, expert, organ) skip flags. Callers must pass the
+ * routed-FFN layer index (or DS4_N_LAYER to disable). */
 static void matvec_iq2_xxs_experts_mid_prequant(
  float *mid,
  const ds4_model *m,
@@ -4610,7 +4637,8 @@ static void matvec_iq2_xxs_experts_mid_prequant(
  const int *selected,
  const float *expert_weight,
  int n_expert,
- float clamp) {
+ float clamp,
+ uint32_t layer_idx) {
  if (gate_w->type != 16 || up_w->type != 16) ds4_die("expected IQ2_XXS expert tensors");
  if (n_expert < 1 || n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
 
@@ -4640,11 +4668,14 @@ static void matvec_iq2_xxs_experts_mid_prequant(
  ds4_die("IQ2_XXS expert tensors do not share a layout");
  }
  ctx.expert_weight[i] = expert_weight[i];
+ ctx.selected_experts[i] = (uint32_t)selected[i];
  }
  if (in_dim0 % QK_K != 0) ds4_die("IQ2_XXS expert row is not QK_K aligned");
 
  ctx.in_dim = in_dim0;
  ctx.out_dim = out_dim0;
+ ctx.layer_idx = layer_idx;
+ ctx.organ_skip_active = (uint8_t)g_organ_skip_initialized;
  ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_iq2_xxs_mid_worker, &ctx);
 }
 
@@ -6902,7 +6933,8 @@ static void layer_routed_moe_one_prealloc(
  selected,
  expert_weight,
  effective_k,
- clamp);
+ clamp,
+ il);
 
  /* silv 2026-05-27 — input-conditioned expert decode.
   * DS4_DUMP_EXPERT_MID=path captures per-(token, layer) the post-SwiGLU
@@ -7002,6 +7034,10 @@ static void layer_routed_moe_selected_one_prealloc(
  DS4_N_EXPERT_USED,
  clamp);
  } else {
+ /* GPU→CPU batch handoff path: layer index is not available here.
+  * Pass DS4_N_LAYER as a sentinel — ds4_organ_should_skip's bounds
+  * check makes the skip a no-op on this path. The harm scorer
+  * runs through the single-token --cpu-moe path that has `il`. */
  matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
  layer->ffn_gate_exps,
  layer->ffn_up_exps,
@@ -7009,7 +7045,8 @@ static void layer_routed_moe_selected_one_prealloc(
  selected,
  weight_rows,
  DS4_N_EXPERT_USED,
- clamp);
+ clamp,
+ DS4_N_LAYER);
  }
 
  for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
