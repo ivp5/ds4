@@ -1905,6 +1905,19 @@ int main(int argc, char **argv) {
         const uint32_t iters = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 1;
         return ds4_gpu_mtl4_hc_split_sinkhorn_canary(n_rows, iters) ? 0 : 1;
     }
+    /* --get-rows-f32-canary [n_table_rows [row_width [n_ids]]] : task #691 */
+    if (argc >= 2 && !strcmp(argv[1], "--get-rows-f32-canary")) {
+        const uint32_t ntab = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 32;
+        const uint32_t rw   = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 128;
+        const uint32_t nid  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
+        return ds4_gpu_mtl4_get_rows_f32_canary(ntab, rw, nid) ? 0 : 1;
+    }
+    /* --argsort-f32-i32-desc-canary [row_n [top_k]] : task #692 bitonic argsort */
+    if (argc >= 2 && !strcmp(argv[1], "--argsort-f32-i32-desc-canary")) {
+        const uint32_t row_n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t top_k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 8;
+        return ds4_gpu_mtl4_argsort_f32_i32_desc_canary(row_n, top_k) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

@@ -1303,3 +1303,13 @@ int ds4_gpu_mtl4_moe_swiglu_weight_f16_canary(uint32_t rows, uint32_t width);
  * 4×4 combination matrix. NEW patterns: stable row-softmax (max-shift),
  * iterative col/row normalization for sinkhorn_iters steps. */
 int ds4_gpu_mtl4_hc_split_sinkhorn_canary(uint32_t n_rows, uint32_t sinkhorn_iters);
+
+/* silv 2026-05-27 task #691 — get_rows_f32 MTL4. Generic embedding /
+ * table lookup: gather rows by int32 ids. Used for token embeddings
+ * + router/hash lookup outputs. */
+int ds4_gpu_mtl4_get_rows_f32_canary(uint32_t n_table_rows, uint32_t row_width, uint32_t n_ids);
+
+/* silv 2026-05-27 task #692 — argsort_f32_i32_desc MTL4. Bitonic sort
+ * of indices keyed by float values, descending order. Returns top_k
+ * largest-value indices per row. Used by router top-K selection. */
+int ds4_gpu_mtl4_argsort_f32_i32_desc_canary(uint32_t row_n, uint32_t top_k);
