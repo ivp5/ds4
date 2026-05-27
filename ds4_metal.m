@@ -36006,6 +36006,162 @@ int ds4_gpu_mtl4_wide_tile_audit_iq2_xxs(uint32_t M, uint32_t K, uint32_t R) {
 }
 
 /* ============================================================ */
+/* Classic Metal wide-tile audit — verifies bug exists in antirez */
+/* PR #264 (not just my MTL4 port).                                */
+/* ============================================================ */
+/* Same canary shape as ds4_mtl4_wide_tile_audit_run but dispatches
+ * via classic MTL Compute API (matches production path). Loads the
+ * antirez classic Metal pipelines via ds4_gpu_get_mul_mm_id_pipeline
+ * (which compiles from metal/moe.metal — antirez source unchanged). */
+static int ds4_gpu_classic_wide_tile_audit_run(
+    const char *kernel_name,
+    uint32_t M, uint32_t K, uint32_t R, uint32_t tile_n,
+    const char *label)
+{
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_get_mul_mm_id_pipeline(kernel_name, false);
+    if (!pipeline) {
+        fprintf(stderr, "ds4: classic wide-tile audit %s: pipeline not found\n", label);
+        return 0;
+    }
+    if ((M % 64) != 0 || (K % 256) != 0 || R == 0 || tile_n == 0) {
+        fprintf(stderr, "ds4: classic wide-tile audit %s arg error\n", label);
+        return 0;
+    }
+    const uint64_t block_bytes = 66;
+    const uint32_t n_blocks_per_row = K / 256u;
+    const uint64_t iq2_row_bytes = (uint64_t)n_blocks_per_row * block_bytes;
+    const uint64_t b_total = (uint64_t)M * iq2_row_bytes;
+    const uint64_t a_total = (uint64_t)R * K;
+    const uint64_t c_total = (uint64_t)R * M;
+
+    uint8_t  *host_b   = (uint8_t  *)calloc(b_total, 1);
+    uint16_t *host_a   = (uint16_t *)calloc(a_total, sizeof(uint16_t));
+    float    *host_c   = (float    *)calloc(c_total, sizeof(float));
+    uint32_t *host_tpe = (uint32_t *)calloc(1, sizeof(uint32_t));
+    int32_t  *host_ids = (int32_t  *)calloc(R, sizeof(int32_t));
+    float    *expected = (float    *)calloc(c_total, sizeof(float));
+    if (!host_b || !host_a || !host_c || !host_tpe || !host_ids || !expected) {
+        free(host_b); free(host_a); free(host_c); free(host_tpe); free(host_ids); free(expected);
+        return 0;
+    }
+    /* Same all-zero-qs analytic setup as MTL4 audit. */
+    for (uint32_t m = 0; m < M; m++) {
+        const float d_f = 0.5f + (float)m * 0.001f;
+        const _Float16 d_h = (_Float16)d_f;
+        uint8_t *row = host_b + (uint64_t)m * iq2_row_bytes;
+        for (uint32_t b = 0; b < n_blocks_per_row; b++) {
+            uint8_t *blk = row + (uint64_t)b * block_bytes;
+            memcpy(blk, &d_h, sizeof(d_h));
+        }
+        const float row_sum = (float)K * (float)d_h;
+        for (uint32_t t = 0; t < R; t++) expected[(uint64_t)t * M + m] = row_sum;
+    }
+    host_tpe[0] = R;
+    for (uint32_t t = 0; t < R; t++) host_ids[t] = (int32_t)t;
+    _Float16 one = (_Float16)1.0f;
+    for (uint64_t i = 0; i < a_total; i++) memcpy(&host_a[i], &one, sizeof(one));
+
+    int rc = 0;
+    @autoreleasepool {
+        /* The classic Metal args struct comes from metal/moe.metal —
+         * ds4_metal_args_mul_mm_id has the same layout as my mm_id_args. */
+        struct {
+            int ne00, ne02;
+            uint64_t nb01, nb02, nb03;
+            int ne11;
+            uint64_t nb10, nb11, nb12, nb13;
+            int ne20, ne21;
+            int ne0, ne1;
+            int16_t r2, r3;
+        } args;
+        memset(&args, 0, sizeof(args));
+        args.ne00 = K;
+        args.ne02 = 1;
+        args.nb01 = iq2_row_bytes;
+        args.nb02 = (uint64_t)M * iq2_row_bytes;
+        args.nb03 = args.nb02;
+        args.ne11 = 1;
+        args.nb10 = sizeof(uint16_t);
+        args.nb11 = (uint64_t)K * sizeof(uint16_t);
+        args.nb12 = (uint64_t)K * sizeof(uint16_t);
+        args.nb13 = args.nb12;
+        args.ne20 = 1;
+        args.ne21 = R;
+        args.ne0 = M; args.ne1 = 1;
+        args.r2 = 1; args.r3 = 1;
+
+        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:b_total options:MTLResourceStorageModeShared];
+        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:R*sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:bBuf   offset:0 atIndex:1];
+        [enc setBuffer:aBuf   offset:0 atIndex:2];
+        [enc setBuffer:tpeBuf offset:0 atIndex:3];
+        [enc setBuffer:idsBuf offset:0 atIndex:4];
+        [enc setBuffer:cBuf   offset:0 atIndex:5];
+        [enc setThreadgroupMemoryLength:8192u atIndex:0];
+        const NSUInteger tgx = (R + tile_n - 1u) / tile_n;
+        [enc dispatchThreadgroups:MTLSizeMake(tgx, M / 64, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        memcpy(host_c, cBuf.contents, c_total * sizeof(float));
+        rc = 1;
+    }
+
+    int total_mismatch = 0;
+    double max_rel = 0.0;
+    uint32_t first_bad_token = UINT32_MAX;
+    for (uint32_t t = 0; t < R; t++) {
+        for (uint32_t m = 0; m < M; m++) {
+            const float got = host_c[(uint64_t)t * M + m];
+            const float ref = expected[(uint64_t)t * M + m];
+            const double d = fabs((double)(got - ref));
+            const double rel = d / (fabs((double)ref) + 1e-3);
+            if (rel > max_rel) max_rel = rel;
+            if (rel > 5e-2) {
+                total_mismatch++;
+                if (first_bad_token == UINT32_MAX) first_bad_token = t;
+            }
+        }
+    }
+    fprintf(stderr,
+        "ds4: CLASSIC wide-tile audit %s M=%u K=%u R=%u tile_n=%u mismatch=%d/%u "
+        "max_rel=%.4e first_bad_token=%u c[t0,0]=%.4f (ref=%.4f) "
+        "c[t%u,0]=%.4f (ref=%.4f)\n",
+        label, M, K, R, tile_n, total_mismatch, (unsigned)c_total, max_rel,
+        first_bad_token, (double)host_c[0], (double)expected[0],
+        R-1, (double)host_c[(uint64_t)(R-1) * M], (double)expected[(uint64_t)(R-1) * M]);
+    free(host_b); free(host_a); free(host_c);
+    free(host_tpe); free(host_ids); free(expected);
+    (void)rc;
+    return (total_mismatch == 0) ? 1 : 0;
+}
+
+int ds4_gpu_classic_wide_tile_audit_iq2_xxs(uint32_t M, uint32_t K, uint32_t R) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    int ok_n32  = ds4_gpu_classic_wide_tile_audit_run(
+        "kernel_mul_mm_id_iq2_xxs_f32",      M, K, R, 32,  "iq2_xxs_n32_classic");
+    int ok_n64  = ds4_gpu_classic_wide_tile_audit_run(
+        "kernel_mul_mm_id_iq2_xxs_f32_n64",  M, K, R, 64,  "iq2_xxs_n64_classic");
+    int ok_n128 = ds4_gpu_classic_wide_tile_audit_run(
+        "kernel_mul_mm_id_iq2_xxs_f32_n128", M, K, R, 128, "iq2_xxs_n128_classic");
+    fprintf(stderr, "ds4: CLASSIC wide-tile audit summary R=%u: n32=%s n64=%s n128=%s\n",
+            R, ok_n32 ? "PASS" : "FAIL", ok_n64 ? "PASS" : "FAIL",
+            ok_n128 ? "PASS" : "FAIL");
+    return (ok_n32 && ok_n64 && ok_n128) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +
