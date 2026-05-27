@@ -1462,3 +1462,9 @@ int ds4_gpu_mtl4_dsv4_shared_gate_up_swiglu_q8_0_canary(uint32_t M, uint32_t N, 
  * block_v * post[c] + Σ_k comb[c, k] * residual[d, k]. Hardcoded
  * n_hc=4, n_tokens=1 (decode path). 9 buffers. NR0=2, NSG=4 via FC. */
 int ds4_gpu_mtl4_dsv4_q8_hc_expand4_q8_0_canary(uint32_t M, uint32_t N);
+
+/* silv 2026-05-28 task #727 — mul_mv_f16_f32 MTL4.
+ * Half-precision matrix × FP32 vector → FP32 output. Twin of #722
+ * mul_mv_f32_f32; src0 element type is half. FC pattern via the
+ * refactored ds4_mtl4_build_kernel_pipeline helper. */
+int ds4_gpu_mtl4_mul_mv_f16_f32_canary(uint32_t M, uint32_t N);

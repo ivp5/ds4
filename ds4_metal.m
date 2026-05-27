@@ -29176,6 +29176,262 @@ cleanup:
 }
 
 /* ============================================================ */
+/* mul_mv_f16_f32 MTL4 port (silv 2026-05-28 #727)              */
+/* ============================================================ */
+/* Half-precision matrix × FP32 vector → FP32 output. Twin of #722
+ * mul_mv_f32_f32; only src0 element type changes (half instead of
+ * float). Used for FP16-stored attention/projection weights.
+ * NR0=4 hardcoded; NSG=4 via FC. Uses the refactored
+ * ds4_mtl4_build_kernel_pipeline helper. */
+
+static id<MTLComputePipelineState> ds4_mul_mv_f16_f32_build_pipeline(short nsg_value) {
+    NSString *source = [NSString stringWithFormat:
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "#define FC_MUL_MV 600\n"
+         "#define N_SIMDWIDTH 32\n"
+         "constant short FC_mul_mv_nsg [[function_constant(FC_MUL_MV + 0)]];\n"
+         "struct mv_args {\n"
+         "  int ne00; int ne01; int ne02;\n"
+         "  ulong nb00; ulong nb01; ulong nb02; ulong nb03;\n"
+         "  int ne10; int ne11; int ne12;\n"
+         "  ulong nb10; ulong nb11; ulong nb12; ulong nb13;\n"
+         "  int ne0; int ne1; int nr0;\n"
+         "  short r2; short r3;\n"
+         "};\n"
+         "static inline void reduce_write(\n"
+         "    device float *dst_f32,\n"
+         "    thread float *sumf,\n"
+         "    const int r0,\n"
+         "    const int ne01,\n"
+         "    ushort tiisg,\n"
+         "    ushort sgitg,\n"
+         "    threadgroup char *shmem) {\n"
+         "  constexpr short NW = N_SIMDWIDTH;\n"
+         "  constexpr short NR0 = 4;\n"
+         "  threadgroup float *shmem_f32[NR0];\n"
+         "  for (short row = 0; row < NR0; ++row) {\n"
+         "    shmem_f32[row] = (threadgroup float *)shmem + NW*row;\n"
+         "    if (sgitg == 0) shmem_f32[row][tiisg] = 0.0f;\n"
+         "    sumf[row] = simd_sum(sumf[row]);\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (short row = 0; row < NR0; ++row) {\n"
+         "    if (tiisg == 0) shmem_f32[row][sgitg] = sumf[row];\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {\n"
+         "    float tot = simd_sum(shmem_f32[row][tiisg]);\n"
+         "    if (tiisg == 0 && sgitg == 0) dst_f32[r0 + row] = tot;\n"
+         "  }\n"
+         "}\n"
+         "kernel void mul_mv_f16_f32_mtl4(\n"
+         "    device const mv_args *args [[buffer(0)]],\n"
+         "    device const char    *src0 [[buffer(1)]],\n"
+         "    device const char    *src1 [[buffer(2)]],\n"
+         "    device       char    *dst  [[buffer(3)]],\n"
+         "    threadgroup  char    *shmem [[threadgroup(0)]],\n"
+         "    uint3   tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort  tiisg [[thread_index_in_simdgroup]],\n"
+         "    ushort  sgitg [[simdgroup_index_in_threadgroup]]) {\n"
+         "  constexpr short NR0 = 4;\n"
+         "  const short NSG = FC_mul_mv_nsg;\n"
+         "  constexpr short NW = N_SIMDWIDTH;\n"
+         "  constexpr short NB = 32;\n"
+         "  constexpr short NF = 8;\n"
+         "  const int nb = args->ne00 / NB;\n"
+         "  const int r0 = tgpig.x * NR0;\n"
+         "  const int r1 = tgpig.y;\n"
+         "  const int im = tgpig.z;\n"
+         "  const uint i12 = im %% args->ne12;\n"
+         "  const uint i13 = im / args->ne12;\n"
+         "  const ulong offset1 = r1*args->nb11 + i12*args->nb12 + i13*args->nb13;\n"
+         "  device const float *y = (device const float *)(src1 + offset1);\n"
+         "  device const half *ax[NR0];\n"
+         "  for (short row = 0; row < NR0; ++row) {\n"
+         "    const ulong offset0 = (r0 + row)*args->nb01\n"
+         "                       + (i12/args->r2)*args->nb02\n"
+         "                       + (i13/args->r3)*args->nb03;\n"
+         "    ax[row] = (device const half *)((device const char *)src0 + offset0);\n"
+         "  }\n"
+         "  float sumf[NR0] = {0.0f};\n"
+         "  const short ix = tiisg / (NW / NF);\n"
+         "  const short il = tiisg %% (NW / NF);\n"
+         "  const int ib0 = sgitg * NF + ix;\n"
+         "  float yl[NF];\n"
+         "  device const float *yb = y + ib0*NB + il*NF;\n"
+         "  for (int ib = ib0; ib < nb; ib += NSG*NF) {\n"
+         "    for (short i = 0; i < NF; ++i) yl[i] = yb[i];\n"
+         "    for (short row = 0; row < NR0; ++row) {\n"
+         "      device const half *xb = ax[row] + ib*NB + il*NF;\n"
+         "      float sumq = 0.0f;\n"
+         "      for (short i = 0; i < NF; ++i) sumq += (float)xb[i] * yl[i];\n"
+         "      sumf[row] += sumq;\n"
+         "    }\n"
+         "    yb += NSG*NF*NW;\n"
+         "  }\n"
+         "  for (int i = nb*NB + sgitg*NW + tiisg; i < args->ne00; i += NW*NSG) {\n"
+         "    for (short row = 0; row < NR0; ++row) sumf[row] += (float)ax[row][i] * y[i];\n"
+         "  }\n"
+         "  device float *dst_f32 = (device float *)dst\n"
+         "    + (ulong)im*args->ne0*args->ne1 + (ulong)r1*args->ne0;\n"
+         "  reduce_write(dst_f32, sumf, r0, args->ne01, tiisg, sgitg, shmem);\n"
+         "}\n"];
+
+    const ds4_mtl4_fc_short fcs[] = {{nsg_value, 600}};
+    return ds4_mtl4_build_kernel_pipeline(
+        source,
+        @"ds4_mul_mv_f16_f32_mtl4",
+        @"mul_mv_f16_f32_mtl4",
+        1024,
+        fcs, 1);
+}
+
+static id<MTLComputePipelineState> g_mul_mv_f16_f32_nsg4_mtl4_pipeline;
+static int g_mul_mv_f16_f32_nsg4_mtl4_init_attempted;
+static int g_mul_mv_f16_f32_nsg4_mtl4_init_ok;
+
+static int ds4_mul_mv_f16_f32_nsg4_mtl4_pipeline_init(void) {
+    if (g_mul_mv_f16_f32_nsg4_mtl4_init_attempted) return g_mul_mv_f16_f32_nsg4_mtl4_init_ok;
+    g_mul_mv_f16_f32_nsg4_mtl4_init_attempted = 1;
+    g_mul_mv_f16_f32_nsg4_mtl4_pipeline = ds4_mul_mv_f16_f32_build_pipeline(4);
+    g_mul_mv_f16_f32_nsg4_mtl4_init_ok = (g_mul_mv_f16_f32_nsg4_mtl4_pipeline != nil) ? 1 : 0;
+    return g_mul_mv_f16_f32_nsg4_mtl4_init_ok;
+}
+
+int ds4_gpu_mtl4_mul_mv_f16_f32_canary(uint32_t M, uint32_t N) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_mul_mv_f16_f32_nsg4_mtl4_pipeline_init()) return 0;
+    if (M == 0 || N == 0 || (M % 4) != 0 || (N % 32) != 0) {
+        fprintf(stderr, "ds4: mul_mv_f16_f32 canary needs M%%4==0 and N%%32==0 (got M=%u N=%u)\n", M, N);
+        return 0;
+    }
+
+    const uint64_t matrix_n = (uint64_t)M * N;
+    uint16_t *host_mat = (uint16_t *)calloc(matrix_n, sizeof(uint16_t));
+    float *host_vec = (float *)calloc(N, sizeof(float));
+    float *host_dst = (float *)calloc(M, sizeof(float));
+    float *expected = (float *)calloc(M, sizeof(float));
+    if (!host_mat || !host_vec || !host_dst || !expected) {
+        free(host_mat); free(host_vec); free(host_dst); free(expected); return 0;
+    }
+    for (uint32_t r = 0; r < M; r++) {
+        for (uint32_t c = 0; c < N; c++) {
+            float v = (float)((int)r % 7) * 0.01f + (float)((int)c % 5) * 0.001f;
+            _Float16 h = (_Float16)v;
+            memcpy(&host_mat[(uint64_t)r * N + c], &h, sizeof(h));
+        }
+    }
+    for (uint32_t c = 0; c < N; c++) host_vec[c] = (float)((int)c % 3) * 0.1f + 0.5f;
+    for (uint32_t r = 0; r < M; r++) {
+        double acc = 0.0;
+        for (uint32_t c = 0; c < N; c++) {
+            _Float16 h;
+            memcpy(&h, &host_mat[(uint64_t)r * N + c], sizeof(h));
+            acc += (double)(float)h * (double)host_vec[c];
+        }
+        expected[r] = (float)acc;
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> matBuf = [g_device newBufferWithBytes:host_mat length:matrix_n*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> vecBuf = [g_device newBufferWithBytes:host_vec length:N*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:M*sizeof(float) options:MTLResourceStorageModeShared];
+
+        struct {
+            int ne00, ne01, ne02;
+            uint64_t nb00, nb01, nb02, nb03;
+            int ne10, ne11, ne12;
+            uint64_t nb10, nb11, nb12, nb13;
+            int ne0, ne1, nr0;
+            int16_t r2, r3;
+        } args;
+        memset(&args, 0, sizeof(args));
+        args.ne00 = N; args.ne01 = M; args.ne02 = 1;
+        args.nb00 = sizeof(uint16_t);
+        args.nb01 = (uint64_t)N * sizeof(uint16_t);
+        args.nb02 = (uint64_t)M * N * sizeof(uint16_t);
+        args.nb03 = (uint64_t)M * N * sizeof(uint16_t);
+        args.ne10 = N; args.ne11 = 1; args.ne12 = 1;
+        args.nb10 = sizeof(float);
+        args.nb11 = (uint64_t)N * sizeof(float);
+        args.nb12 = args.nb11; args.nb13 = args.nb11;
+        args.ne0 = M; args.ne1 = 1; args.nr0 = 4;
+        args.r2 = 1; args.r3 = 1;
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 6;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[4] = {(id)argsBuf, (id)matBuf, (id)vecBuf, (id)dstBuf};
+            [residency addAllocations:allocs count:4];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:matBuf.gpuAddress atIndex:1];
+                [argTable setAddress:vecBuf.gpuAddress atIndex:2];
+                [argTable setAddress:dstBuf.gpuAddress atIndex:3];
+
+                NSUInteger nth = 4u * 32u;
+                NSUInteger shmem_bytes = 4u * 32u * sizeof(float);
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_mul_mv_f16_f32_nsg4_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(M / 4, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_dst, dstBuf.contents, M * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 8);
+            }
+        }
+    }
+    if (!rc) { free(host_mat); free(host_vec); free(host_dst); free(expected); return 0; }
+
+    int mismatch = 0;
+    double max_rel = 0.0;
+    for (uint32_t r = 0; r < M; r++) {
+        const double diff = fabs((double)(host_dst[r] - expected[r]));
+        const double rel = diff / (fabs((double)expected[r]) + 1e-7);
+        if (rel > max_rel) max_rel = rel;
+        if (rel > 1e-4) mismatch++;
+    }
+    fprintf(stderr,
+        "ds4: mul_mv_f16_f32 MTL4 canary M=%u N=%u "
+        "dst[0]=%.5f (ref=%.5f) dst[end]=%.5f (ref=%.5f) mismatch=%d max_rel=%.4e\n",
+        M, N,
+        (double)host_dst[0], (double)expected[0],
+        (double)host_dst[M - 1], (double)expected[M - 1],
+        mismatch, max_rel);
+    free(host_mat); free(host_vec); free(host_dst); free(expected);
+    return (mismatch == 0) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +
