@@ -78,3 +78,60 @@ remains 42/81 (51.9%). No broken canary shipped.
 This is the first port-attempt failure in 36 ports across the session.
 The simdgroup MMA pattern is the FIRST genuinely hard pattern that
 requires investigation beyond template-mechanical porting.
+
+## 2nd attempt: ulong2(0, 0) — REFUTED (turn N+1)
+
+Applied hypothesis #1 (explicit `ulong2(0, 0)` origin on all simdgroup_load
+and simdgroup_store). Same failure pattern: score[0,0] = 0.
+
+Then progressively diagnosed:
+
+**Step 1**: With `pos0=1024 ratio=1` (causal masking turned off):
+- All 256 cells = 0 regardless of n_head. neg_inf_count = 0.
+
+**Step 2**: Replaced MMA with constant `mdot = 42.0`, simdgroup_store:
+- score[0, 0..15] = 42 (sg=0 and sg=1 both wrote row 0 correctly)
+- score[1, 0] = 0 (row 1 missing)
+
+**Step 3**: Replaced simdgroup_store with manual per-lane fill loop
+(`if (sg==0) for (i=lane; i<TM*TN; i+=32) dot[i]=42;`):
+- Same pattern: row 0 = 42, row 1 = 0.
+
+**Step 4**: Bypassed dot[] entirely, direct write `acc0=(float)(token0*100+comp0)`:
+- score[0, 0..15] = [0, 1, 2, ..., 15] (row 0 correct: token=0)
+- score[1, 0] = 0 (row 1 missing: should be 100)
+
+## Deeper finding — NOT a simdgroup_store / threadgroup_mem issue
+
+The failure is at a MORE FUNDAMENTAL layer: **lanes 8-31 of every
+simdgroup silently skip the per-thread write path**. Only lanes 0-7
+(which map to `row0 = lane >> 3 = 0`, i.e., token=0) actually execute
+the `*dst = acc0` store.
+
+This is a **lane masking** symptom. Possible causes:
+- MTL4 dispatch shape misinterpretation: maybe `threadsPerThreadgroup`
+  with (128, 1, 1) is being clamped to (32, 1, 1) silently.
+- A control-flow predicate higher in the kernel (the `c0 >=
+  max_visible` early-return) executes lane-divergent and only lanes
+  0-7 reach the main path.
+- MSL `[[thread_index_in_simdgroup]]` returns a value different from
+  what classic-MTL returns under MTL4 dispatch.
+
+**Most actionable next debug**: instrument the kernel with an atomic
+counter to verify HOW MANY threads enter the main path. If only 32
+threads (not 128), the dispatch shape isn't reaching the runtime.
+
+## Status (2nd attempt)
+
+Code reverted again. Build clean. Coverage 42/81 (51.9%).
+
+Conclusion from 2-turn investigation: the simdgroup MMA port blocks
+on a deeper MTL4 dispatch-shape or lane-execution issue that requires
+multi-turn debug (atomic instrumentation + lane-by-lane analysis +
+possibly cross-reference against codex's MTL4 ML pipeline findings
+which discussed dispatch semantics in H1779/H1780).
+
+Recommend deferring all simdgroup-MMA / Q8_0 / FlashAttention / mul_mm
+ports until this is resolved, OR moving to non-MMA ports (Q4_K
+dispatch, generic copy/conversion variants, FA's pad/blk subkernels
+that don't use MMA).
