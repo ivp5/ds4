@@ -1076,3 +1076,19 @@ int ds4_gpu_hadamard16_fp16_batched_tensor(ds4_gpu_tensor *tensor,
                                             uint32_t n_rows,
                                             uint32_t blocks_per_row,
                                             uint64_t row_stride_bytes);
+
+/* silv 2026-05-27 task #667/#668 — per-layer attention scale + loop rescue.
+ *
+ * Per-layer scale: env DS4_ATTN_SCALE_MULT_PER_LAYER="L=X,L=X,..." sets
+ * different multipliers per layer; layers without overrides fall back to
+ * the global DS4_ATTN_SCALE_MULT. To use per-layer overrides, ds4.c must
+ * call ds4_set_current_layer_idx(il) BEFORE each layer's flash-attn
+ * dispatch. Without that wire, the global mult applies uniformly.
+ *
+ * Runtime rescue: ds4_set_attn_scale_mult_runtime(v) updates the GLOBAL
+ * multiplier mid-generation. Use case: cache_lock_detector fires → loop
+ * detected → call this with elevated v (e.g. 1.5) to sharpen attention
+ * and break the loop, then restore to 1.0f after N tokens. Per-layer
+ * overrides remain in effect for layers that have them set. */
+void ds4_set_current_layer_idx(int il);
+void ds4_set_attn_scale_mult_runtime(float v);

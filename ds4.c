@@ -13583,6 +13583,14 @@ static bool metal_graph_encode_layer_attention_batch(
  uint32_t n_tokens) {
  if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
 
+ /* silv 2026-05-27 task #667 — record which layer is about to dispatch
+  * flash-attn so per-layer attention-scale overrides take effect. The
+  * underlying flash-attn .scale init reads g_ds4_current_layer_idx via
+  * ds4_attn_scale_mult() in ds4_metal.m. Without this wire, per-layer
+  * env DS4_ATTN_SCALE_MULT_PER_LAYER overrides are parsed but never
+  * applied. Idempotent on same il. */
+ ds4_set_current_layer_idx((int)il);
+
  const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
  const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
  const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -18337,6 +18345,20 @@ static int generate_raw_swa_cpu(
  ds4_cache_lock_get_state(cache_lock, &st);
  fprintf(stderr, "ds4: CACHE_LOCK fired at step %d (repeat_factor=%.2f top_count=%u)\n",
  i, (double)st.repeat_factor, (unsigned)st.top_count);
+ /* silv 2026-05-27 task #668 — auto-rescue: when loop fires, sharpen
+  * attention to break the rote-recall pattern (cross-prompt sweep on
+  * IQ2_XXS showed sharper temperature destabilizes rote answers).
+  * Opt-in via DS4_CACHE_LOCK_RESCUE_MULT (e.g. 1.5 or 4.0; non-monotonic
+  * at high temp per tmp/20260527_dsml_aime/attn_temp/FINDINGS.md). */
+ const char *rescue_mult_env = getenv("DS4_CACHE_LOCK_RESCUE_MULT");
+ if (rescue_mult_env && *rescue_mult_env) {
+ float v = strtof(rescue_mult_env, NULL);
+ if (v > 0.0f && v < 100.0f) {
+ fprintf(stderr,
+ "ds4: attempting loop-rescue via attn-scale sharpen mult=%.2f\n", (double)v);
+ ds4_set_attn_scale_mult_runtime(v);
+ }
+ }
  }
  }
 

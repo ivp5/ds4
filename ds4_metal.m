@@ -291,14 +291,82 @@ static int g_quality_mode;
 static int g_mpp_invalid_env_reported;
 
 /* silv 2026-05-27 — runtime attention scale multiplier.
- * env DS4_ATTN_SCALE_MULT=0.2 sharpens attention to push model out of
- * non-convergent loops (per Qwen3.5-4B finding: at 4-bit quant, default
- * temperature too smooth → loops; ×0.2 sharpens softmax → forces commit).
  *
- * Applied to every flash-attn `.scale = 1.0/sqrt(head_dim) * g_ds4_attn_scale_mult`.
+ * Empirical correction to prior comment: mult < 1.0 = SOFTER (diffuse)
+ * softmax; mult > 1.0 = SHARPER (concentrated). Cross-prompt sweep on
+ * IQ2_XXS (tmp/20260527_dsml_aime/attn_temp/cross_prompt/) shows:
+ *   - mult=1.0 baseline preserves top-1 across math/know/code/dsml
+ *   - mult=0.5 (softer): top-1 stable, confidence -0.05 to -0.6
+ *   - mult=2.0+ (sharper): BREAKS rote-knowledge and structured-fill
+ *   - Non-monotonic at high temp (mult=4.0 cleaner than mult=2.5)
+ *
+ * Two override levels:
+ *   1. Global mult via env DS4_ATTN_SCALE_MULT=X (legacy interface)
+ *   2. Per-layer mult via env DS4_ATTN_SCALE_MULT_PER_LAYER="L=X,L=X,..."
+ *      e.g. DS4_ATTN_SCALE_MULT_PER_LAYER="22=1.5,25=1.5,28=1.5"
+ *      Per-layer entries override the global for those layers.
+ *
+ * Runtime override (called by ds4.c cache_lock_detector when loop fires):
+ *   ds4_set_attn_scale_mult_runtime(float v) — sets the global, restoring
+ *   layer entries that were unset. Subsequent ds4_attn_scale_mult() calls
+ *   return v unless a per-layer override matches the tracked current layer.
+ *
+ * Layer tracking:
+ *   ds4_set_current_layer_idx(int il) — called by ds4.c before each
+ *   layer's flash-attn dispatch. Read by ds4_attn_scale_mult() to consult
+ *   the per-layer table. Default: -1 (no layer info → use global).
+ *
+ * Applied to every flash-attn `.scale = 1.0/sqrt(head_dim) * mult`.
  * Defaults to 1.0 (no change to baseline behavior). */
 static float g_ds4_attn_scale_mult = 1.0f;
 static int   g_ds4_attn_scale_mult_checked = 0;
+static float g_ds4_attn_scale_mult_per_layer[DS4_N_LAYER];
+static int   g_ds4_attn_scale_per_layer_active = 0;  /* any layer override set */
+static int   g_ds4_attn_scale_per_layer_checked = 0;
+static int   g_ds4_current_layer_idx = -1;  /* set by ds4.c before flash-attn dispatch */
+
+static void ds4_attn_scale_init_per_layer(void) {
+    if (g_ds4_attn_scale_per_layer_checked) return;
+    g_ds4_attn_scale_per_layer_checked = 1;
+    /* Sentinel value -1.0 means "use global". */
+    for (int i = 0; i < DS4_N_LAYER; i++) g_ds4_attn_scale_mult_per_layer[i] = -1.0f;
+
+    const char *e = getenv("DS4_ATTN_SCALE_MULT_PER_LAYER");
+    if (!e || !*e) return;
+
+    /* Parse "L=X,L=X,..." into the array. */
+    char buf[1024];
+    size_t n = strlen(e);
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, e, n); buf[n] = '\0';
+
+    int n_set = 0;
+    char *p = buf;
+    while (*p) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        char *eq = strchr(p, '=');
+        if (!eq) break;
+        *eq = '\0';
+        long layer = strtol(p, NULL, 10);
+        char *val_start = eq + 1;
+        char *next = strchr(val_start, ',');
+        if (next) *next = '\0';
+        float v = strtof(val_start, NULL);
+        if (layer >= 0 && layer < DS4_N_LAYER && v > 0.0f && v < 100.0f) {
+            g_ds4_attn_scale_mult_per_layer[layer] = v;
+            n_set++;
+        }
+        if (!next) break;
+        p = next + 1;
+    }
+    if (n_set > 0) {
+        g_ds4_attn_scale_per_layer_active = 1;
+        fprintf(stderr,
+            "ds4: DS4_ATTN_SCALE_MULT_PER_LAYER — %d layer overrides active "
+            "(env: '%s')\n", n_set, e);
+    }
+}
 
 static float ds4_attn_scale_mult(void) {
     if (!g_ds4_attn_scale_mult_checked) {
@@ -308,17 +376,44 @@ static float ds4_attn_scale_mult(void) {
             if (v > 0.0f && v < 100.0f) {
                 g_ds4_attn_scale_mult = v;
                 fprintf(stderr,
-                    "ds4: DS4_ATTN_SCALE_MULT=%.3f — attention temperature %s "
+                    "ds4: DS4_ATTN_SCALE_MULT=%.3f — attention scale %s "
                     "(× of default 1/sqrt(head_dim))\n",
-                    v, v < 1.0f ? "sharpened" : (v > 1.0f ? "smoothed" : "default"));
+                    v, v < 1.0f ? "softened" : (v > 1.0f ? "sharpened" : "default"));
             } else {
                 fprintf(stderr,
                     "ds4: DS4_ATTN_SCALE_MULT='%s' invalid (must be > 0 and < 100); using 1.0\n", e);
             }
         }
         g_ds4_attn_scale_mult_checked = 1;
+        ds4_attn_scale_init_per_layer();
+    }
+    /* Per-layer override takes precedence when current layer is tracked. */
+    if (g_ds4_attn_scale_per_layer_active &&
+        g_ds4_current_layer_idx >= 0 &&
+        g_ds4_current_layer_idx < DS4_N_LAYER) {
+        float v = g_ds4_attn_scale_mult_per_layer[g_ds4_current_layer_idx];
+        if (v > 0.0f) return v;  /* sentinel -1.0 means "use global" */
     }
     return g_ds4_attn_scale_mult;
+}
+
+/* Public setter used by ds4.c per-layer dispatch loops to track which
+ * layer is about to run flash-attn. Pass -1 to clear (e.g. between layers
+ * if the next op isn't a tracked flash-attn). Idempotent on same value. */
+void ds4_set_current_layer_idx(int il) {
+    g_ds4_current_layer_idx = il;
+}
+
+/* Public runtime setter used by ds4.c cache_lock_detector when a loop
+ * is detected. Updates the global mult (per-layer overrides still take
+ * precedence for layers that have them set). Pass 1.0f to restore
+ * default. Bounded: silently clamps to (0, 100). */
+void ds4_set_attn_scale_mult_runtime(float v) {
+    if (!(v > 0.0f) || !(v < 100.0f)) return;
+    g_ds4_attn_scale_mult = v;
+    g_ds4_attn_scale_mult_checked = 1;  /* don't let env-read overwrite */
+    fprintf(stderr,
+        "ds4: attn-scale runtime override = %.3f (loop-rescue / per-call adjustment)\n", v);
 }
 
 static uint64_t ds4_gpu_system_memory_bytes(void) {
