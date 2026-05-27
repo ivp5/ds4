@@ -76,10 +76,31 @@ typedef struct ds4_hot_expert_store {
     uint64_t *gate_row_blocks;
     uint64_t *up_row_blocks;
     uint64_t *down_row_blocks;
+    /* silv 2026-05-27 (post-codex-H1967..H2068, see
+     * tmp/20260527_hadamard/DEPLOYMENT_RULES.md):
+     * per-organ per-row-block Hadamard-16 basis flag. Bit i set means the
+     * pinned tile at row-block i is stored in Hadamard-16 basis and the
+     * dispatch MUST apply the matching activation-side transform on the
+     * input to that organ's matmul. 0 (default) = original basis, no
+     * transform required.
+     * Rule 2 (DEPLOYMENT_RULES.md): per-organ — never apply uniformly
+     *   across gate/up/down based on organ role.
+     * Rule 6: dispatch must check calibration_domain_id (below) against
+     *   the current route-domain hint before honoring this flag. */
+    uint64_t *gate_basis_hadamard16;
+    uint64_t *up_basis_hadamard16;
+    uint64_t *down_basis_hadamard16;
     void     *fp16_heap;
     uint64_t  heap_bytes;
     uint64_t  budget_bytes;
     uint32_t  n_pinned;
+    /* silv 2026-05-27 — calibration-domain id (DEPLOYMENT_RULES Rule 6).
+     * Non-zero when a basis-aware sidecar (or any prompt-domain-specific
+     * pin) was loaded into this store. Dispatch should compare against
+     * the current route-domain hint before applying any per-organ basis
+     * transform. 0 = no domain certificate; in that state the dispatch
+     * MUST NOT apply any basis transform, regardless of basis flags. */
+    uint64_t  calibration_domain_id;
 } ds4_hot_expert_store;
 
 ds4_hot_expert_store *ds4_hot_expert_store_alloc(uint64_t budget_bytes);
@@ -100,6 +121,45 @@ uint64_t ds4_hot_store_heap_bytes_get(const ds4_hot_expert_store *store);
 const void *ds4_hot_get_gate_fp16(const ds4_hot_expert_store *store, uint32_t layer, uint32_t expert);
 const void *ds4_hot_get_up_fp16  (const ds4_hot_expert_store *store, uint32_t layer, uint32_t expert);
 const void *ds4_hot_get_down_fp16(const ds4_hot_expert_store *store, uint32_t layer, uint32_t expert);
+
+/* silv 2026-05-27 — basis-aware accessors (DEPLOYMENT_RULES.md task #2).
+ *
+ * Returns the per-organ Hadamard-16 row-block bitmask for the given
+ * (layer, expert). Bit i set ⇒ tile at row-block i is stored in
+ * Hadamard-16 basis and the activation-side transform must be applied
+ * before the matmul that consumes this organ.
+ *
+ * Returns 0 (no transform required) if:
+ *   - store is NULL
+ *   - basis arrays not allocated
+ *   - calibration_domain_id is 0 (Rule 6: no domain certificate, refuse
+ *     to honor basis flags)
+ *   - layer/expert out of range
+ *
+ * The calibration-domain gate is enforced here so callers cannot bypass
+ * Rule 6 by reading the bitmask field directly. */
+uint64_t ds4_hot_get_gate_basis_hadamard16(const ds4_hot_expert_store *store,
+                                           uint32_t layer, uint32_t expert);
+uint64_t ds4_hot_get_up_basis_hadamard16  (const ds4_hot_expert_store *store,
+                                           uint32_t layer, uint32_t expert);
+uint64_t ds4_hot_get_down_basis_hadamard16(const ds4_hot_expert_store *store,
+                                           uint32_t layer, uint32_t expert);
+
+/* Mark one (layer, expert, row_block) as Hadamard-16-encoded for the
+ * given organ. Called by basis-aware sidecar loader after registering
+ * the tile in the heap. kind = 0/1/2 (gate/up/down). Returns 0 on
+ * success, -1 if store/arrays not initialized or args out of range. */
+int ds4_hot_mark_basis_hadamard16(ds4_hot_expert_store *store,
+                                  uint32_t layer, uint32_t expert,
+                                  uint32_t kind, uint32_t row_block);
+
+/* Set the calibration-domain id from sidecar metadata (Rule 6 gate).
+ * 0 = no domain (default; basis transforms refused even if flagged).
+ * Non-zero values are opaque to this module; the dispatch site is
+ * responsible for matching against its current route-domain hint. */
+void     ds4_hot_store_set_calibration_domain(ds4_hot_expert_store *store,
+                                              uint64_t domain_id);
+uint64_t ds4_hot_store_get_calibration_domain(const ds4_hot_expert_store *store);
 
 /* Row-block constants. Full row mask must equal these for hot-path. */
 #define DS4_VQB2_ROW_BLOCK_ROWS          128ULL

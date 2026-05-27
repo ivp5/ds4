@@ -146,9 +146,16 @@ ds4_hot_expert_store *ds4_hot_expert_store_alloc(uint64_t budget_bytes) {
     store->gate_row_blocks = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
     store->up_row_blocks   = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
     store->down_row_blocks = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
+    /* silv 2026-05-27 — per-organ Hadamard-16 basis bitmasks (DEPLOYMENT_RULES.md
+     * task #647). calloc'd to zero ⇒ default "not basis-transformed". */
+    store->gate_basis_hadamard16 = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
+    store->up_basis_hadamard16   = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
+    store->down_basis_hadamard16 = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
+    store->calibration_domain_id = 0;  /* Rule 6: 0 ⇒ basis flags refused */
     (void)row_blocks_bytes;
     if (!store->gate_offset || !store->up_offset || !store->down_offset ||
-        !store->gate_row_blocks || !store->up_row_blocks || !store->down_row_blocks) {
+        !store->gate_row_blocks || !store->up_row_blocks || !store->down_row_blocks ||
+        !store->gate_basis_hadamard16 || !store->up_basis_hadamard16 || !store->down_basis_hadamard16) {
         ds4_hot_expert_store_free(store);
         return NULL;
     }
@@ -182,8 +189,83 @@ void ds4_hot_expert_store_free(ds4_hot_expert_store *store) {
     if (store->gate_row_blocks) free(store->gate_row_blocks);
     if (store->up_row_blocks)   free(store->up_row_blocks);
     if (store->down_row_blocks) free(store->down_row_blocks);
+    if (store->gate_basis_hadamard16) free(store->gate_basis_hadamard16);
+    if (store->up_basis_hadamard16)   free(store->up_basis_hadamard16);
+    if (store->down_basis_hadamard16) free(store->down_basis_hadamard16);
     if (store->fp16_heap)   free(store->fp16_heap);
     free(store);
+}
+
+/* silv 2026-05-27 — basis-aware accessors (ENCODE_FINAL.md item #2, task #647).
+ *
+ * The calibration_domain_id gate (Rule 6) is enforced INSIDE these getters.
+ * If domain_id == 0 the getter returns 0 even if the bitmask field is
+ * populated — so a caller that does `if (basis_mask & (1ULL << rb))` will
+ * naturally skip the transform when no domain certificate is set.
+ *
+ * This is defense-in-depth: the GGUF loader is responsible for setting
+ * domain_id when it loads a basis-aware sidecar; the dispatch site is
+ * responsible for matching domain_id against the current route-domain
+ * hint; the getter is the third guard that catches both upstream paths
+ * forgetting Rule 6. */
+
+static uint64_t basis_get_or_zero(const uint64_t *arr, uint64_t domain_id,
+                                  uint32_t layer, uint32_t expert) {
+    if (!arr || domain_id == 0) return 0;
+    if (layer >= DS4_N_LAYER || expert >= DS4_N_EXPERT) return 0;
+    return arr[(size_t)layer * DS4_N_EXPERT + expert];
+}
+
+uint64_t ds4_hot_get_gate_basis_hadamard16(const ds4_hot_expert_store *store,
+                                           uint32_t layer, uint32_t expert) {
+    if (!store) return 0;
+    return basis_get_or_zero(store->gate_basis_hadamard16,
+                             store->calibration_domain_id, layer, expert);
+}
+
+uint64_t ds4_hot_get_up_basis_hadamard16(const ds4_hot_expert_store *store,
+                                         uint32_t layer, uint32_t expert) {
+    if (!store) return 0;
+    return basis_get_or_zero(store->up_basis_hadamard16,
+                             store->calibration_domain_id, layer, expert);
+}
+
+uint64_t ds4_hot_get_down_basis_hadamard16(const ds4_hot_expert_store *store,
+                                           uint32_t layer, uint32_t expert) {
+    if (!store) return 0;
+    return basis_get_or_zero(store->down_basis_hadamard16,
+                             store->calibration_domain_id, layer, expert);
+}
+
+int ds4_hot_mark_basis_hadamard16(ds4_hot_expert_store *store,
+                                  uint32_t layer, uint32_t expert,
+                                  uint32_t kind, uint32_t row_block) {
+    if (!store) return -1;
+    if (layer >= DS4_N_LAYER || expert >= DS4_N_EXPERT) return -1;
+    /* row_block range: gate/up have 16 row blocks, down has 32. Use the
+     * larger bound here; the per-organ DS4_VQB2_*_FULL_ROW_BLOCKS constants
+     * are what matters for "is the tile fully covered" elsewhere. */
+    if (row_block >= 64u) return -1;
+    uint64_t *arr = NULL;
+    switch (kind) {
+        case 0: arr = store->gate_basis_hadamard16; break;
+        case 1: arr = store->up_basis_hadamard16;   break;
+        case 2: arr = store->down_basis_hadamard16; break;
+        default: return -1;
+    }
+    if (!arr) return -1;
+    arr[(size_t)layer * DS4_N_EXPERT + expert] |= (1ULL << row_block);
+    return 0;
+}
+
+void ds4_hot_store_set_calibration_domain(ds4_hot_expert_store *store,
+                                          uint64_t domain_id) {
+    if (!store) return;
+    store->calibration_domain_id = domain_id;
+}
+
+uint64_t ds4_hot_store_get_calibration_domain(const ds4_hot_expert_store *store) {
+    return store ? store->calibration_domain_id : 0;
 }
 
 /* Stub populator: validates budget, returns -1 because actual IQ2_XXS → FP16

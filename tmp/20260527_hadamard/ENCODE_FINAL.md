@@ -90,27 +90,39 @@ The codec pipeline can now be:
 
 ## What's NOT done in this turn (deferred follow-ups)
 
-- **GGUF rewrite tool** that applies the transform across an entire
-  routed-expert tensor set and emits a new GGUF (or sidecar pack)
-  with the transformed weights. The `--gguf` ingest path in
-  `encode.py` reads single tensors; full-model rewrite requires
-  tensor-walker + emit pipeline. This is mechanical extension of
-  the existing `trim_experts_gguf.py` infra.
+**IMPORTANT**: these three items now carry the explicit selector-design
+constraints in `DEPLOYMENT_RULES.md` (post-codex-H1967..H2068 read).
+Re-read that memo before shipping any of the three.
 
-- **Hot-store loader basis-aware marker.** When `ds4_hot_pin_*`
-  reads tiles that are already in Hadamard basis, the runtime needs
-  to know NOT to apply the input-side Hadamard transform redundantly.
-  Cleanest design: add a `is_basis_transformed` flag to
-  `ds4_hot_expert_store`, set at file-load time from sidecar
-  metadata.
+- **GGUF rewrite tool**: BLOCKED on selector design. Per Rule 3 must NOT
+  be a full-tensor walk; the legal shape is route-resident sidecar
+  keyed on `(route-domain, expert, row-block, organ)`. Per Rule 5 the
+  encode-time validator must score signed source-top-k harm, not
+  `|max_err|` or `|rel_L2|`.
+
+- **Hot-store loader basis-aware marker.** ✅ SHIPPED 2026-05-27 as
+  task #647. `ds4_hot_expert_store` now carries:
+  - `gate_basis_hadamard16` / `up_basis_hadamard16` / `down_basis_hadamard16`
+    (uint64_t per (layer, expert), bit i ⇔ row-block i in Hadamard basis)
+  - `calibration_domain_id` (Rule 6 gate)
+  Accessors `ds4_hot_get_{gate,up,down}_basis_hadamard16()` enforce
+  Rule 6 inside the getter: when domain_id == 0 they return 0
+  regardless of the underlying bitmask. Setter
+  `ds4_hot_mark_basis_hadamard16()` OR's bits into the bitmask;
+  `ds4_hot_store_set_calibration_domain()` flips the gate.
+  Smoke test at `tmp/20260527_hadamard/basis_marker_smoke.c` (28/28).
 
 - **Dispatch-site pre-pass integration**: in
   `ds4_gpu_dispatch_fp16_simdgroup_pair_swiglu` (the #631 wire),
   conditionally call `ds4_gpu_encode_hadamard16_fp16_batched` on
   the activation buffer when the layer is basis-transformed.
-  Currently un-wired.
-
-Each is a mechanical follow-up requiring no new substrate research.
+  Now UNBLOCKED by the marker above — the dispatch site can call
+  `ds4_hot_get_gate_basis_hadamard16(store, layer, expert)` and
+  apply the Hadamard transform when the relevant row-block bit is
+  set. Per Rule 2 the check is PER-ORGAN, never uniform across
+  gate/up/down. Per Rule 6 the getter already enforces the
+  calibration-domain gate, so the dispatch site doesn't need to
+  duplicate that check.
 
 ## Run the smokes
 
