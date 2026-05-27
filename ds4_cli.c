@@ -2325,6 +2325,18 @@ int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--routed-mm-dispatch-probe")) {
         return ds4_gpu_mtl4_routed_mm_dispatch_probe() ? 0 : 1;
     }
+    /* --vqb2-pack-probe <pack> <index_csv> : silv 2026-05-28
+     * Opens pack + index, verifies summary, materializes 5 views from across
+     * the pack range, decodes a sample pair, prints results. Smoke test for
+     * the pack-backed VQB2 view loader (codex H2116-H2125). */
+    if (argc >= 2 && !strcmp(argv[1], "--vqb2-pack-probe")) {
+        if (argc < 4) {
+            fprintf(stderr, "usage: --vqb2-pack-probe <pack> <index_csv>\n");
+            return 1;
+        }
+        extern int ds4_cli_vqb2_pack_probe(const char *pack, const char *index);
+        return ds4_cli_vqb2_pack_probe(argv[2], argv[3]);
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

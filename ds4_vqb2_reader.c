@@ -64,9 +64,12 @@ bool ds4_vqb2_open(const char *path, ds4_vqb2_file *out) {
     memcpy(&n_codes_lo,     p + 36, 4);
     out->n_codes = (uint64_t)n_codes_lo;
 
-    /* Validate bit-width vs k. */
-    if (out->bit_width != 4 && out->bit_width != 6 && out->bit_width != 8) {
-        fprintf(stderr, "ds4_vqb2: %s unsupported bit_width=%u (expected 4|6|8)\n",
+    /* Validate bit-width vs k. silv 2026-05-28: added bit_width=2 (K=4) for
+     * codex H2090+ mixed-K artifacts. Decoder handles 2/4/6/8 uniformly via
+     * vqb2_extract_code. */
+    if (out->bit_width != 2 && out->bit_width != 4 &&
+        out->bit_width != 6 && out->bit_width != 8) {
+        fprintf(stderr, "ds4_vqb2: %s unsupported bit_width=%u (expected 2|4|6|8)\n",
                 path, out->bit_width);
         munmap(map, out->map_size); close(fd);
         memset(out, 0, sizeof(*out)); out->fd = -1;
