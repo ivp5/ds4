@@ -1,0 +1,13 @@
+=== PROMPT: aime_p03_easy ===
+--- MULT=0.5 ---
+ds4: another ds4 process is already running (pid 72219); refusing to start
+--- MULT=0.8 ---
+ds4: another ds4 process is already running (pid 72219); refusing to start
+--- MULT=1.0 ---
+ds4: another ds4 process is already running (pid 72219); refusing to start
+--- MULT=1.3 ---
+ds4: another ds4 process is already running (pid 72219); refusing to start
+--- MULT=1.7 ---
+ds4: another ds4 process is already running (pid 72219); refusing to start
+--- MULT=2.5 ---
+ds4: another ds4 process is already running (pid 72219); refusing to start

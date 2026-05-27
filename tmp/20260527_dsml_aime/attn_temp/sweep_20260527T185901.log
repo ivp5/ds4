@@ -1,0 +1,32 @@
+PROMPT: Compute 7 * 11 + 2. Final answer: oxed{
+
+=== DS4_ATTN_SCALE_MULT=0.5 ===
+ds4: cpu-moe: layers 0..42 run their routed MoE on the CPU (first 43 of 43)
+ds4: Metal device Apple M1 Max, 64.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal expert inverse table uploaded (44032 bytes, 43*256 int32)
+ds4: Metal model views created in 0.022 ms, residency requested in 3.461 ms, warmup 0.994 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.462 ms, residency requested in 2894.143 ms, warmup 1.790 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.047 ms, warmup 0.370 ms
+=== DS4_ATTN_SCALE_MULT=0.8 ===
+=== DS4_ATTN_SCALE_MULT=1.0 ===
+ds4: cpu-moe: layers 0..42 run their routed MoE on the CPU (first 43 of 43)
+ds4: Metal device Apple M1 Max, 64.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal expert inverse table uploaded (44032 bytes, 43*256 int32)
+ds4: Metal model views created in 0.017 ms, residency requested in 3.643 ms, warmup 1.730 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.292 ms, residency requested in 3324.253 ms, warmup 1.009 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.029 ms, warmup 0.330 ms
+=== DS4_ATTN_SCALE_MULT=1.3 ===
+=== DS4_ATTN_SCALE_MULT=1.7 ===
+ds4: cpu-moe: layers 0..42 run their routed MoE on the CPU (first 43 of 43)
+ds4: Metal device Apple M1 Max, 64.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal expert inverse table uploaded (44032 bytes, 43*256 int32)
+ds4: Metal model views created in 0.017 ms, residency requested in 3.663 ms, warmup 1.751 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.447 ms, residency requested in 3756.516 ms, warmup 1.838 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.038 ms, warmup 0.429 ms
+=== DS4_ATTN_SCALE_MULT=2.5 ===
