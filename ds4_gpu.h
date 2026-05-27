@@ -1236,3 +1236,7 @@ int ds4_gpu_mtl4_hc_weighted_sum_canary(uint32_t n_embd, uint32_t n_hc, uint32_t
  * 5-kernel router cycle MTL4 set. 256-thread bitonic sort with optional
  * bias + hash-mode bypass. */
 int ds4_gpu_mtl4_router_finalize_one_canary(int has_bias_flag);
+
+/* silv 2026-05-27 task #685 — qkv_rms_norm_f32_4 MTL4. Per-layer fused
+ * Q+KV RMSNorm. Fires 43× per token. High call-density target. */
+int ds4_gpu_mtl4_qkv_rms_norm_canary(uint32_t q_n, uint32_t kv_n);

@@ -20051,6 +20051,246 @@ int ds4_gpu_mtl4_router_finalize_one_canary(int has_bias_flag) {
 }
 
 /* ============================================================ */
+/* MTL4 port: kernel_dsv4_qkv_rms_norm_f32_4 (task #685)        */
+/* metal/norm.metal:102. Fused Q+KV RMSNorm — fires 43× per     */
+/* token (once per layer). 1 args + 6 buffers + simd reductions.*/
+/* High call-density target.                                     */
+/* ============================================================ */
+static id<MTLComputePipelineState> g_qkv_rms_norm_mtl4_pipeline;
+static int g_qkv_rms_norm_mtl4_init_attempted;
+static int g_qkv_rms_norm_mtl4_init_ok;
+
+static int ds4_qkv_rms_norm_mtl4_pipeline_init(void) {
+    if (g_qkv_rms_norm_mtl4_init_attempted) return g_qkv_rms_norm_mtl4_init_ok;
+    g_qkv_rms_norm_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct qkv_args {\n"
+         "  int32_t q_n; int32_t q_n4; int32_t kv_n; int32_t kv_n4;\n"
+         "  uint64_t q_row_stride; uint64_t kv_row_stride; float eps;\n"
+         "};\n"
+         "kernel void qkv_rms_norm_mtl4(\n"
+         "    device const qkv_args *args_ptr [[buffer(0)]],\n"
+         "    device const float4 *q_src [[buffer(1)]],\n"
+         "    device const float4 *q_weight [[buffer(2)]],\n"
+         "    device float4 *q_dst [[buffer(3)]],\n"
+         "    device const float4 *kv_src [[buffer(4)]],\n"
+         "    device const float4 *kv_weight [[buffer(5)]],\n"
+         "    device float4 *kv_dst [[buffer(6)]],\n"
+         "    threadgroup float *shmem_f32 [[threadgroup(0)]],\n"
+         "    uint3 tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort3 tpitg [[thread_position_in_threadgroup]],\n"
+         "    ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+         "    ushort tiisg [[thread_index_in_simdgroup]],\n"
+         "    ushort3 ntg [[threads_per_threadgroup]]) {\n"
+         "  if (sgitg == 0) shmem_f32[tiisg] = 0.0f;\n"
+         "  const uint row = tgpig.x;\n"
+         "  const bool kv_task = tgpig.y != 0;\n"
+         "  const int n = kv_task ? args_ptr->kv_n : args_ptr->q_n;\n"
+         "  const int n4 = kv_task ? args_ptr->kv_n4 : args_ptr->q_n4;\n"
+         "  const uint64_t row_stride4 = (kv_task ? args_ptr->kv_row_stride : args_ptr->q_row_stride) / sizeof(float4);\n"
+         "  device const float4 *x = kv_task ? kv_src + row * row_stride4 : q_src + row * row_stride4;\n"
+         "  device const float4 *w = kv_task ? kv_weight : q_weight;\n"
+         "  device float4 *y = kv_task ? kv_dst + row * row_stride4 : q_dst + row * row_stride4;\n"
+         "  float sumf = 0.0f;\n"
+         "  for (int i = tpitg.x; i < n4; i += ntg.x) {\n"
+         "    const float4 v = x[i]; sumf += dot(v, v);\n"
+         "  }\n"
+         "  sumf = simd_sum(sumf);\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  if (tiisg == 0) shmem_f32[sgitg] = sumf;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  sumf = shmem_f32[tiisg];\n"
+         "  sumf = simd_sum(sumf);\n"
+         "  const float scale = rsqrt(sumf / float(n) + args_ptr->eps);\n"
+         "  for (int i = tpitg.x; i < n4; i += ntg.x) {\n"
+         "    y[i] = (x[i] * scale) * w[i];\n"
+         "  }\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_qkv_rms_norm_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: qkv_rms_norm MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"qkv_rms_norm_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_qkv_rms_norm_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_qkv_rms_norm_mtl4_pipeline) {
+        fprintf(stderr, "ds4: qkv_rms_norm MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: qkv_rms_norm MTL4 pipeline initialized\n");
+    g_qkv_rms_norm_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_qkv_rms_norm_canary(uint32_t q_n, uint32_t kv_n) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_qkv_rms_norm_mtl4_pipeline_init()) return 0;
+    if (q_n % 4 != 0 || kv_n % 4 != 0) {
+        fprintf(stderr, "ds4: qkv_rms_norm canary requires q_n, kv_n %% 4 == 0\n");
+        return 0;
+    }
+
+    /* Single row each for Q + KV. Q dim: q_n; KV dim: kv_n.
+     * Synthesize: q_src = constant 1.0, q_weight = constant 0.5 →
+     *   sum_sq = q_n; rms = sqrt(q_n/q_n + eps) ≈ 1; scale ≈ 1; y = 1*1*0.5 = 0.5.
+     * Same for KV. */
+    const float eps = 1.0e-6f;
+    const uint32_t q_n4 = q_n / 4;
+    const uint32_t kv_n4 = kv_n / 4;
+
+    float *host_q_src = (float *)calloc(q_n, sizeof(float));
+    float *host_q_weight = (float *)calloc(q_n, sizeof(float));
+    float *host_q_dst = (float *)calloc(q_n, sizeof(float));
+    float *host_kv_src = (float *)calloc(kv_n, sizeof(float));
+    float *host_kv_weight = (float *)calloc(kv_n, sizeof(float));
+    float *host_kv_dst = (float *)calloc(kv_n, sizeof(float));
+    if (!host_q_src || !host_q_weight || !host_q_dst ||
+        !host_kv_src || !host_kv_weight || !host_kv_dst) {
+        free(host_q_src); free(host_q_weight); free(host_q_dst);
+        free(host_kv_src); free(host_kv_weight); free(host_kv_dst);
+        return 0;
+    }
+    for (uint32_t i = 0; i < q_n; i++) { host_q_src[i] = 1.0f; host_q_weight[i] = 0.5f; }
+    for (uint32_t i = 0; i < kv_n; i++) { host_kv_src[i] = 1.0f; host_kv_weight[i] = 0.25f; }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:48
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> qSrcBuf = [g_device newBufferWithBytes:host_q_src length:q_n * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> qWBuf = [g_device newBufferWithBytes:host_q_weight length:q_n * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> qDstBuf = [g_device newBufferWithLength:q_n * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kvSrcBuf = [g_device newBufferWithBytes:host_kv_src length:kv_n * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kvWBuf = [g_device newBufferWithBytes:host_kv_weight length:kv_n * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kvDstBuf = [g_device newBufferWithLength:kv_n * sizeof(float) options:MTLResourceStorageModeShared];
+
+        struct {
+            int32_t q_n_, q_n4_, kv_n_, kv_n4_;
+            uint64_t q_row_stride, kv_row_stride;
+            float eps;
+            uint32_t pad;
+        } args = {
+            .q_n_ = (int32_t)q_n, .q_n4_ = (int32_t)q_n4,
+            .kv_n_ = (int32_t)kv_n, .kv_n4_ = (int32_t)kv_n4,
+            .q_row_stride = (uint64_t)q_n * sizeof(float),
+            .kv_row_stride = (uint64_t)kv_n * sizeof(float),
+            .eps = eps,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[7] = {
+                (id<MTLAllocation>)argsBuf,
+                (id<MTLAllocation>)qSrcBuf, (id<MTLAllocation>)qWBuf, (id<MTLAllocation>)qDstBuf,
+                (id<MTLAllocation>)kvSrcBuf, (id<MTLAllocation>)kvWBuf, (id<MTLAllocation>)kvDstBuf,
+            };
+            [residency addAllocations:allocs count:7];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:qSrcBuf.gpuAddress atIndex:1];
+                [argTable setAddress:qWBuf.gpuAddress atIndex:2];
+                [argTable setAddress:qDstBuf.gpuAddress atIndex:3];
+                [argTable setAddress:kvSrcBuf.gpuAddress atIndex:4];
+                [argTable setAddress:kvWBuf.gpuAddress atIndex:5];
+                [argTable setAddress:kvDstBuf.gpuAddress atIndex:6];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_qkv_rms_norm_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                /* shmem: 32 simdgroups × 4 bytes = 128 bytes scratch */
+                [enc setThreadgroupMemoryLength:128 atIndex:0];
+                /* Dispatch: 1 row × 2 tasks (q, kv) */
+                [enc dispatchThreadgroups:MTLSizeMake(1, 2, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_q_dst, qDstBuf.contents, q_n * sizeof(float));
+                    memcpy(host_kv_dst, kvDstBuf.contents, kv_n * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 8);
+            }
+        }
+    }
+    if (!rc) {
+        free(host_q_src); free(host_q_weight); free(host_q_dst);
+        free(host_kv_src); free(host_kv_weight); free(host_kv_dst);
+        return 0;
+    }
+
+    /* Reference: sum_sq = q_n × 1.0; rms = sqrt(q_n / q_n + eps) ≈ 1; scale ≈ rsqrt(1+eps) ≈ 1.
+     * y_q = 1.0 * 1.0 * 0.5 = 0.5; y_kv = 1.0 * 1.0 * 0.25 = 0.25. */
+    const float q_scale = 1.0f / sqrtf(1.0f + eps);
+    const float kv_scale = 1.0f / sqrtf(1.0f + eps);
+    const float q_ref = 1.0f * q_scale * 0.5f;
+    const float kv_ref = 1.0f * kv_scale * 0.25f;
+
+    double max_abs_q = 0.0, max_abs_kv = 0.0;
+    for (uint32_t i = 0; i < q_n; i++) {
+        double d = fabs((double)(host_q_dst[i] - q_ref));
+        if (d > max_abs_q) max_abs_q = d;
+    }
+    for (uint32_t i = 0; i < kv_n; i++) {
+        double d = fabs((double)(host_kv_dst[i] - kv_ref));
+        if (d > max_abs_kv) max_abs_kv = d;
+    }
+    fprintf(stderr,
+        "ds4: qkv_rms_norm MTL4 canary q_n=%u kv_n=%u "
+        "q[0]=%.4f (ref=%.4f) kv[0]=%.4f (ref=%.4f) "
+        "max_abs_q=%.4e max_abs_kv=%.4e\n",
+        q_n, kv_n,
+        (double)host_q_dst[0], (double)q_ref,
+        (double)host_kv_dst[0], (double)kv_ref,
+        max_abs_q, max_abs_kv);
+    free(host_q_src); free(host_q_weight); free(host_q_dst);
+    free(host_kv_src); free(host_kv_weight); free(host_kv_dst);
+    return (max_abs_q < 1.0e-5 && max_abs_kv < 1.0e-5) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +

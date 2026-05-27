@@ -1832,6 +1832,12 @@ int main(int argc, char **argv) {
         const int has_bias = (argc >= 3) ? atoi(argv[2]) : 0;
         return ds4_gpu_mtl4_router_finalize_one_canary(has_bias) ? 0 : 1;
     }
+    /* --qkv-rms-norm-canary [q_n [kv_n]] : task #685 per-layer Q+KV RMSNorm */
+    if (argc >= 2 && !strcmp(argv[1], "--qkv-rms-norm-canary")) {
+        const uint32_t q_n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 1024;
+        const uint32_t kv_n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 512;
+        return ds4_gpu_mtl4_qkv_rms_norm_canary(q_n, kv_n) ? 0 : 1;
+    }
     /* --hc-weighted-sum-canary [n_embd [n_hc [n_tokens]]] : task #683 */
     if (argc >= 2 && !strcmp(argv[1], "--hc-weighted-sum-canary")) {
         const uint32_t n_embd = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
