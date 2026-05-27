@@ -13156,30 +13156,67 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mv_pipeline(uint32_t type) {
  }
 }
 
+/* silv 2026-05-28 I-1: forward-decl MTL4-fixed wide-tile pipelines + init fns.
+ * The mc[NR1/4] structural fix lives only in the MTL4 MSL strings; antirez's
+ * moe.metal `kernel_mul_mm_id` template hardcodes mc[8] which silently
+ * miscomputes rows 32+ at NR1=64 and rows 32+/96+ at NR1=128. For wide-tile
+ * paths (n64/n128) we redirect to the MTL4-fixed pipelines; n32 stays on
+ * antirez (correct at NR1=32). */
+static int ds4_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline_init(void);
+static int ds4_mul_mm_id_iq2_xxs_f32_n128_mtl4_pipeline_init(void);
+static int ds4_mul_mm_id_q4_K_f32_n64_mtl4_pipeline_init(void);
+static int ds4_mul_mm_id_q4_K_f32_n128_mtl4_pipeline_init(void);
+static int ds4_mul_mm_id_q2_K_f32_n64_mtl4_pipeline_init(void);
+static int ds4_mul_mm_id_q2_K_f32_n128_mtl4_pipeline_init(void);
+static id<MTLComputePipelineState> g_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline;
+static id<MTLComputePipelineState> g_mul_mm_id_iq2_xxs_f32_n128_mtl4_pipeline;
+static id<MTLComputePipelineState> g_mul_mm_id_q4_K_f32_n64_mtl4_pipeline;
+static id<MTLComputePipelineState> g_mul_mm_id_q4_K_f32_n128_mtl4_pipeline;
+static id<MTLComputePipelineState> g_mul_mm_id_q2_K_f32_n64_mtl4_pipeline;
+static id<MTLComputePipelineState> g_mul_mm_id_q2_K_f32_n128_mtl4_pipeline;
+
 static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline_for_tile(uint32_t type,
                                                                          uint32_t tile_n) {
     switch (type) {
     case DS4_METAL_TENSOR_IQ2_XXS:
         if (tile_n == 128u) {
+            if (ds4_mul_mm_id_iq2_xxs_f32_n128_mtl4_pipeline_init()) {
+                return g_mul_mm_id_iq2_xxs_f32_n128_mtl4_pipeline;
+            }
             return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32_n128", false);
         }
         if (tile_n == 64u) {
+            if (ds4_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline_init()) {
+                return g_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline;
+            }
             return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32_n64", false);
         }
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32", false);
     case DS4_METAL_TENSOR_Q2_K:
         if (tile_n == 128u) {
+            if (ds4_mul_mm_id_q2_K_f32_n128_mtl4_pipeline_init()) {
+                return g_mul_mm_id_q2_K_f32_n128_mtl4_pipeline;
+            }
             return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32_n128", false);
         }
         if (tile_n == 64u) {
+            if (ds4_mul_mm_id_q2_K_f32_n64_mtl4_pipeline_init()) {
+                return g_mul_mm_id_q2_K_f32_n64_mtl4_pipeline;
+            }
             return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32_n64", false);
         }
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
     case DS4_METAL_TENSOR_Q4_K:
         if (tile_n == 128u) {
+            if (ds4_mul_mm_id_q4_K_f32_n128_mtl4_pipeline_init()) {
+                return g_mul_mm_id_q4_K_f32_n128_mtl4_pipeline;
+            }
             return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32_n128", false);
         }
         if (tile_n == 64u) {
+            if (ds4_mul_mm_id_q4_K_f32_n64_mtl4_pipeline_init()) {
+                return g_mul_mm_id_q4_K_f32_n64_mtl4_pipeline;
+            }
             return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32_n64", false);
         }
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
@@ -13886,7 +13923,11 @@ static int ds4_gpu_encode_mul_mm_id_mapped_tile(
  [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:3];
  [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:4];
  [enc setBuffer:dst offset:dst_off atIndex:5];
- [enc setThreadgroupMemoryLength:8192u atIndex:0];
+ /* silv 2026-05-28 I-1: shmem scales with NR1. 8 KB at NR1=32, 16 KB at NR1=64,
+  * 32 KB at NR1=128 — sa+sb banks both grow with row count. Was hardcoded 8 KB
+  * which caused n64/n128 dispatches to read garbage beyond the sa region. */
+ const NSUInteger shmem_bytes = (NSUInteger)256u * tile_n;
+ [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
  [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)mm_args->ne21 + tile_n - 1u) / tile_n,
  ((NSUInteger)mm_args->ne0 + 63u) / 64u,
  (NSUInteger)mm_args->ne02)
