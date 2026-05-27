@@ -18037,6 +18037,67 @@ static DS4_MAYBE_UNUSED void logits_top2(const float *logits, uint32_t n_vocab,
  if (logit1) *logit1 = v1;
 }
 
+/* silv 2026-05-27 Spec-tree Turn 2 (SPEC_TREE_IMPL.md): top-K logit
+ * extraction. Returns the top k token IDs in out_tokens (descending
+ * order of logit). Used by tree spec-decode to expand the per-step
+ * draft into k parallel branches at low-entropy decode positions.
+ *
+ * O(n_vocab * k) — fine for k ≤ 4 and n_vocab ≈ 128K. For larger k,
+ * a partial heap would be better, but tree spec-decode is bounded to
+ * k = 4 by mtp_draft_tree_width clamp.
+ *
+ * Returns the number of tokens actually written (= k if k ≤ n_vocab,
+ * else n_vocab). out_logits is optional. */
+static DS4_MAYBE_UNUSED int logits_top_k(const float *logits, uint32_t n_vocab,
+                                          int k, int *out_tokens,
+                                          float *out_logits) {
+ if (!logits || !out_tokens || k <= 0) return 0;
+ if ((uint32_t)k > n_vocab) k = (int)n_vocab;
+ for (int i = 0; i < k; i++) {
+  out_tokens[i] = -1;
+  if (out_logits) out_logits[i] = DS4_NEG_INF;
+ }
+ /* Track best k values seen so far. Insert each new logit by linear
+  * scan — O(k) per insertion → O(n_vocab * k) total. */
+ for (uint32_t v = 0; v < n_vocab; v++) {
+  const float vlog = logits[v];
+  /* Find the slot where vlog would push out the worst (smallest)
+   * tracked value, if any. */
+  int worst_idx = -1;
+  float worst_v = vlog;
+  for (int i = 0; i < k; i++) {
+   const float cur = out_logits ? out_logits[i] :
+                     (out_tokens[i] >= 0 ? logits[out_tokens[i]] : DS4_NEG_INF);
+   if (cur < worst_v) {
+    worst_v = cur;
+    worst_idx = i;
+   }
+  }
+  if (worst_idx >= 0) {
+   /* Insert vlog at worst_idx, then bubble up to maintain descending
+    * order so out_tokens[0] is the best. */
+   out_tokens[worst_idx] = (int)v;
+   if (out_logits) out_logits[worst_idx] = vlog;
+   /* Bubble-up: swap upward while bigger than predecessor */
+   for (int i = worst_idx; i > 0; i--) {
+    const float a = out_logits ? out_logits[i] :
+                    (out_tokens[i] >= 0 ? logits[out_tokens[i]] : DS4_NEG_INF);
+    const float b = out_logits ? out_logits[i-1] :
+                    (out_tokens[i-1] >= 0 ? logits[out_tokens[i-1]] : DS4_NEG_INF);
+    if (a > b) {
+     int ti = out_tokens[i]; out_tokens[i] = out_tokens[i-1]; out_tokens[i-1] = ti;
+     if (out_logits) {
+      float lf = out_logits[i]; out_logits[i] = out_logits[i-1]; out_logits[i-1] = lf;
+     }
+    } else {
+     break;
+    }
+   }
+  }
+ }
+ return k;
+}
+
 static uint64_t sample_rng_next(uint64_t *state) {
  uint64_t x = *state;
  if (x == 0) x = 0x9e3779b97f4a7c15ULL;

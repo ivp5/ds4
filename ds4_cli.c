@@ -1858,6 +1858,11 @@ int main(int argc, char **argv) {
         const uint32_t n_comp = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 32;
         return ds4_gpu_mtl4_indexer_score_one_direct_canary(n_comp) ? 0 : 1;
     }
+    /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
+    if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
+        extern int ds4_prefix_cache_phase1_self_test(void);
+        return ds4_prefix_cache_phase1_self_test() ? 0 : 1;
+    }
     /* --hc-weighted-sum-canary [n_embd [n_hc [n_tokens]]] : task #683 */
     if (argc >= 2 && !strcmp(argv[1], "--hc-weighted-sum-canary")) {
         const uint32_t n_embd = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
