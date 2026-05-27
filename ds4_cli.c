@@ -2203,6 +2203,14 @@ int main(int argc, char **argv) {
         const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
         return ds4_gpu_mtl4_mul_mm_id_q8_0_f32_canary(m, n, k, e) ? 0 : 1;
     }
+    /* --mul-mm-id-iq2-xxs-canary [M [N [K [E]]]] : #735 IQ2_XXS routed MoE matmul */
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-iq2-xxs-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
+        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
+        return ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_canary(m, n, k, e) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

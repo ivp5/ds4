@@ -1525,3 +1525,11 @@ int ds4_gpu_mtl4_mul_mm_q8_0_f32_canary(uint32_t M, uint32_t N, uint32_t K);
  * indirection. DS4 shared-expert prefill path for Q8_0 weights.
  * Canary: n_experts experts × 1 routed token each. */
 int ds4_gpu_mtl4_mul_mm_id_q8_0_f32_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
+
+/* silv 2026-05-28 task #735 — mul_mm_id_iq2_xxs_f32 MTL4.
+ * Routed MoE IQ2_XXS prefill matmul. DS4 production critical path
+ * (IQ2_XXS is the bulk of DS4 expert weights). Same routing plumbing
+ * as #734 with IQ2_XXS dequant (2 KB grid + signs + mask tables
+ * embedded inline in MSL). Canary uses all-zero qs blocks (every
+ * dequant val = d) for analytic reference. */
+int ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
