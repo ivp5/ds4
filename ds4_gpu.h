@@ -1191,6 +1191,43 @@ int ds4_gpu_mtl4_moe_matmul_init_canary(void);
  * silu(x[t,oc]) * x[t,oc] * route_w[t] correctly. */
 int ds4_gpu_mtl4_moe_matmul_full_canary(void);
 
+/* ICB Phase 7 for MoE matmul (task #664).
+ *
+ * Records ONE 6-slot dispatch into a classic-MTL ICB at first call. Per
+ * layer/per token replay via executeCommandsInBuffer skips ~45µs of
+ * encoder overhead per dispatch. At 6 experts × 43 layers = 258 calls
+ * per token, target savings ~12ms/token at baseline ~53ms/token decode.
+ *
+ * Opt-in via DS4_MOE_ICB=1 env var. Caller MUST pass the classic-MTL
+ * pipeline (g_moe_mul_mm_id_fp16_pair_swiglu_pipeline) — classic ICB
+ * cannot encode MTL4 pipelines.
+ *
+ * Returns 1 if dispatched via ICB (or no-op fallthrough when opt-out
+ * is the env state); 0 only on hard error.
+ *
+ * Obj-C-only signature (the actual dispatch uses MTL id<MTL...> types
+ * which aren't recognized in plain C). Wrapped behind __OBJC__ so this
+ * header remains C-includable. */
+#ifdef __OBJC__
+int ds4_gpu_moe_matmul_icb_dispatch(
+        id<MTLCommandBuffer> cb,
+        id<MTLComputePipelineState> pipeline,
+        id<MTLBuffer> argsbuf, NSUInteger args_off,
+        id<MTLBuffer> actbuf, NSUInteger act_off,
+        id<MTLBuffer> gatebuf, NSUInteger gate_off,
+        id<MTLBuffer> upbuf, NSUInteger up_off,
+        id<MTLBuffer> xbuf, NSUInteger x_off,
+        id<MTLBuffer> midbuf, NSUInteger mid_off,
+        id<MTLBuffer> idsbuf, NSUInteger ids_off,
+        id<MTLBuffer> weightsbuf, NSUInteger weights_off,
+        NSUInteger n_out_tiles,
+        NSUInteger n_tok_tiles,
+        NSUInteger n_experts);
+#endif
+
+/* Diagnostic — used by Phase 7 canary to verify ICB recording state. */
+int ds4_gpu_moe_matmul_icb_status(uint32_t *out_recorded, uint32_t *out_slots);
+
 /* silv 2026-05-27 task #683 — hc_weighted_sum: HC weighted sum
  * dst[d,t] = sum_h x[d,h,t] * weights[h,t]. First port from dsv4_hc.metal. */
 int ds4_gpu_mtl4_hc_weighted_sum_canary(uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens);

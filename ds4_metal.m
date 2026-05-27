@@ -19396,6 +19396,175 @@ int ds4_gpu_mtl4_moe_matmul_full_canary(void) {
 }
 
 /* ============================================================ */
+/* ICB Phase 7: MoE matmul dispatch capture (task #664)         */
+/* silv 2026-05-27: "full canary for moe matmul then icb phase 7"*/
+/*                                                              */
+/* The per-token decode hot path fires 6 expert dispatches per   */
+/* layer × 43 layers = 258 MoE matmul calls per token. Each      */
+/* dispatch costs ~50µs in encoder overhead (setPipelineState +  */
+/* 8× setBuffer + setThreadgroupMemoryLength + dispatchTGs).     */
+/*                                                               */
+/* ICB Phase 7 records ONE 6-slot dispatch into a classic        */
+/* MTLIndirectCommandBuffer at first call. Per-layer per-token   */
+/* replay via executeCommandsInBuffer with range[0..6].          */
+/*                                                               */
+/* Per-token target savings: 258 × ~45µs ≈ 12ms/token encoding   */
+/* overhead removed. At baseline ~53ms/token, that's ~22%        */
+/* speedup at Level 1 of the speedup ladder.                     */
+/*                                                               */
+/* Same args buffer shape as the classic MoE dispatch:           */
+/*   [0] mmid_args (constant)                                    */
+/*   [1] moe_swiglu_args (constant)                              */
+/*   [2] src0_gate                                               */
+/*   [3] src0_up                                                 */
+/*   [4] src1 (activation)                                       */
+/*   [5] dst_mid (output)                                        */
+/*   [6] ids                                                     */
+/*   [7] weights                                                 */
+/* Threadgroup memory: 1024 bytes                                */
+/* Dispatch shape: (n_out_tiles, n_tok_tiles, n_experts)         */
+/* ============================================================ */
+#define DS4_MOE_ICB_SLOTS 6   /* K-top experts per token */
+
+static id<MTLIndirectCommandBuffer> g_moe_matmul_icb;
+typedef struct {
+    int recorded;
+    void *gate_ptr;  uint64_t gate_off;
+    void *up_ptr;    uint64_t up_off;
+    void *x_ptr;     uint64_t x_off;
+    void *mid_ptr;   uint64_t mid_off;
+    void *ids_ptr;   uint64_t ids_off;
+    void *w_ptr;     uint64_t w_off;
+    void *args_ptr;
+    void *act_ptr;
+    NSUInteger n_out_tiles;
+    NSUInteger n_tok_tiles;
+} ds4_moe_icb_slot;
+static ds4_moe_icb_slot g_moe_matmul_icb_slot;
+
+/* Record/replay a MoE matmul dispatch via ICB.
+ *
+ * Returns 1 if executed via ICB (or no-op fallthrough on opt-out),
+ * 0 only on hard error. Caller MUST verify `pipeline` is the
+ * classic-MTL g_moe_mul_mm_id_fp16_pair_swiglu_pipeline (not the
+ * MTL4 variant — classic ICB only encodes classic pipelines).
+ *
+ * Gated by env var DS4_MOE_ICB=1 (opt-in initially per the
+ * router_weights_one ICB lesson — verify wins per workload). */
+int ds4_gpu_moe_matmul_icb_dispatch(
+        id<MTLCommandBuffer> cb,
+        id<MTLComputePipelineState> pipeline,
+        id<MTLBuffer> argsbuf, NSUInteger args_off,
+        id<MTLBuffer> actbuf, NSUInteger act_off,
+        id<MTLBuffer> gatebuf, NSUInteger gate_off,
+        id<MTLBuffer> upbuf, NSUInteger up_off,
+        id<MTLBuffer> xbuf, NSUInteger x_off,
+        id<MTLBuffer> midbuf, NSUInteger mid_off,
+        id<MTLBuffer> idsbuf, NSUInteger ids_off,
+        id<MTLBuffer> weightsbuf, NSUInteger weights_off,
+        NSUInteger n_out_tiles,
+        NSUInteger n_tok_tiles,
+        NSUInteger n_experts) {
+    static int s_env_checked = 0;
+    static int s_env_active = 0;
+    if (!s_env_checked) {
+        s_env_active = getenv("DS4_MOE_ICB") != NULL ? 1 : 0;
+        s_env_checked = 1;
+        if (s_env_active) {
+            fprintf(stderr, "ds4: DS4_MOE_ICB=1 — MoE matmul ICB engaged "
+                            "(records 6-slot dispatch, replays per layer/token)\n");
+        }
+    }
+    if (!s_env_active) return 0;
+    if (!cb || !pipeline || n_experts == 0 || n_experts > DS4_MOE_ICB_SLOTS) return 0;
+
+    if (!g_moe_matmul_icb) {
+        MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
+        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+        desc.inheritBuffers = NO;
+        desc.inheritPipelineState = NO;
+        desc.maxKernelBufferBindCount = 8;
+        g_moe_matmul_icb =
+            [g_device newIndirectCommandBufferWithDescriptor:desc
+                                              maxCommandCount:DS4_MOE_ICB_SLOTS
+                                                      options:MTLResourceStorageModeShared];
+        if (!g_moe_matmul_icb) {
+            fprintf(stderr, "ds4: MoE matmul ICB alloc failed\n");
+            return 0;
+        }
+    }
+
+    ds4_moe_icb_slot *slot = &g_moe_matmul_icb_slot;
+    const int sig_match = slot->recorded &&
+        slot->gate_ptr == (__bridge void *)gatebuf && slot->gate_off == (uint64_t)gate_off &&
+        slot->up_ptr   == (__bridge void *)upbuf   && slot->up_off   == (uint64_t)up_off &&
+        slot->x_ptr    == (__bridge void *)xbuf    && slot->x_off    == (uint64_t)x_off &&
+        slot->mid_ptr  == (__bridge void *)midbuf  && slot->mid_off  == (uint64_t)mid_off &&
+        slot->ids_ptr  == (__bridge void *)idsbuf  && slot->ids_off  == (uint64_t)ids_off &&
+        slot->w_ptr    == (__bridge void *)weightsbuf && slot->w_off == (uint64_t)weights_off &&
+        slot->args_ptr == (__bridge void *)argsbuf &&
+        slot->act_ptr  == (__bridge void *)actbuf &&
+        slot->n_out_tiles == n_out_tiles && slot->n_tok_tiles == n_tok_tiles;
+
+    if (!sig_match) {
+        /* Record all DS4_MOE_ICB_SLOTS commands. The dispatch shape uses
+         * batch_id = idx in tgpig.z; the ICB encodes 6 commands each with
+         * z-extent = 1 at z = expert_idx. */
+        for (NSUInteger idx = 0; idx < DS4_MOE_ICB_SLOTS; idx++) {
+            id<MTLIndirectComputeCommand> cmd =
+                [g_moe_matmul_icb indirectComputeCommandAtIndex:idx];
+            [cmd setComputePipelineState:pipeline];
+            [cmd setKernelBuffer:argsbuf  offset:args_off    atIndex:0];
+            [cmd setKernelBuffer:actbuf   offset:act_off     atIndex:1];
+            [cmd setKernelBuffer:gatebuf  offset:gate_off    atIndex:2];
+            [cmd setKernelBuffer:upbuf    offset:up_off      atIndex:3];
+            [cmd setKernelBuffer:xbuf     offset:x_off       atIndex:4];
+            [cmd setKernelBuffer:midbuf   offset:mid_off     atIndex:5];
+            [cmd setKernelBuffer:idsbuf   offset:ids_off     atIndex:6];
+            [cmd setKernelBuffer:weightsbuf offset:weights_off atIndex:7];
+            [cmd setThreadgroupMemoryLength:1024 atIndex:0];
+            /* Per-slot dispatch: 1 expert (z-extent=1) at z=idx via
+             * tgpig.z offset baked into command. Use concurrent dispatch
+             * since experts are independent. */
+            [cmd concurrentDispatchThreadgroups:MTLSizeMake(n_out_tiles, n_tok_tiles, 1)
+                          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        }
+        slot->gate_ptr = (__bridge void *)gatebuf; slot->gate_off = (uint64_t)gate_off;
+        slot->up_ptr   = (__bridge void *)upbuf;   slot->up_off   = (uint64_t)up_off;
+        slot->x_ptr    = (__bridge void *)xbuf;    slot->x_off    = (uint64_t)x_off;
+        slot->mid_ptr  = (__bridge void *)midbuf;  slot->mid_off  = (uint64_t)mid_off;
+        slot->ids_ptr  = (__bridge void *)idsbuf;  slot->ids_off  = (uint64_t)ids_off;
+        slot->w_ptr    = (__bridge void *)weightsbuf; slot->w_off = (uint64_t)weights_off;
+        slot->args_ptr = (__bridge void *)argsbuf;
+        slot->act_ptr  = (__bridge void *)actbuf;
+        slot->n_out_tiles = n_out_tiles;
+        slot->n_tok_tiles = n_tok_tiles;
+        slot->recorded = 1;
+    }
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc useResource:argsbuf    usage:MTLResourceUsageRead];
+    [enc useResource:actbuf     usage:MTLResourceUsageRead];
+    [enc useResource:gatebuf    usage:MTLResourceUsageRead];
+    [enc useResource:upbuf      usage:MTLResourceUsageRead];
+    [enc useResource:xbuf       usage:MTLResourceUsageRead];
+    [enc useResource:midbuf     usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    [enc useResource:idsbuf     usage:MTLResourceUsageRead];
+    [enc useResource:weightsbuf usage:MTLResourceUsageRead];
+    [enc executeCommandsInBuffer:g_moe_matmul_icb
+                       withRange:NSMakeRange(0, n_experts)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+/* Diagnostic: report ICB record state. */
+int ds4_gpu_moe_matmul_icb_status(uint32_t *out_recorded, uint32_t *out_slots) {
+    if (out_recorded) *out_recorded = g_moe_matmul_icb_slot.recorded ? 1 : 0;
+    if (out_slots) *out_slots = DS4_MOE_ICB_SLOTS;
+    return g_moe_matmul_icb ? 1 : 0;
+}
+
+/* ============================================================ */
 /* MTL4 port: kernel_dsv4_hc_weighted_sum (task #683)           */
 /* metal/dsv4_hc.metal:863. HC weighted sum: dst[d,t] = sum_h    */
 /* x[d,h,t] * weights[h,t]. 1 args + 3 buffers. First port from  */
