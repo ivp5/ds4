@@ -1411,3 +1411,15 @@ int ds4_gpu_mtl4_rms_norm_f32_4_canary(uint32_t n_rows, uint32_t row_width, floa
  * i32 preserves type for embedding-table hash lookups. */
 int ds4_gpu_mtl4_get_rows_f16_canary(uint32_t n_table_rows, uint32_t row_width, uint32_t n_ids);
 int ds4_gpu_mtl4_get_rows_i32_canary(uint32_t n_table_rows, uint32_t row_width, uint32_t n_ids);
+
+/* silv 2026-05-27 task #713 — bin_fuse_add_f32 MTL4.
+ * FC-specialized variant of kernel_bin_fuse_impl: OP=0 (add), F=1
+ * (single src1), RB=0, CB=0. The residual-add path (x + attn_out and
+ * x + ffn_out at every layer). Non-MMA elementwise. */
+int ds4_gpu_mtl4_bin_fuse_add_f32_canary(uint32_t n_rows, uint32_t row_width);
+
+/* silv 2026-05-27 tasks #714/#715/#716 — bin_fuse sub/mul/div f32 MTL4.
+ * Companion ops to #713 add. Same skeleton, only operator infix differs. */
+int ds4_gpu_mtl4_bin_fuse_sub_f32_canary(uint32_t n_rows, uint32_t row_width);
+int ds4_gpu_mtl4_bin_fuse_mul_f32_canary(uint32_t n_rows, uint32_t row_width);
+int ds4_gpu_mtl4_bin_fuse_div_f32_canary(uint32_t n_rows, uint32_t row_width);

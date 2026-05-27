@@ -2042,6 +2042,30 @@ int main(int argc, char **argv) {
         const uint32_t ni = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
         return ds4_gpu_mtl4_get_rows_i32_canary(nt, rw, ni) ? 0 : 1;
     }
+    /* --bin-add-canary [n_rows [row_width]] : task #713 residual-add */
+    if (argc >= 2 && !strcmp(argv[1], "--bin-add-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_bin_fuse_add_f32_canary(nr, rw) ? 0 : 1;
+    }
+    /* --bin-sub-canary [n_rows [row_width]] : task #714 subtract */
+    if (argc >= 2 && !strcmp(argv[1], "--bin-sub-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_bin_fuse_sub_f32_canary(nr, rw) ? 0 : 1;
+    }
+    /* --bin-mul-canary [n_rows [row_width]] : task #715 multiply */
+    if (argc >= 2 && !strcmp(argv[1], "--bin-mul-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_bin_fuse_mul_f32_canary(nr, rw) ? 0 : 1;
+    }
+    /* --bin-div-canary [n_rows [row_width]] : task #716 divide */
+    if (argc >= 2 && !strcmp(argv[1], "--bin-div-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_bin_fuse_div_f32_canary(nr, rw) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

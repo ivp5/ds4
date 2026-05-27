@@ -28081,6 +28081,487 @@ int ds4_gpu_mtl4_get_rows_i32_canary(uint32_t n_table_rows, uint32_t row_width, 
 }
 
 /* ============================================================ */
+/* bin_fuse_add_f32 MTL4 port (silv 2026-05-27 #713)            */
+/* ============================================================ */
+/* Function-constant-specialized variant of kernel_bin_fuse_impl with
+ * FC_OP=0 (add), FC_F=1 (single src1), FC_RB=0 (no row-broadcast),
+ * FC_CB=0 (no col-broadcast). The residual-add path used at every
+ * layer's attn-out + x and ffn-out + x connections.
+ *
+ * Non-MMA elementwise. The classic kernel template-parameterizes via
+ * function constants; this MTL4 port hardcodes the production residual
+ * path. Additional bin_fuse specializations (mul, scalar-mul, div) can
+ * follow the same pattern at separate pipelines. */
+
+static id<MTLComputePipelineState> g_bin_fuse_add_f32_mtl4_pipeline;
+static int g_bin_fuse_add_f32_mtl4_init_attempted;
+static int g_bin_fuse_add_f32_mtl4_init_ok;
+
+static int ds4_bin_fuse_add_f32_mtl4_pipeline_init(void) {
+    if (g_bin_fuse_add_f32_mtl4_init_attempted) return g_bin_fuse_add_f32_mtl4_init_ok;
+    g_bin_fuse_add_f32_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    /* Args layout mirrors ds4_metal_args_bin (FC_F=1 only needs o1[0]) but we
+     * size for all 8 to match the host-side struct. */
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct bin_args {\n"
+         "  int32_t  ne00; int32_t ne01; int32_t ne02; int32_t ne03;\n"
+         "  uint64_t nb00; uint64_t nb01; uint64_t nb02; uint64_t nb03;\n"
+         "  int32_t  ne10; int32_t ne11; int32_t ne12; int32_t ne13;\n"
+         "  uint64_t nb10; uint64_t nb11; uint64_t nb12; uint64_t nb13;\n"
+         "  int32_t  ne0;  int32_t ne1;  int32_t ne2;  int32_t ne3;\n"
+         "  uint64_t nb0;  uint64_t nb1; uint64_t nb2; uint64_t nb3;\n"
+         "  uint64_t offs;\n"
+         "  uint64_t o1[8];\n"
+         "};\n"
+         "kernel void bin_fuse_add_f32_mtl4(\n"
+         "    device const bin_args *args [[buffer(0)]],\n"
+         "    device const char     *src0 [[buffer(1)]],\n"
+         "    device const char     *src1 [[buffer(2)]],\n"
+         "    device       char     *dst  [[buffer(3)]],\n"
+         "    uint3   tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort3 tpitg [[thread_position_in_threadgroup]],\n"
+         "    ushort3 ntg   [[threads_per_threadgroup]]) {\n"
+         "  const int i03 = tgpig.z;\n"
+         "  const int i02 = tgpig.y;\n"
+         "  const int i01 = tgpig.x;\n"
+         "  if (i01 >= args->ne01) return;\n"
+         "  const int i13 = i03 % args->ne13;\n"
+         "  const int i12 = i02 % args->ne12;\n"
+         "  const int i11 = i01 % args->ne11;\n"
+         "  device const float *src0_ptr = (device const float *)\n"
+         "    (src0 + i03*args->nb03 + i02*args->nb02 + i01*args->nb01 + args->offs);\n"
+         "  device       float *dst_ptr  = (device float *)\n"
+         "    (dst + i03*args->nb3 + i02*args->nb2 + i01*args->nb1 + args->offs);\n"
+         "  device const float *src1_ptr = (device const float *)\n"
+         "    (src1 + args->o1[0] + i13*args->nb13 + i12*args->nb12 + i11*args->nb11);\n"
+         "  for (int i0 = tpitg.x; i0 < args->ne0; i0 += ntg.x) {\n"
+         "    dst_ptr[i0] = src0_ptr[i0] + src1_ptr[i0];\n"
+         "  }\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_bin_fuse_add_f32_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: bin_fuse_add_f32 MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"bin_fuse_add_f32_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_bin_fuse_add_f32_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_bin_fuse_add_f32_mtl4_pipeline) {
+        fprintf(stderr, "ds4: bin_fuse_add_f32 MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: bin_fuse_add_f32 MTL4 pipeline initialized\n");
+    g_bin_fuse_add_f32_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_bin_fuse_add_f32_canary(uint32_t n_rows, uint32_t row_width) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_bin_fuse_add_f32_mtl4_pipeline_init()) return 0;
+    if (n_rows == 0 || row_width == 0) return 0;
+
+    const uint64_t total = (uint64_t)n_rows * row_width;
+    float *host_src0 = (float *)calloc(total, sizeof(float));
+    float *host_src1 = (float *)calloc(total, sizeof(float));
+    float *host_dst = (float *)calloc(total, sizeof(float));
+    if (!host_src0 || !host_src1 || !host_dst) {
+        free(host_src0); free(host_src1); free(host_dst); return 0;
+    }
+    for (uint32_t r = 0; r < n_rows; r++) {
+        for (uint32_t c = 0; c < row_width; c++) {
+            host_src0[(uint64_t)r * row_width + c] = 0.1f + 0.01f * (float)((int)r * 13 + (int)c);
+            host_src1[(uint64_t)r * row_width + c] = -0.05f + 0.001f * (float)((int)r - (int)c);
+        }
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src0Buf = [g_device newBufferWithBytes:host_src0 length:total*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src1Buf = [g_device newBufferWithBytes:host_src1 length:total*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:total*sizeof(float) options:MTLResourceStorageModeShared];
+
+        struct {
+            int32_t ne00, ne01, ne02, ne03;
+            uint64_t nb00, nb01, nb02, nb03;
+            int32_t ne10, ne11, ne12, ne13;
+            uint64_t nb10, nb11, nb12, nb13;
+            int32_t ne0, ne1, ne2, ne3;
+            uint64_t nb0, nb1, nb2, nb3;
+            uint64_t offs;
+            uint64_t o1[8];
+        } args;
+        memset(&args, 0, sizeof(args));
+        args.ne00 = row_width; args.ne01 = n_rows; args.ne02 = 1; args.ne03 = 1;
+        args.nb00 = sizeof(float);
+        args.nb01 = (uint64_t)row_width * sizeof(float);
+        args.nb02 = (uint64_t)n_rows * row_width * sizeof(float);
+        args.nb03 = (uint64_t)n_rows * row_width * sizeof(float);
+        args.ne10 = row_width; args.ne11 = n_rows; args.ne12 = 1; args.ne13 = 1;
+        args.nb10 = sizeof(float);
+        args.nb11 = (uint64_t)row_width * sizeof(float);
+        args.nb12 = (uint64_t)n_rows * row_width * sizeof(float);
+        args.nb13 = (uint64_t)n_rows * row_width * sizeof(float);
+        args.ne0 = row_width; args.ne1 = n_rows; args.ne2 = 1; args.ne3 = 1;
+        args.nb0 = sizeof(float);
+        args.nb1 = (uint64_t)row_width * sizeof(float);
+        args.nb2 = (uint64_t)n_rows * row_width * sizeof(float);
+        args.nb3 = (uint64_t)n_rows * row_width * sizeof(float);
+        args.offs = 0;
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 6;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[4] = {(id)argsBuf, (id)src0Buf, (id)src1Buf, (id)dstBuf};
+            [residency addAllocations:allocs count:4];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:src0Buf.gpuAddress atIndex:1];
+                [argTable setAddress:src1Buf.gpuAddress atIndex:2];
+                [argTable setAddress:dstBuf.gpuAddress atIndex:3];
+
+                NSUInteger tx = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)row_width));
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_bin_fuse_add_f32_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tx, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_dst, dstBuf.contents, total * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 8);
+            }
+        }
+    }
+    if (!rc) { free(host_src0); free(host_src1); free(host_dst); return 0; }
+
+    int mismatch = 0;
+    double max_abs = 0.0;
+    for (uint64_t i = 0; i < total; i++) {
+        const float ref = host_src0[i] + host_src1[i];
+        const double d = fabs((double)(host_dst[i] - ref));
+        if (d > max_abs) max_abs = d;
+        if (d > 1.0e-5) mismatch++;
+    }
+    fprintf(stderr,
+        "ds4: bin_fuse_add_f32 MTL4 canary n_rows=%u row_width=%u "
+        "dst[0]=%.5f (ref=%.5f) dst[end]=%.5f (ref=%.5f) mismatch=%d max_abs=%.4e\n",
+        n_rows, row_width,
+        (double)host_dst[0], (double)(host_src0[0] + host_src1[0]),
+        (double)host_dst[total - 1], (double)(host_src0[total - 1] + host_src1[total - 1]),
+        mismatch, max_abs);
+    free(host_src0); free(host_src1); free(host_dst);
+    return (mismatch == 0) ? 1 : 0;
+}
+
+/* ============================================================ */
+/* bin_fuse_mul/sub/div_f32 MTL4 ports (silv 2026-05-27 #714/#715/#716) */
+/* ============================================================ */
+/* Companion ops to #713 bin_fuse_add. Same skeleton, FC_OP varies:
+ * sub (1), mul (2), div (3). All FC_F=1, FC_RB=0, FC_CB=0. Used for
+ * residual subtraction (rare), elementwise multiply (gate*up), and
+ * row-wise division (norm-style ops). */
+
+/* Generic helper to instantiate any of the 4 bin op variants at the same
+ * kernel structure. The OP_INFIX string is embedded into the MSL source. */
+static id<MTLComputePipelineState> ds4_bin_fuse_build_pipeline(
+        const char *op_infix, const char *kernel_name, const char *lib_name) {
+    if (!ds4_polar_pipeline_init()) return nil;
+    NSError *err = nil;
+    NSString *source = [NSString stringWithFormat:
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct bin_args {\n"
+         "  int32_t  ne00; int32_t ne01; int32_t ne02; int32_t ne03;\n"
+         "  uint64_t nb00; uint64_t nb01; uint64_t nb02; uint64_t nb03;\n"
+         "  int32_t  ne10; int32_t ne11; int32_t ne12; int32_t ne13;\n"
+         "  uint64_t nb10; uint64_t nb11; uint64_t nb12; uint64_t nb13;\n"
+         "  int32_t  ne0;  int32_t ne1;  int32_t ne2;  int32_t ne3;\n"
+         "  uint64_t nb0;  uint64_t nb1; uint64_t nb2; uint64_t nb3;\n"
+         "  uint64_t offs;\n"
+         "  uint64_t o1[8];\n"
+         "};\n"
+         "kernel void %s(\n"
+         "    device const bin_args *args [[buffer(0)]],\n"
+         "    device const char     *src0 [[buffer(1)]],\n"
+         "    device const char     *src1 [[buffer(2)]],\n"
+         "    device       char     *dst  [[buffer(3)]],\n"
+         "    uint3   tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort3 tpitg [[thread_position_in_threadgroup]],\n"
+         "    ushort3 ntg   [[threads_per_threadgroup]]) {\n"
+         "  const int i03 = tgpig.z;\n"
+         "  const int i02 = tgpig.y;\n"
+         "  const int i01 = tgpig.x;\n"
+         "  if (i01 >= args->ne01) return;\n"
+         "  const int i13 = i03 %% args->ne13;\n"
+         "  const int i12 = i02 %% args->ne12;\n"
+         "  const int i11 = i01 %% args->ne11;\n"
+         "  device const float *src0_ptr = (device const float *)\n"
+         "    (src0 + i03*args->nb03 + i02*args->nb02 + i01*args->nb01 + args->offs);\n"
+         "  device       float *dst_ptr  = (device float *)\n"
+         "    (dst + i03*args->nb3 + i02*args->nb2 + i01*args->nb1 + args->offs);\n"
+         "  device const float *src1_ptr = (device const float *)\n"
+         "    (src1 + args->o1[0] + i13*args->nb13 + i12*args->nb12 + i11*args->nb11);\n"
+         "  for (int i0 = tpitg.x; i0 < args->ne0; i0 += ntg.x) {\n"
+         "    dst_ptr[i0] = src0_ptr[i0] %s src1_ptr[i0];\n"
+         "  }\n"
+         "}\n",
+        kernel_name, op_infix];
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = [NSString stringWithUTF8String:lib_name];
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: %s MTL4 library compile failed: %s\n",
+                lib_name, err ? err.localizedDescription.UTF8String : "(no error)");
+        return nil;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = [NSString stringWithUTF8String:kernel_name];
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    id<MTLComputePipelineState> pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!pipeline) {
+        fprintf(stderr, "ds4: %s MTL4 pipeline failed: %s\n",
+                lib_name, err ? err.localizedDescription.UTF8String : "(no error)");
+        return nil;
+    }
+    fprintf(stderr, "ds4: %s MTL4 pipeline initialized\n", lib_name);
+    return pipeline;
+}
+
+static id<MTLComputePipelineState> g_bin_fuse_sub_f32_mtl4_pipeline;
+static id<MTLComputePipelineState> g_bin_fuse_mul_f32_mtl4_pipeline;
+static id<MTLComputePipelineState> g_bin_fuse_div_f32_mtl4_pipeline;
+static int g_bin_fuse_sub_f32_mtl4_init_attempted;
+static int g_bin_fuse_mul_f32_mtl4_init_attempted;
+static int g_bin_fuse_div_f32_mtl4_init_attempted;
+static int g_bin_fuse_sub_f32_mtl4_init_ok;
+static int g_bin_fuse_mul_f32_mtl4_init_ok;
+static int g_bin_fuse_div_f32_mtl4_init_ok;
+
+static int ds4_bin_fuse_sub_f32_mtl4_pipeline_init(void) {
+    if (g_bin_fuse_sub_f32_mtl4_init_attempted) return g_bin_fuse_sub_f32_mtl4_init_ok;
+    g_bin_fuse_sub_f32_mtl4_init_attempted = 1;
+    g_bin_fuse_sub_f32_mtl4_pipeline = ds4_bin_fuse_build_pipeline("-", "bin_fuse_sub_f32_mtl4", "ds4_bin_fuse_sub_f32_mtl4");
+    g_bin_fuse_sub_f32_mtl4_init_ok = (g_bin_fuse_sub_f32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_bin_fuse_sub_f32_mtl4_init_ok;
+}
+
+static int ds4_bin_fuse_mul_f32_mtl4_pipeline_init(void) {
+    if (g_bin_fuse_mul_f32_mtl4_init_attempted) return g_bin_fuse_mul_f32_mtl4_init_ok;
+    g_bin_fuse_mul_f32_mtl4_init_attempted = 1;
+    g_bin_fuse_mul_f32_mtl4_pipeline = ds4_bin_fuse_build_pipeline("*", "bin_fuse_mul_f32_mtl4", "ds4_bin_fuse_mul_f32_mtl4");
+    g_bin_fuse_mul_f32_mtl4_init_ok = (g_bin_fuse_mul_f32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_bin_fuse_mul_f32_mtl4_init_ok;
+}
+
+static int ds4_bin_fuse_div_f32_mtl4_pipeline_init(void) {
+    if (g_bin_fuse_div_f32_mtl4_init_attempted) return g_bin_fuse_div_f32_mtl4_init_ok;
+    g_bin_fuse_div_f32_mtl4_init_attempted = 1;
+    g_bin_fuse_div_f32_mtl4_pipeline = ds4_bin_fuse_build_pipeline("/", "bin_fuse_div_f32_mtl4", "ds4_bin_fuse_div_f32_mtl4");
+    g_bin_fuse_div_f32_mtl4_init_ok = (g_bin_fuse_div_f32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_bin_fuse_div_f32_mtl4_init_ok;
+}
+
+/* Shared canary runner: same dispatch + arg shape, only pipeline + expected
+ * value differ per op. */
+static int ds4_bin_fuse_run_canary(
+        id<MTLComputePipelineState> pipeline,
+        const char *op_name,
+        uint32_t n_rows, uint32_t row_width,
+        float (*reduce)(float, float)) {
+    if (n_rows == 0 || row_width == 0 || !pipeline) return 0;
+
+    const uint64_t total = (uint64_t)n_rows * row_width;
+    float *host_src0 = (float *)calloc(total, sizeof(float));
+    float *host_src1 = (float *)calloc(total, sizeof(float));
+    float *host_dst = (float *)calloc(total, sizeof(float));
+    if (!host_src0 || !host_src1 || !host_dst) {
+        free(host_src0); free(host_src1); free(host_dst); return 0;
+    }
+    for (uint32_t r = 0; r < n_rows; r++) {
+        for (uint32_t c = 0; c < row_width; c++) {
+            host_src0[(uint64_t)r * row_width + c] = 1.0f + 0.1f * (float)((int)r + (int)c);
+            host_src1[(uint64_t)r * row_width + c] = 0.5f + 0.05f * (float)((int)r * 3 - (int)c);
+            /* Keep src1 nonzero to avoid div-by-zero */
+            if (host_src1[(uint64_t)r * row_width + c] == 0.0f) host_src1[(uint64_t)r * row_width + c] = 1.0f;
+        }
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src0Buf = [g_device newBufferWithBytes:host_src0 length:total*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src1Buf = [g_device newBufferWithBytes:host_src1 length:total*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:total*sizeof(float) options:MTLResourceStorageModeShared];
+
+        struct {
+            int32_t ne00, ne01, ne02, ne03;
+            uint64_t nb00, nb01, nb02, nb03;
+            int32_t ne10, ne11, ne12, ne13;
+            uint64_t nb10, nb11, nb12, nb13;
+            int32_t ne0, ne1, ne2, ne3;
+            uint64_t nb0, nb1, nb2, nb3;
+            uint64_t offs;
+            uint64_t o1[8];
+        } args;
+        memset(&args, 0, sizeof(args));
+        args.ne00 = row_width; args.ne01 = n_rows; args.ne02 = 1; args.ne03 = 1;
+        args.nb00 = sizeof(float);
+        args.nb01 = (uint64_t)row_width * sizeof(float);
+        args.nb02 = (uint64_t)n_rows * row_width * sizeof(float);
+        args.nb03 = (uint64_t)n_rows * row_width * sizeof(float);
+        args.ne10 = row_width; args.ne11 = n_rows; args.ne12 = 1; args.ne13 = 1;
+        args.nb10 = sizeof(float);
+        args.nb11 = (uint64_t)row_width * sizeof(float);
+        args.nb12 = (uint64_t)n_rows * row_width * sizeof(float);
+        args.nb13 = (uint64_t)n_rows * row_width * sizeof(float);
+        args.ne0 = row_width; args.ne1 = n_rows; args.ne2 = 1; args.ne3 = 1;
+        args.nb0 = sizeof(float);
+        args.nb1 = (uint64_t)row_width * sizeof(float);
+        args.nb2 = (uint64_t)n_rows * row_width * sizeof(float);
+        args.nb3 = (uint64_t)n_rows * row_width * sizeof(float);
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 6;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[4] = {(id)argsBuf, (id)src0Buf, (id)src1Buf, (id)dstBuf};
+            [residency addAllocations:allocs count:4];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:src0Buf.gpuAddress atIndex:1];
+                [argTable setAddress:src1Buf.gpuAddress atIndex:2];
+                [argTable setAddress:dstBuf.gpuAddress atIndex:3];
+
+                NSUInteger tx = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)row_width));
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:pipeline];
+                [enc setArgumentTable:argTable];
+                [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tx, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_dst, dstBuf.contents, total * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 8);
+            }
+        }
+    }
+    if (!rc) { free(host_src0); free(host_src1); free(host_dst); return 0; }
+
+    int mismatch = 0;
+    double max_rel = 0.0;
+    for (uint64_t i = 0; i < total; i++) {
+        const float ref = reduce(host_src0[i], host_src1[i]);
+        const double d = fabs((double)(host_dst[i] - ref));
+        const double rel = d / (fabs((double)ref) + 1e-7);
+        if (rel > max_rel) max_rel = rel;
+        if (rel > 1e-5) mismatch++;
+    }
+    fprintf(stderr,
+        "ds4: bin_fuse_%s_f32 MTL4 canary n_rows=%u row_width=%u "
+        "dst[0]=%.5f (ref=%.5f) dst[end]=%.5f (ref=%.5f) mismatch=%d max_rel=%.4e\n",
+        op_name, n_rows, row_width,
+        (double)host_dst[0], (double)reduce(host_src0[0], host_src1[0]),
+        (double)host_dst[total - 1], (double)reduce(host_src0[total - 1], host_src1[total - 1]),
+        mismatch, max_rel);
+    free(host_src0); free(host_src1); free(host_dst);
+    return (mismatch == 0) ? 1 : 0;
+}
+
+static float ds4_bin_sub(float a, float b) { return a - b; }
+static float ds4_bin_mul(float a, float b) { return a * b; }
+static float ds4_bin_div(float a, float b) { return a / b; }
+
+int ds4_gpu_mtl4_bin_fuse_sub_f32_canary(uint32_t n_rows, uint32_t row_width) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_bin_fuse_sub_f32_mtl4_pipeline_init()) return 0;
+    return ds4_bin_fuse_run_canary(g_bin_fuse_sub_f32_mtl4_pipeline, "sub", n_rows, row_width, ds4_bin_sub);
+}
+
+int ds4_gpu_mtl4_bin_fuse_mul_f32_canary(uint32_t n_rows, uint32_t row_width) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_bin_fuse_mul_f32_mtl4_pipeline_init()) return 0;
+    return ds4_bin_fuse_run_canary(g_bin_fuse_mul_f32_mtl4_pipeline, "mul", n_rows, row_width, ds4_bin_mul);
+}
+
+int ds4_gpu_mtl4_bin_fuse_div_f32_canary(uint32_t n_rows, uint32_t row_width) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_bin_fuse_div_f32_mtl4_pipeline_init()) return 0;
+    return ds4_bin_fuse_run_canary(g_bin_fuse_div_f32_mtl4_pipeline, "div", n_rows, row_width, ds4_bin_div);
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +
