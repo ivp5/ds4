@@ -2066,6 +2066,18 @@ int main(int argc, char **argv) {
         const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
         return ds4_gpu_mtl4_bin_fuse_div_f32_canary(nr, rw) ? 0 : 1;
     }
+    /* --bin-add-cb-canary [n_rows [row_width]] : task #717 bias-add */
+    if (argc >= 2 && !strcmp(argv[1], "--bin-add-cb-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_bin_fuse_add_cb_f32_canary(nr, rw) ? 0 : 1;
+    }
+    /* --bin-mul-cb-canary [n_rows [row_width]] : task #718 per-channel scale */
+    if (argc >= 2 && !strcmp(argv[1], "--bin-mul-cb-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_bin_fuse_mul_cb_f32_canary(nr, rw) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

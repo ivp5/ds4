@@ -1423,3 +1423,9 @@ int ds4_gpu_mtl4_bin_fuse_add_f32_canary(uint32_t n_rows, uint32_t row_width);
 int ds4_gpu_mtl4_bin_fuse_sub_f32_canary(uint32_t n_rows, uint32_t row_width);
 int ds4_gpu_mtl4_bin_fuse_mul_f32_canary(uint32_t n_rows, uint32_t row_width);
 int ds4_gpu_mtl4_bin_fuse_div_f32_canary(uint32_t n_rows, uint32_t row_width);
+
+/* silv 2026-05-27 tasks #717/#718 — bin_fuse add/mul column-broadcast.
+ * dst[r,c] = src0[r,c] OP src1[c % ne10]. The bias-add path and the
+ * per-channel-scale path. Non-MMA. */
+int ds4_gpu_mtl4_bin_fuse_add_cb_f32_canary(uint32_t n_rows, uint32_t row_width);
+int ds4_gpu_mtl4_bin_fuse_mul_cb_f32_canary(uint32_t n_rows, uint32_t row_width);
