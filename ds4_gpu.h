@@ -1555,6 +1555,13 @@ int ds4_gpu_mtl4_mul_mm_id_q4_K_f32_n128_canary(uint32_t M, uint32_t N, uint32_t
 int ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n64_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
 int ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n128_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
 
+/* silv 2026-05-28 task #742 — wide-tile audit canary.
+ * Routes R tokens to a single expert (htpe[0]=R, hids[0..R-1]={0..R-1}),
+ * runs each of n32/n64/n128 pipelines, reports per-token mismatch
+ * boundary. Detects if mc[8]-sized accumulators write garbage past
+ * row 32 of a NR1=64/128 tile (hypothesized antirez wide-tile bug). */
+int ds4_gpu_mtl4_wide_tile_audit_iq2_xxs(uint32_t M, uint32_t K, uint32_t R);
+
 /* silv 2026-05-28 task #736 — mul_mm_id_q4_K_f32 MTL4.
  * Routed MoE Q4_K prefill matmul. 144-byte 256-element blocks with
  * 6-bit packed scales+mins (get_scale_min_k4_just2) and 4-bit qs.

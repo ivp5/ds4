@@ -35706,6 +35706,231 @@ int ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n128_canary(uint32_t M, uint32_t N, uint32_t
 }
 
 /* ============================================================ */
+/* Wide-tile audit (silv 2026-05-28 #742) — ne21>NR1/2 canary    */
+/* ============================================================ */
+/* My earlier canaries route 1 token per expert (ne21=1), which never
+ * exercises NR1>1 — wide-tile speedup-purpose. Worse, if antirez's
+ * NR1=64/128 has a latent mc[8]-sizing bug (only covers rows 0-31
+ * of a 0-NR1-1 stripe), the ne21=1 canary CANNOT detect it because
+ * nr1=min(neh1-r1, NR1)=1 keeps work inside the safe region.
+ *
+ * This audit routes R tokens to ONE expert via:
+ *   htpe[0] = R, hids[0..R-1] = {0, 1, ..., R-1} (idt=t, ide=0, ne20=1)
+ * Each routed token uses the same K input (all 1.0) → all R outputs
+ * should equal sum_k dequant(W[0, r, k]) = K * d_row.
+ *
+ * For NR1=64 and R=64, the kernel processes nr1=64 rows in a single
+ * threadgroup. If mc[8] is structurally limited to 32 rows, tokens
+ * 32..63 receive garbage.
+ *
+ * Reuses the all-zero-qs IQ2_XXS pattern (every dequant val = d) so
+ * the analytic reference is K * d[m], independent of grid lookup.
+ */
+
+static int ds4_mtl4_wide_tile_audit_run(
+    id<MTLComputePipelineState> pipeline,
+    uint32_t M, uint32_t K, uint32_t R, uint32_t tile_n,
+    const char *label)
+{
+    if (!pipeline) {
+        fprintf(stderr, "ds4: wide-tile audit %s: pipeline nil\n", label);
+        return 0;
+    }
+    if ((M % 64) != 0 || (K % 256) != 0 || R == 0 || tile_n == 0) {
+        fprintf(stderr, "ds4: wide-tile audit %s needs M%%64==0, K%%256==0, R>0, tile_n>0 "
+                "(got M=%u K=%u R=%u tile_n=%u)\n", label, M, K, R, tile_n);
+        return 0;
+    }
+    const uint64_t block_bytes = 66;  /* half d + 32 ushorts qs */
+    const uint32_t n_blocks_per_row = K / 256u;
+    const uint64_t iq2_row_bytes = (uint64_t)n_blocks_per_row * block_bytes;
+    const uint64_t b_total = (uint64_t)M * iq2_row_bytes;  /* 1 expert */
+    const uint64_t a_total = (uint64_t)R * K;              /* R tokens */
+    const uint64_t c_total = (uint64_t)R * M;              /* R tokens × M rows out */
+
+    uint8_t  *host_b   = (uint8_t  *)calloc(b_total, 1);
+    uint16_t *host_a   = (uint16_t *)calloc(a_total, sizeof(uint16_t));
+    float    *host_c   = (float    *)calloc(c_total, sizeof(float));
+    uint32_t *host_tpe = (uint32_t *)calloc(1, sizeof(uint32_t));
+    int32_t  *host_ids = (int32_t  *)calloc(R, sizeof(int32_t));
+    float    *expected = (float    *)calloc(c_total, sizeof(float));
+    if (!host_b || !host_a || !host_c || !host_tpe || !host_ids || !expected) {
+        free(host_b); free(host_a); free(host_c); free(host_tpe); free(host_ids); free(expected);
+        return 0;
+    }
+    /* Single expert, R routed tokens (ide=0, idt=0..R-1). */
+    for (uint32_t m = 0; m < M; m++) {
+        const float d_f = 0.5f + (float)m * 0.001f;  /* varying per row */
+        const _Float16 d_h = (_Float16)d_f;
+        uint8_t *row = host_b + (uint64_t)m * iq2_row_bytes;
+        for (uint32_t b = 0; b < n_blocks_per_row; b++) {
+            uint8_t *blk = row + (uint64_t)b * block_bytes;
+            memcpy(blk, &d_h, sizeof(d_h));
+            /* qs all zero from calloc */
+        }
+        /* All R tokens get the same expected output (same expert, same input) */
+        const float row_sum = (float)K * (float)d_h;
+        for (uint32_t t = 0; t < R; t++) expected[(uint64_t)t * M + m] = row_sum;
+    }
+    host_tpe[0] = R;
+    for (uint32_t t = 0; t < R; t++) host_ids[t] = (int32_t)t;  /* idt=t, ide=0 */
+    _Float16 one = (_Float16)1.0f;
+    for (uint64_t i = 0; i < a_total; i++) memcpy(&host_a[i], &one, sizeof(one));
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:b_total options:MTLResourceStorageModeShared];
+        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:R*sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
+
+        struct {
+            int ne00, ne02;
+            uint64_t nb01, nb02, nb03;
+            int ne11;
+            uint64_t nb10, nb11, nb12, nb13;
+            int ne20, ne21;
+            int ne0, ne1;
+            int16_t r2, r3;
+        } args;
+        memset(&args, 0, sizeof(args));
+        args.ne00 = K;
+        args.ne02 = 1;
+        args.nb01 = iq2_row_bytes;
+        args.nb02 = (uint64_t)M * iq2_row_bytes;
+        args.nb03 = args.nb02;
+        args.ne11 = 1;
+        args.nb10 = sizeof(uint16_t);
+        args.nb11 = (uint64_t)K * sizeof(uint16_t);  /* slot stride (1 slot) */
+        args.nb12 = (uint64_t)K * sizeof(uint16_t);  /* per-token stride */
+        args.nb13 = args.nb12;
+        args.ne20 = 1;
+        args.ne21 = R;
+        args.ne0 = M; args.ne1 = 1;  /* ne1 = R tokens... wait, the output stride is idt*ne1*ne0 */
+        /* Output: dst + ide*ne0 + idt*ne1*ne0. With ide=0, idt=t: dst + t*ne1*M.
+         * For consecutive token storage as float[R][M], we need ne1*M = M, so ne1=1. */
+        args.r2 = 1; args.r3 = 1;
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
+            [residency addAllocations:allocs count:6];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:bBuf.gpuAddress atIndex:1];
+                [argTable setAddress:aBuf.gpuAddress atIndex:2];
+                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
+                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
+                [argTable setAddress:cBuf.gpuAddress atIndex:5];
+                NSUInteger shmem_bytes = 8192;
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:pipeline];
+                [enc setArgumentTable:argTable];
+                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
+                /* Dispatch grid: tg.x = ceil(R / tile_n), tg.y = M/64, tg.z = 1 expert */
+                const NSUInteger tgx = (R + tile_n - 1u) / tile_n;
+                [enc dispatchThreadgroups:MTLSizeMake(tgx, M / 64, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 8);
+            }
+        }
+    }
+    if (!rc) {
+        free(host_b); free(host_a); free(host_c);
+        free(host_tpe); free(host_ids); free(expected);
+        return 0;
+    }
+
+    /* Per-token mismatch reporting — surface which routed tokens deviate */
+    int total_mismatch = 0;
+    double max_rel = 0.0;
+    uint32_t first_bad_token = UINT32_MAX;
+    int per_token_bad[256] = {0};  /* count bad cells per token, capped at 256 */
+    for (uint32_t t = 0; t < R; t++) {
+        int bad = 0;
+        for (uint32_t m = 0; m < M; m++) {
+            const float got = host_c[(uint64_t)t * M + m];
+            const float ref = expected[(uint64_t)t * M + m];
+            const double d = fabs((double)(got - ref));
+            const double rel = d / (fabs((double)ref) + 1e-3);
+            if (rel > max_rel) max_rel = rel;
+            if (rel > 5e-2) {
+                bad++;
+                total_mismatch++;
+                if (first_bad_token == UINT32_MAX) first_bad_token = t;
+            }
+        }
+        if (t < 256) per_token_bad[t] = bad;
+    }
+    /* Find boundary: first token where >50% of cells are bad */
+    uint32_t threshold_token = R;
+    for (uint32_t t = 0; t < R && t < 256; t++) {
+        if (per_token_bad[t] > (int)(M / 2)) { threshold_token = t; break; }
+    }
+    fprintf(stderr,
+        "ds4: wide-tile audit %s M=%u K=%u R=%u tile_n=%u mismatch=%d/%u max_rel=%.4e "
+        "first_bad_token=%u boundary_token=%u "
+        "c[t0,0]=%.4f (ref=%.4f) c[t%u,0]=%.4f (ref=%.4f)\n",
+        label, M, K, R, tile_n, total_mismatch, (unsigned)c_total, max_rel,
+        first_bad_token, threshold_token,
+        (double)host_c[0], (double)expected[0],
+        R-1, (double)host_c[(uint64_t)(R-1) * M], (double)expected[(uint64_t)(R-1) * M]);
+    free(host_b); free(host_a); free(host_c);
+    free(host_tpe); free(host_ids); free(expected);
+    return (total_mismatch == 0) ? 1 : 0;
+}
+
+int ds4_gpu_mtl4_wide_tile_audit_iq2_xxs(uint32_t M, uint32_t K, uint32_t R) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    int ok_n32  = 0, ok_n64 = 0, ok_n128 = 0;
+    if (ds4_mul_mm_id_iq2_xxs_f32_mtl4_pipeline_init()) {
+        ok_n32 = ds4_mtl4_wide_tile_audit_run(g_mul_mm_id_iq2_xxs_f32_mtl4_pipeline,
+                                              M, K, R, 32, "iq2_xxs_n32");
+    }
+    if (ds4_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline_init()) {
+        ok_n64 = ds4_mtl4_wide_tile_audit_run(g_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline,
+                                              M, K, R, 64, "iq2_xxs_n64");
+    }
+    if (ds4_mul_mm_id_iq2_xxs_f32_n128_mtl4_pipeline_init()) {
+        ok_n128 = ds4_mtl4_wide_tile_audit_run(g_mul_mm_id_iq2_xxs_f32_n128_mtl4_pipeline,
+                                               M, K, R, 128, "iq2_xxs_n128");
+    }
+    fprintf(stderr, "ds4: wide-tile audit summary R=%u: n32=%s n64=%s n128=%s\n",
+            R, ok_n32 ? "PASS" : "FAIL", ok_n64 ? "PASS" : "FAIL",
+            ok_n128 ? "PASS" : "FAIL");
+    return (ok_n32 && ok_n64 && ok_n128) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +

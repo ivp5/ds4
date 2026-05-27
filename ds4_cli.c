@@ -2270,6 +2270,13 @@ int main(int argc, char **argv) {
         const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
         return ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n128_canary(m, n, k, e) ? 0 : 1;
     }
+    /* #742 wide-tile audit: routes R tokens to 1 expert; tests all 3 widths */
+    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        const uint32_t r = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
+        return ds4_gpu_mtl4_wide_tile_audit_iq2_xxs(m, k, r) ? 0 : 1;
+    }
     /* --mul-mm-id-q4-k-canary [M [N [K [E]]]] : #736 Q4_K routed MoE matmul */
     if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q4-k-canary")) {
         const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
