@@ -31445,6 +31445,110 @@ static int ds4_mul_mm_id_q8_0_f32_mtl4_pipeline_init(void) {
     return g_mul_mm_id_q8_0_f32_mtl4_init_ok;
 }
 
+/* Round 2: unified canary dispatch helper for mul_mm_id family (12 canaries).
+ * Sets up MTL buffers + args struct + dispatches via MTL4 + reads back to host_c_out.
+ * Per-canary code fills host_b/host_tpe/host_ids/expected + cfg fields, then calls this. */
+typedef struct {
+    uint64_t b_total;
+    uint64_t a_total_elems;
+    uint64_t c_total_elems;
+    uint32_t M;
+    uint32_t K;
+    uint32_t n_experts;
+    uint64_t row_bytes;
+    NSUInteger shmem_bytes;
+} ds4_mtl4_canary_cfg_t;
+
+static int ds4_mtl4_mm_id_canary_dispatch(
+    id<MTLComputePipelineState> pipeline,
+    const ds4_mtl4_canary_cfg_t *cfg,
+    const uint8_t  *host_b,
+    const uint16_t *host_a,
+    const uint32_t *host_tpe,
+    const int32_t  *host_ids,
+    float          *host_c_out)
+{
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:cfg->b_total options:MTLResourceStorageModeShared];
+        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:cfg->a_total_elems*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:cfg->n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:cfg->n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cBuf = [g_device newBufferWithLength:cfg->c_total_elems*sizeof(float) options:MTLResourceStorageModeShared];
+
+        struct {
+            int ne00, ne02;
+            uint64_t nb01, nb02, nb03;
+            int ne11;
+            uint64_t nb10, nb11, nb12, nb13;
+            int ne20, ne21;
+            int ne0, ne1;
+            int16_t r2, r3;
+        } args;
+        memset(&args, 0, sizeof(args));
+        args.ne00 = cfg->K;
+        args.ne02 = cfg->n_experts;
+        args.nb01 = cfg->row_bytes;
+        args.nb02 = (uint64_t)cfg->M * cfg->row_bytes;
+        args.nb03 = args.nb02 * cfg->n_experts;
+        args.ne11 = 1;
+        args.nb10 = sizeof(uint16_t);
+        args.nb11 = (uint64_t)cfg->K * sizeof(uint16_t);
+        args.nb12 = args.nb11;
+        args.nb13 = args.nb12 * cfg->n_experts;
+        args.ne20 = 1; args.ne21 = 1;
+        args.ne0 = cfg->M; args.ne1 = 1;
+        args.r2 = 1; args.r3 = 1;
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
+            [residency addAllocations:allocs count:6];
+            [residency commit];
+            [residency requestResidency];
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:bBuf.gpuAddress atIndex:1];
+                [argTable setAddress:aBuf.gpuAddress atIndex:2];
+                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
+                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
+                [argTable setAddress:cBuf.gpuAddress atIndex:5];
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:pipeline];
+                [enc setArgumentTable:argTable];
+                [enc setThreadgroupMemoryLength:cfg->shmem_bytes atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(1, cfg->M / 64, cfg->n_experts)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_c_out, cBuf.contents, cfg->c_total_elems * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 8);
+            }
+        }
+    }
+    return rc;
+}
+
 int ds4_gpu_mtl4_mul_mm_id_q8_0_f32_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!ds4_mul_mm_id_q8_0_f32_mtl4_pipeline_init()) return 0;
@@ -31515,90 +31619,16 @@ int ds4_gpu_mtl4_mul_mm_id_q8_0_f32_canary(uint32_t M, uint32_t N, uint32_t K, u
         }
     }
 
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b_q8 length:b_q8_total options:MTLResourceStorageModeShared];
-        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
-
-        struct {
-            int ne00, ne02;
-            uint64_t nb01, nb02, nb03;
-            int ne11;
-            uint64_t nb10, nb11, nb12, nb13;
-            int ne20, ne21;
-            int ne0, ne1;
-            int16_t r2, r3;
-        } args;
-        memset(&args, 0, sizeof(args));
-        args.ne00 = K;
-        args.ne02 = n_experts;
-        args.nb01 = q8_row_bytes;
-        args.nb02 = (uint64_t)M * q8_row_bytes;
-        args.nb03 = args.nb02 * n_experts;
-        args.ne11 = 1;
-        args.nb10 = sizeof(uint16_t);
-        args.nb11 = (uint64_t)K * sizeof(uint16_t);     /* slot stride (unused: only 1 slot) */
-        args.nb12 = (uint64_t)K * sizeof(uint16_t);     /* per-token stride */
-        args.nb13 = args.nb12 * n_experts;              /* batch stride (unused) */
-        args.ne20 = 1;                 /* one slot per token */
-        args.ne21 = 1;                 /* one routed row per expert */
-        args.ne0 = M; args.ne1 = 1;    /* idt stride = ne1*ne0 = M floats */
-        args.r2 = 1; args.r3 = 1;
-        memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
-            [residency addAllocations:allocs count:6];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:bBuf.gpuAddress atIndex:1];
-                [argTable setAddress:aBuf.gpuAddress atIndex:2];
-                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
-                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
-                [argTable setAddress:cBuf.gpuAddress atIndex:5];
-                NSUInteger shmem_bytes = 8192;
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_mul_mm_id_q8_0_f32_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-                /* Grid: (ceil(ne1/NR1), ceil(ne0/NR0), ne02). With ne1=1 → 1 tg.x */
-                [enc dispatchThreadgroups:MTLSizeMake(1, M / 64, n_experts)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
-                id<MTL4CommandBuffer> bufs[1] = {cb};
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 8);
-            }
-        }
-    }
+    ds4_mtl4_canary_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.b_total       = b_q8_total;
+    cfg.a_total_elems = a_total;
+    cfg.c_total_elems = c_total;
+    cfg.M = M; cfg.K = K; cfg.n_experts = n_experts;
+    cfg.row_bytes     = q8_row_bytes;
+    cfg.shmem_bytes   = 8192u;
+    int rc = ds4_mtl4_mm_id_canary_dispatch(
+        g_mul_mm_id_q8_0_f32_mtl4_pipeline, &cfg, (const uint8_t *)host_b_q8, host_a, host_tpe, host_ids, host_c);
     if (!rc) {
         free(host_b); free(host_b_q8); free(host_a); free(host_c);
         free(host_tpe); free(host_ids); free(expected);
@@ -31957,89 +31987,16 @@ int ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_canary(uint32_t M, uint32_t N, uint32_t K
     _Float16 one = (_Float16)1.0f;
     for (uint64_t i = 0; i < a_total; i++) memcpy(&host_a[i], &one, sizeof(one));
 
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:b_q8_total options:MTLResourceStorageModeShared];
-        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
-
-        struct {
-            int ne00, ne02;
-            uint64_t nb01, nb02, nb03;
-            int ne11;
-            uint64_t nb10, nb11, nb12, nb13;
-            int ne20, ne21;
-            int ne0, ne1;
-            int16_t r2, r3;
-        } args;
-        memset(&args, 0, sizeof(args));
-        args.ne00 = K;
-        args.ne02 = n_experts;
-        args.nb01 = iq2_row_bytes;
-        args.nb02 = (uint64_t)M * iq2_row_bytes;
-        args.nb03 = args.nb02 * n_experts;
-        args.ne11 = 1;
-        args.nb10 = sizeof(uint16_t);
-        args.nb11 = (uint64_t)K * sizeof(uint16_t);
-        args.nb12 = args.nb11;
-        args.nb13 = args.nb12 * n_experts;
-        args.ne20 = 1;
-        args.ne21 = 1;
-        args.ne0 = M; args.ne1 = 1;
-        args.r2 = 1; args.r3 = 1;
-        memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
-            [residency addAllocations:allocs count:6];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:bBuf.gpuAddress atIndex:1];
-                [argTable setAddress:aBuf.gpuAddress atIndex:2];
-                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
-                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
-                [argTable setAddress:cBuf.gpuAddress atIndex:5];
-                NSUInteger shmem_bytes = 8192;
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_mul_mm_id_iq2_xxs_f32_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(1, M / 64, n_experts)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
-                id<MTL4CommandBuffer> bufs[1] = {cb};
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 8);
-            }
-        }
-    }
+    ds4_mtl4_canary_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.b_total       = b_q8_total;
+    cfg.a_total_elems = a_total;
+    cfg.c_total_elems = c_total;
+    cfg.M = M; cfg.K = K; cfg.n_experts = n_experts;
+    cfg.row_bytes     = iq2_row_bytes;
+    cfg.shmem_bytes   = 8192u;
+    int rc = ds4_mtl4_mm_id_canary_dispatch(
+        g_mul_mm_id_iq2_xxs_f32_mtl4_pipeline, &cfg, (const uint8_t *)host_b, host_a, host_tpe, host_ids, host_c);
     if (!rc) {
         free(host_b); free(host_a); free(host_c);
         free(host_tpe); free(host_ids); free(expected);
@@ -32165,89 +32122,16 @@ int ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_n64_canary(uint32_t M, uint32_t N, uint32
     _Float16 one = (_Float16)1.0f;
     for (uint64_t i = 0; i < a_total; i++) memcpy(&host_a[i], &one, sizeof(one));
 
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:b_q8_total options:MTLResourceStorageModeShared];
-        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
-
-        struct {
-            int ne00, ne02;
-            uint64_t nb01, nb02, nb03;
-            int ne11;
-            uint64_t nb10, nb11, nb12, nb13;
-            int ne20, ne21;
-            int ne0, ne1;
-            int16_t r2, r3;
-        } args;
-        memset(&args, 0, sizeof(args));
-        args.ne00 = K;
-        args.ne02 = n_experts;
-        args.nb01 = iq2_row_bytes;
-        args.nb02 = (uint64_t)M * iq2_row_bytes;
-        args.nb03 = args.nb02 * n_experts;
-        args.ne11 = 1;
-        args.nb10 = sizeof(uint16_t);
-        args.nb11 = (uint64_t)K * sizeof(uint16_t);
-        args.nb12 = args.nb11;
-        args.nb13 = args.nb12 * n_experts;
-        args.ne20 = 1;
-        args.ne21 = 1;
-        args.ne0 = M; args.ne1 = 1;
-        args.r2 = 1; args.r3 = 1;
-        memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
-            [residency addAllocations:allocs count:6];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:bBuf.gpuAddress atIndex:1];
-                [argTable setAddress:aBuf.gpuAddress atIndex:2];
-                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
-                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
-                [argTable setAddress:cBuf.gpuAddress atIndex:5];
-                NSUInteger shmem_bytes = 16384u;
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(1, M / 64, n_experts)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
-                id<MTL4CommandBuffer> bufs[1] = {cb};
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 8);
-            }
-        }
-    }
+    ds4_mtl4_canary_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.b_total       = b_q8_total;
+    cfg.a_total_elems = a_total;
+    cfg.c_total_elems = c_total;
+    cfg.M = M; cfg.K = K; cfg.n_experts = n_experts;
+    cfg.row_bytes     = iq2_row_bytes;
+    cfg.shmem_bytes   = 16384u;
+    int rc = ds4_mtl4_mm_id_canary_dispatch(
+        g_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline, &cfg, (const uint8_t *)host_b, host_a, host_tpe, host_ids, host_c);
     if (!rc) {
         free(host_b); free(host_a); free(host_c);
         free(host_tpe); free(host_ids); free(expected);
@@ -32375,89 +32259,16 @@ int ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_n128_canary(uint32_t M, uint32_t N, uint3
     _Float16 one = (_Float16)1.0f;
     for (uint64_t i = 0; i < a_total; i++) memcpy(&host_a[i], &one, sizeof(one));
 
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:b_q8_total options:MTLResourceStorageModeShared];
-        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
-
-        struct {
-            int ne00, ne02;
-            uint64_t nb01, nb02, nb03;
-            int ne11;
-            uint64_t nb10, nb11, nb12, nb13;
-            int ne20, ne21;
-            int ne0, ne1;
-            int16_t r2, r3;
-        } args;
-        memset(&args, 0, sizeof(args));
-        args.ne00 = K;
-        args.ne02 = n_experts;
-        args.nb01 = iq2_row_bytes;
-        args.nb02 = (uint64_t)M * iq2_row_bytes;
-        args.nb03 = args.nb02 * n_experts;
-        args.ne11 = 1;
-        args.nb10 = sizeof(uint16_t);
-        args.nb11 = (uint64_t)K * sizeof(uint16_t);
-        args.nb12 = args.nb11;
-        args.nb13 = args.nb12 * n_experts;
-        args.ne20 = 1;
-        args.ne21 = 1;
-        args.ne0 = M; args.ne1 = 1;
-        args.r2 = 1; args.r3 = 1;
-        memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
-            [residency addAllocations:allocs count:6];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:bBuf.gpuAddress atIndex:1];
-                [argTable setAddress:aBuf.gpuAddress atIndex:2];
-                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
-                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
-                [argTable setAddress:cBuf.gpuAddress atIndex:5];
-                NSUInteger shmem_bytes = 32768u;
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_mul_mm_id_iq2_xxs_f32_n128_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(1, M / 64, n_experts)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
-                id<MTL4CommandBuffer> bufs[1] = {cb};
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 8);
-            }
-        }
-    }
+    ds4_mtl4_canary_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.b_total       = b_q8_total;
+    cfg.a_total_elems = a_total;
+    cfg.c_total_elems = c_total;
+    cfg.M = M; cfg.K = K; cfg.n_experts = n_experts;
+    cfg.row_bytes     = iq2_row_bytes;
+    cfg.shmem_bytes   = 32768u;
+    int rc = ds4_mtl4_mm_id_canary_dispatch(
+        g_mul_mm_id_iq2_xxs_f32_n128_mtl4_pipeline, &cfg, (const uint8_t *)host_b, host_a, host_tpe, host_ids, host_c);
     if (!rc) {
         free(host_b); free(host_a); free(host_c);
         free(host_tpe); free(host_ids); free(expected);
@@ -32735,89 +32546,16 @@ int ds4_gpu_mtl4_mul_mm_id_q4_K_f32_canary(uint32_t M, uint32_t N, uint32_t K, u
     _Float16 one = (_Float16)1.0f;
     for (uint64_t i = 0; i < a_total; i++) memcpy(&host_a[i], &one, sizeof(one));
 
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:b_total options:MTLResourceStorageModeShared];
-        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
-
-        struct {
-            int ne00, ne02;
-            uint64_t nb01, nb02, nb03;
-            int ne11;
-            uint64_t nb10, nb11, nb12, nb13;
-            int ne20, ne21;
-            int ne0, ne1;
-            int16_t r2, r3;
-        } args;
-        memset(&args, 0, sizeof(args));
-        args.ne00 = K;
-        args.ne02 = n_experts;
-        args.nb01 = q4k_row_bytes;
-        args.nb02 = (uint64_t)M * q4k_row_bytes;
-        args.nb03 = args.nb02 * n_experts;
-        args.ne11 = 1;
-        args.nb10 = sizeof(uint16_t);
-        args.nb11 = (uint64_t)K * sizeof(uint16_t);
-        args.nb12 = args.nb11;
-        args.nb13 = args.nb12 * n_experts;
-        args.ne20 = 1;
-        args.ne21 = 1;
-        args.ne0 = M; args.ne1 = 1;
-        args.r2 = 1; args.r3 = 1;
-        memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
-            [residency addAllocations:allocs count:6];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:bBuf.gpuAddress atIndex:1];
-                [argTable setAddress:aBuf.gpuAddress atIndex:2];
-                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
-                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
-                [argTable setAddress:cBuf.gpuAddress atIndex:5];
-                NSUInteger shmem_bytes = 8192;
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_mul_mm_id_q4_K_f32_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(1, M / 64, n_experts)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
-                id<MTL4CommandBuffer> bufs[1] = {cb};
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 8);
-            }
-        }
-    }
+    ds4_mtl4_canary_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.b_total       = b_total;
+    cfg.a_total_elems = a_total;
+    cfg.c_total_elems = c_total;
+    cfg.M = M; cfg.K = K; cfg.n_experts = n_experts;
+    cfg.row_bytes     = q4k_row_bytes;
+    cfg.shmem_bytes   = 8192u;
+    int rc = ds4_mtl4_mm_id_canary_dispatch(
+        g_mul_mm_id_q4_K_f32_mtl4_pipeline, &cfg, (const uint8_t *)host_b, host_a, host_tpe, host_ids, host_c);
     if (!rc) {
         free(host_b); free(host_a); free(host_c);
         free(host_tpe); free(host_ids); free(expected);
@@ -33088,89 +32826,16 @@ int ds4_gpu_mtl4_mul_mm_id_q2_K_f32_canary(uint32_t M, uint32_t N, uint32_t K, u
     _Float16 one = (_Float16)1.0f;
     for (uint64_t i = 0; i < a_total; i++) memcpy(&host_a[i], &one, sizeof(one));
 
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:b_total options:MTLResourceStorageModeShared];
-        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
-
-        struct {
-            int ne00, ne02;
-            uint64_t nb01, nb02, nb03;
-            int ne11;
-            uint64_t nb10, nb11, nb12, nb13;
-            int ne20, ne21;
-            int ne0, ne1;
-            int16_t r2, r3;
-        } args;
-        memset(&args, 0, sizeof(args));
-        args.ne00 = K;
-        args.ne02 = n_experts;
-        args.nb01 = q2k_row_bytes;
-        args.nb02 = (uint64_t)M * q2k_row_bytes;
-        args.nb03 = args.nb02 * n_experts;
-        args.ne11 = 1;
-        args.nb10 = sizeof(uint16_t);
-        args.nb11 = (uint64_t)K * sizeof(uint16_t);
-        args.nb12 = args.nb11;
-        args.nb13 = args.nb12 * n_experts;
-        args.ne20 = 1;
-        args.ne21 = 1;
-        args.ne0 = M; args.ne1 = 1;
-        args.r2 = 1; args.r3 = 1;
-        memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
-            [residency addAllocations:allocs count:6];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:bBuf.gpuAddress atIndex:1];
-                [argTable setAddress:aBuf.gpuAddress atIndex:2];
-                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
-                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
-                [argTable setAddress:cBuf.gpuAddress atIndex:5];
-                NSUInteger shmem_bytes = 8192;
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_mul_mm_id_q2_K_f32_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(1, M / 64, n_experts)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
-                id<MTL4CommandBuffer> bufs[1] = {cb};
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 8);
-            }
-        }
-    }
+    ds4_mtl4_canary_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.b_total       = b_total;
+    cfg.a_total_elems = a_total;
+    cfg.c_total_elems = c_total;
+    cfg.M = M; cfg.K = K; cfg.n_experts = n_experts;
+    cfg.row_bytes     = q2k_row_bytes;
+    cfg.shmem_bytes   = 8192u;
+    int rc = ds4_mtl4_mm_id_canary_dispatch(
+        g_mul_mm_id_q2_K_f32_mtl4_pipeline, &cfg, (const uint8_t *)host_b, host_a, host_tpe, host_ids, host_c);
     if (!rc) {
         free(host_b); free(host_a); free(host_c);
         free(host_tpe); free(host_ids); free(expected);
@@ -33300,90 +32965,16 @@ int ds4_gpu_mtl4_mul_mm_id_q8_0_f32_n64_canary(uint32_t M, uint32_t N, uint32_t 
         }
     }
 
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b_q8 length:b_q8_total options:MTLResourceStorageModeShared];
-        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
-
-        struct {
-            int ne00, ne02;
-            uint64_t nb01, nb02, nb03;
-            int ne11;
-            uint64_t nb10, nb11, nb12, nb13;
-            int ne20, ne21;
-            int ne0, ne1;
-            int16_t r2, r3;
-        } args;
-        memset(&args, 0, sizeof(args));
-        args.ne00 = K;
-        args.ne02 = n_experts;
-        args.nb01 = q8_row_bytes;
-        args.nb02 = (uint64_t)M * q8_row_bytes;
-        args.nb03 = args.nb02 * n_experts;
-        args.ne11 = 1;
-        args.nb10 = sizeof(uint16_t);
-        args.nb11 = (uint64_t)K * sizeof(uint16_t);     /* slot stride (unused: only 1 slot) */
-        args.nb12 = (uint64_t)K * sizeof(uint16_t);     /* per-token stride */
-        args.nb13 = args.nb12 * n_experts;              /* batch stride (unused) */
-        args.ne20 = 1;                 /* one slot per token */
-        args.ne21 = 1;                 /* one routed row per expert */
-        args.ne0 = M; args.ne1 = 1;    /* idt stride = ne1*ne0 = M floats */
-        args.r2 = 1; args.r3 = 1;
-        memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
-            [residency addAllocations:allocs count:6];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:bBuf.gpuAddress atIndex:1];
-                [argTable setAddress:aBuf.gpuAddress atIndex:2];
-                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
-                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
-                [argTable setAddress:cBuf.gpuAddress atIndex:5];
-                NSUInteger shmem_bytes = 16384u;
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_mul_mm_id_q8_0_f32_n64_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-                /* Grid: (ceil(ne1/NR1), ceil(ne0/NR0), ne02). With ne1=1 → 1 tg.x */
-                [enc dispatchThreadgroups:MTLSizeMake(1, M / 64, n_experts)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
-                id<MTL4CommandBuffer> bufs[1] = {cb};
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 8);
-            }
-        }
-    }
+    ds4_mtl4_canary_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.b_total       = b_q8_total;
+    cfg.a_total_elems = a_total;
+    cfg.c_total_elems = c_total;
+    cfg.M = M; cfg.K = K; cfg.n_experts = n_experts;
+    cfg.row_bytes     = q8_row_bytes;
+    cfg.shmem_bytes   = 16384u;
+    int rc = ds4_mtl4_mm_id_canary_dispatch(
+        g_mul_mm_id_q8_0_f32_n64_mtl4_pipeline, &cfg, (const uint8_t *)host_b_q8, host_a, host_tpe, host_ids, host_c);
     if (!rc) {
         free(host_b); free(host_b_q8); free(host_a); free(host_c);
         free(host_tpe); free(host_ids); free(expected);
@@ -33515,90 +33106,16 @@ int ds4_gpu_mtl4_mul_mm_id_q8_0_f32_n128_canary(uint32_t M, uint32_t N, uint32_t
         }
     }
 
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b_q8 length:b_q8_total options:MTLResourceStorageModeShared];
-        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
-
-        struct {
-            int ne00, ne02;
-            uint64_t nb01, nb02, nb03;
-            int ne11;
-            uint64_t nb10, nb11, nb12, nb13;
-            int ne20, ne21;
-            int ne0, ne1;
-            int16_t r2, r3;
-        } args;
-        memset(&args, 0, sizeof(args));
-        args.ne00 = K;
-        args.ne02 = n_experts;
-        args.nb01 = q8_row_bytes;
-        args.nb02 = (uint64_t)M * q8_row_bytes;
-        args.nb03 = args.nb02 * n_experts;
-        args.ne11 = 1;
-        args.nb10 = sizeof(uint16_t);
-        args.nb11 = (uint64_t)K * sizeof(uint16_t);     /* slot stride (unused: only 1 slot) */
-        args.nb12 = (uint64_t)K * sizeof(uint16_t);     /* per-token stride */
-        args.nb13 = args.nb12 * n_experts;              /* batch stride (unused) */
-        args.ne20 = 1;                 /* one slot per token */
-        args.ne21 = 1;                 /* one routed row per expert */
-        args.ne0 = M; args.ne1 = 1;    /* idt stride = ne1*ne0 = M floats */
-        args.r2 = 1; args.r3 = 1;
-        memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
-            [residency addAllocations:allocs count:6];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:bBuf.gpuAddress atIndex:1];
-                [argTable setAddress:aBuf.gpuAddress atIndex:2];
-                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
-                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
-                [argTable setAddress:cBuf.gpuAddress atIndex:5];
-                NSUInteger shmem_bytes = 32768u;
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_mul_mm_id_q8_0_f32_n128_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-                /* Grid: (ceil(ne1/NR1), ceil(ne0/NR0), ne02). With ne1=1 → 1 tg.x */
-                [enc dispatchThreadgroups:MTLSizeMake(1, M / 64, n_experts)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
-                id<MTL4CommandBuffer> bufs[1] = {cb};
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 8);
-            }
-        }
-    }
+    ds4_mtl4_canary_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.b_total       = b_q8_total;
+    cfg.a_total_elems = a_total;
+    cfg.c_total_elems = c_total;
+    cfg.M = M; cfg.K = K; cfg.n_experts = n_experts;
+    cfg.row_bytes     = q8_row_bytes;
+    cfg.shmem_bytes   = 32768u;
+    int rc = ds4_mtl4_mm_id_canary_dispatch(
+        g_mul_mm_id_q8_0_f32_n128_mtl4_pipeline, &cfg, (const uint8_t *)host_b_q8, host_a, host_tpe, host_ids, host_c);
     if (!rc) {
         free(host_b); free(host_b_q8); free(host_a); free(host_c);
         free(host_tpe); free(host_ids); free(expected);
@@ -33718,89 +33235,16 @@ int ds4_gpu_mtl4_mul_mm_id_q4_K_f32_n64_canary(uint32_t M, uint32_t N, uint32_t 
     _Float16 one = (_Float16)1.0f;
     for (uint64_t i = 0; i < a_total; i++) memcpy(&host_a[i], &one, sizeof(one));
 
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:b_total options:MTLResourceStorageModeShared];
-        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
-
-        struct {
-            int ne00, ne02;
-            uint64_t nb01, nb02, nb03;
-            int ne11;
-            uint64_t nb10, nb11, nb12, nb13;
-            int ne20, ne21;
-            int ne0, ne1;
-            int16_t r2, r3;
-        } args;
-        memset(&args, 0, sizeof(args));
-        args.ne00 = K;
-        args.ne02 = n_experts;
-        args.nb01 = q4k_row_bytes;
-        args.nb02 = (uint64_t)M * q4k_row_bytes;
-        args.nb03 = args.nb02 * n_experts;
-        args.ne11 = 1;
-        args.nb10 = sizeof(uint16_t);
-        args.nb11 = (uint64_t)K * sizeof(uint16_t);
-        args.nb12 = args.nb11;
-        args.nb13 = args.nb12 * n_experts;
-        args.ne20 = 1;
-        args.ne21 = 1;
-        args.ne0 = M; args.ne1 = 1;
-        args.r2 = 1; args.r3 = 1;
-        memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
-            [residency addAllocations:allocs count:6];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:bBuf.gpuAddress atIndex:1];
-                [argTable setAddress:aBuf.gpuAddress atIndex:2];
-                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
-                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
-                [argTable setAddress:cBuf.gpuAddress atIndex:5];
-                NSUInteger shmem_bytes = 16384u;
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_mul_mm_id_q4_K_f32_n64_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(1, M / 64, n_experts)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
-                id<MTL4CommandBuffer> bufs[1] = {cb};
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 8);
-            }
-        }
-    }
+    ds4_mtl4_canary_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.b_total       = b_total;
+    cfg.a_total_elems = a_total;
+    cfg.c_total_elems = c_total;
+    cfg.M = M; cfg.K = K; cfg.n_experts = n_experts;
+    cfg.row_bytes     = q4k_row_bytes;
+    cfg.shmem_bytes   = 16384u;
+    int rc = ds4_mtl4_mm_id_canary_dispatch(
+        g_mul_mm_id_q4_K_f32_n64_mtl4_pipeline, &cfg, (const uint8_t *)host_b, host_a, host_tpe, host_ids, host_c);
     if (!rc) {
         free(host_b); free(host_a); free(host_c);
         free(host_tpe); free(host_ids); free(expected);
@@ -33919,89 +33363,16 @@ int ds4_gpu_mtl4_mul_mm_id_q4_K_f32_n128_canary(uint32_t M, uint32_t N, uint32_t
     _Float16 one = (_Float16)1.0f;
     for (uint64_t i = 0; i < a_total; i++) memcpy(&host_a[i], &one, sizeof(one));
 
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:b_total options:MTLResourceStorageModeShared];
-        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
-
-        struct {
-            int ne00, ne02;
-            uint64_t nb01, nb02, nb03;
-            int ne11;
-            uint64_t nb10, nb11, nb12, nb13;
-            int ne20, ne21;
-            int ne0, ne1;
-            int16_t r2, r3;
-        } args;
-        memset(&args, 0, sizeof(args));
-        args.ne00 = K;
-        args.ne02 = n_experts;
-        args.nb01 = q4k_row_bytes;
-        args.nb02 = (uint64_t)M * q4k_row_bytes;
-        args.nb03 = args.nb02 * n_experts;
-        args.ne11 = 1;
-        args.nb10 = sizeof(uint16_t);
-        args.nb11 = (uint64_t)K * sizeof(uint16_t);
-        args.nb12 = args.nb11;
-        args.nb13 = args.nb12 * n_experts;
-        args.ne20 = 1;
-        args.ne21 = 1;
-        args.ne0 = M; args.ne1 = 1;
-        args.r2 = 1; args.r3 = 1;
-        memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
-            [residency addAllocations:allocs count:6];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:bBuf.gpuAddress atIndex:1];
-                [argTable setAddress:aBuf.gpuAddress atIndex:2];
-                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
-                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
-                [argTable setAddress:cBuf.gpuAddress atIndex:5];
-                NSUInteger shmem_bytes = 32768u;
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_mul_mm_id_q4_K_f32_n128_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(1, M / 64, n_experts)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
-                id<MTL4CommandBuffer> bufs[1] = {cb};
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 8);
-            }
-        }
-    }
+    ds4_mtl4_canary_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.b_total       = b_total;
+    cfg.a_total_elems = a_total;
+    cfg.c_total_elems = c_total;
+    cfg.M = M; cfg.K = K; cfg.n_experts = n_experts;
+    cfg.row_bytes     = q4k_row_bytes;
+    cfg.shmem_bytes   = 32768u;
+    int rc = ds4_mtl4_mm_id_canary_dispatch(
+        g_mul_mm_id_q4_K_f32_n128_mtl4_pipeline, &cfg, (const uint8_t *)host_b, host_a, host_tpe, host_ids, host_c);
     if (!rc) {
         free(host_b); free(host_a); free(host_c);
         free(host_tpe); free(host_ids); free(expected);
@@ -34125,89 +33496,16 @@ int ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n64_canary(uint32_t M, uint32_t N, uint32_t 
     _Float16 one = (_Float16)1.0f;
     for (uint64_t i = 0; i < a_total; i++) memcpy(&host_a[i], &one, sizeof(one));
 
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:b_total options:MTLResourceStorageModeShared];
-        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
-
-        struct {
-            int ne00, ne02;
-            uint64_t nb01, nb02, nb03;
-            int ne11;
-            uint64_t nb10, nb11, nb12, nb13;
-            int ne20, ne21;
-            int ne0, ne1;
-            int16_t r2, r3;
-        } args;
-        memset(&args, 0, sizeof(args));
-        args.ne00 = K;
-        args.ne02 = n_experts;
-        args.nb01 = q2k_row_bytes;
-        args.nb02 = (uint64_t)M * q2k_row_bytes;
-        args.nb03 = args.nb02 * n_experts;
-        args.ne11 = 1;
-        args.nb10 = sizeof(uint16_t);
-        args.nb11 = (uint64_t)K * sizeof(uint16_t);
-        args.nb12 = args.nb11;
-        args.nb13 = args.nb12 * n_experts;
-        args.ne20 = 1;
-        args.ne21 = 1;
-        args.ne0 = M; args.ne1 = 1;
-        args.r2 = 1; args.r3 = 1;
-        memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
-            [residency addAllocations:allocs count:6];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:bBuf.gpuAddress atIndex:1];
-                [argTable setAddress:aBuf.gpuAddress atIndex:2];
-                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
-                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
-                [argTable setAddress:cBuf.gpuAddress atIndex:5];
-                NSUInteger shmem_bytes = 16384u;
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_mul_mm_id_q2_K_f32_n64_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(1, M / 64, n_experts)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
-                id<MTL4CommandBuffer> bufs[1] = {cb};
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 8);
-            }
-        }
-    }
+    ds4_mtl4_canary_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.b_total       = b_total;
+    cfg.a_total_elems = a_total;
+    cfg.c_total_elems = c_total;
+    cfg.M = M; cfg.K = K; cfg.n_experts = n_experts;
+    cfg.row_bytes     = q2k_row_bytes;
+    cfg.shmem_bytes   = 16384u;
+    int rc = ds4_mtl4_mm_id_canary_dispatch(
+        g_mul_mm_id_q2_K_f32_n64_mtl4_pipeline, &cfg, (const uint8_t *)host_b, host_a, host_tpe, host_ids, host_c);
     if (!rc) {
         free(host_b); free(host_a); free(host_c);
         free(host_tpe); free(host_ids); free(expected);
@@ -34329,89 +33627,16 @@ int ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n128_canary(uint32_t M, uint32_t N, uint32_t
     _Float16 one = (_Float16)1.0f;
     for (uint64_t i = 0; i < a_total; i++) memcpy(&host_a[i], &one, sizeof(one));
 
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:b_total options:MTLResourceStorageModeShared];
-        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
-
-        struct {
-            int ne00, ne02;
-            uint64_t nb01, nb02, nb03;
-            int ne11;
-            uint64_t nb10, nb11, nb12, nb13;
-            int ne20, ne21;
-            int ne0, ne1;
-            int16_t r2, r3;
-        } args;
-        memset(&args, 0, sizeof(args));
-        args.ne00 = K;
-        args.ne02 = n_experts;
-        args.nb01 = q2k_row_bytes;
-        args.nb02 = (uint64_t)M * q2k_row_bytes;
-        args.nb03 = args.nb02 * n_experts;
-        args.ne11 = 1;
-        args.nb10 = sizeof(uint16_t);
-        args.nb11 = (uint64_t)K * sizeof(uint16_t);
-        args.nb12 = args.nb11;
-        args.nb13 = args.nb12 * n_experts;
-        args.ne20 = 1;
-        args.ne21 = 1;
-        args.ne0 = M; args.ne1 = 1;
-        args.r2 = 1; args.r3 = 1;
-        memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
-            [residency addAllocations:allocs count:6];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:bBuf.gpuAddress atIndex:1];
-                [argTable setAddress:aBuf.gpuAddress atIndex:2];
-                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
-                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
-                [argTable setAddress:cBuf.gpuAddress atIndex:5];
-                NSUInteger shmem_bytes = 32768u;
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_mul_mm_id_q2_K_f32_n128_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(1, M / 64, n_experts)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
-                id<MTL4CommandBuffer> bufs[1] = {cb};
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 8);
-            }
-        }
-    }
+    ds4_mtl4_canary_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.b_total       = b_total;
+    cfg.a_total_elems = a_total;
+    cfg.c_total_elems = c_total;
+    cfg.M = M; cfg.K = K; cfg.n_experts = n_experts;
+    cfg.row_bytes     = q2k_row_bytes;
+    cfg.shmem_bytes   = 32768u;
+    int rc = ds4_mtl4_mm_id_canary_dispatch(
+        g_mul_mm_id_q2_K_f32_n128_mtl4_pipeline, &cfg, (const uint8_t *)host_b, host_a, host_tpe, host_ids, host_c);
     if (!rc) {
         free(host_b); free(host_a); free(host_c);
         free(host_tpe); free(host_ids); free(expected);
