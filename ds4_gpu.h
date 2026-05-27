@@ -1436,3 +1436,10 @@ int ds4_gpu_mtl4_bin_fuse_mul_cb_f32_canary(uint32_t n_rows, uint32_t row_width)
 int ds4_gpu_mtl4_mul_mm_id_map0_ne20_10_canary(uint32_t n_experts, uint32_t n_tokens);
 int ds4_gpu_mtl4_mul_mm_id_map0_ne20_16_canary(uint32_t n_experts, uint32_t n_tokens);
 int ds4_gpu_mtl4_mul_mm_id_map0_ne20_22_canary(uint32_t n_experts, uint32_t n_tokens);
+
+/* silv 2026-05-27 task #722 — mul_mv_f32_f32 MTL4 (FIRST FC-aware port).
+ * Dense f32 matvec using MTL4SpecializedFunctionDescriptor with
+ * MTLFunctionConstantValues to set FC_mul_mv_nsg. NR0=4 (template),
+ * NSG=4 (FC). Unlocks the function-constant pattern for future ports
+ * (mul_mv_f16_f32, Q8_0 dequant kernels, full bin_fuse). */
+int ds4_gpu_mtl4_mul_mv_f32_f32_canary(uint32_t M, uint32_t N);
