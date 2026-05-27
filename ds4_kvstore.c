@@ -26,6 +26,10 @@
 #define KV_CACHE_MAGIC1 'V'
 #define KV_CACHE_MAGIC2 'C'
 #define KV_CACHE_VERSION 1u
+/* Header byte 20 carries the graph-payload ABI.  It is separate from the outer
+ * file version because the KVC envelope can remain stable while the serialized
+ * ds4_session internals become unsafe to restore across runtime changes. */
+#define KV_CACHE_PAYLOAD_ABI 2u
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
 #define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
 /* Tokenizers may merge text across the prompt boundary. Trimming a small tail
@@ -404,6 +408,7 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
     ds4_kvstore_le_put32(h + 8, tokens);
     ds4_kvstore_le_put32(h + 12, hits);
     ds4_kvstore_le_put32(h + 16, ctx_size);
+    h[20] = KV_CACHE_PAYLOAD_ABI;
     kv_le_put64(h + 24, created_at);
     kv_le_put64(h + 32, last_used);
     kv_le_put64(h + 40, payload_bytes);
@@ -415,6 +420,7 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
     if (fread(h, 1, sizeof(h), fp) != sizeof(h)) return false;
     if (h[0] != KV_CACHE_MAGIC0 || h[1] != KV_CACHE_MAGIC1 ||
         h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
+    if (h[20] != KV_CACHE_PAYLOAD_ABI) return false;
     e->quant_bits = h[4];
     e->reason = h[5] <= DS4_KVSTORE_REASON_AGENT_SESSION ? h[5] :
                 DS4_KVSTORE_REASON_UNKNOWN;
