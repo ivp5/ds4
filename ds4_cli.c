@@ -2157,6 +2157,23 @@ int main(int argc, char **argv) {
         const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
         return ds4_gpu_mtl4_dsv4_shared_down_hc_expand4_q8_0_canary(m, n) ? 0 : 1;
     }
+    /* --lane-diag [nthreads] : MTL4 lane-execution diagnostic */
+    if (argc >= 2 && !strcmp(argv[1], "--lane-diag")) {
+        const uint32_t n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
+        return ds4_gpu_mtl4_lane_diag_canary(n) ? 0 : 1;
+    }
+    /* --mma-iso [n_simdgroups] : MTL4 simdgroup MMA isolation test */
+    if (argc >= 2 && !strcmp(argv[1], "--mma-iso")) {
+        const uint32_t n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 1;
+        return ds4_gpu_mtl4_mma_iso_canary(n) ? 0 : 1;
+    }
+    /* --indexer-scores-tiled-canary [n_tokens [n_comp [n_head]]] : #730 unblocks #701 */
+    if (argc >= 2 && !strcmp(argv[1], "--indexer-scores-tiled-canary")) {
+        const uint32_t nt = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
+        const uint32_t nc = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        const uint32_t nh = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 1;
+        return ds4_gpu_mtl4_indexer_scores_tiled_f32_canary(nt, nc, nh) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

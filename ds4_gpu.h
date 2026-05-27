@@ -1483,3 +1483,20 @@ int ds4_gpu_mtl4_mul_mv_f16_f32_canary(uint32_t M, uint32_t N);
  * + Σ_k comb[c,k] * residual[d,k]. 10 buffers. Hardcoded n_hc=4,
  * n_tokens=1 (decode path). NR0=2, NSG=4 via FC. */
 int ds4_gpu_mtl4_dsv4_shared_down_hc_expand4_q8_0_canary(uint32_t M, uint32_t N);
+
+/* silv 2026-05-28 — MTL4 lane-execution diagnostic (cracking #701).
+ * Dispatch nthreads to a kernel that writes its tpitg to dst[tpitg].
+ * Records ntg/tiisg/sgitg seen. Reports which lanes actually fired. */
+int ds4_gpu_mtl4_lane_diag_canary(uint32_t nthreads);
+
+/* silv 2026-05-28 — MTL4 simdgroup MMA isolation test (#701).
+ * Per simdgroup: fill 8x8 all-ones A,B → MMA → store C → verify 64 = 8.
+ * Returns success iff every C cell = 8.0. */
+int ds4_gpu_mtl4_mma_iso_canary(uint32_t n_sg);
+
+/* silv 2026-05-28 task #730 — dsv4_indexer_scores_tiled_f32 MTL4 (UNBLOCKS #701).
+ * Computes per-(token, comp) score = sum over heads of
+ * max(<Q[t,head,:], K[c,:]>, 0) * weights[t,head] * scale.
+ * Uses simdgroup MMA (8x8 tiles) with 4 simdgroups × 32 lanes = 128 threads.
+ * shmem: 21 KB at D=128. Re-attempt after isolation tests verified MMA works. */
+int ds4_gpu_mtl4_indexer_scores_tiled_f32_canary(uint32_t n_tokens, uint32_t n_comp, uint32_t n_head);
