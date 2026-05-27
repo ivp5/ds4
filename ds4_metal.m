@@ -34566,6 +34566,401 @@ static int ds4_vqb2_decode_fp16_batched_mtl4_pipeline_init(void) {
     return g_vqb2_decode_fp16_batched_mtl4_init_ok;
 }
 
+/* ============================================================ */
+/* VECTORIZED VQB2 DECODER — silv 2026-05-28 OOM-speedup target  */
+/* ============================================================ */
+/* Earlier stacked bench (tmp/20260528_cache_audit/SPEEDUP_ANALYSIS.md)
+ * found per-code kernel is instruction-bound at ~4 G outputs/sec
+ * (~8 inst/code: cond-load, shift, mask, LUT, cast, store). This
+ * vectorizes the bit-extraction by processing 8 codes per thread for
+ * K=16 (4-bit codes) and 4 codes per thread for K=256 (8-bit codes).
+ *
+ * Per-K specialization eliminates the `(bw+shift>8) ? codes[byte+1] : 0`
+ * branch (alignment is known at compile time). One uint32 load fetches
+ * 8 nibbles (K=16) or 4 bytes (K=256); the body is 1 load + N shifts +
+ * N lookups + N stores. Instruction count drops from ~8/code to ~3/code.
+ *
+ * Cache key requirements (for byte-alignment safety):
+ *   - K=16: codes_per_expert MUST be divisible by 8 (8 codes per uint32)
+ *   - K=256: codes_per_expert MUST be divisible by 4
+ *   For DS4 V4 Flash (n_rows=128, n_pairs=256/1024): codes_per_expert ∈
+ *   {32768, 131072} — both divisible by 8 ✓.
+ *
+ * Output: same packed-by-selection-order layout as the base kernel; both
+ * are byte-exact for valid inputs. */
+
+static NSString * const k_vqb2_decode_fp16_k16_x8_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct args_t {\n"
+     "  uint n_rows;\n"
+     "  uint n_pairs;\n"
+     "  uint n_selected;\n"
+     "  uint n_packets;\n"
+     "  uint codes_stride;\n"
+     "  uint out_stride;\n"
+     "  uint pad0; uint pad1;\n"
+     "};\n"
+     "kernel void vqb2_decode_fp16_k16_x8(\n"
+     "    device const args_t *args         [[buffer(0)]],\n"
+     "    device const float  *codebook     [[buffer(1)]],\n"
+     "    device const uchar  *codes_base   [[buffer(2)]],\n"
+     "    device const uint   *selected     [[buffer(3)]],\n"
+     "    device       half2  *out_base     [[buffer(4)]],\n"
+     "    uint3 gid [[thread_position_in_grid]]) {\n"
+     "  const uint codes_per_expert = args->n_rows * args->n_pairs;\n"
+     "  const uint x_base = gid.x * 8u;\n"
+     "  if (x_base >= codes_per_expert) return;\n"
+     "  if (gid.y >= args->n_selected) return;\n"
+     "  if (gid.z >= args->n_packets) return;\n"
+     "  const device uchar *codes = codes_base + gid.z * args->codes_stride;\n"
+     "  device       half2 *out   = out_base   + gid.z * args->out_stride;\n"
+     "  const uint expert = selected[gid.y];\n"
+     "  const uint linear_base = expert * codes_per_expert + x_base;\n"
+     "  /* K=16 → bit_width=4 → 8 codes = 32 bits = 1 uint32. Bytes-aligned. */\n"
+     "  const uint byte_off = linear_base >> 1;\n"
+     "  const device uint *codes_u32 = (device const uint *)(codes + byte_off);\n"
+     "  const uint packed = *codes_u32;\n"
+     "  const uint out_idx = gid.y * codes_per_expert + x_base;\n"
+     "  /* Extract 8 nibbles and emit 8 half2 (re, im) pairs */\n"
+     "  for (uint i = 0; i < 8u; i++) {\n"
+     "    const uint code = (packed >> (i * 4u)) & 0xFu;\n"
+     "    const float re = codebook[code * 2u + 0u];\n"
+     "    const float im = codebook[code * 2u + 1u];\n"
+     "    out[out_idx + i] = half2((half)re, (half)im);\n"
+     "  }\n"
+     "}\n";
+
+static id<MTLComputePipelineState> g_vqb2_decode_fp16_k16_x8_mtl4_pipeline;
+static int g_vqb2_decode_fp16_k16_x8_mtl4_init_attempted;
+static int g_vqb2_decode_fp16_k16_x8_mtl4_init_ok;
+
+static int ds4_vqb2_decode_fp16_k16_x8_mtl4_pipeline_init(void) {
+    if (g_vqb2_decode_fp16_k16_x8_mtl4_init_attempted) return g_vqb2_decode_fp16_k16_x8_mtl4_init_ok;
+    g_vqb2_decode_fp16_k16_x8_mtl4_init_attempted = 1;
+    g_vqb2_decode_fp16_k16_x8_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_vqb2_decode_fp16_k16_x8_msl, @"ds4_vqb2_decode_fp16_k16_x8_mtl4",
+        @"vqb2_decode_fp16_k16_x8", 64, NULL, 0);
+    g_vqb2_decode_fp16_k16_x8_mtl4_init_ok =
+        (g_vqb2_decode_fp16_k16_x8_mtl4_pipeline != nil) ? 1 : 0;
+    return g_vqb2_decode_fp16_k16_x8_mtl4_init_ok;
+}
+
+/* Vectorized K=4 (2-bit codes): 16 codes per thread = 32 bits = 1 uint32.
+ * Byte-aligned for codes_per_expert divisible by 16; n_rows×n_pairs ≥ 1024×128
+ * in DS4 → divisible by 16 ✓. */
+static NSString * const k_vqb2_decode_fp16_k4_x16_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct args_t {\n"
+     "  uint n_rows;\n"
+     "  uint n_pairs;\n"
+     "  uint n_selected;\n"
+     "  uint n_packets;\n"
+     "  uint codes_stride;\n"
+     "  uint out_stride;\n"
+     "  uint pad0; uint pad1;\n"
+     "};\n"
+     "kernel void vqb2_decode_fp16_k4_x16(\n"
+     "    device const args_t *args         [[buffer(0)]],\n"
+     "    device const float  *codebook     [[buffer(1)]],\n"
+     "    device const uchar  *codes_base   [[buffer(2)]],\n"
+     "    device const uint   *selected     [[buffer(3)]],\n"
+     "    device       half2  *out_base     [[buffer(4)]],\n"
+     "    uint3 gid [[thread_position_in_grid]]) {\n"
+     "  const uint codes_per_expert = args->n_rows * args->n_pairs;\n"
+     "  const uint x_base = gid.x * 16u;\n"
+     "  if (x_base >= codes_per_expert) return;\n"
+     "  if (gid.y >= args->n_selected) return;\n"
+     "  if (gid.z >= args->n_packets) return;\n"
+     "  const device uchar *codes = codes_base + gid.z * args->codes_stride;\n"
+     "  device       half2 *out   = out_base   + gid.z * args->out_stride;\n"
+     "  const uint expert = selected[gid.y];\n"
+     "  const uint linear_base = expert * codes_per_expert + x_base;\n"
+     "  /* K=4 → bit_width=2 → 16 codes = 32 bits */\n"
+     "  const uint byte_off = linear_base >> 2;\n"
+     "  const device uint *codes_u32 = (device const uint *)(codes + byte_off);\n"
+     "  const uint packed = *codes_u32;\n"
+     "  const uint out_idx = gid.y * codes_per_expert + x_base;\n"
+     "  for (uint i = 0; i < 16u; i++) {\n"
+     "    const uint code = (packed >> (i * 2u)) & 0x3u;\n"
+     "    const float re = codebook[code * 2u + 0u];\n"
+     "    const float im = codebook[code * 2u + 1u];\n"
+     "    out[out_idx + i] = half2((half)re, (half)im);\n"
+     "  }\n"
+     "}\n";
+
+static id<MTLComputePipelineState> g_vqb2_decode_fp16_k4_x16_mtl4_pipeline;
+static int g_vqb2_decode_fp16_k4_x16_mtl4_init_attempted;
+static int g_vqb2_decode_fp16_k4_x16_mtl4_init_ok;
+
+static int ds4_vqb2_decode_fp16_k4_x16_mtl4_pipeline_init(void) {
+    if (g_vqb2_decode_fp16_k4_x16_mtl4_init_attempted) return g_vqb2_decode_fp16_k4_x16_mtl4_init_ok;
+    g_vqb2_decode_fp16_k4_x16_mtl4_init_attempted = 1;
+    g_vqb2_decode_fp16_k4_x16_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_vqb2_decode_fp16_k4_x16_msl, @"ds4_vqb2_decode_fp16_k4_x16_mtl4",
+        @"vqb2_decode_fp16_k4_x16", 64, NULL, 0);
+    g_vqb2_decode_fp16_k4_x16_mtl4_init_ok =
+        (g_vqb2_decode_fp16_k4_x16_mtl4_pipeline != nil) ? 1 : 0;
+    return g_vqb2_decode_fp16_k4_x16_mtl4_init_ok;
+}
+
+/* Vectorized K=256 (8-bit codes): 4 codes per thread = 32 bits = 1 uint32. */
+static NSString * const k_vqb2_decode_fp16_k256_x4_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct args_t {\n"
+     "  uint n_rows;\n"
+     "  uint n_pairs;\n"
+     "  uint n_selected;\n"
+     "  uint n_packets;\n"
+     "  uint codes_stride;\n"
+     "  uint out_stride;\n"
+     "  uint pad0; uint pad1;\n"
+     "};\n"
+     "kernel void vqb2_decode_fp16_k256_x4(\n"
+     "    device const args_t *args         [[buffer(0)]],\n"
+     "    device const float  *codebook     [[buffer(1)]],\n"
+     "    device const uchar  *codes_base   [[buffer(2)]],\n"
+     "    device const uint   *selected     [[buffer(3)]],\n"
+     "    device       half2  *out_base     [[buffer(4)]],\n"
+     "    uint3 gid [[thread_position_in_grid]]) {\n"
+     "  const uint codes_per_expert = args->n_rows * args->n_pairs;\n"
+     "  const uint x_base = gid.x * 4u;\n"
+     "  if (x_base >= codes_per_expert) return;\n"
+     "  if (gid.y >= args->n_selected) return;\n"
+     "  if (gid.z >= args->n_packets) return;\n"
+     "  const device uchar *codes = codes_base + gid.z * args->codes_stride;\n"
+     "  device       half2 *out   = out_base   + gid.z * args->out_stride;\n"
+     "  const uint expert = selected[gid.y];\n"
+     "  const uint linear_base = expert * codes_per_expert + x_base;\n"
+     "  /* K=256 → bit_width=8 → 4 codes = 32 bits */\n"
+     "  const device uint *codes_u32 = (device const uint *)(codes + linear_base);\n"
+     "  const uint packed = *codes_u32;\n"
+     "  const uint out_idx = gid.y * codes_per_expert + x_base;\n"
+     "  for (uint i = 0; i < 4u; i++) {\n"
+     "    const uint code = (packed >> (i * 8u)) & 0xFFu;\n"
+     "    const float re = codebook[code * 2u + 0u];\n"
+     "    const float im = codebook[code * 2u + 1u];\n"
+     "    out[out_idx + i] = half2((half)re, (half)im);\n"
+     "  }\n"
+     "}\n";
+
+static id<MTLComputePipelineState> g_vqb2_decode_fp16_k256_x4_mtl4_pipeline;
+static int g_vqb2_decode_fp16_k256_x4_mtl4_init_attempted;
+static int g_vqb2_decode_fp16_k256_x4_mtl4_init_ok;
+
+static int ds4_vqb2_decode_fp16_k256_x4_mtl4_pipeline_init(void) {
+    if (g_vqb2_decode_fp16_k256_x4_mtl4_init_attempted) return g_vqb2_decode_fp16_k256_x4_mtl4_init_ok;
+    g_vqb2_decode_fp16_k256_x4_mtl4_init_attempted = 1;
+    g_vqb2_decode_fp16_k256_x4_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_vqb2_decode_fp16_k256_x4_msl, @"ds4_vqb2_decode_fp16_k256_x4_mtl4",
+        @"vqb2_decode_fp16_k256_x4", 64, NULL, 0);
+    g_vqb2_decode_fp16_k256_x4_mtl4_init_ok =
+        (g_vqb2_decode_fp16_k256_x4_mtl4_pipeline != nil) ? 1 : 0;
+    return g_vqb2_decode_fp16_k256_x4_mtl4_init_ok;
+}
+
+/* Vectorized canary + bench: cross-checks vectorized output against the
+ * baseline scalar batched decoder for bit-exactness, then measures throughput.
+ * K=4 / K=16 / K=256 all supported; selects the appropriate specialization. */
+int ds4_gpu_mtl4_vqb2_decode_vectorized_bench(uint32_t n_packets,
+                                               uint32_t n_selected,
+                                               uint32_t n_experts_total,
+                                               uint32_t n_rows,
+                                               uint32_t n_pairs,
+                                               uint32_t k_val,
+                                               uint32_t rounds) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_vqb2_decode_fp16_batched_mtl4_pipeline_init()) return 0;
+    id<MTLComputePipelineState> vec_pipeline = nil;
+    uint32_t codes_per_thread = 0;
+    uint32_t bit_width = 0;
+    switch (k_val) {
+        case 4:
+            if (!ds4_vqb2_decode_fp16_k4_x16_mtl4_pipeline_init()) return 0;
+            vec_pipeline = g_vqb2_decode_fp16_k4_x16_mtl4_pipeline;
+            codes_per_thread = 16; bit_width = 2; break;
+        case 16:
+            if (!ds4_vqb2_decode_fp16_k16_x8_mtl4_pipeline_init()) return 0;
+            vec_pipeline = g_vqb2_decode_fp16_k16_x8_mtl4_pipeline;
+            codes_per_thread = 8; bit_width = 4; break;
+        case 256:
+            if (!ds4_vqb2_decode_fp16_k256_x4_mtl4_pipeline_init()) return 0;
+            vec_pipeline = g_vqb2_decode_fp16_k256_x4_mtl4_pipeline;
+            codes_per_thread = 4; bit_width = 8; break;
+        default:
+            fprintf(stderr, "ds4: vqb2_decode_vectorized_bench requires K∈{4,16,256} (got %u)\n", k_val);
+            return 0;
+    }
+    if (n_packets == 0 || n_selected == 0 || n_selected > n_experts_total) return 0;
+    if (n_rows == 0 || n_pairs == 0 || rounds == 0) return 0;
+    const uint32_t codes_per_expert = n_rows * n_pairs;
+    if (codes_per_expert % codes_per_thread != 0) {
+        fprintf(stderr, "ds4: codes_per_expert=%u not divisible by codes_per_thread=%u\n",
+                codes_per_expert, codes_per_thread);
+        return 0;
+    }
+    const uint64_t total_codes_per_packet = (uint64_t)n_experts_total * codes_per_expert;
+    const size_t codes_bytes_per_packet = (size_t)(total_codes_per_packet * bit_width + 7u) >> 3;
+    const size_t sel_out_per_packet  = (size_t)n_selected * codes_per_expert * 2u * sizeof(_Float16);
+
+    int rc = 0;
+    int mismatch = 0;
+    double t_scalar_ms = 0, t_vec_ms = 0;
+
+    @autoreleasepool {
+        const float step = 1.0f / (float)k_val;
+        id<MTLBuffer> cbBuf = [g_device newBufferWithLength:(NSUInteger)k_val * 2u * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> codesBuf = [g_device newBufferWithLength:(NSUInteger)n_packets * codes_bytes_per_packet options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf = [g_device newBufferWithLength:(NSUInteger)n_selected * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outScalarBuf = [g_device newBufferWithLength:(NSUInteger)n_packets * sel_out_per_packet options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outVecBuf    = [g_device newBufferWithLength:(NSUInteger)n_packets * sel_out_per_packet options:MTLResourceStorageModeShared];
+        if (!cbBuf || !codesBuf || !selBuf || !outScalarBuf || !outVecBuf) return 0;
+
+        float *cb_data = (float *)cbBuf.contents;
+        for (uint32_t i = 0; i < k_val; i++) {
+            cb_data[i * 2u + 0u] =  (float)i * step;
+            cb_data[i * 2u + 1u] = -(float)i * step;
+        }
+        /* Pack distinct codes per (expert, position) so any divergence is detectable. */
+        uint8_t *codes_host = (uint8_t *)codesBuf.contents;
+        memset(codes_host, 0, (size_t)n_packets * codes_bytes_per_packet);
+        for (uint32_t p = 0; p < n_packets; p++) {
+            uint8_t *base = codes_host + (size_t)p * codes_bytes_per_packet;
+            for (uint32_t e = 0; e < n_experts_total; e++) {
+                for (uint32_t i = 0; i < codes_per_expert; i++) {
+                    const uint32_t code = (e + i + p) % k_val;
+                    const uint64_t linear = (uint64_t)e * codes_per_expert + i;
+                    const uint64_t bit_off = linear * bit_width;
+                    const size_t byte_off = (size_t)(bit_off >> 3);
+                    const uint32_t shift = (uint32_t)(bit_off & 7ull);
+                    base[byte_off] |= (uint8_t)((code << shift) & 0xFFu);
+                    if (bit_width + shift > 8u) {
+                        base[byte_off + 1u] |= (uint8_t)((code >> (8u - shift)) & 0xFFu);
+                    }
+                }
+            }
+        }
+        uint32_t *sel = (uint32_t *)selBuf.contents;
+        for (uint32_t i = 0; i < n_selected; i++) sel[i] = i * (n_experts_total / n_selected);
+
+        /* Args structs */
+        struct scalar_args_t {
+            uint32_t bit_width, code_mask, n_rows, n_pairs,
+                     n_selected, n_packets, codes_stride, out_stride;
+        } scalar_args = {
+            bit_width, (1u << bit_width) - 1u, n_rows, n_pairs,
+            n_selected, n_packets,
+            (uint32_t)codes_bytes_per_packet,
+            (uint32_t)(sel_out_per_packet / sizeof(_Float16) / 2u),
+        };
+        id<MTLBuffer> scalarArgsBuf = [g_device newBufferWithBytes:&scalar_args length:sizeof(scalar_args) options:MTLResourceStorageModeShared];
+
+        struct vec_args_t {
+            uint32_t n_rows, n_pairs, n_selected, n_packets,
+                     codes_stride, out_stride, pad0, pad1;
+        } vec_args = {
+            n_rows, n_pairs, n_selected, n_packets,
+            (uint32_t)codes_bytes_per_packet,
+            (uint32_t)(sel_out_per_packet / sizeof(_Float16) / 2u),
+            0, 0,
+        };
+        id<MTLBuffer> vecArgsBuf = [g_device newBufferWithBytes:&vec_args length:sizeof(vec_args) options:MTLResourceStorageModeShared];
+
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+
+        /* === SCALAR baseline (the batched kernel from earlier session) === */
+        const uint64_t tS0 = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+            [cb beginCommandBufferWithAllocator:g_polar_allocator];
+            id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+            if (!at) return 0;
+            [at setAddress:scalarArgsBuf.gpuAddress atIndex:0];
+            [at setAddress:cbBuf.gpuAddress atIndex:1];
+            [at setAddress:codesBuf.gpuAddress atIndex:2];
+            [at setAddress:selBuf.gpuAddress atIndex:3];
+            [at setAddress:outScalarBuf.gpuAddress atIndex:4];
+            [enc setComputePipelineState:g_vqb2_decode_fp16_batched_mtl4_pipeline];
+            [enc setArgumentTable:at];
+            [enc dispatchThreadgroups:MTLSizeMake((codes_per_expert + 63u) / 64u, n_selected, n_packets)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+            [cb endCommandBuffer];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            MTL4CommitOptions *opts = [MTL4CommitOptions new];
+            [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+            id<MTL4CommandBuffer> bufs[1] = {cb};
+            [g_polar_queue commit:bufs count:1 options:opts];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+            ds4_mtl4_pool_release(at, 8);
+        }
+        const uint64_t tS1 = mach_absolute_time();
+        t_scalar_ms = (double)(tS1 - tS0) * (double)tb.numer / (double)tb.denom / 1e6;
+
+        /* === VECTORIZED === */
+        const uint32_t tg_x = (codes_per_expert / codes_per_thread + 63u) / 64u;
+        const uint64_t tV0 = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+            [cb beginCommandBufferWithAllocator:g_polar_allocator];
+            id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+            if (!at) return 0;
+            [at setAddress:vecArgsBuf.gpuAddress atIndex:0];
+            [at setAddress:cbBuf.gpuAddress atIndex:1];
+            [at setAddress:codesBuf.gpuAddress atIndex:2];
+            [at setAddress:selBuf.gpuAddress atIndex:3];
+            [at setAddress:outVecBuf.gpuAddress atIndex:4];
+            [enc setComputePipelineState:vec_pipeline];
+            [enc setArgumentTable:at];
+            [enc dispatchThreadgroups:MTLSizeMake(tg_x, n_selected, n_packets)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+            [cb endCommandBuffer];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            MTL4CommitOptions *opts = [MTL4CommitOptions new];
+            [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+            id<MTL4CommandBuffer> bufs[1] = {cb};
+            [g_polar_queue commit:bufs count:1 options:opts];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+            ds4_mtl4_pool_release(at, 8);
+        }
+        const uint64_t tV1 = mach_absolute_time();
+        t_vec_ms = (double)(tV1 - tV0) * (double)tb.numer / (double)tb.denom / 1e6;
+
+        /* Cross-check bit-exactness against scalar output */
+        const _Float16 *scalar_out = (const _Float16 *)outScalarBuf.contents;
+        const _Float16 *vec_out    = (const _Float16 *)outVecBuf.contents;
+        const size_t n_halves = (size_t)n_packets * sel_out_per_packet / sizeof(_Float16);
+        for (size_t i = 0; i < n_halves; i++) {
+            if ((float)scalar_out[i] != (float)vec_out[i]) mismatch++;
+        }
+        rc = 1;
+    }
+
+    const uint64_t bytes_per_round =
+        (uint64_t)n_packets * n_selected * codes_per_expert * 2u * sizeof(_Float16);
+    const double gbs_scalar = ((double)bytes_per_round * rounds / 1e9) / (t_scalar_ms / 1000.0);
+    const double gbs_vec    = ((double)bytes_per_round * rounds / 1e9) / (t_vec_ms / 1000.0);
+
+    fprintf(stderr,
+        "ds4: vqb2_decode_vectorized_bench n_packets=%u n_sel=%u/%u rows=%u pairs=%u K=%u "
+        "codes_per_thread=%u rounds=%u\n"
+        "  scalar (1 code/thread):  %.3f ms (%.3f ms/round)  %.1f GB/s\n"
+        "  vector (%u codes/thread): %.3f ms (%.3f ms/round)  %.1f GB/s   speedup=%.2fx\n"
+        "  cross-check mismatch=%d (bit-exact must be 0)  rc=%d\n",
+        n_packets, n_selected, n_experts_total, n_rows, n_pairs, k_val,
+        codes_per_thread, rounds,
+        t_scalar_ms, t_scalar_ms / (double)rounds, gbs_scalar,
+        codes_per_thread, t_vec_ms, t_vec_ms / (double)rounds, gbs_vec,
+        t_scalar_ms / t_vec_ms,
+        mismatch, rc);
+    return (rc && mismatch == 0) ? 1 : 0;
+}
+
 static NSString * const k_vqb2_decode_fp16_msl =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"

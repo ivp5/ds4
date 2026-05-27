@@ -74,3 +74,37 @@ This is the 10×-accuracy refinement that justifies "wire the GPU decode into
 production" — but only AFTER the per-code vectorization lands. Wiring the
 current 2.3 GB/s kernel into production gives ~3× over CPU dequant; wiring
 after vectorization gives 50-100×.
+
+---
+
+## UPDATE — vectorization falsified the instruction-bound hypothesis
+
+Built K=4/16/256 specialized vectorized kernels (8/16/4 codes per thread,
+one uint32 load per group, fully unrolled bit extraction). All three are
+bit-exact against scalar (mismatch=0) but produce **no measurable speedup**:
+
+  K=4   scalar: 87.7 ms/round  vector: 99.3 ms/round  speedup = 0.88×
+  K=16  scalar: 90.2 ms/round  vector: 90.4 ms/round  speedup = 1.00×
+  K=256 scalar: 22.9 ms/round  vector: 22.8 ms/round  speedup = 1.00×
+
+(K=4 vector is slower — register pressure from 16 unrolled iterations.)
+
+Effective output throughput stays at 2.2 GB/s across all variants — well
+below the ~200 GB/s the M1 Max can sustain for compute kernels. So the
+kernel is NOT instruction-bound either, despite the earlier per-instruction
+arithmetic seeming to match.
+
+What the falsification leaves on the table:
+  - Codebook fetch pattern (16-entry random LUT × 64 threads/TG may bank-conflict)
+  - Threadgroup launch overhead (786K TGs at this dispatch shape)
+  - Compiler may already auto-vectorize the scalar loop body
+  - Sync/commit overhead (each round = 1 cmdbuf + 1 wait)
+
+The honest take: I don't know what the wall is. The architectural move
+that would bypass this entirely is to FUSE the decode INTO the matmul
+kernel (no materialized dequantized weights — decode-on-demand in the
+matmul inner loop), removing the intermediate fp16 write entirely. That
+turns ~50M memory writes per layer event into zero. Multi-session work.
+
+The honest signal: the next-level speedup is not bit-extraction
+optimization. It's eliminating the intermediate fp16 store.

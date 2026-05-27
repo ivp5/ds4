@@ -1602,6 +1602,20 @@ int ds4_gpu_mtl4_vqb2_decode_stacked_speedup_bench(uint32_t n_packets,
                                                    uint32_t k_val,
                                                    uint32_t rounds);
 
+/* silv 2026-05-28 — vectorized VQB2 decoder bench. Compares scalar
+ * (1 code/thread) against K-specialized vector kernels:
+ *   K=4   → 16 codes/thread (32-bit packed nibble pairs)
+ *   K=16  → 8 codes/thread  (32-bit packed nibbles)
+ *   K=256 → 4 codes/thread  (32-bit packed bytes)
+ * Cross-checks bit-exactness against scalar output. K∈{4,16,256}. */
+int ds4_gpu_mtl4_vqb2_decode_vectorized_bench(uint32_t n_packets,
+                                              uint32_t n_selected,
+                                              uint32_t n_experts_total,
+                                              uint32_t n_rows,
+                                              uint32_t n_pairs,
+                                              uint32_t k_val,
+                                              uint32_t rounds);
+
 /* silv 2026-05-28 task #742 — wide-tile audit canary.
  * Routes R tokens to a single expert (htpe[0]=R, hids[0..R-1]={0..R-1}),
  * runs each of n32/n64/n128 pipelines, reports per-token mismatch
