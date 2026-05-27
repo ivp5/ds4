@@ -2113,6 +2113,12 @@ int main(int argc, char **argv) {
         const float cv = (argc >= 5) ? (float)atof(argv[4]) : 0.0f;
         return ds4_gpu_mtl4_dsv4_shared_gate_up_swiglu_q8_0_canary(m, n, cv) ? 0 : 1;
     }
+    /* --q8-hc-expand4-canary [M [N]] : task #725 Q8_0 matvec + 4-channel HC expand */
+    if (argc >= 2 && !strcmp(argv[1], "--q8-hc-expand4-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_dsv4_q8_hc_expand4_q8_0_canary(m, n) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

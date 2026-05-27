@@ -1456,3 +1456,9 @@ int ds4_gpu_mtl4_mul_mv_q8_0_f32_canary(uint32_t M, uint32_t N);
  * both gate and up dequant lanes). NR0=2, NSG=4 via FC. Used at shared
  * expert head every layer. */
 int ds4_gpu_mtl4_dsv4_shared_gate_up_swiglu_q8_0_canary(uint32_t M, uint32_t N, float clamp_value);
+
+/* silv 2026-05-27 task #725 — dsv4_q8_hc_expand4_q8_0 MTL4.
+ * Q8_0 matvec fused with 4-channel HC expansion. dst[d, c] =
+ * block_v * post[c] + Σ_k comb[c, k] * residual[d, k]. Hardcoded
+ * n_hc=4, n_tokens=1 (decode path). 9 buffers. NR0=2, NSG=4 via FC. */
+int ds4_gpu_mtl4_dsv4_q8_hc_expand4_q8_0_canary(uint32_t M, uint32_t N);

@@ -30034,6 +30034,374 @@ cleanup:
 }
 
 /* ============================================================ */
+/* dsv4_q8_hc_expand4_q8_0 MTL4 port (silv 2026-05-27 #725)     */
+/* ============================================================ */
+/* Q8_0 matvec fused with 4-channel HC expansion. Hardcoded n_hc=4
+ * and n_tokens=1 (decode-time path). Per output row d:
+ *   1. Compute block_v = <Q8_0 weight row d, input vec>
+ *   2. Read 4 residual values r0..r3 from residual[d, *]
+ *   3. For each hc-channel c in [0,4): dst[d, c] =
+ *        block_v * post[c] + sum_k comb[c, k] * rk
+ *
+ * 9 buffers: args_mv, args_hc, weight (Q8_0), input (FP32),
+ * block_out (FP32), residual (FP32), post (FP32 × 4),
+ * comb (FP32 × 16), dst (FP32 × M × 4).
+ *
+ * Uses FC_mul_mv_nsg via the established pattern. NR0=2, NSG=4. */
+
+static id<MTLComputePipelineState> ds4_dsv4_q8_hc_expand4_q8_0_build_pipeline(short nsg_value) {
+    if (!ds4_polar_pipeline_init()) return nil;
+    NSError *err = nil;
+
+    NSString *source = [NSString stringWithFormat:
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "#define FC_MUL_MV 600\n"
+         "#define N_SIMDWIDTH 32\n"
+         "#define QK8_0 32\n"
+         "constant short FC_mul_mv_nsg [[function_constant(FC_MUL_MV + 0)]];\n"
+         "struct block_q8_0 { half d; int8_t qs[QK8_0]; };\n"
+         "struct mv_args {\n"
+         "  int ne00; int ne01; int ne02;\n"
+         "  ulong nb00; ulong nb01; ulong nb02; ulong nb03;\n"
+         "  int ne10; int ne11; int ne12;\n"
+         "  ulong nb10; ulong nb11; ulong nb12; ulong nb13;\n"
+         "  int ne0; int ne1; int nr0;\n"
+         "  short r2; short r3;\n"
+         "};\n"
+         "struct hc_args {\n"
+         "  long n_embd; long n_hc; long n_tokens;\n"
+         "  ulong nb_block0; ulong nb_block1;\n"
+         "  ulong nb_add0; ulong nb_add1;\n"
+         "  ulong nb_res0; ulong nb_res1; ulong nb_res2;\n"
+         "  ulong nb_post0; ulong nb_post1;\n"
+         "  ulong nb_comb0; ulong nb_comb1; ulong nb_comb2;\n"
+         "  ulong nb0; ulong nb1;\n"
+         "};\n"
+         "kernel void dsv4_q8_hc_expand4_q8_0_mtl4(\n"
+         "    device const mv_args *mv        [[buffer(0)]],\n"
+         "    device const hc_args *hc        [[buffer(1)]],\n"
+         "    device const char    *weight    [[buffer(2)]],\n"
+         "    device const char    *input     [[buffer(3)]],\n"
+         "    device       char    *block_out [[buffer(4)]],\n"
+         "    device const char    *residual  [[buffer(5)]],\n"
+         "    device const char    *post      [[buffer(6)]],\n"
+         "    device const char    *comb      [[buffer(7)]],\n"
+         "    device       char    *dst       [[buffer(8)]],\n"
+         "    threadgroup  char    *shmem     [[threadgroup(0)]],\n"
+         "    uint3   tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort  tiisg [[thread_index_in_simdgroup]],\n"
+         "    ushort  sgitg [[simdgroup_index_in_threadgroup]]) {\n"
+         "  if (hc->n_hc != 4 || hc->n_tokens != 1) return;\n"
+         "  constexpr short NR0 = 2;\n"
+         "  const short NSG = FC_mul_mv_nsg;\n"
+         "  constexpr short NW = N_SIMDWIDTH;\n"
+         "  constexpr short NQ = 8;\n"
+         "  const int nb = mv->ne00 / QK8_0;\n"
+         "  const int row0 = tgpig.x * NR0;\n"
+         "  const short ix = tiisg / (NW / NQ);\n"
+         "  const short il = tiisg %% (NW / NQ);\n"
+         "  const int ib0 = sgitg * NQ + ix;\n"
+         "  device const float *y = (device const float *)(input);\n"
+         "  device const float *yb = y + ib0*QK8_0 + il*NQ;\n"
+         "  device const block_q8_0 *ax[NR0];\n"
+         "  for (short row = 0; row < NR0; ++row) {\n"
+         "    const ulong off0 = (ulong)(row0 + row) * mv->nb01;\n"
+         "    ax[row] = (device const block_q8_0 *)(weight + off0);\n"
+         "  }\n"
+         "  float sumf[NR0] = {0.0f};\n"
+         "  float yl[NQ];\n"
+         "  for (int ib = ib0; ib < nb; ib += NSG*NQ) {\n"
+         "    for (short i = 0; i < NQ; ++i) yl[i] = yb[i];\n"
+         "    for (short row = 0; row < NR0; ++row) {\n"
+         "      device const int8_t *qs = ax[row][ib].qs + il*NQ;\n"
+         "      float sumq = 0.0f;\n"
+         "      for (short i = 0; i < NQ; ++i) sumq += (float)qs[i] * yl[i];\n"
+         "      sumf[row] += sumq * (float)ax[row][ib].d;\n"
+         "    }\n"
+         "    yb += NSG*NQ*QK8_0;\n"
+         "  }\n"
+         "  threadgroup float *shmem_f32[NR0];\n"
+         "  for (short row = 0; row < NR0; ++row) {\n"
+         "    shmem_f32[row] = (threadgroup float *)shmem + NW * row;\n"
+         "    if (sgitg == 0) shmem_f32[row][tiisg] = 0.0f;\n"
+         "    sumf[row] = simd_sum(sumf[row]);\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (short row = 0; row < NR0; ++row) {\n"
+         "    if (tiisg == 0) shmem_f32[row][sgitg] = sumf[row];\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (short row = 0; row < NR0; ++row) {\n"
+         "    const int d = row0 + row;\n"
+         "    if (d >= mv->ne01) continue;\n"
+         "    const float block_v = simd_sum(shmem_f32[row][tiisg]);\n"
+         "    if (tiisg == 0 && sgitg == 0) {\n"
+         "      *((device float *)(block_out + (ulong)d * sizeof(float))) = block_v;\n"
+         "      const float r0v = *((device const float *)(residual + (ulong)d * hc->nb_res0 + 0 * hc->nb_res1));\n"
+         "      const float r1v = *((device const float *)(residual + (ulong)d * hc->nb_res0 + 1 * hc->nb_res1));\n"
+         "      const float r2v = *((device const float *)(residual + (ulong)d * hc->nb_res0 + 2 * hc->nb_res1));\n"
+         "      const float r3v = *((device const float *)(residual + (ulong)d * hc->nb_res0 + 3 * hc->nb_res1));\n"
+         "      for (long dst_hc = 0; dst_hc < 4; ++dst_hc) {\n"
+         "        float acc = block_v * *((device const float *)(post + dst_hc * hc->nb_post0));\n"
+         "        acc += *((device const float *)(comb + dst_hc * hc->nb_comb0 + 0 * hc->nb_comb1)) * r0v;\n"
+         "        acc += *((device const float *)(comb + dst_hc * hc->nb_comb0 + 1 * hc->nb_comb1)) * r1v;\n"
+         "        acc += *((device const float *)(comb + dst_hc * hc->nb_comb0 + 2 * hc->nb_comb1)) * r2v;\n"
+         "        acc += *((device const float *)(comb + dst_hc * hc->nb_comb0 + 3 * hc->nb_comb1)) * r3v;\n"
+         "        *((device float *)(dst + (ulong)d * hc->nb0 + dst_hc * hc->nb1)) = acc;\n"
+         "      }\n"
+         "    }\n"
+         "  }\n"
+         "}\n"];
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_dsv4_q8_hc_expand4_q8_0_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: dsv4_q8_hc_expand4_q8_0 MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return nil;
+    }
+    MTL4LibraryFunctionDescriptor *baseDesc = [MTL4LibraryFunctionDescriptor new];
+    baseDesc.library = lib;
+    baseDesc.name = @"dsv4_q8_hc_expand4_q8_0_mtl4";
+
+    MTLFunctionConstantValues *fcVals = [[MTLFunctionConstantValues alloc] init];
+    [fcVals setConstantValue:&nsg_value type:MTLDataTypeShort atIndex:600];
+    MTL4SpecializedFunctionDescriptor *specDesc = [MTL4SpecializedFunctionDescriptor new];
+    specDesc.functionDescriptor = baseDesc;
+    specDesc.constantValues = fcVals;
+    char spec_name[80];
+    snprintf(spec_name, sizeof(spec_name), "dsv4_q8_hc_expand4_q8_0_nsg%d", (int)nsg_value);
+    specDesc.specializedName = [NSString stringWithUTF8String:spec_name];
+
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = specDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 1024;
+    id<MTLComputePipelineState> pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!pipeline) {
+        fprintf(stderr, "ds4: dsv4_q8_hc_expand4_q8_0 MTL4 pipeline (NSG=%d) failed: %s\n",
+                (int)nsg_value, err ? err.localizedDescription.UTF8String : "(no error)");
+        return nil;
+    }
+    fprintf(stderr, "ds4: dsv4_q8_hc_expand4_q8_0 MTL4 pipeline initialized (NSG=%d, NR0=2)\n",
+            (int)nsg_value);
+    return pipeline;
+}
+
+static id<MTLComputePipelineState> g_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_pipeline;
+static int g_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_init_attempted;
+static int g_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_init_ok;
+
+static int ds4_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_pipeline_init(void) {
+    if (g_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_init_attempted) return g_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_init_ok;
+    g_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_init_attempted = 1;
+    g_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_pipeline = ds4_dsv4_q8_hc_expand4_q8_0_build_pipeline(4);
+    g_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_init_ok = (g_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_pipeline != nil) ? 1 : 0;
+    return g_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_init_ok;
+}
+
+int ds4_gpu_mtl4_dsv4_q8_hc_expand4_q8_0_canary(uint32_t M, uint32_t N) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_pipeline_init()) return 0;
+    if (M == 0 || N == 0 || (M % 2) != 0 || (N % 32) != 0) {
+        fprintf(stderr, "ds4: q8_hc_expand4 canary needs M%%2==0 and N%%32==0 (got M=%u N=%u)\n", M, N);
+        return 0;
+    }
+
+    float *host_w = (float *)calloc((uint64_t)M * N, sizeof(float));
+    float *host_input = (float *)calloc(N, sizeof(float));
+    float *host_block_out = (float *)calloc(M, sizeof(float));
+    float *host_residual = (float *)calloc((uint64_t)M * 4, sizeof(float));
+    float host_post[4] = {0.5f, 0.25f, 0.125f, 0.0625f};
+    float host_comb[16];
+    for (int i = 0; i < 16; i++) host_comb[i] = 0.1f * (float)(i % 5);
+    float *host_dst = (float *)calloc((uint64_t)M * 4, sizeof(float));
+    float *expected_block = (float *)calloc(M, sizeof(float));
+    float *expected_dst = (float *)calloc((uint64_t)M * 4, sizeof(float));
+    const uint32_t n_blocks_per_row = N / 32u;
+    const uint64_t q8_row_bytes = (uint64_t)n_blocks_per_row * 34u;
+    uint8_t *host_q8 = (uint8_t *)calloc((uint64_t)M * q8_row_bytes, 1);
+    if (!host_w || !host_input || !host_block_out || !host_residual || !host_dst ||
+        !expected_block || !expected_dst || !host_q8) {
+        free(host_w); free(host_input); free(host_block_out); free(host_residual);
+        free(host_dst); free(expected_block); free(expected_dst); free(host_q8);
+        return 0;
+    }
+    for (uint32_t r = 0; r < M; r++) {
+        for (uint32_t c = 0; c < N; c++) {
+            host_w[(uint64_t)r * N + c] = (float)((int)((r * 13 + c * 7) % 250) - 125);
+        }
+        ds4_quantize_q8_0_row(host_w + (uint64_t)r * N, N, host_q8 + (uint64_t)r * q8_row_bytes);
+        for (uint32_t b = 0; b < n_blocks_per_row; b++) {
+            const uint8_t *blk = host_q8 + (uint64_t)r * q8_row_bytes + (uint64_t)b * 34u;
+            _Float16 d_half;
+            memcpy(&d_half, blk, sizeof(d_half));
+            const float d = (float)d_half;
+            const int8_t *qs = (const int8_t *)(blk + 2);
+            for (uint32_t i = 0; i < 32; i++) {
+                host_w[(uint64_t)r * N + (uint64_t)b * 32u + i] = (float)qs[i] * d;
+            }
+        }
+        for (int c = 0; c < 4; c++) {
+            host_residual[(uint64_t)r * 4 + c] = 0.1f * (float)((int)r + c);
+        }
+    }
+    for (uint32_t c = 0; c < N; c++) host_input[c] = ((float)((int)(c % 7)) - 3.0f) * 0.5f;
+    for (uint32_t r = 0; r < M; r++) {
+        double acc = 0.0;
+        for (uint32_t c = 0; c < N; c++) acc += (double)host_w[(uint64_t)r * N + c] * (double)host_input[c];
+        const float block_v = (float)acc;
+        expected_block[r] = block_v;
+        for (int dst_hc = 0; dst_hc < 4; dst_hc++) {
+            float v = block_v * host_post[dst_hc];
+            for (int k = 0; k < 4; k++) v += host_comb[dst_hc * 4 + k] * host_residual[(uint64_t)r * 4 + k];
+            expected_dst[(uint64_t)r * 4 + dst_hc] = v;
+        }
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> mvBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> hcBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> wBuf = [g_device newBufferWithBytes:host_q8 length:(uint64_t)M*q8_row_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> inBuf = [g_device newBufferWithBytes:host_input length:N*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> blockOutBuf = [g_device newBufferWithLength:M*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> resBuf = [g_device newBufferWithBytes:host_residual length:(uint64_t)M*4*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> postBuf = [g_device newBufferWithBytes:host_post length:4*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> combBuf = [g_device newBufferWithBytes:host_comb length:16*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:(uint64_t)M*4*sizeof(float) options:MTLResourceStorageModeShared];
+
+        struct {
+            int ne00, ne01, ne02;
+            uint64_t nb00, nb01, nb02, nb03;
+            int ne10, ne11, ne12;
+            uint64_t nb10, nb11, nb12, nb13;
+            int ne0, ne1, nr0;
+            int16_t r2, r3;
+        } mv;
+        memset(&mv, 0, sizeof(mv));
+        mv.ne00 = N; mv.ne01 = M; mv.ne02 = 1;
+        mv.nb00 = 1; mv.nb01 = q8_row_bytes;
+        mv.nb02 = (uint64_t)M * q8_row_bytes; mv.nb03 = mv.nb02;
+        mv.ne10 = N; mv.ne11 = 1; mv.ne12 = 1;
+        mv.nb10 = sizeof(float); mv.nb11 = (uint64_t)N * sizeof(float);
+        mv.nb12 = mv.nb11; mv.nb13 = mv.nb11;
+        mv.ne0 = M; mv.ne1 = 1; mv.nr0 = 2; mv.r2 = 1; mv.r3 = 1;
+        memcpy(mvBuf.contents, &mv, sizeof(mv));
+
+        struct {
+            int64_t n_embd, n_hc, n_tokens;
+            uint64_t nb_block0, nb_block1;
+            uint64_t nb_add0, nb_add1;
+            uint64_t nb_res0, nb_res1, nb_res2;
+            uint64_t nb_post0, nb_post1;
+            uint64_t nb_comb0, nb_comb1, nb_comb2;
+            uint64_t nb0, nb1;
+        } hc;
+        memset(&hc, 0, sizeof(hc));
+        hc.n_embd = M; hc.n_hc = 4; hc.n_tokens = 1;
+        hc.nb_block0 = sizeof(float); hc.nb_block1 = (uint64_t)M * sizeof(float);
+        /* residual layout: [M, 4] row-major — nb_res0 = 4*sizeof(float), nb_res1 = sizeof(float) */
+        hc.nb_res0 = 4 * sizeof(float); hc.nb_res1 = sizeof(float); hc.nb_res2 = 0;
+        /* post layout: [4] — stride sizeof(float) */
+        hc.nb_post0 = sizeof(float); hc.nb_post1 = 0;
+        /* comb layout: [4, 4] row-major — nb_comb0 = 4*sizeof(float), nb_comb1 = sizeof(float) */
+        hc.nb_comb0 = 4 * sizeof(float); hc.nb_comb1 = sizeof(float); hc.nb_comb2 = 0;
+        /* dst layout: [M, 4] row-major — nb0 = 4*sizeof(float), nb1 = sizeof(float) */
+        hc.nb0 = 4 * sizeof(float); hc.nb1 = sizeof(float);
+        memcpy(hcBuf.contents, &hc, sizeof(hc));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 16;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[9] = {
+                (id)mvBuf, (id)hcBuf, (id)wBuf, (id)inBuf,
+                (id)blockOutBuf, (id)resBuf, (id)postBuf, (id)combBuf, (id)dstBuf
+            };
+            [residency addAllocations:allocs count:9];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(16);
+            if (argTable) {
+                [argTable setAddress:mvBuf.gpuAddress atIndex:0];
+                [argTable setAddress:hcBuf.gpuAddress atIndex:1];
+                [argTable setAddress:wBuf.gpuAddress atIndex:2];
+                [argTable setAddress:inBuf.gpuAddress atIndex:3];
+                [argTable setAddress:blockOutBuf.gpuAddress atIndex:4];
+                [argTable setAddress:resBuf.gpuAddress atIndex:5];
+                [argTable setAddress:postBuf.gpuAddress atIndex:6];
+                [argTable setAddress:combBuf.gpuAddress atIndex:7];
+                [argTable setAddress:dstBuf.gpuAddress atIndex:8];
+
+                NSUInteger nth = 4u * 32u;
+                NSUInteger shmem_bytes = 2u * 32u * sizeof(float);
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(M / 2, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_block_out, blockOutBuf.contents, M * sizeof(float));
+                    memcpy(host_dst, dstBuf.contents, (uint64_t)M * 4 * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 16);
+            }
+        }
+    }
+    if (!rc) goto cleanup;
+
+    int block_mismatch = 0, dst_mismatch = 0;
+    double max_rel_block = 0.0, max_rel_dst = 0.0;
+    for (uint32_t r = 0; r < M; r++) {
+        double d = fabs((double)(host_block_out[r] - expected_block[r]));
+        double rel = d / (fabs((double)expected_block[r]) + 1e-3);
+        if (rel > max_rel_block) max_rel_block = rel;
+        if (rel > 5.0e-3) block_mismatch++;
+        for (int c = 0; c < 4; c++) {
+            d = fabs((double)(host_dst[(uint64_t)r * 4 + c] - expected_dst[(uint64_t)r * 4 + c]));
+            rel = d / (fabs((double)expected_dst[(uint64_t)r * 4 + c]) + 1e-3);
+            if (rel > max_rel_dst) max_rel_dst = rel;
+            if (rel > 5.0e-3) dst_mismatch++;
+        }
+    }
+    fprintf(stderr,
+        "ds4: dsv4_q8_hc_expand4_q8_0 MTL4 canary M=%u N=%u "
+        "block_mismatch=%d (max_rel=%.4e) dst_mismatch=%d (max_rel=%.4e)\n",
+        M, N,
+        block_mismatch, max_rel_block, dst_mismatch, max_rel_dst);
+
+cleanup:
+    free(host_w); free(host_input); free(host_block_out); free(host_residual);
+    free(host_dst); free(expected_block); free(expected_dst); free(host_q8);
+    return rc && (block_mismatch == 0 && dst_mismatch == 0) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +
