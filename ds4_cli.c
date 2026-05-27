@@ -2284,6 +2284,25 @@ int main(int argc, char **argv) {
         const uint32_t r = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
         return ds4_gpu_classic_wide_tile_audit_iq2_xxs(m, k, r) ? 0 : 1;
     }
+    /* Per-quant wide-tile audits — verify n64/n128 fixes work at R>32 */
+    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit-q8-0")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 64;
+        const uint32_t r = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
+        return ds4_gpu_mtl4_wide_tile_audit_q8_0(m, k, r) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit-q4-k")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        const uint32_t r = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
+        return ds4_gpu_mtl4_wide_tile_audit_q4_K(m, k, r) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit-q2-k")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        const uint32_t r = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
+        return ds4_gpu_mtl4_wide_tile_audit_q2_K(m, k, r) ? 0 : 1;
+    }
     /* --mul-mm-id-q4-k-canary [M [N [K [E]]]] : #736 Q4_K routed MoE matmul */
     if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q4-k-canary")) {
         const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;

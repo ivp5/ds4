@@ -1567,6 +1567,13 @@ int ds4_gpu_mtl4_wide_tile_audit_iq2_xxs(uint32_t M, uint32_t K, uint32_t R);
  * Verifies bug exists in upstream antirez, not just my MTL4 port. */
 int ds4_gpu_classic_wide_tile_audit_iq2_xxs(uint32_t M, uint32_t K, uint32_t R);
 
+/* silv 2026-05-28 task #749 — wide-tile audit for Q8_0/Q4_K/Q2_K.
+ * Same routing pattern as IQ2_XXS audit, per-quant analytic block setups.
+ * Verifies the n64/n128 fixes work at R>32 for all 3 remaining quants. */
+int ds4_gpu_mtl4_wide_tile_audit_q8_0(uint32_t M, uint32_t K, uint32_t R);
+int ds4_gpu_mtl4_wide_tile_audit_q4_K(uint32_t M, uint32_t K, uint32_t R);
+int ds4_gpu_mtl4_wide_tile_audit_q2_K(uint32_t M, uint32_t K, uint32_t R);
+
 /* silv 2026-05-28 task #736 — mul_mm_id_q4_K_f32 MTL4.
  * Routed MoE Q4_K prefill matmul. 144-byte 256-element blocks with
  * 6-bit packed scales+mins (get_scale_min_k4_just2) and 4-bit qs.
