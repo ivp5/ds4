@@ -1390,3 +1390,8 @@ int ds4_gpu_mtl4_mul_mm_id_map0_ne20_8_canary(uint32_t n_experts, uint32_t n_tok
  * Broadcast/repeat with modulo addressing. Used at layer-0 input
  * for HC-channel expansion of token embeddings. Non-MMA. */
 int ds4_gpu_mtl4_repeat_f32_canary(uint32_t src_rows, uint32_t src_cols, uint32_t row_factor, uint32_t col_factor);
+
+/* silv 2026-05-27 task #708 — swiglu_f32 MTL4.
+ * SiLU(x0) * x1 * alpha with optional clamp limit. Shared-expert
+ * activation. Non-MMA elementwise. */
+int ds4_gpu_mtl4_swiglu_f32_canary(uint32_t n_rows, uint32_t row_width, float alpha, float limit);

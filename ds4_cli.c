@@ -2006,6 +2006,14 @@ int main(int argc, char **argv) {
         const uint32_t cf = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
         return ds4_gpu_mtl4_repeat_f32_canary(sr, sc, rf, cf) ? 0 : 1;
     }
+    /* --swiglu-canary [n_rows [row_width [alpha [limit]]]] : task #708 SwiGLU activation */
+    if (argc >= 2 && !strcmp(argv[1], "--swiglu-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 64;
+        const float al = (argc >= 5) ? (float)atof(argv[4]) : 1.0f;
+        const float li = (argc >= 6) ? (float)atof(argv[5]) : 0.0f;
+        return ds4_gpu_mtl4_swiglu_f32_canary(nr, rw, al, li) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);
