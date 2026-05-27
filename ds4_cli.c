@@ -1968,6 +1968,44 @@ int main(int argc, char **argv) {
         const uint32_t top_k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
         return ds4_gpu_mtl4_argsort_merge_f32_i32_desc_canary(len, top_k) ? 0 : 1;
     }
+    /* --cpy-f32-f16-canary [n_rows [row_width]] : task #702 f32→f16 typed copy */
+    if (argc >= 2 && !strcmp(argv[1], "--cpy-f32-f16-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_cpy_f32_f16_canary(nr, rw) ? 0 : 1;
+    }
+    /* --cpy-f16-f32-canary [n_rows [row_width]] : task #703 f16→f32 typed copy */
+    if (argc >= 2 && !strcmp(argv[1], "--cpy-f16-f32-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_cpy_f16_f32_canary(nr, rw) ? 0 : 1;
+    }
+    /* --sum-rows-canary [n_rows [row_width]] : task #704 row-sum reduction */
+    if (argc >= 2 && !strcmp(argv[1], "--sum-rows-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_sum_rows_f32_f32_canary(nr, rw) ? 0 : 1;
+    }
+    /* --set-rows-canary [n_src [row_width]] : task #705 KV-cache scatter */
+    if (argc >= 2 && !strcmp(argv[1], "--set-rows-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_set_rows_f32_i32_canary(nr, rw) ? 0 : 1;
+    }
+    /* --map0-ne20-8-canary [n_experts [n_tokens]] : task #706 MoE routing-table builder */
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-8-canary")) {
+        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_8_canary(ne, nt) ? 0 : 1;
+    }
+    /* --repeat-canary [src_r [src_c [r_fac [c_fac]]]] : task #707 broadcast kernel */
+    if (argc >= 2 && !strcmp(argv[1], "--repeat-canary")) {
+        const uint32_t sr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
+        const uint32_t sc = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
+        const uint32_t rf = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 4;
+        const uint32_t cf = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
+        return ds4_gpu_mtl4_repeat_f32_canary(sr, sc, rf, cf) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

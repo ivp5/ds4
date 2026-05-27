@@ -1363,3 +1363,30 @@ int ds4_gpu_mtl4_hadamard16_wide_canary(uint32_t n_rows, uint32_t blocks_per_row
  * NEW patterns: binary-search partition + per-thread merge-front
  * advance + sentinel tail copy. */
 int ds4_gpu_mtl4_argsort_merge_f32_i32_desc_canary(uint32_t len, uint32_t top_k);
+
+/* silv 2026-05-27 tasks #702/#703 — cpy_f32_f16 + cpy_f16_f32 MTL4.
+ * Type-conversion variants of #693 cpy_f32_f32. Used at graph
+ * boundaries for f32↔f16 layout conversion. Non-MMA ports. */
+int ds4_gpu_mtl4_cpy_f32_f16_canary(uint32_t n_rows, uint32_t row_width);
+int ds4_gpu_mtl4_cpy_f16_f32_canary(uint32_t n_rows, uint32_t row_width);
+
+/* silv 2026-05-27 task #704 — sum_rows_f32_f32 MTL4.
+ * Per-row sum reduction with simd_sum + threadgroup combine.
+ * Used at compressor-pooling graph boundary. Non-MMA. */
+int ds4_gpu_mtl4_sum_rows_f32_f32_canary(uint32_t n_rows, uint32_t row_width);
+
+/* silv 2026-05-27 task #705 — set_rows_f32_i32 MTL4.
+ * KV-cache scatter: dst[idx[i]] = src[i]. Integer-indexed gather/
+ * scatter, no MMA. Used during KV writes. */
+int ds4_gpu_mtl4_set_rows_f32_i32_canary(uint32_t n_src_rows, uint32_t row_width);
+
+/* silv 2026-05-27 task #706 — mul_mm_id_map0_ne20_8 MTL4.
+ * MoE routing-table inverter: per-token expert list →
+ * per-expert (token, slot) list. NE20=8 hardcoded (DS4 production
+ * top-K). Non-MMA, threadgroup-memory cooperative. */
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_8_canary(uint32_t n_experts, uint32_t n_tokens);
+
+/* silv 2026-05-27 task #707 — repeat_f32 MTL4.
+ * Broadcast/repeat with modulo addressing. Used at layer-0 input
+ * for HC-channel expansion of token embeddings. Non-MMA. */
+int ds4_gpu_mtl4_repeat_f32_canary(uint32_t src_rows, uint32_t src_cols, uint32_t row_factor, uint32_t col_factor);

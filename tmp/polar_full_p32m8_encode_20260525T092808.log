@@ -1,3 +1,0 @@
-polar_mlx: 33024 encodings across 43 shards | GPU batch=64 | IO workers=4 | diag-every=8
-polar_mlx: 33024/33024 ok (0 err) in 44.69s = 1.35 ms/expert
-polar_mlx: cos_sim mean=0.9930  rel_L2 mean=0.1211
