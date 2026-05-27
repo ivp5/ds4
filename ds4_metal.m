@@ -16223,9 +16223,15 @@ int ds4_gpu_mtl4_hadamard16_canary(uint32_t n_rows, uint32_t n_in) {
         /* 16 blocks × 16 halves × 2 bytes = 512 B of threadgroup scratch. */
         [enc setThreadgroupMemoryLength:(NSUInteger)(16 * 16 * sizeof(uint16_t)) atIndex:0];
 
-        /* Apply H twice: H × H = I orthogonally, so the buffer round-trips. */
+        /* Apply H twice: H × H = I orthogonally, so the buffer round-trips.
+         * R1 fix: same-encoder sequential dispatches need an explicit memory
+         * barrier in MTL4 — there's no implicit ordering between the writes
+         * of dispatch #1 and the reads of dispatch #2. */
         [enc dispatchThreadgroups:MTLSizeMake(n_rows, tg_y, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc barrierAfterEncoderStages:MTLStageDispatch
+                   beforeEncoderStages:MTLStageDispatch
+                     visibilityOptions:MTL4VisibilityOptionDevice];
         [enc dispatchThreadgroups:MTLSizeMake(n_rows, tg_y, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
