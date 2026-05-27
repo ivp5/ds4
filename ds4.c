@@ -4803,6 +4803,12 @@ typedef struct {
  uint64_t gate_row_bytes[DS4_N_EXPERT_USED];
  uint64_t up_row_bytes[DS4_N_EXPERT_USED];
  int n_expert;
+ /* silv 2026-05-27 task #654 — organ-skip hook on Q4_K main CPU MoE path.
+  * Mirrors the IQ2_XXS path additions from #652. honest per-organ semantic:
+  * GATE→gate=1.0; UP→up=1.0; DOWN→mid=0. */
+ uint32_t layer_idx;
+ uint32_t selected_experts[DS4_N_EXPERT_USED];
+ uint8_t  organ_skip_active;
 } matvec_q4_k_mid_ctx;
 
 static void matvec_q4_k_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
@@ -4819,10 +4825,34 @@ static void matvec_q4_k_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
  float gate = 0.0f;
  float up = 0.0f;
 
+ /* Per-organ honest ablation (Q4_K mirror of #651 IQ2_XXS work).
+  * DOWN skip → mid=0 (whole expert ablation, cheapest path).
+  * GATE skip → gate=1.0 (silu(1)*up*ew = 0.731*up*ew).
+  * UP   skip → up=1.0   (silu(gate)*ew).
+  * Skip flag check is one bool branch per row when organ_skip_active=0. */
+ int skip_gate = 0, skip_up = 0;
+ if (ctx->organ_skip_active) {
+ const uint32_t E = ctx->selected_experts[slot];
+ if (ds4_organ_should_skip(ctx->layer_idx, E, DS4_ORGAN_DOWN)) {
+ ctx->mid[idx] = 0.0f;
+ continue;
+ }
+ skip_gate = ds4_organ_should_skip(ctx->layer_idx, E, DS4_ORGAN_GATE);
+ skip_up   = ds4_organ_should_skip(ctx->layer_idx, E, DS4_ORGAN_UP);
+ }
+
+ if (!skip_gate) {
  const block_q4_K *gate_row = (const block_q4_K *)(ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot]);
- const block_q4_K *up_row = (const block_q4_K *)(ctx->up_base[slot] + row * ctx->up_row_bytes[slot]);
  ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &gate, gate_row, ctx->xq);
+ } else {
+ gate = 1.0f;
+ }
+ if (!skip_up) {
+ const block_q4_K *up_row = (const block_q4_K *)(ctx->up_base[slot] + row * ctx->up_row_bytes[slot]);
  ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &up, up_row, ctx->xq);
+ } else {
+ up = 1.0f;
+ }
 
  if (ctx->clamp > 1.0e-6f) {
  if (gate > ctx->clamp) gate = ctx->clamp;
@@ -4834,7 +4864,11 @@ static void matvec_q4_k_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
 }
 
 /* Build all selected expert hidden vectors: Q4_K gate/up, clamp, SwiGLU, and
- * router weight. The down projection runs later on the quantized mids. */
+ * router weight. The down projection runs later on the quantized mids.
+ *
+ * silv 2026-05-27 task #654 — Q4_K mirror of #652 IQ2_XXS layer_idx
+ * parameter. Pass DS4_N_LAYER from callers that don't have a layer index
+ * to disable organ-skip on that path. */
 static DS4_MAYBE_UNUSED void matvec_q4_k_experts_mid_prequant(
  float *mid,
  const ds4_model *m,
@@ -4844,7 +4878,8 @@ static DS4_MAYBE_UNUSED void matvec_q4_k_experts_mid_prequant(
  const int *selected,
  const float *expert_weight,
  int n_expert,
- float clamp) {
+ float clamp,
+ uint32_t layer_idx) {
  if (gate_w->type != 12 || up_w->type != 12) ds4_die("expected Q4_K expert tensors");
  if (n_expert < 1 || n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
 
@@ -4874,11 +4909,14 @@ static DS4_MAYBE_UNUSED void matvec_q4_k_experts_mid_prequant(
  ds4_die("Q4_K expert tensors do not share a layout");
  }
  ctx.expert_weight[i] = expert_weight[i];
+ ctx.selected_experts[i] = (uint32_t)selected[i];
  }
  if (in_dim0 % QK_K != 0) ds4_die("Q4_K expert row is not QK_K aligned");
 
  ctx.in_dim = in_dim0;
  ctx.out_dim = out_dim0;
+ ctx.layer_idx = layer_idx;
+ ctx.organ_skip_active = (uint8_t)g_organ_skip_initialized;
  ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_q4_k_mid_worker, &ctx);
 }
 
@@ -7025,6 +7063,8 @@ static void layer_routed_moe_selected_one_prealloc(
  ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
 
  if (is_q4) {
+ /* GPU→CPU handoff path: no layer index. DS4_N_LAYER sentinel
+  * disables organ-skip via the bounds check in ds4_organ_should_skip. */
  matvec_q4_k_experts_mid_prequant(mid_all, model,
  layer->ffn_gate_exps,
  layer->ffn_up_exps,
@@ -7032,7 +7072,8 @@ static void layer_routed_moe_selected_one_prealloc(
  selected,
  weight_rows,
  DS4_N_EXPERT_USED,
- clamp);
+ clamp,
+ DS4_N_LAYER);
  } else {
  /* GPU→CPU batch handoff path: layer index is not available here.
   * Pass DS4_N_LAYER as a sentinel — ds4_organ_should_skip's bounds
