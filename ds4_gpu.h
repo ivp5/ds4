@@ -1540,3 +1540,10 @@ int ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_canary(uint32_t M, uint32_t N, uint32_t K
  * Canary uses scales=[1,1,1,1,0,0,0,0,1,1,1,1] + qs=0x11 + d=16,dmin=0
  * → every dequant val = 16 (analytic reference). */
 int ds4_gpu_mtl4_mul_mm_id_q4_K_f32_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
+
+/* silv 2026-05-28 task #737 — mul_mm_id_q2_K_f32 MTL4.
+ * Routed MoE Q2_K prefill matmul. 84-byte 256-element blocks with
+ * 4-bit sc/mn pair scales + 2-bit qs (4 elements per byte) + shift-based
+ * coef/mask LUT. Canary uses scales=0x11 + qs=0x55 + d=1,dmin=0 → every
+ * dequant val = 1 across all (il/2)%4 shifts. */
+int ds4_gpu_mtl4_mul_mm_id_q2_K_f32_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
