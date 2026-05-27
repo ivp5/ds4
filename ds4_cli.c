@@ -2337,6 +2337,18 @@ int main(int argc, char **argv) {
         extern int ds4_cli_vqb2_pack_probe(const char *pack, const char *index);
         return ds4_cli_vqb2_pack_probe(argv[2], argv[3]);
     }
+    /* --vqb2-pack-layer-tour <pack> <index_csv> <layer> : silv 2026-05-28
+     * H2125 layer-major iterator smoke test. Walks all 64 packets for the
+     * given layer in (kind, row_start) order, decodes one pair per packet.
+     * Expected: 16 gate + 16 up + 32 down = 64 packets, 64 successful decodes. */
+    if (argc >= 2 && !strcmp(argv[1], "--vqb2-pack-layer-tour")) {
+        if (argc < 5) {
+            fprintf(stderr, "usage: --vqb2-pack-layer-tour <pack> <index_csv> <layer>\n");
+            return 1;
+        }
+        extern int ds4_cli_vqb2_pack_layer_tour(const char *pack, const char *index, uint32_t layer);
+        return ds4_cli_vqb2_pack_layer_tour(argv[2], argv[3], (uint32_t)atoi(argv[4]));
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

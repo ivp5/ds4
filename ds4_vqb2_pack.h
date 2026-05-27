@@ -93,6 +93,23 @@ bool ds4_vqb2_pack_view_from_entry(const ds4_vqb2_pack *p,
                                    uint32_t entry_index,
                                    ds4_vqb2_file *out_view);
 
+/* H2125 layer-packet locality: iterate every entry for one layer in
+ * (kind, row_start)-major order and invoke the callback with a freshly
+ * materialized view. The view is valid only during the callback. Returns
+ * the number of entries visited; -1 on error.
+ *
+ * Each routed layer event touches at most 64 packets (16 gate + 16 up + 32
+ * down for the standard DS4 V4 shape). With this iterator, decode dispatch
+ * can walk the layer's resident packets in cache-friendly order. */
+typedef int (*ds4_vqb2_pack_layer_cb)(uint32_t entry_idx,
+                                      const ds4_vqb2_pack_entry *entry,
+                                      const ds4_vqb2_file *view,
+                                      void *userdata);
+int ds4_vqb2_pack_for_layer(const ds4_vqb2_pack *p,
+                            uint32_t layer,
+                            ds4_vqb2_pack_layer_cb cb,
+                            void *userdata);
+
 /* Print summary to stderr: pack size, n_entries, K mix, kind mix, layer span. */
 void ds4_vqb2_pack_print_summary(const ds4_vqb2_pack *p);
 

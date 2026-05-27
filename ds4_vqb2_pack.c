@@ -310,6 +310,31 @@ bool ds4_vqb2_pack_get_view(const ds4_vqb2_pack *p,
     return ds4_vqb2_pack_view_from_entry(p, (uint32_t)idx, out_view);
 }
 
+int ds4_vqb2_pack_for_layer(const ds4_vqb2_pack *p,
+                            uint32_t layer,
+                            ds4_vqb2_pack_layer_cb cb,
+                            void *userdata) {
+    if (!p || !cb) return -1;
+    int visited = 0;
+    /* Walk lookup in (kind_id, row_block_idx) order so callback sees
+     * gate-rows-0..15, up-rows-0..15, down-rows-0..31 — the layer-major
+     * access pattern H2125 calls out as the canonical decode order. */
+    for (uint32_t kind = 0; kind < DS4_VQB2_PACK_N_KIND; kind++) {
+        for (uint32_t rb = 0; rb < DS4_VQB2_PACK_MAX_ROW_BLOCKS; rb++) {
+            const int32_t slot = lookup_slot(layer, kind, rb * 128u);
+            if (slot < 0) continue;
+            const int32_t idx = p->lookup[slot];
+            if (idx < 0) continue;
+            ds4_vqb2_file view;
+            if (!ds4_vqb2_pack_view_from_entry(p, (uint32_t)idx, &view)) continue;
+            const int rc = cb((uint32_t)idx, &p->entries[idx], &view, userdata);
+            visited++;
+            if (rc < 0) return -visited;  /* callback abort */
+        }
+    }
+    return visited;
+}
+
 /* silv 2026-05-28 — smoke test entry point used by --vqb2-pack-probe.
  * Opens pack, prints summary, materializes views from 5 entries spread
  * across the pack range, decodes a sample pair from each, and (if a
@@ -429,6 +454,54 @@ int ds4_cli_vqb2_pack_probe(const char *pack_path, const char *index_csv_path) {
     ds4_vqb2_pack_close(&pack);
     fprintf(stderr, "ds4_cli_vqb2_pack_probe: %d/%u views decoded\n", ok_views, sample_n + 1);
     return ok_views == (int)sample_n + 1 ? 0 : 1;
+}
+
+/* Layer-tour callback: count and decode-probe each entry. */
+typedef struct {
+    uint32_t n_visited;
+    uint32_t n_decoded;
+    uint32_t n_gate;
+    uint32_t n_up;
+    uint32_t n_down;
+    uint32_t k_min;
+    uint32_t k_max;
+} layer_tour_state;
+
+static int layer_tour_cb(uint32_t entry_idx,
+                         const ds4_vqb2_pack_entry *entry,
+                         const ds4_vqb2_file *view,
+                         void *userdata) {
+    layer_tour_state *s = (layer_tour_state *)userdata;
+    s->n_visited++;
+    float re = 0.f, im = 0.f;
+    if (ds4_vqb2_decode_pair(view, 0, 0, 0, &re, &im)) s->n_decoded++;
+    if (entry->kind_id == 0) s->n_gate++;
+    else if (entry->kind_id == 1) s->n_up++;
+    else if (entry->kind_id == 2) s->n_down++;
+    if (entry->k < s->k_min) s->k_min = entry->k;
+    if (entry->k > s->k_max) s->k_max = entry->k;
+    (void)entry_idx;
+    return 0;
+}
+
+int ds4_cli_vqb2_pack_layer_tour(const char *pack_path, const char *index_csv_path, uint32_t layer) {
+    ds4_vqb2_pack pack;
+    if (!ds4_vqb2_pack_open(pack_path, index_csv_path, &pack)) {
+        fprintf(stderr, "ds4_cli_vqb2_pack_layer_tour: open failed\n");
+        return 1;
+    }
+    layer_tour_state s = { .n_visited = 0, .n_decoded = 0,
+                           .n_gate = 0, .n_up = 0, .n_down = 0,
+                           .k_min = 0xFFFFFFFFu, .k_max = 0 };
+    const int visited = ds4_vqb2_pack_for_layer(&pack, layer, layer_tour_cb, &s);
+    fprintf(stderr,
+        "ds4_cli_vqb2_pack_layer_tour: layer=%u visited=%d (gate=%u up=%u down=%u) "
+        "decoded=%u K=[%u, %u]\n",
+        layer, visited, s.n_gate, s.n_up, s.n_down, s.n_decoded,
+        s.k_min == 0xFFFFFFFFu ? 0 : s.k_min, s.k_max);
+    ds4_vqb2_pack_close(&pack);
+    /* Standard DS4 V4 layer: 16 gate + 16 up + 32 down = 64 packets. */
+    return (visited == 64 && s.n_decoded == 64) ? 0 : 1;
 }
 
 void ds4_vqb2_pack_print_summary(const ds4_vqb2_pack *p) {
