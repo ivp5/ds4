@@ -1512,3 +1512,9 @@ int ds4_gpu_mtl4_indexer_scores_tiled_canary(uint32_t n_tokens, uint32_t n_comp,
  * 128 threads. Hardcoded FCs (bc_inp=false, bc_out=false). 6 KB shmem
  * minimum. Production matmul: covers all dense FP16 prefill matmuls. */
 int ds4_gpu_mtl4_mul_mm_f16_f32_canary(uint32_t M, uint32_t N, uint32_t K);
+
+/* silv 2026-05-28 task #733 — mul_mm_q8_0_f32 MTL4.
+ * Q8_0-weight × FP16-input → FP32-output GEMM with inline Q8_0 dequant.
+ * nl=2 (2 sub-blocks per 32-element Q8_0 block). Sister of #732 with
+ * block_q8_0 reads instead of half4x4. */
+int ds4_gpu_mtl4_mul_mm_q8_0_f32_canary(uint32_t M, uint32_t N, uint32_t K);
