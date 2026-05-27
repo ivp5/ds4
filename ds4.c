@@ -17100,6 +17100,7 @@ struct ds4_engine {
  ds4_mtp_weights mtp_weights;
  ds4_backend backend;
  int mtp_draft_tokens;
+ int mtp_draft_tree_width;  /* silv 2026-05-27 spec-tree branching */
  float mtp_margin;
  char *directional_steering_file;
  float *directional_steering_dirs;
@@ -20721,6 +20722,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  e->quality = opt->quality;
  e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
  if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
+ e->mtp_draft_tree_width = opt->mtp_draft_tree_width > 0 ? opt->mtp_draft_tree_width : 1;
+ if (e->mtp_draft_tree_width > 4) e->mtp_draft_tree_width = 4;
+ if (e->mtp_draft_tree_width > 1) {
+   fprintf(stderr, "ds4: mtp_draft_tree_width=%d (spec-tree mode, not yet wired — falls back to linear)\n",
+           e->mtp_draft_tree_width);
+ }
  e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
  if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
  (!opt->directional_steering_file || !opt->directional_steering_file[0]))

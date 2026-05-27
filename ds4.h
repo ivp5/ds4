@@ -79,6 +79,9 @@ typedef struct {
     ds4_backend backend;
     int n_threads;
     int mtp_draft_tokens;
+    int mtp_draft_tree_width;  /* silv 2026-05-27: spec-tree branching factor B.
+                                * 1 = linear (default, current behavior);
+                                * 2-4 = tree spec-decode at low-entropy positions */
     float mtp_margin;
     const char *directional_steering_file;
     float directional_steering_attn;

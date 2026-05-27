@@ -1439,6 +1439,7 @@ static cli_config parse_options(int argc, char **argv) {
             .model_path = "ds4flash.gguf",
             .backend = default_backend(),
             .mtp_draft_tokens = 1,
+            .mtp_draft_tree_width = 1,  /* silv 2026-05-27: spec-tree default linear */
             .mtp_margin = 3.0f,
         },
         .gen = {
@@ -1481,6 +1482,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-tree-width")) {
+            /* silv 2026-05-27: spec-tree branching factor (1=linear, 2-4=tree). */
+            c.engine.mtp_draft_tree_width = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
