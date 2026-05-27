@@ -30393,6 +30393,279 @@ int ds4_gpu_mtl4_indexer_scores_tiled_f32_canary(uint32_t n_tokens, uint32_t n_c
 }
 
 /* ============================================================ */
+/* dsv4_indexer_scores_tiled MTL4 port (silv 2026-05-28 #731)   */
+/* ============================================================ */
+/* Half-precision Q/K staging variant of #730. The Q and K tiles
+ * downcast to half before MMA; dot accumulator and final score
+ * stay float. Long-context profiling identified the indexer score
+ * matrix as prefill-slope dominant, so this trades ~1e-3 relative
+ * error in the ranking for a ~2× MMA throughput improvement. */
+
+static id<MTLComputePipelineState> g_indexer_scores_tiled_mtl4_pipeline;
+static int g_indexer_scores_tiled_mtl4_init_attempted;
+static int g_indexer_scores_tiled_mtl4_init_ok;
+
+static int ds4_indexer_scores_tiled_mtl4_pipeline_init(void) {
+    if (g_indexer_scores_tiled_mtl4_init_attempted) return g_indexer_scores_tiled_mtl4_init_ok;
+    g_indexer_scores_tiled_mtl4_init_attempted = 1;
+
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "#include <metal_simdgroup_matrix>\n"
+         "using namespace metal;\n"
+         "struct sf_args {\n"
+         "  uint n_comp; uint n_tokens; uint n_head; uint head_dim;\n"
+         "  uint pos0; uint ratio;\n"
+         "  ulong q_token_stride; ulong q_head_stride;\n"
+         "  ulong weights_token_stride;\n"
+         "  ulong index_row_stride;\n"
+         "  ulong score_token_stride;\n"
+         "  float scale;\n"
+         "};\n"
+         "kernel void indexer_scores_tiled_mtl4(\n"
+         "    device const sf_args *args      [[buffer(0)]],\n"
+         "    device const char    *q         [[buffer(1)]],\n"
+         "    device const char    *weights   [[buffer(2)]],\n"
+         "    device const char    *index_comp[[buffer(3)]],\n"
+         "    device       char    *scores    [[buffer(4)]],\n"
+         "    threadgroup  float   *shared    [[threadgroup(0)]],\n"
+         "    uint2  tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort tid   [[thread_index_in_threadgroup]],\n"
+         "    ushort lane  [[thread_index_in_simdgroup]],\n"
+         "    ushort sg    [[simdgroup_index_in_threadgroup]]) {\n"
+         "  constexpr uint TM = 8;\n"
+         "  constexpr uint TN = 32;\n"
+         "  constexpr uint TS = 8;\n"
+         "  constexpr uint D = 128;\n"
+         "  const uint c0 = tgpig.x * TN;\n"
+         "  const uint t0 = tgpig.y * TM;\n"
+         "  threadgroup half *qtg = (threadgroup half *)shared;\n"
+         "  threadgroup half *ktg = qtg + TM*D;\n"
+         "  threadgroup float *dot = (threadgroup float *)(ktg + TN*D);\n"
+         "  const uint last_token = min(t0 + TM, args->n_tokens);\n"
+         "  const uint max_visible = last_token > t0 ?\n"
+         "    min((args->pos0 + last_token) / args->ratio, args->n_comp) : 0u;\n"
+         "  if (c0 >= max_visible) {\n"
+         "    for (uint i = tid; i < TM*TN; i += 128) {\n"
+         "      const uint r = i / TN;\n"
+         "      const uint cc = i - r*TN;\n"
+         "      const uint token = t0 + r;\n"
+         "      const uint comp = c0 + cc;\n"
+         "      if (token < args->n_tokens && comp < args->n_comp) {\n"
+         "        device float *dst = (device float *)(scores +\n"
+         "          (ulong)token * args->score_token_stride) + comp;\n"
+         "        *dst = -INFINITY;\n"
+         "      }\n"
+         "    }\n"
+         "    return;\n"
+         "  }\n"
+         "  for (uint i = tid; i < TN*D; i += 128) {\n"
+         "    const uint cc = i / D;\n"
+         "    const uint d = i - cc*D;\n"
+         "    const uint comp = c0 + cc;\n"
+         "    half v = half(0.0f);\n"
+         "    if (comp < args->n_comp) {\n"
+         "      device const float *row = (device const float *)(index_comp +\n"
+         "        (ulong)comp * args->index_row_stride);\n"
+         "      v = half(row[d]);\n"
+         "    }\n"
+         "    ktg[i] = v;\n"
+         "  }\n"
+         "  const uint cell0 = lane;\n"
+         "  const uint cell1 = lane + 32u;\n"
+         "  const uint row0 = cell0 >> 3;\n"
+         "  const uint row1 = cell1 >> 3;\n"
+         "  const uint sub0 = cell0 & 7u;\n"
+         "  const uint sub1 = cell1 & 7u;\n"
+         "  const uint col0 = (uint)sg * TS + sub0;\n"
+         "  const uint col1 = (uint)sg * TS + sub1;\n"
+         "  const uint token0 = t0 + row0;\n"
+         "  const uint token1 = t0 + row1;\n"
+         "  const uint comp0 = c0 + col0;\n"
+         "  const uint comp1 = c0 + col1;\n"
+         "  float acc0 = 0.0f;\n"
+         "  float acc1 = 0.0f;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (uint head = 0; head < args->n_head; head++) {\n"
+         "    for (uint i = tid; i < TM*D; i += 128) {\n"
+         "      const uint r = i / D;\n"
+         "      const uint d = i - r*D;\n"
+         "      const uint token = t0 + r;\n"
+         "      half v = half(0.0f);\n"
+         "      if (token < args->n_tokens) {\n"
+         "        device const float *qrow = (device const float *)(q +\n"
+         "          (ulong)token * args->q_token_stride +\n"
+         "          (ulong)head * args->q_head_stride);\n"
+         "        v = half(qrow[d]);\n"
+         "      }\n"
+         "      qtg[i] = v;\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    simdgroup_float8x8 mdot = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+         "    for (uint db = 0; db < D/TS; db++) {\n"
+         "      simdgroup_half8x8 mq;\n"
+         "      simdgroup_half8x8 mk;\n"
+         "      simdgroup_load(mq, qtg + db*TS, D, ulong2(0, 0), false);\n"
+         "      simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, ulong2(0, 0), true);\n"
+         "      simdgroup_multiply_accumulate(mdot, mq, mk, mdot);\n"
+         "    }\n"
+         "    simdgroup_store(mdot, dot + (uint)sg * TS, TN, ulong2(0, 0), false);\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    if (token0 < args->n_tokens && comp0 < args->n_comp) {\n"
+         "      device const float *w = (device const float *)(weights +\n"
+         "        (ulong)token0 * args->weights_token_stride);\n"
+         "      const float s = dot[row0*TN + col0];\n"
+         "      acc0 += max(s, 0.0f) * (w[head] * args->scale);\n"
+         "    }\n"
+         "    if (token1 < args->n_tokens && comp1 < args->n_comp) {\n"
+         "      device const float *w = (device const float *)(weights +\n"
+         "        (ulong)token1 * args->weights_token_stride);\n"
+         "      const float s = dot[row1*TN + col1];\n"
+         "      acc1 += max(s, 0.0f) * (w[head] * args->scale);\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  if (token0 < args->n_tokens && comp0 < args->n_comp) {\n"
+         "    const uint visible = min((args->pos0 + token0 + 1u) / args->ratio, args->n_comp);\n"
+         "    device float *dst = (device float *)(scores +\n"
+         "      (ulong)token0 * args->score_token_stride) + comp0;\n"
+         "    *dst = comp0 < visible ? acc0 : -INFINITY;\n"
+         "  }\n"
+         "  if (token1 < args->n_tokens && comp1 < args->n_comp) {\n"
+         "    const uint visible = min((args->pos0 + token1 + 1u) / args->ratio, args->n_comp);\n"
+         "    device float *dst = (device float *)(scores +\n"
+         "      (ulong)token1 * args->score_token_stride) + comp1;\n"
+         "    *dst = comp1 < visible ? acc1 : -INFINITY;\n"
+         "  }\n"
+         "}\n";
+    g_indexer_scores_tiled_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_indexer_scores_tiled_mtl4", @"indexer_scores_tiled_mtl4", 1024, NULL, 0);
+    g_indexer_scores_tiled_mtl4_init_ok = (g_indexer_scores_tiled_mtl4_pipeline != nil) ? 1 : 0;
+    return g_indexer_scores_tiled_mtl4_init_ok;
+}
+
+int ds4_gpu_mtl4_indexer_scores_tiled_canary(uint32_t n_tokens, uint32_t n_comp, uint32_t n_head) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_indexer_scores_tiled_mtl4_pipeline_init()) return 0;
+    if ((n_tokens % 8) != 0 || (n_comp % 32) != 0) return 0;
+    const uint32_t D = 128;
+    const uint64_t q_total = (uint64_t)n_tokens * n_head * D;
+    const uint64_t k_total = (uint64_t)n_comp * D;
+    const uint64_t w_total = (uint64_t)n_tokens * n_head;
+    const uint64_t s_total = (uint64_t)n_tokens * n_comp;
+
+    float *host_q = (float *)calloc(q_total, sizeof(float));
+    float *host_k = (float *)calloc(k_total, sizeof(float));
+    float *host_w = (float *)calloc(w_total, sizeof(float));
+    float *host_s = (float *)calloc(s_total, sizeof(float));
+    if (!host_q || !host_k || !host_w || !host_s) {
+        free(host_q); free(host_k); free(host_w); free(host_s); return 0;
+    }
+    for (uint64_t i = 0; i < q_total; i++) host_q[i] = 1.0f;
+    for (uint64_t i = 0; i < k_total; i++) host_k[i] = 1.0f;
+    for (uint64_t i = 0; i < w_total; i++) host_w[i] = 1.0f;
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> qBuf = [g_device newBufferWithBytes:host_q length:q_total*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kBuf = [g_device newBufferWithBytes:host_k length:k_total*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> wBuf = [g_device newBufferWithBytes:host_w length:w_total*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> sBuf = [g_device newBufferWithLength:s_total*sizeof(float) options:MTLResourceStorageModeShared];
+
+        struct {
+            uint32_t n_comp, n_tokens, n_head, head_dim;
+            uint32_t pos0, ratio;
+            uint64_t q_token_stride, q_head_stride;
+            uint64_t weights_token_stride;
+            uint64_t index_row_stride;
+            uint64_t score_token_stride;
+            float scale;
+        } args;
+        memset(&args, 0, sizeof(args));
+        args.n_comp = n_comp; args.n_tokens = n_tokens; args.n_head = n_head; args.head_dim = D;
+        args.pos0 = 1u << 30; args.ratio = 1;  /* bypass causal mask */
+        args.q_token_stride = (uint64_t)n_head * D * sizeof(float);
+        args.q_head_stride = (uint64_t)D * sizeof(float);
+        args.weights_token_stride = (uint64_t)n_head * sizeof(float);
+        args.index_row_stride = (uint64_t)D * sizeof(float);
+        args.score_token_stride = (uint64_t)n_comp * sizeof(float);
+        args.scale = 1.0f;
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 6;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[5] = {(id)argsBuf, (id)qBuf, (id)kBuf, (id)wBuf, (id)sBuf};
+            [residency addAllocations:allocs count:5];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:qBuf.gpuAddress atIndex:1];
+                [argTable setAddress:wBuf.gpuAddress atIndex:2];
+                [argTable setAddress:kBuf.gpuAddress atIndex:3];
+                [argTable setAddress:sBuf.gpuAddress atIndex:4];
+
+                /* shmem: half tiles + float dot. (8 + 32) × 128 halves + 8 × 32 floats
+                 * = 40 × 128 × 2 + 256 × 4 = 10240 + 1024 = 11264 bytes. */
+                NSUInteger shmem_bytes = 40u * 128u * sizeof(uint16_t) + 8u * 32u * sizeof(float);
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_indexer_scores_tiled_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(n_comp / 32, n_tokens / 8, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_s, sBuf.contents, s_total * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 8);
+            }
+        }
+    }
+    if (!rc) { free(host_q); free(host_k); free(host_w); free(host_s); return 0; }
+
+    /* FP16-tile MMA expected result: D × n_head exactly (1.0 × 1.0 = 1.0 in half is exact).
+     * For non-trivial inputs there's ~3e-4 relative noise. For all-ones, expect exact. */
+    const float expected = (float)D * (float)n_head;
+    int n_match = 0, n_other = 0;
+    double max_rel = 0.0;
+    for (uint64_t i = 0; i < s_total; i++) {
+        const double d = fabs((double)(host_s[i] - expected));
+        const double rel = d / (fabs((double)expected) + 1e-7);
+        if (rel > max_rel) max_rel = rel;
+        if (rel < 1e-3) n_match++;
+        else n_other++;
+    }
+    fprintf(stderr,
+        "ds4: indexer_scores_tiled MTL4 canary n_tokens=%u n_comp=%u n_head=%u "
+        "expected=%.1f match=%d other=%d max_rel=%.4e s[0]=%.2f\n",
+        n_tokens, n_comp, n_head, (double)expected, n_match, n_other, max_rel, (double)host_s[0]);
+    free(host_q); free(host_k); free(host_w); free(host_s);
+    return (n_match == (int)s_total) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +

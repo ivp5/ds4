@@ -1500,3 +1500,8 @@ int ds4_gpu_mtl4_mma_iso_canary(uint32_t n_sg);
  * Uses simdgroup MMA (8x8 tiles) with 4 simdgroups × 32 lanes = 128 threads.
  * shmem: 21 KB at D=128. Re-attempt after isolation tests verified MMA works. */
 int ds4_gpu_mtl4_indexer_scores_tiled_f32_canary(uint32_t n_tokens, uint32_t n_comp, uint32_t n_head);
+
+/* silv 2026-05-28 task #731 — dsv4_indexer_scores_tiled MTL4 (half variant).
+ * Same as #730 but Q/K tiles downcast to half for ~2× MMA throughput.
+ * Dot accumulator stays float. shmem: 11 KB at D=128. */
+int ds4_gpu_mtl4_indexer_scores_tiled_canary(uint32_t n_tokens, uint32_t n_comp, uint32_t n_head);
