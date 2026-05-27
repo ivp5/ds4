@@ -1338,3 +1338,10 @@ int ds4_gpu_mtl4_rope_tail_f32_canary(uint32_t head_dim, uint32_t n_rot, uint32_
  * two float tensors along a chosen dim. Used to assemble attention
  * inputs with the exact tensor layout downstream kernels expect. */
 int ds4_gpu_mtl4_concat_canary(uint32_t n0, uint32_t n1, uint32_t n_rows);
+
+/* silv 2026-05-27 task #697 — dsv4_hc_split_weighted_sum_norm4 MTL4.
+ * Three-stage fused kernel: HC=4 Sinkhorn split + HC-weighted sum
+ * into 4096-wide row + RMSNorm with weight × row scaling. Hardcoded
+ * n_hc=4, n_embd=4096 (DS4 production shape). 16.5KB threadgroup memory.
+ * Saves 2 dispatches per token vs separate split + sum + RMSNorm. */
+int ds4_gpu_mtl4_hc_split_weighted_sum_norm4_canary(uint32_t n_rows);

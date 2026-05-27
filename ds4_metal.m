@@ -24519,6 +24519,363 @@ int ds4_gpu_mtl4_concat_canary(uint32_t n0, uint32_t n1, uint32_t n_rows) {
 }
 
 /* ============================================================ */
+/* dsv4_hc_split_weighted_sum_norm4 MTL4 port (silv 2026-05-27 #697) */
+/* ============================================================ */
+/* MTL4 port of kernel_dsv4_hc_split_weighted_sum_norm4. Three-stage
+ * fused kernel:
+ *   1. tid 0 runs HC=4 Sinkhorn split path (same as #690 / #694)
+ *   2. All threads collapse HC streams into row_shmem[4096] +
+ *      accumulate sumf for RMSNorm (cross-simd reduction)
+ *   3. Write dst[i] = collapsed_v + norm_dst[i] = (v * rsqrt(rms))*w
+ *
+ * Hardcoded n_hc=4 and n_embd=4096 (DS4 production shape).
+ * Threadgroup memory: row_shmem[4096] + pre_shmem[4] + sum_shmem[32]
+ *   = 4132 floats × 4 bytes = 16528 bytes. Under Metal 32K tg limit. */
+
+static id<MTLComputePipelineState> g_hc_split_weighted_sum_norm4_mtl4_pipeline;
+static int g_hc_split_weighted_sum_norm4_mtl4_init_attempted;
+static int g_hc_split_weighted_sum_norm4_mtl4_init_ok;
+
+static int ds4_hc_split_weighted_sum_norm4_mtl4_pipeline_init(void) {
+    if (g_hc_split_weighted_sum_norm4_mtl4_init_attempted) return g_hc_split_weighted_sum_norm4_mtl4_init_ok;
+    g_hc_split_weighted_sum_norm4_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct hcswn_args {\n"
+         "  int64_t  n_embd;\n"
+         "  int32_t  n_hc;\n"
+         "  int32_t  sinkhorn_iters;\n"
+         "  int64_t  n_rows;\n"
+         "  int64_t  mix_hc;\n"
+         "  uint64_t nb_mix1;\n"
+         "  uint64_t nb_split1;\n"
+         "  uint64_t nb_x0;\n"
+         "  uint64_t nb_x1;\n"
+         "  uint64_t nb_x2;\n"
+         "  uint64_t nb0;\n"
+         "  uint64_t nb1;\n"
+         "  uint64_t nb_norm1;\n"
+         "  float    eps;\n"
+         "  float    norm_eps;\n"
+         "};\n"
+         "kernel void hc_split_weighted_sum_norm4_mtl4(\n"
+         "    device const hcswn_args *args [[buffer(0)]],\n"
+         "    device const char       *mixes [[buffer(1)]],\n"
+         "    device const float      *scale [[buffer(2)]],\n"
+         "    device const float      *base  [[buffer(3)]],\n"
+         "    device const char       *x     [[buffer(4)]],\n"
+         "    device       char       *split [[buffer(5)]],\n"
+         "    device       char       *dst   [[buffer(6)]],\n"
+         "    device const char       *norm_weight [[buffer(7)]],\n"
+         "    device       char       *norm_dst    [[buffer(8)]],\n"
+         "    threadgroup  float      *shared [[threadgroup(0)]],\n"
+         "    uint   row   [[threadgroup_position_in_grid]],\n"
+         "    ushort tid   [[thread_position_in_threadgroup]],\n"
+         "    ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+         "    ushort tiisg [[thread_index_in_simdgroup]],\n"
+         "    ushort ntg   [[threads_per_threadgroup]]) {\n"
+         "  if ((int64_t)row >= args->n_rows || args->n_hc != 4 || args->n_embd != 4096) return;\n"
+         "  threadgroup float4 *row_shmem = (threadgroup float4 *)shared;       /* [1024] = 4096 floats */\n"
+         "  threadgroup float  *pre_shmem = shared + 4096;                       /* [4]  */\n"
+         "  threadgroup float  *sum_shmem = pre_shmem + 4;                       /* [32] */\n"
+         "  device const float *mix = (device const float *)(mixes + (uint64_t)row * args->nb_mix1);\n"
+         "  device       float *out = (device       float *)(split + (uint64_t)row * args->nb_split1);\n"
+         "  if (sgitg == 0) sum_shmem[tiisg] = 0.0f;\n"
+         "  if (tid == 0) {\n"
+         "    const float epsv = args->eps;\n"
+         "    const float pre_s = scale[0];\n"
+         "    const float post_s = scale[1];\n"
+         "    const float comb_s = scale[2];\n"
+         "    const float4 pre_z = *((device const float4 *)mix) * pre_s + *((device const float4 *)base);\n"
+         "    const float4 pre = 1.0f / (1.0f + exp(-pre_z)) + epsv;\n"
+         "    *((device float4 *)out) = pre;\n"
+         "    pre_shmem[0] = pre.x; pre_shmem[1] = pre.y;\n"
+         "    pre_shmem[2] = pre.z; pre_shmem[3] = pre.w;\n"
+         "    const float4 post_z = *((device const float4 *)(mix + 4)) * post_s + *((device const float4 *)(base + 4));\n"
+         "    *((device float4 *)(out + 4)) = 2.0f / (1.0f + exp(-post_z));\n"
+         "    float4 r0 = *((device const float4 *)(mix +  8)) * comb_s + *((device const float4 *)(base +  8));\n"
+         "    float4 r1 = *((device const float4 *)(mix + 12)) * comb_s + *((device const float4 *)(base + 12));\n"
+         "    float4 r2 = *((device const float4 *)(mix + 16)) * comb_s + *((device const float4 *)(base + 16));\n"
+         "    float4 r3 = *((device const float4 *)(mix + 20)) * comb_s + *((device const float4 *)(base + 20));\n"
+         "    const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));\n"
+         "    const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));\n"
+         "    const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));\n"
+         "    const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));\n"
+         "    r0 = exp(r0 - m0); r1 = exp(r1 - m1); r2 = exp(r2 - m2); r3 = exp(r3 - m3);\n"
+         "    r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;\n"
+         "    r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;\n"
+         "    r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;\n"
+         "    r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;\n"
+         "    float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);\n"
+         "    r0 *= col_inv; r1 *= col_inv; r2 *= col_inv; r3 *= col_inv;\n"
+         "    for (int iter = 1; iter < args->sinkhorn_iters; ++iter) {\n"
+         "      r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);\n"
+         "      r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);\n"
+         "      r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);\n"
+         "      r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);\n"
+         "      col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);\n"
+         "      r0 *= col_inv; r1 *= col_inv; r2 *= col_inv; r3 *= col_inv;\n"
+         "    }\n"
+         "    *((device float4 *)(out +  8)) = r0;\n"
+         "    *((device float4 *)(out + 12)) = r1;\n"
+         "    *((device float4 *)(out + 16)) = r2;\n"
+         "    *((device float4 *)(out + 20)) = r3;\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  /* Stage 2: HC-weighted sum + RMS sumf accumulate */\n"
+         "  float sumf = 0.0f;\n"
+         "  const uint n4 = 1024u;\n"
+         "  for (uint i = tid; i < n4; i += ntg) {\n"
+         "    device const float4 *x0 = (device const float4 *)(x + 0*args->nb_x1 + (uint64_t)row*args->nb_x2);\n"
+         "    device const float4 *x1 = (device const float4 *)(x + 1*args->nb_x1 + (uint64_t)row*args->nb_x2);\n"
+         "    device const float4 *x2 = (device const float4 *)(x + 2*args->nb_x1 + (uint64_t)row*args->nb_x2);\n"
+         "    device const float4 *x3 = (device const float4 *)(x + 3*args->nb_x1 + (uint64_t)row*args->nb_x2);\n"
+         "    const float4 v = x0[i] * pre_shmem[0] + x1[i] * pre_shmem[1]\n"
+         "                   + x2[i] * pre_shmem[2] + x3[i] * pre_shmem[3];\n"
+         "    row_shmem[i] = v;\n"
+         "    sumf += dot(v, v);\n"
+         "  }\n"
+         "  sumf = simd_sum(sumf);\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  if (tiisg == 0) sum_shmem[sgitg] = sumf;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  sumf = sum_shmem[tiisg];\n"
+         "  sumf = simd_sum(sumf);\n"
+         "  const float norm_scale = rsqrt(sumf / 4096.0f + args->norm_eps);\n"
+         "  /* Stage 3: dst + norm_dst writeback */\n"
+         "  device float4 *dst4 = (device float4 *)(dst + (uint64_t)row * args->nb1);\n"
+         "  device const float4 *w4 = (device const float4 *)norm_weight;\n"
+         "  device float4 *norm4 = (device float4 *)(norm_dst + (uint64_t)row * args->nb_norm1);\n"
+         "  for (uint i = tid; i < n4; i += ntg) {\n"
+         "    const float4 v = row_shmem[i];\n"
+         "    dst4[i] = v;\n"
+         "    norm4[i] = (v * norm_scale) * w4[i];\n"
+         "  }\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_hc_split_weighted_sum_norm4_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: hc_split_weighted_sum_norm4 MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"hc_split_weighted_sum_norm4_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 1024;
+    g_hc_split_weighted_sum_norm4_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_hc_split_weighted_sum_norm4_mtl4_pipeline) {
+        fprintf(stderr, "ds4: hc_split_weighted_sum_norm4 MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: hc_split_weighted_sum_norm4 MTL4 pipeline initialized\n");
+    g_hc_split_weighted_sum_norm4_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_hc_split_weighted_sum_norm4_canary(uint32_t n_rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_hc_split_weighted_sum_norm4_mtl4_pipeline_init()) return 0;
+    if (n_rows == 0) {
+        fprintf(stderr, "ds4: hc_split_weighted_sum_norm4 canary requires n_rows > 0\n");
+        return 0;
+    }
+
+    /* Canary: mix=0, base=0, scale=[1,1,1], eps=0, x[d,h,r]=1.0, w[d]=1.0
+     *
+     * Stage 1: pre=0.5, post=1.0, comb=0.25 (same as #694)
+     * Stage 2: row[d] = 4 × 1.0 × 0.5 = 2.0 across all 4096 d
+     *          rms = mean(v^2) = 4.0; norm_scale = rsqrt(4.0) = 0.5
+     * Stage 3: dst[d] = 2.0; norm_dst[d] = 2.0 × 0.5 × 1.0 = 1.0 */
+    const uint32_t mix_hc = 24;
+    const uint32_t n_embd = 4096;
+    const uint64_t mix_total = (uint64_t)n_rows * mix_hc;
+    const uint64_t split_total = mix_total;
+    const uint64_t x_total = (uint64_t)n_embd * 4 * n_rows;
+    const uint64_t dst_total = (uint64_t)n_embd * n_rows;
+    const uint64_t norm_dst_total = (uint64_t)n_embd * n_rows;
+
+    float *host_mix = (float *)calloc(mix_total, sizeof(float));
+    float *host_scale = (float *)calloc(3, sizeof(float));
+    float *host_base = (float *)calloc(mix_hc, sizeof(float));
+    float *host_x = (float *)calloc(x_total, sizeof(float));
+    float *host_w = (float *)calloc(n_embd, sizeof(float));
+    float *host_split = (float *)calloc(split_total, sizeof(float));
+    float *host_dst = (float *)calloc(dst_total, sizeof(float));
+    float *host_norm_dst = (float *)calloc(norm_dst_total, sizeof(float));
+    if (!host_mix || !host_scale || !host_base || !host_x || !host_w ||
+        !host_split || !host_dst || !host_norm_dst) {
+        free(host_mix); free(host_scale); free(host_base);
+        free(host_x); free(host_w);
+        free(host_split); free(host_dst); free(host_norm_dst);
+        return 0;
+    }
+    host_scale[0] = host_scale[1] = host_scale[2] = 1.0f;
+    for (uint64_t i = 0; i < x_total; i++) host_x[i] = 1.0f;
+    for (uint32_t i = 0; i < n_embd; i++) host_w[i] = 1.0f;
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> mixBuf = [g_device newBufferWithBytes:host_mix length:mix_total*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> scaleBuf = [g_device newBufferWithBytes:host_scale length:3*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> baseBuf = [g_device newBufferWithBytes:host_base length:mix_hc*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> xBuf = [g_device newBufferWithBytes:host_x length:x_total*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> splitBuf = [g_device newBufferWithLength:split_total*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:dst_total*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> wBuf = [g_device newBufferWithBytes:host_w length:n_embd*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> normDstBuf = [g_device newBufferWithLength:norm_dst_total*sizeof(float) options:MTLResourceStorageModeShared];
+
+        struct {
+            int64_t n_embd_;
+            int32_t n_hc_, sinkhorn_iters_;
+            int64_t n_rows_, mix_hc_;
+            uint64_t nb_mix1_, nb_split1_;
+            uint64_t nb_x0_, nb_x1_, nb_x2_;
+            uint64_t nb0_, nb1_;
+            uint64_t nb_norm1_;
+            float eps_, norm_eps_;
+        } args = {
+            .n_embd_ = n_embd,
+            .n_hc_ = 4, .sinkhorn_iters_ = 1,
+            .n_rows_ = n_rows, .mix_hc_ = mix_hc,
+            .nb_mix1_ = (uint64_t)mix_hc * sizeof(float),
+            .nb_split1_ = (uint64_t)mix_hc * sizeof(float),
+            .nb_x0_ = sizeof(float),
+            .nb_x1_ = (uint64_t)n_embd * sizeof(float),
+            .nb_x2_ = (uint64_t)n_embd * 4 * sizeof(float),
+            .nb0_ = sizeof(float),
+            .nb1_ = (uint64_t)n_embd * sizeof(float),
+            .nb_norm1_ = (uint64_t)n_embd * sizeof(float),
+            .eps_ = 0.0f, .norm_eps_ = 0.0f,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 10;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[9] = {
+                (id<MTLAllocation>)argsBuf, (id<MTLAllocation>)mixBuf,
+                (id<MTLAllocation>)scaleBuf, (id<MTLAllocation>)baseBuf,
+                (id<MTLAllocation>)xBuf, (id<MTLAllocation>)splitBuf,
+                (id<MTLAllocation>)dstBuf, (id<MTLAllocation>)wBuf,
+                (id<MTLAllocation>)normDstBuf,
+            };
+            [residency addAllocations:allocs count:9];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(10);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:mixBuf.gpuAddress atIndex:1];
+                [argTable setAddress:scaleBuf.gpuAddress atIndex:2];
+                [argTable setAddress:baseBuf.gpuAddress atIndex:3];
+                [argTable setAddress:xBuf.gpuAddress atIndex:4];
+                [argTable setAddress:splitBuf.gpuAddress atIndex:5];
+                [argTable setAddress:dstBuf.gpuAddress atIndex:6];
+                [argTable setAddress:wBuf.gpuAddress atIndex:7];
+                [argTable setAddress:normDstBuf.gpuAddress atIndex:8];
+
+                /* 1024 threads/tg matches the n4=1024 float4 grid */
+                NSUInteger nth = 1024;
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_hc_split_weighted_sum_norm4_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                /* tg memory: 4096 + 4 + 32 = 4132 floats */
+                [enc setThreadgroupMemoryLength:4132 * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_split, splitBuf.contents, split_total * sizeof(float));
+                    memcpy(host_dst, dstBuf.contents, dst_total * sizeof(float));
+                    memcpy(host_norm_dst, normDstBuf.contents, norm_dst_total * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 10);
+            }
+        }
+    }
+    if (!rc) {
+        free(host_mix); free(host_scale); free(host_base);
+        free(host_x); free(host_w);
+        free(host_split); free(host_dst); free(host_norm_dst);
+        return 0;
+    }
+
+    /* Validate */
+    double split_dev = 0.0, dst_dev = 0.0, norm_dev = 0.0;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        const float *s = host_split + (uint64_t)r * mix_hc;
+        for (int i = 0; i < 4; i++) {
+            double d = fabs((double)(s[i] - 0.5));
+            if (d > split_dev) split_dev = d;
+        }
+        for (int i = 4; i < 8; i++) {
+            double d = fabs((double)(s[i] - 1.0));
+            if (d > split_dev) split_dev = d;
+        }
+        for (int i = 8; i < 24; i++) {
+            double d = fabs((double)(s[i] - 0.25));
+            if (d > split_dev) split_dev = d;
+        }
+        for (uint32_t d = 0; d < n_embd; d++) {
+            double e_dst = fabs((double)(host_dst[(uint64_t)r * n_embd + d] - 2.0));
+            double e_nrm = fabs((double)(host_norm_dst[(uint64_t)r * n_embd + d] - 1.0));
+            if (e_dst > dst_dev) dst_dev = e_dst;
+            if (e_nrm > norm_dev) norm_dev = e_nrm;
+        }
+    }
+    fprintf(stderr,
+        "ds4: hc_split_weighted_sum_norm4 MTL4 canary n_rows=%u n_embd=4096 "
+        "split[0]=%.4f (ref=0.5) split[8]=%.4f (ref=0.25) "
+        "dst[0]=%.4f (ref=2.0) norm_dst[0]=%.4f (ref=1.0) "
+        "split_dev=%.4e dst_dev=%.4e norm_dev=%.4e\n",
+        n_rows,
+        (double)host_split[0], (double)host_split[8],
+        (double)host_dst[0], (double)host_norm_dst[0],
+        split_dev, dst_dev, norm_dev);
+    free(host_mix); free(host_scale); free(host_base);
+    free(host_x); free(host_w);
+    free(host_split); free(host_dst); free(host_norm_dst);
+    return (split_dev < 1.0e-6 && dst_dev < 1.0e-6 && norm_dev < 1.0e-5) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +

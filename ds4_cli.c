@@ -1944,6 +1944,11 @@ int main(int argc, char **argv) {
         const uint32_t nr = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
         return ds4_gpu_mtl4_concat_canary(n0, n1, nr) ? 0 : 1;
     }
+    /* --hc-split-weighted-sum-norm4-canary [n_rows] : task #697 fused HC+RMSNorm at 4096 */
+    if (argc >= 2 && !strcmp(argv[1], "--hc-split-weighted-sum-norm4-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
+        return ds4_gpu_mtl4_hc_split_weighted_sum_norm4_canary(nr) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);
