@@ -5012,6 +5012,11 @@ typedef struct {
  uint64_t gate_row_bytes[DS4_N_EXPERT];
  uint64_t up_row_bytes[DS4_N_EXPERT];
  uint64_t xq_blocks;
+ /* silv 2026-05-27 task #657 — organ-skip on BATCHED prefill path.
+  * The pilot uncovered that Phase A.2 only wired the SINGLE-TOKEN worker;
+  * prefill goes through THIS (batched) worker which had no hook. */
+ uint32_t layer_idx;
+ uint8_t  organ_skip_active;
 } matvec_iq2_xxs_batch_mid_ctx;
 
 static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
@@ -5024,11 +5029,30 @@ static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t
  const uint32_t begin = ctx->expert_offset[expert];
  const uint32_t end = ctx->expert_offset[expert + 1];
 
+ /* Per-organ honest ablation — same semantic as the single-token worker
+  * from Phase A.1/A.2. Skip check fires ONCE per (active_idx, row); each
+  * thread handles all tokens routed to this expert at this row. */
+ int skip_gate = 0, skip_up = 0, skip_down = 0;
+ if (ctx->organ_skip_active) {
+ skip_down = ds4_organ_should_skip(ctx->layer_idx, expert, DS4_ORGAN_DOWN);
+ if (!skip_down) {
+ skip_gate = ds4_organ_should_skip(ctx->layer_idx, expert, DS4_ORGAN_GATE);
+ skip_up   = ds4_organ_should_skip(ctx->layer_idx, expert, DS4_ORGAN_UP);
+ }
+ }
+
  const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert]);
  const block_iq2_xxs *up_row = (const block_iq2_xxs *)(ctx->up_base[expert] + row * ctx->up_row_bytes[expert]);
 
  for (uint32_t i = begin; i < end; i++) {
  const uint32_t pair_id = ctx->pair_ids[i];
+
+ if (skip_down) {
+ /* Whole-expert ablation — zero this expert's contribution. */
+ ctx->mid[(uint64_t)pair_id * ctx->out_dim + row] = 0.0f;
+ continue;
+ }
+
  const uint32_t token = pair_id / DS4_N_EXPERT_USED;
  const block_q8_K *xq = ctx->xq + (uint64_t)token * ctx->xq_blocks;
  float gate = 0.0f;
@@ -5041,6 +5065,9 @@ static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t
  if (up > ctx->clamp) up = ctx->clamp;
  if (up < -ctx->clamp) up = -ctx->clamp;
  }
+
+ if (skip_gate) gate = 1.0f;  /* silu(1)*up*ew = 0.731*up*ew */
+ if (skip_up)   up   = 1.0f;  /* silu(gate)*ew */
 
  ctx->mid[(uint64_t)pair_id * ctx->out_dim + row] = silu(gate) * up * ctx->pair_weight[pair_id];
  }
@@ -5452,6 +5479,7 @@ static void layer_routed_moe_selected_batch_prealloc(
  float *moe,
  const ds4_model *model,
  const ds4_layer_weights *layer,
+ uint32_t il,
  const float *norm,
  const int32_t *selected_rows,
  const float *weight_rows,
@@ -5578,6 +5606,11 @@ static void layer_routed_moe_selected_batch_prealloc(
  .in_dim = expert_in_dim,
  .out_dim = expert_out_dim,
  .xq_blocks = xq_blocks,
+ /* silv 2026-05-27 task #657 — il now threaded through; the GPU→CPU
+  * handoff path is what ds4-logitlens prefill actually uses, so the
+  * harm scorer needs THIS to honor the organ-skip flags. */
+ .layer_idx = il,
+ .organ_skip_active = (uint8_t)g_organ_skip_initialized,
  };
 
  for (uint32_t ai = 0; ai < n_active; ai++) {
@@ -7114,6 +7147,7 @@ static void layer_routed_moe_selected_one_prealloc(
 static DS4_MAYBE_UNUSED void cpu_routed_moe_batch_handoff_prealloc(
  const ds4_model *cpu_model,
  const ds4_layer_weights *layer,
+ uint32_t il,
  const float *ffn_norm_rows,
  const int32_t *selected_rows,
  const float *weight_rows,
@@ -7141,6 +7175,7 @@ static DS4_MAYBE_UNUSED void cpu_routed_moe_batch_handoff_prealloc(
  layer_routed_moe_selected_batch_prealloc(routed_out_rows,
  cpu_model,
  layer,
+ il,
  ffn_norm_rows,
  selected_rows,
  weight_rows,
@@ -7233,6 +7268,10 @@ static void layer_routed_moe_batch(
  .in_dim = expert_in_dim,
  .out_dim = expert_out_dim,
  .xq_blocks = xq_blocks,
+ /* layer_routed_moe_batch has `il` — the PREFILL CPU MoE path.
+  * This is the one the harm scorer needs active. */
+ .layer_idx = il,
+ .organ_skip_active = (uint8_t)g_organ_skip_initialized,
  };
 
  for (uint32_t ai = 0; ai < n_active; ai++) {
@@ -10115,6 +10154,7 @@ typedef struct {
  pthread_t cpu_moe_async_thread;
  bool cpu_moe_async_active;
  const ds4_layer_weights *cpu_moe_async_layer;
+ uint32_t cpu_moe_async_il;  /* silv 2026-05-27 task #657 — layer index for organ-skip */
  const float *cpu_moe_async_xs;
  const int32_t *cpu_moe_async_sel;
  const float *cpu_moe_async_w;
@@ -10262,6 +10302,7 @@ static void *cpu_moe_async_worker_fn(void *arg) {
  cpu_routed_moe_batch_handoff_prealloc(
  g->cpu_model,
  g->cpu_moe_async_layer,
+ g->cpu_moe_async_il,
  g->cpu_moe_async_xs,
  g->cpu_moe_async_sel,
  g->cpu_moe_async_w,
@@ -10287,12 +10328,14 @@ static void *cpu_moe_async_worker_fn(void *arg) {
  * op to the GPU. */
 static bool cpu_moe_async_kick(ds4_gpu_graph *g,
  const ds4_layer_weights *layer,
+ uint32_t il,
  const float *xs,
  const int32_t *sel,
  const float *w,
  float *out,
  uint32_t n_tokens) {
  g->cpu_moe_async_layer = layer;
+ g->cpu_moe_async_il = il;
  g->cpu_moe_async_xs = xs;
  g->cpu_moe_async_sel = sel;
  g->cpu_moe_async_w = w;
@@ -12073,7 +12116,7 @@ static bool metal_graph_encode_decode_layer(
  }
  }
  if (!dispatched_via_hot) {
- cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer,
+ cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer, il,
  xs, sel, w, out,
  1, DS4_SWIGLU_CLAMP_EXP,
  g->cpu_moe_mid,
@@ -15063,9 +15106,9 @@ static bool metal_graph_encode_layer_ffn_batch(
  float *out = (float *) ds4_gpu_tensor_contents(g->batch_routed_out);
  ok = xs && sel && w && out;
  if (ok) {
- if (!cpu_moe_async_kick(g, layer, xs, sel, w, out, n_tokens)) {
+ if (!cpu_moe_async_kick(g, layer, il, xs, sel, w, out, n_tokens)) {
  /* pthread_create failed -- fall back to synchronous handoff. */
- cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer,
+ cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer, il,
  xs, sel, w, out,
  n_tokens, DS4_SWIGLU_CLAMP_EXP,
  g->cpu_moe_mid,
