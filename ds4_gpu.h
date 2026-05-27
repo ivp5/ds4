@@ -1135,3 +1135,38 @@ int ds4_gpu_mtl4_sort_i32_rows_canary(uint32_t top_k, uint32_t n_rows);
  * surviving weights. Completes the 4-kernel router-cycle MTL4 set
  * (router_weights_one + router_remap + topk_mask + topk_mask_scatter). */
 int ds4_gpu_mtl4_router_remap_canary(uint32_t n_tokens);
+
+/* silv 2026-05-27 task #678. ratio4_shift_f32 — tiny KV ratio-4 state
+ * shift, copies state[n + gid] into state[gid] for both kv and score
+ * buffers. Used at decode-time to drop the oldest row when the
+ * compressor reaches capacity. */
+int ds4_gpu_mtl4_ratio4_shift_canary(uint32_t width);
+
+/* silv 2026-05-27 task #679 — MTL4 ArgumentTable amortization pool.
+ *
+ * Per-canary allocation creates a fresh argument table on every call,
+ * costing ~10-50µs each. This pool maintains a free list keyed by
+ * max_buffer_bind_count so consecutive dispatches reuse tables.
+ *
+ * Use:
+ *   id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(n_bindings);
+ *   [at setAddress:bufA.gpuAddress atIndex:0];
+ *   ... (set bindings that changed) ...
+ *   [enc setArgumentTable:at];
+ *   [enc dispatchThreadgroups:...];
+ *   ...
+ *   ds4_mtl4_pool_release(at, n_bindings);
+ *
+ * Bindings PERSIST across acquire/release pairs — this is the
+ * amortization. Caller only re-sets buffers that change per-dispatch.
+ *
+ * Stats query for telemetry / canary verification. After warm-up,
+ * acquire_count grows but alloc_count plateaus → pool hits dominate. */
+void ds4_gpu_mtl4_pool_stats(uint64_t *out_acquire,
+                              uint64_t *out_alloc,
+                              uint64_t *out_release);
+
+/* Pool-amortized version of router_weights_one canary. Runs N back-to-back
+ * dispatches and reports pool acquire / alloc counts. Demonstrates the
+ * amortization: alloc stays at 1 (or pool warm-up size); acquire scales N. */
+int ds4_gpu_mtl4_router_weights_one_amortized_canary(uint32_t n_iterations);

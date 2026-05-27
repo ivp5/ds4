@@ -1789,6 +1789,21 @@ int main(int argc, char **argv) {
         const uint32_t n_tokens = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4;
         return ds4_gpu_mtl4_router_remap_canary(n_tokens) ? 0 : 1;
     }
+    /* --ratio4-shift-canary [width] : task #678 MTL4 port of
+     * kernel_dsv4_ratio4_shift_f32 (dsv4_kv.metal:271). Tiny KV
+     * ratio-4 state shift on 4*width elements. */
+    if (argc >= 2 && !strcmp(argv[1], "--ratio4-shift-canary")) {
+        const uint32_t width = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
+        return ds4_gpu_mtl4_ratio4_shift_canary(width) ? 0 : 1;
+    }
+    /* --amortized-canary [n_iter] : task #679 demonstrates ArgumentTable
+     * pool amortization. Runs N back-to-back dispatches using the pool;
+     * reports alloc_count vs acquire_count. Pool-hit rate should be
+     * (N-1)/N after warm-up (1 alloc, N acquires). */
+    if (argc >= 2 && !strcmp(argv[1], "--amortized-canary")) {
+        const uint32_t n_iter = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 100;
+        return ds4_gpu_mtl4_router_weights_one_amortized_canary(n_iter) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {

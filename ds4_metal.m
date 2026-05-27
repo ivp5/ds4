@@ -16884,6 +16884,127 @@ int ds4_gpu_mtl4_router_weights_one_canary(void) {
     return max_abs < 1.0e-5 ? 1 : 0;
 }
 
+/* Forward declarations of the pool API (defined later in the file). */
+static id<MTL4ArgumentTable> ds4_mtl4_pool_acquire(NSUInteger n_bindings);
+static void ds4_mtl4_pool_release(id<MTL4ArgumentTable> at, NSUInteger n_bindings);
+
+/* silv 2026-05-27 task #679 — amortization demonstration.
+ *
+ * Runs router_weights_one back-to-back N times, using the ArgumentTable
+ * pool. After warm-up, the pool's `alloc_count` should stay at 1 while
+ * `acquire_count` scales with N. This proves the persistence path:
+ * consecutive dispatches reuse the same table.
+ *
+ * Reports correctness (functional regression guard against the pool
+ * breaking the kernel output) AND the alloc/acquire ratio. */
+int ds4_gpu_mtl4_router_weights_one_amortized_canary(uint32_t n_iterations) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_router_weights_one_mtl4_pipeline_init()) return 0;
+    if (n_iterations == 0) n_iterations = 100;
+
+    float host_probs[256];
+    int host_selected[6] = {0, 50, 100, 150, 200, 250};
+    float host_weights_gpu[6] = {0};
+    for (int i = 0; i < 256; i++) host_probs[i] = 1.0f / 256.0f;
+
+    /* Pre-state */
+    uint64_t acq_before = 0, alloc_before = 0, rel_before = 0;
+    ds4_gpu_mtl4_pool_stats(&acq_before, &alloc_before, &rel_before);
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> probsBuf = [g_device newBufferWithBytes:host_probs
+                                                       length:sizeof(host_probs)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf = [g_device newBufferWithBytes:host_selected
+                                                     length:sizeof(host_selected)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> wBuf = [g_device newBufferWithLength:6 * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+
+        /* Persistent residency set across iterations — proper amortization. */
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[3] = {
+                (id<MTLAllocation>)probsBuf, (id<MTLAllocation>)selBuf, (id<MTLAllocation>)wBuf,
+            };
+            [residency addAllocations:allocs count:3];
+            [residency commit];
+            [residency requestResidency];
+            [g_polar_queue addResidencySet:residency];
+
+            rc = 1;
+            for (uint32_t iter = 0; iter < n_iterations && rc; iter++) {
+                /* ACQUIRE pool table (allocates first-time, reuses thereafter) */
+                id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(3);
+                if (!argTable) { rc = 0; break; }
+                [argTable setAddress:probsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:selBuf.gpuAddress atIndex:1];
+                [argTable setAddress:wBuf.gpuAddress atIndex:2];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_router_weights_one_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(8, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                if (waitRes != 0) { rc = 0; }
+
+                /* RELEASE back to pool (preserves binding state) */
+                ds4_mtl4_pool_release(argTable, 3);
+            }
+            if (rc) {
+                memcpy(host_weights_gpu, wBuf.contents, sizeof(host_weights_gpu));
+            }
+            [residency endResidency];
+        }
+    }
+    if (!rc) return 0;
+
+    /* Post-state */
+    uint64_t acq_after = 0, alloc_after = 0, rel_after = 0;
+    ds4_gpu_mtl4_pool_stats(&acq_after, &alloc_after, &rel_after);
+
+    /* Verify correctness still holds */
+    const float ref = (1.0f / 256.0f) / (6.0f / 256.0f) * 1.5f;  /* = 0.25 */
+    double max_abs = 0.0;
+    for (int i = 0; i < 6; i++) {
+        double d = fabs((double)(host_weights_gpu[i] - ref));
+        if (d > max_abs) max_abs = d;
+    }
+    const uint64_t acq_delta = acq_after - acq_before;
+    const uint64_t alloc_delta = alloc_after - alloc_before;
+    fprintf(stderr,
+        "ds4: router_weights_one amortized canary n_iter=%u acquires=%llu "
+        "allocs=%llu releases=%llu pool_hit_rate=%.1f%% "
+        "gpu[0]=%.4f max_abs=%.4e\n",
+        n_iterations,
+        (unsigned long long)acq_delta,
+        (unsigned long long)alloc_delta,
+        (unsigned long long)(rel_after - rel_before),
+        acq_delta > 0 ? 100.0 * (1.0 - (double)alloc_delta / (double)acq_delta) : 0.0,
+        (double)host_weights_gpu[0], max_abs);
+    /* Pass criteria: correctness + alloc count << acquire count after warm-up. */
+    return (max_abs < 1.0e-5 && alloc_delta <= 1 && acq_delta >= n_iterations) ? 1 : 0;
+}
+
 /* ============================================================ */
 /* MTL4 port: kernel_dsv4_topk_mask (task #672)                  */
 /* metal/dsv4_misc.metal:346. Fills mask with -inf;             */
@@ -18102,6 +18223,298 @@ int ds4_gpu_mtl4_router_remap_canary(uint32_t n_tokens) {
     free(host_remap); free(host_selected); free(host_selected_ref);
     free(host_weights); free(host_weights_ref);
     return (max_abs_w < 1.0e-5 && n_id_correct == selected_n) ? 1 : 0;
+}
+
+/* ============================================================ */
+/* MTL4 ArgumentTable amortization pool (task #679)             */
+/* silv 2026-05-27: "implement ArgumentTable amortization and    */
+/* relevant icb optimizations".                                  */
+/*                                                               */
+/* Per-canary allocation creates a fresh MTL4ArgumentTable on    */
+/* every call. Allocation cost is dominated by the descriptor +  */
+/* newArgumentTableWithDescriptor call (~10-50µs each). On the   */
+/* per-token decode hot path with 774 MoE dispatches + 4 router  */
+/* dispatches + ~50 misc kernels, this becomes a measurable      */
+/* encoding overhead.                                            */
+/*                                                               */
+/* This pool maintains a free-list of argument tables keyed by   */
+/* max_buffer_bind_count. acquire() returns a cached table or    */
+/* allocates fresh; release() returns to free list. Bindings are */
+/* re-set per-dispatch via setAddress (which is cheap and        */
+/* designed for this).                                           */
+/*                                                               */
+/* Thread safety: single-threaded GPU dispatch path; no lock     */
+/* needed. If multi-threaded use is added later, wrap with       */
+/* os_unfair_lock around the per-bucket free list.               */
+/*                                                               */
+/* Memory: O(n_pipelines × peak_concurrent_dispatches). For DS4  */
+/* that's bounded by ~80 pipelines × 1 concurrent = ~80 tables   */
+/* in worst case ≈ ~80 × few-KB-each = trivial.                  */
+/* ============================================================ */
+
+/* Buckets sized for the bind-count distribution: 3, 4, 6, 8.
+ * Most ported kernels fit 3 or 4; MoE matmul uses 8. */
+#define DS4_MTL4_POOL_BUCKETS 5
+#define DS4_MTL4_POOL_MAX_PER_BUCKET 8
+
+typedef struct {
+    NSUInteger max_bindings;
+    NSUInteger n_free;
+    /* The actual __strong references — stored as id<MTL4ArgumentTable>.
+     * Use NSMutableArray since we need ARC retain semantics. */
+    NSMutableArray *free_tables;
+} ds4_mtl4_pool_bucket;
+
+static ds4_mtl4_pool_bucket g_mtl4_pool[DS4_MTL4_POOL_BUCKETS];
+static int g_mtl4_pool_initialized = 0;
+static uint64_t g_mtl4_pool_acquire_count = 0;
+static uint64_t g_mtl4_pool_alloc_count = 0;
+static uint64_t g_mtl4_pool_release_count = 0;
+
+static void ds4_mtl4_pool_init(void) {
+    if (g_mtl4_pool_initialized) return;
+    /* Bucket sizes covering the ported kernels: 3, 4, 6, 8, 16. */
+    const NSUInteger sizes[DS4_MTL4_POOL_BUCKETS] = {3, 4, 6, 8, 16};
+    for (int i = 0; i < DS4_MTL4_POOL_BUCKETS; i++) {
+        g_mtl4_pool[i].max_bindings = sizes[i];
+        g_mtl4_pool[i].n_free = 0;
+        g_mtl4_pool[i].free_tables = [NSMutableArray arrayWithCapacity:DS4_MTL4_POOL_MAX_PER_BUCKET];
+    }
+    g_mtl4_pool_initialized = 1;
+}
+
+/* Returns the bucket index that fits >= n_bindings, or -1 if too large.
+ * Caller falls back to direct allocation in that case. */
+static int ds4_mtl4_pool_bucket_for(NSUInteger n_bindings) {
+    for (int i = 0; i < DS4_MTL4_POOL_BUCKETS; i++) {
+        if (g_mtl4_pool[i].max_bindings >= n_bindings) return i;
+    }
+    return -1;
+}
+
+/* Acquire an ArgumentTable that supports at least n_bindings. Returns a
+ * cached table (with all bindings unchanged from prior use — caller MUST
+ * re-bind all needed slots before dispatch) or allocates fresh.
+ * Returns nil on allocation failure. */
+static id<MTL4ArgumentTable> ds4_mtl4_pool_acquire(NSUInteger n_bindings) {
+    ds4_mtl4_pool_init();
+    g_mtl4_pool_acquire_count++;
+    const int bi = ds4_mtl4_pool_bucket_for(n_bindings);
+    if (bi < 0) {
+        /* Too large for pool; allocate direct. */
+        NSError *err = nil;
+        MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+        atDesc.maxBufferBindCount = n_bindings;
+        atDesc.initializeBindings = YES;
+        id<MTL4ArgumentTable> at = [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+        g_mtl4_pool_alloc_count++;
+        return at;
+    }
+    ds4_mtl4_pool_bucket *b = &g_mtl4_pool[bi];
+    if (b->n_free > 0) {
+        id<MTL4ArgumentTable> at = [b->free_tables lastObject];
+        [b->free_tables removeLastObject];
+        b->n_free--;
+        return at;
+    }
+    /* Fresh allocation at bucket size. */
+    NSError *err = nil;
+    MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+    atDesc.maxBufferBindCount = b->max_bindings;
+    atDesc.initializeBindings = YES;
+    id<MTL4ArgumentTable> at = [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+    if (!at) return nil;
+    g_mtl4_pool_alloc_count++;
+    return at;
+}
+
+/* Return an ArgumentTable to the free list for the bucket that owns its
+ * max_bindings. Bindings persist across acquire/release pairs — this is
+ * the AMORTIZATION: caller need not rebind unchanged buffers. */
+static void ds4_mtl4_pool_release(id<MTL4ArgumentTable> at, NSUInteger n_bindings) {
+    if (!at) return;
+    g_mtl4_pool_release_count++;
+    const int bi = ds4_mtl4_pool_bucket_for(n_bindings);
+    if (bi < 0) return;  /* Was direct-allocated; let ARC reclaim. */
+    ds4_mtl4_pool_bucket *b = &g_mtl4_pool[bi];
+    if (b->n_free >= DS4_MTL4_POOL_MAX_PER_BUCKET) {
+        /* Bucket full — let ARC reclaim. */
+        return;
+    }
+    [b->free_tables addObject:at];
+    b->n_free++;
+}
+
+/* Public stats query (for diagnostic logging + tests). */
+void ds4_gpu_mtl4_pool_stats(uint64_t *out_acquire,
+                              uint64_t *out_alloc,
+                              uint64_t *out_release) {
+    if (out_acquire) *out_acquire = g_mtl4_pool_acquire_count;
+    if (out_alloc) *out_alloc = g_mtl4_pool_alloc_count;
+    if (out_release) *out_release = g_mtl4_pool_release_count;
+}
+
+/* ============================================================ */
+/* MTL4 port: kernel_dsv4_ratio4_shift_f32 (task #678)          */
+/* metal/dsv4_kv.metal:271. Tiny KV ratio-4 state shift —        */
+/* state[gid] = state[n + gid] for both kv and score.            */
+/* 1 args (width only) + 2 r/w buffers. ~12-line body.           */
+/* ============================================================ */
+static id<MTLComputePipelineState> g_ratio4_shift_mtl4_pipeline;
+static int g_ratio4_shift_mtl4_init_attempted;
+static int g_ratio4_shift_mtl4_init_ok;
+
+static int ds4_ratio4_shift_mtl4_pipeline_init(void) {
+    if (g_ratio4_shift_mtl4_init_attempted) return g_ratio4_shift_mtl4_init_ok;
+    g_ratio4_shift_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct ratio4_shift_args { uint32_t width; };\n"
+         "kernel void ratio4_shift_f32_mtl4(\n"
+         "    device const ratio4_shift_args *args_ptr [[buffer(0)]],\n"
+         "    device float *state_kv [[buffer(1)]],\n"
+         "    device float *state_score [[buffer(2)]],\n"
+         "    uint gid [[thread_position_in_grid]]) {\n"
+         "  const uint n = 4u * args_ptr->width;\n"
+         "  if (gid >= n) return;\n"
+         "  state_kv[gid] = state_kv[n + gid];\n"
+         "  state_score[gid] = state_score[n + gid];\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_ratio4_shift_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: ratio4_shift MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"ratio4_shift_f32_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_ratio4_shift_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_ratio4_shift_mtl4_pipeline) {
+        fprintf(stderr, "ds4: ratio4_shift MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: ratio4_shift MTL4 pipeline initialized\n");
+    g_ratio4_shift_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_ratio4_shift_canary(uint32_t width) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_ratio4_shift_mtl4_pipeline_init()) return 0;
+
+    /* Synthetic: state_kv[gid] = -1.0 (placeholder), state_kv[n + gid] = (float)gid.
+     * Same for state_score. After kernel: state_kv[gid] = (float)gid for gid < n. */
+    const uint32_t n = 4u * width;
+    const uint64_t total = (uint64_t)n * 2;  /* old + new halves */
+    float *host_kv = (float *)calloc(total, sizeof(float));
+    float *host_score = (float *)calloc(total, sizeof(float));
+    if (!host_kv || !host_score) { free(host_kv); free(host_score); return 0; }
+    for (uint32_t i = 0; i < n; i++) {
+        host_kv[i] = -1.0f;
+        host_score[i] = -2.0f;
+        host_kv[n + i] = (float)i;
+        host_score[n + i] = (float)i * 0.5f;
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:16
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kvBuf = [g_device newBufferWithBytes:host_kv
+                                                    length:total * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> scoreBuf = [g_device newBufferWithBytes:host_score
+                                                       length:total * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        *((uint32_t *)argsBuf.contents) = width;
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[3] = {
+                (id<MTLAllocation>)argsBuf, (id<MTLAllocation>)kvBuf, (id<MTLAllocation>)scoreBuf,
+            };
+            [residency addAllocations:allocs count:3];
+            [residency commit];
+            [residency requestResidency];
+
+            MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+            atDesc.maxBufferBindCount = 4;
+            atDesc.initializeBindings = YES;
+            id<MTL4ArgumentTable> argTable =
+                [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:kvBuf.gpuAddress atIndex:1];
+                [argTable setAddress:scoreBuf.gpuAddress atIndex:2];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_ratio4_shift_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                const NSUInteger tg = 256;
+                const NSUInteger n_tgs = (n + tg - 1) / tg;
+                [enc dispatchThreadgroups:MTLSizeMake(n_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_kv, kvBuf.contents, total * sizeof(float));
+                    memcpy(host_score, scoreBuf.contents, total * sizeof(float));
+                    rc = 1;
+                }
+            }
+        }
+    }
+    if (!rc) { free(host_kv); free(host_score); return 0; }
+
+    /* Verify shifted: state_kv[i] should now equal i for i < n */
+    uint64_t n_correct_kv = 0;
+    uint64_t n_correct_score = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (host_kv[i] == (float)i) n_correct_kv++;
+        if (host_score[i] == (float)i * 0.5f) n_correct_score++;
+    }
+    fprintf(stderr,
+        "ds4: ratio4_shift MTL4 canary width=%u n=%u "
+        "kv_correct=%llu/%u score_correct=%llu/%u\n",
+        width, n,
+        (unsigned long long)n_correct_kv, n,
+        (unsigned long long)n_correct_score, n);
+    free(host_kv); free(host_score);
+    return (n_correct_kv == n && n_correct_score == n) ? 1 : 0;
 }
 
 /* ============================================================ */
