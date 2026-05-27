@@ -1816,6 +1816,12 @@ int main(int argc, char **argv) {
         const uint32_t n_rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 32;
         return ds4_gpu_mtl4_softmax_pool_canary(ne0, ne1, n_rows) ? 0 : 1;
     }
+    /* --moe-matmul-init-canary : task #682 MTL4 port of
+     * kernel_mul_mm_id_fp16_pair_swiglu_f32 (moe.metal:1282). Pipeline-
+     * init smoke test; full output canary multi-turn. */
+    if (argc >= 2 && !strcmp(argv[1], "--moe-matmul-init-canary")) {
+        return ds4_gpu_mtl4_moe_matmul_init_canary() ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {

@@ -1176,3 +1176,12 @@ int ds4_gpu_mtl4_router_weights_one_amortized_canary(uint32_t n_iterations);
  * softmax_pool: fused softmax-weighted pool of KV rows. */
 int ds4_gpu_mtl4_compressor_store_one_canary(uint32_t width);
 int ds4_gpu_mtl4_softmax_pool_canary(uint32_t ne0, uint32_t ne1, uint32_t n_rows);
+
+/* silv 2026-05-27 task #682 — MTL4 port of kernel_mul_mm_id_fp16_pair_swiglu_f32
+ * (THE per-token decode bottleneck — 774 dispatches/token). This entry point
+ * just initializes the MTL4 pipeline; full output canary deferred to next-
+ * turn ship (synthetic 8-buffer test bench is multi-turn work). The pipeline
+ * existence is the foundation for ICB Phase 7 capture and hot-path integration.
+ *
+ * Returns 1 if pipeline compiles + initializes; 0 on failure. */
+int ds4_gpu_mtl4_moe_matmul_init_canary(void);

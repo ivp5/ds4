@@ -18955,6 +18955,185 @@ int ds4_gpu_mtl4_softmax_pool_canary(uint32_t ne0, uint32_t ne1, uint32_t n_rows
 }
 
 /* ============================================================ */
+/* MTL4 port: kernel_mul_mm_id_fp16_pair_swiglu_f32 (task #682) */
+/* metal/moe.metal:1282. THE per-token decode bottleneck —      */
+/* 774 dispatches/token. 8 buffer bindings + 2 args structs +    */
+/* 1024-byte threadgroup. FP16 simdgroup matmul (8×8 tile) +     */
+/* SwiGLU + route-weight fusion in one kernel.                   */
+/*                                                               */
+/* PIPELINE SHIPS THIS TURN — canary deferred (synthetic data    */
+/* synthesis for a 130-line kernel with 8 bindings needs careful */
+/* setup; multi-turn item per silv's directive). The pipeline    */
+/* init validates the kernel source compiles under MTL4 and is   */
+/* dispatchable. Hot-path integration into ds4.c is a separate   */
+/* 1-2 turn effort.                                              */
+/* ============================================================ */
+static id<MTLComputePipelineState> g_moe_matmul_mtl4_pipeline;
+static int g_moe_matmul_mtl4_init_attempted;
+static int g_moe_matmul_mtl4_init_ok;
+
+static int ds4_moe_matmul_mtl4_pipeline_init(void) {
+    if (g_moe_matmul_mtl4_init_attempted) return g_moe_matmul_mtl4_init_ok;
+    g_moe_matmul_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct mmid_args {\n"
+         "  int32_t nei0; int32_t nei1; uint64_t nbi1;\n"
+         "  int32_t ne00; int32_t ne01; int32_t ne02;\n"
+         "  uint64_t nb00; uint64_t nb01; uint64_t nb02;\n"
+         "  int32_t ne10; int32_t ne11; int32_t ne12; int32_t ne13;\n"
+         "  uint64_t nb10; uint64_t nb11; uint64_t nb12;\n"
+         "  int32_t ne0; int32_t ne1; uint64_t nb1; int32_t nr0;\n"
+         "};\n"
+         "struct moe_swiglu_args {\n"
+         "  uint32_t width; uint32_t rows;\n"
+         "  uint64_t gate_row_stride; uint64_t up_row_stride;\n"
+         "  uint64_t mid_row_stride; uint64_t weight_stride;\n"
+         "  uint32_t write_clamped; float clamp_value;\n"
+         "};\n"
+         "kernel void mul_mm_id_fp16_pair_swiglu_mtl4(\n"
+         "    device const mmid_args *args_ptr [[buffer(0)]],\n"
+         "    device const moe_swiglu_args *act_ptr [[buffer(1)]],\n"
+         "    device const char *src0_gate [[buffer(2)]],\n"
+         "    device const char *src0_up [[buffer(3)]],\n"
+         "    device const char *src1 [[buffer(4)]],\n"
+         "    device char *dst_mid [[buffer(5)]],\n"
+         "    device const char *ids [[buffer(6)]],\n"
+         "    device const char *weights [[buffer(7)]],\n"
+         "    threadgroup char *shmem [[threadgroup(0)]],\n"
+         "    uint3 tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort tiitg [[thread_index_in_threadgroup]],\n"
+         "    ushort tiisg [[thread_index_in_simdgroup]],\n"
+         "    ushort sgitg [[simdgroup_index_in_threadgroup]]) {\n"
+         "  (void)tiisg; (void)sgitg;\n"
+         "  const uint out_col_tile = tgpig.x;\n"
+         "  const uint token_tile = tgpig.y;\n"
+         "  const int iid1 = (int)(tgpig.z / args_ptr->nei0);\n"
+         "  const int idx = (int)(tgpig.z % args_ptr->nei0);\n"
+         "  {\n"
+         "    device const float *rw_check =\n"
+         "      (device const float *)(weights + (uint64_t)idx * act_ptr->weight_stride);\n"
+         "    if (rw_check[0] == 0.0f) return;\n"
+         "  }\n"
+         "  const int32_t i02 = ((device const int32_t *)(ids + iid1 * args_ptr->nbi1))[idx];\n"
+         "  const int n_in = args_ptr->ne00;\n"
+         "  const int n_out = args_ptr->ne0;\n"
+         "  const uint out_col_start = out_col_tile * 8;\n"
+         "  const uint token_start = token_tile * 8;\n"
+         "  if ((int)out_col_start >= n_out) return;\n"
+         "  device const half *Wg = (device const half *)(src0_gate + (uint64_t)i02 * args_ptr->nb02);\n"
+         "  device const half *Wu = (device const half *)(src0_up + (uint64_t)i02 * args_ptr->nb02);\n"
+         "  device const float *Y = (device const float *)src1;\n"
+         "  simdgroup_float8x8 acc_gate = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+         "  simdgroup_float8x8 acc_up = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+         "  threadgroup half *ts_A = (threadgroup half *)shmem;\n"
+         "  threadgroup half *ts_B = ts_A + 64;\n"
+         "  threadgroup half *ts_Bu = ts_B + 64;\n"
+         "  for (int k = 0; k < n_in; k += 8) {\n"
+         "    if (tiitg < 64) {\n"
+         "      const uint trow = tiitg / 8;\n"
+         "      const uint tcol = tiitg % 8;\n"
+         "      const uint tok = token_start + trow;\n"
+         "      const int kk = k + (int)tcol;\n"
+         "      float v = 0.0f;\n"
+         "      if ((int)tok < args_ptr->ne11 && kk < n_in) {\n"
+         "        v = Y[(uint64_t)tok * (uint64_t)n_in + (uint64_t)kk];\n"
+         "      }\n"
+         "      ts_A[trow * 8 + tcol] = (half)v;\n"
+         "    }\n"
+         "    if (tiitg < 64) {\n"
+         "      const uint trow = tiitg / 8;\n"
+         "      const uint tcol = tiitg % 8;\n"
+         "      const uint out_col = out_col_start + tcol;\n"
+         "      const int kk = k + (int)trow;\n"
+         "      half vg = 0.h, vu = 0.h;\n"
+         "      if ((int)out_col < n_out && kk < n_in) {\n"
+         "        const uint64_t off = (uint64_t)out_col * (uint64_t)n_in + (uint64_t)kk;\n"
+         "        vg = Wg[off]; vu = Wu[off];\n"
+         "      }\n"
+         "      ts_B[trow * 8 + tcol] = vg;\n"
+         "      ts_Bu[trow * 8 + tcol] = vu;\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    simdgroup_half8x8 mA, mBg, mBu;\n"
+         "    simdgroup_load(mA, ts_A, 8, 0, false);\n"
+         "    simdgroup_load(mBg, ts_B, 8, 0, false);\n"
+         "    simdgroup_load(mBu, ts_Bu, 8, 0, false);\n"
+         "    simdgroup_multiply_accumulate(acc_gate, mA, mBg, acc_gate);\n"
+         "    simdgroup_multiply_accumulate(acc_up, mA, mBu, acc_up);\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  threadgroup float *ts_Cg = (threadgroup float *)shmem;\n"
+         "  threadgroup float *ts_Cu = ts_Cg + 64;\n"
+         "  simdgroup_store(acc_gate, ts_Cg, 8, 0, false);\n"
+         "  simdgroup_store(acc_up, ts_Cu, 8, 0, false);\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  if (tiitg < 64) {\n"
+         "    const uint trow = tiitg / 8;\n"
+         "    const uint tcol = tiitg % 8;\n"
+         "    const uint tok = token_start + trow;\n"
+         "    const uint out_col = out_col_start + tcol;\n"
+         "    if ((int)tok < args_ptr->ne11 && (int)out_col < n_out) {\n"
+         "      float g = ts_Cg[trow * 8 + tcol];\n"
+         "      float u = ts_Cu[trow * 8 + tcol];\n"
+         "      const float c = act_ptr->clamp_value;\n"
+         "      if (c > 1.0e-6f) { g = min(g, c); u = clamp(u, -c, c); }\n"
+         "      const float silu = g / (1.0f + exp(-g));\n"
+         "      device const float *route_w =\n"
+         "        (device const float *)(weights + (uint64_t)idx * act_ptr->weight_stride);\n"
+         "      const uint64_t pair_row = (uint64_t)tok * (uint64_t)args_ptr->nei0 + (uint64_t)idx;\n"
+         "      device float *dst_mid_f32 =\n"
+         "        (device float *)(dst_mid + pair_row * act_ptr->mid_row_stride);\n"
+         "      dst_mid_f32[(uint64_t)out_col] = silu * u * route_w[0];\n"
+         "    }\n"
+         "  }\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_moe_matmul_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: moe_matmul MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"mul_mm_id_fp16_pair_swiglu_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 64;
+    g_moe_matmul_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_moe_matmul_mtl4_pipeline) {
+        fprintf(stderr, "ds4: moe_matmul MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: moe_matmul MTL4 pipeline initialized (threadExecutionWidth=%lu)\n",
+            (unsigned long)g_moe_matmul_mtl4_pipeline.threadExecutionWidth);
+    g_moe_matmul_mtl4_init_ok = 1;
+    return 1;
+}
+
+/* Smoke test: confirms the pipeline compiles + initializes. Full output
+ * canary deferred — needs synthetic 8-buffer test bench with single-expert
+ * setup. Multi-turn item; this turn establishes the pipeline state exists. */
+int ds4_gpu_mtl4_moe_matmul_init_canary(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_moe_matmul_mtl4_pipeline_init()) return 0;
+    fprintf(stderr, "ds4: moe_matmul MTL4 pipeline canary — init OK\n");
+    return 1;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +
