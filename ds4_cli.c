@@ -1822,6 +1822,13 @@ int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--moe-matmul-init-canary")) {
         return ds4_gpu_mtl4_moe_matmul_init_canary() ? 0 : 1;
     }
+    /* --hc-weighted-sum-canary [n_embd [n_hc [n_tokens]]] : task #683 */
+    if (argc >= 2 && !strcmp(argv[1], "--hc-weighted-sum-canary")) {
+        const uint32_t n_embd = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
+        const uint32_t n_hc = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 4;
+        const uint32_t n_tokens = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
+        return ds4_gpu_mtl4_hc_weighted_sum_canary(n_embd, n_hc, n_tokens) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {

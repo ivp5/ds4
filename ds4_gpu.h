@@ -1185,3 +1185,7 @@ int ds4_gpu_mtl4_softmax_pool_canary(uint32_t ne0, uint32_t ne1, uint32_t n_rows
  *
  * Returns 1 if pipeline compiles + initializes; 0 on failure. */
 int ds4_gpu_mtl4_moe_matmul_init_canary(void);
+
+/* silv 2026-05-27 task #683 — hc_weighted_sum: HC weighted sum
+ * dst[d,t] = sum_h x[d,h,t] * weights[h,t]. First port from dsv4_hc.metal. */
+int ds4_gpu_mtl4_hc_weighted_sum_canary(uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens);
