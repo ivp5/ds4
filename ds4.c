@@ -51,6 +51,7 @@
 #include "ds4_neon_i8mm.h"
 #include "ds4_moe_route_log.h"
 #include "ds4_polar_reader.h"
+#include "ds4_prefix_cache.h"
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -17108,6 +17109,7 @@ struct ds4_engine {
  float directional_steering_ffn_scale;
  uint32_t power_percent;     /* 1..100; 0 means uninitialized → treated as 100 */
  ds4_polar_pool polar_pool;  /* #563 Phase B: per-(layer, kind) PLR2 mmap pool */
+ ds4_prefix_cache prefix_cache;  /* silv 2026-05-27 Phase 2: cached prefix activations */
  uint8_t polar_layer_enabled[DS4_POLAR_MAX_LAYERS]; /* #563 Phase B-2: DS4_POLAR_LAYERS mask */
  bool quality;
  bool metal_ready;
@@ -20786,7 +20788,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  e->mtp_draft_tree_width = opt->mtp_draft_tree_width > 0 ? opt->mtp_draft_tree_width : 1;
  if (e->mtp_draft_tree_width > 4) e->mtp_draft_tree_width = 4;
  if (e->mtp_draft_tree_width > 1) {
-   fprintf(stderr, "ds4: mtp_draft_tree_width=%d (spec-tree mode, not yet wired — falls back to linear)\n",
+   fprintf(stderr, "ds4: mtp_draft_tree_width=%d (Turn 3 diagnostic active — "
+                   "per-divergence top-K rank logged; decode stays linear until Turn 4)\n",
            e->mtp_draft_tree_width);
  }
  e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
@@ -20809,6 +20812,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  } else {
  e->power_percent = 100;
  }
+ /* silv 2026-05-27 Phase 2: initialize prefix activation cache.
+  * Phase 1 ships only hash + LRU bookkeeping. Phase 3+ adds disk-backed
+  * GPU state save/restore. */
+ ds4_prefix_cache_init(&e->prefix_cache);
  /* #563 Phase B-1.5: load PLR2 polar files if DS4_POLAR_DIR is set.
   * Held alongside FP4 weights; no dispatch substitution yet (Phase B-2). */
  ds4_polar_pool_init(&e->polar_pool);
@@ -21244,6 +21251,14 @@ const char *ds4_mpp_mode_name(ds4_mpp_mode m) {
 
 void ds4_engine_close(ds4_engine *e) {
  if (!e) return;
+ /* silv 2026-05-27 Phase 2: dump prefix cache stats if any activity, then free */
+ if (e->prefix_cache.stat_lookups > 0 || e->prefix_cache.stat_stores > 0) {
+   char statbuf[256];
+   if (ds4_prefix_cache_stats(&e->prefix_cache, statbuf, sizeof(statbuf)) > 0) {
+     fprintf(stderr, "%s\n", statbuf);
+   }
+ }
+ ds4_prefix_cache_free(&e->prefix_cache);
  ds4_polar_pool_close(&e->polar_pool);  /* #563 Phase B-1: release mmap'd PLR2 */
  weights_free(&e->weights);
  vocab_free(&e->vocab);
@@ -21898,6 +21913,19 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  int draft_n = 1;
  drafts[0] = s->mtp_draft_token;
  s->mtp_draft_valid = false;
+ /* silv 2026-05-27 Spec-tree Turn 3: per-step top-K tracking. When
+  * mtp_draft_tree_width > 1 OR DS4_MTP_TREE_DIAG=1, capture top-B
+  * MTP alternatives per depth. Used by the post-verify diagnostic
+  * below to count alt-saves (where row_tops[i-1] matched a top-B
+  * alternative that wasn't the MTP-argmax). No decode behavior change. */
+ const int mtp_tree_width = (e->mtp_draft_tree_width > 1) ? e->mtp_draft_tree_width : 1;
+ const bool mtp_tree_diag = (mtp_tree_width > 1) || (getenv("DS4_MTP_TREE_DIAG") != NULL);
+ int drafts_top_k[16][4];   /* mtp_tree_width <= 4 by engine clamp */
+ if (mtp_tree_diag) {
+  for (int i = 0; i < 16; i++)
+   for (int b = 0; b < 4; b++)
+    drafts_top_k[i][b] = -1;
+ }
  const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
  float mtp_margin_threshold = e->mtp_margin;
  const char *mtp_margin_env = getenv("DS4_MTP_MIN_MARGIN");
@@ -21910,7 +21938,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  const bool mtp_conf_log = getenv("DS4_MTP_CONF_LOG") != NULL;
  const bool mtp_need_logits = mtp_conf_log ||
  getenv("DS4_MTP_FULL_LOGITS") != NULL ||
- (!strict_mtp && mtp_margin_threshold > 0.0f);
+ (!strict_mtp && mtp_margin_threshold > 0.0f) ||
+ mtp_tree_diag;  /* silv 2026-05-27: tree-diag needs full logits for top-K */
  const double mtp_t0 = mtp_timing ? now_sec() : 0.0;
  double mtp_t_after_draft = mtp_t0;
  float mtp_last_margin = 0.0f;
@@ -21961,6 +21990,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  return n_accept;
  }
  drafts[draft_n] = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
+ /* silv 2026-05-27 Spec-tree Turn 3: capture top-K alternatives for
+  * post-verify diagnostic. Uses logits_top_k from this file (defined
+  * near sample_argmax). Cheap — O(n_vocab * K) on already-loaded logits. */
+ if (mtp_tree_diag && mtp_need_logits && draft_n < 16) {
+  logits_top_k(s->mtp_logits, DS4_N_VOCAB, mtp_tree_width,
+               drafts_top_k[draft_n], NULL);
+ }
  if (drafts[draft_n] == eos_token) {
  draft_n++;
  break;
@@ -22160,6 +22196,31 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  for (int i = 1; i < draft_n; i++) {
  if (row_tops[i - 1] != drafts[i]) break;
  commit_drafts++;
+ }
+ /* silv 2026-05-27 Spec-tree Turn 3: at the first divergence position,
+  * count whether row_tops[i-1] (= target's argmax) was inside MTP's
+  * top-K. This measures the potential value of tree-walk: how often
+  * a top-K alternative would have matched target.
+  *
+  * Linear (K=1) takes drafts[i] = top-1 only. With tree (K=B>1), we
+  * could test against alternatives drafts_top_k[i][0..B]. When
+  * row_tops[i-1] is in top-K but not top-1, tree COULD have saved
+  * the acceptance at depth i (subject to MTP-state desync caveat).
+  *
+  * Pure diagnostic — no behavior change. Emits on DS4_MTP_TREE_DIAG=1
+  * or implicitly when mtp_draft_tree_width > 1. */
+ if (mtp_tree_diag && commit_drafts < draft_n) {
+  const int i = commit_drafts; /* first divergence position */
+  const int target_tok = row_tops[i - 1];
+  int rank = -1;
+  for (int b = 0; b < mtp_tree_width; b++) {
+   if (drafts_top_k[i][b] == target_tok) { rank = b; break; }
+  }
+  fprintf(stderr,
+   "ds4: mtp tree-diag depth=%d K=%d target=%d mtp_top1=%d "
+   "target_rank=%d (alt_save_possible=%d)\n",
+   i, mtp_tree_width, target_tok, drafts[i],
+   rank, (rank > 0) ? 1 : 0);
  }
  if (mtp_conf_log) {
  fprintf(stderr,
