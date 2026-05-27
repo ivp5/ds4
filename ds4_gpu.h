@@ -1555,6 +1555,11 @@ int ds4_gpu_mtl4_mul_mm_id_q4_K_f32_n128_canary(uint32_t M, uint32_t N, uint32_t
 int ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n64_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
 int ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n128_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
 
+/* silv 2026-05-28 I-1 wiring probe: calls ds4_gpu_routed_mm_pipeline_for_tile
+ * for each (type, tile_n) combination and prints the pipeline selected.
+ * Pair with DS4_METAL_LOG_ROUTED_MM=1 to see per-pick instrumentation. */
+int ds4_gpu_mtl4_routed_mm_dispatch_probe(void);
+
 /* silv 2026-05-28 task #742 — wide-tile audit canary.
  * Routes R tokens to a single expert (htpe[0]=R, hids[0..R-1]={0..R-1}),
  * runs each of n32/n64/n128 pipelines, reports per-token mismatch

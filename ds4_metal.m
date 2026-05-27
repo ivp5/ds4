@@ -13175,50 +13175,88 @@ static id<MTLComputePipelineState> g_mul_mm_id_q4_K_f32_n128_mtl4_pipeline;
 static id<MTLComputePipelineState> g_mul_mm_id_q2_K_f32_n64_mtl4_pipeline;
 static id<MTLComputePipelineState> g_mul_mm_id_q2_K_f32_n128_mtl4_pipeline;
 
+/* silv 2026-05-28 I-1 instrumentation: env-gated log of which pipeline got
+ * selected. Set DS4_METAL_LOG_ROUTED_MM=1 to verify MTL4 redirect fires in
+ * production. Dedupes per (type, tile_n, kind) — at most ~24 lines per run. */
+static void ds4_gpu_log_routed_mm_pick(uint32_t type, uint32_t tile_n,
+                                       const char *kind, const char *name) {
+    static int s_init;
+    static int s_enabled;
+    if (!s_init) { s_enabled = getenv("DS4_METAL_LOG_ROUTED_MM") != NULL; s_init = 1; }
+    if (!s_enabled) return;
+    static char s_seen[32];
+    int t = -1, n = -1, k = (kind[0] == 'M') ? 1 : 0;
+    if (type == DS4_METAL_TENSOR_IQ2_XXS) t = 0;
+    else if (type == DS4_METAL_TENSOR_Q2_K) t = 1;
+    else if (type == DS4_METAL_TENSOR_Q4_K) t = 2;
+    if (tile_n == 32u) n = 0; else if (tile_n == 64u) n = 1; else if (tile_n == 128u) n = 2;
+    if (t < 0 || n < 0) return;
+    int slot = t * 8 + n * 2 + k;
+    if (slot < 0 || slot >= 32 || s_seen[slot]) return;
+    s_seen[slot] = 1;
+    fprintf(stderr, "ds4: routed_mm dispatch: type=%u tile_n=%u kind=%s pipeline=%s\n",
+            type, tile_n, kind, name);
+}
+
 static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline_for_tile(uint32_t type,
                                                                          uint32_t tile_n) {
     switch (type) {
     case DS4_METAL_TENSOR_IQ2_XXS:
         if (tile_n == 128u) {
             if (ds4_mul_mm_id_iq2_xxs_f32_n128_mtl4_pipeline_init()) {
+                ds4_gpu_log_routed_mm_pick(type, tile_n, "MTL4", "iq2_xxs_f32_n128_mtl4");
                 return g_mul_mm_id_iq2_xxs_f32_n128_mtl4_pipeline;
             }
+            ds4_gpu_log_routed_mm_pick(type, tile_n, "antirez", "kernel_mul_mm_id_iq2_xxs_f32_n128");
             return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32_n128", false);
         }
         if (tile_n == 64u) {
             if (ds4_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline_init()) {
+                ds4_gpu_log_routed_mm_pick(type, tile_n, "MTL4", "iq2_xxs_f32_n64_mtl4");
                 return g_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline;
             }
+            ds4_gpu_log_routed_mm_pick(type, tile_n, "antirez", "kernel_mul_mm_id_iq2_xxs_f32_n64");
             return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32_n64", false);
         }
+        ds4_gpu_log_routed_mm_pick(type, tile_n, "antirez", "kernel_mul_mm_id_iq2_xxs_f32");
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32", false);
     case DS4_METAL_TENSOR_Q2_K:
         if (tile_n == 128u) {
             if (ds4_mul_mm_id_q2_K_f32_n128_mtl4_pipeline_init()) {
+                ds4_gpu_log_routed_mm_pick(type, tile_n, "MTL4", "q2_K_f32_n128_mtl4");
                 return g_mul_mm_id_q2_K_f32_n128_mtl4_pipeline;
             }
+            ds4_gpu_log_routed_mm_pick(type, tile_n, "antirez", "kernel_mul_mm_id_q2_K_f32_n128");
             return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32_n128", false);
         }
         if (tile_n == 64u) {
             if (ds4_mul_mm_id_q2_K_f32_n64_mtl4_pipeline_init()) {
+                ds4_gpu_log_routed_mm_pick(type, tile_n, "MTL4", "q2_K_f32_n64_mtl4");
                 return g_mul_mm_id_q2_K_f32_n64_mtl4_pipeline;
             }
+            ds4_gpu_log_routed_mm_pick(type, tile_n, "antirez", "kernel_mul_mm_id_q2_K_f32_n64");
             return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32_n64", false);
         }
+        ds4_gpu_log_routed_mm_pick(type, tile_n, "antirez", "kernel_mul_mm_id_q2_K_f32");
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
     case DS4_METAL_TENSOR_Q4_K:
         if (tile_n == 128u) {
             if (ds4_mul_mm_id_q4_K_f32_n128_mtl4_pipeline_init()) {
+                ds4_gpu_log_routed_mm_pick(type, tile_n, "MTL4", "q4_K_f32_n128_mtl4");
                 return g_mul_mm_id_q4_K_f32_n128_mtl4_pipeline;
             }
+            ds4_gpu_log_routed_mm_pick(type, tile_n, "antirez", "kernel_mul_mm_id_q4_K_f32_n128");
             return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32_n128", false);
         }
         if (tile_n == 64u) {
             if (ds4_mul_mm_id_q4_K_f32_n64_mtl4_pipeline_init()) {
+                ds4_gpu_log_routed_mm_pick(type, tile_n, "MTL4", "q4_K_f32_n64_mtl4");
                 return g_mul_mm_id_q4_K_f32_n64_mtl4_pipeline;
             }
+            ds4_gpu_log_routed_mm_pick(type, tile_n, "antirez", "kernel_mul_mm_id_q4_K_f32_n64");
             return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32_n64", false);
         }
+        ds4_gpu_log_routed_mm_pick(type, tile_n, "antirez", "kernel_mul_mm_id_q4_K_f32");
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
     default:
         return nil;
@@ -34363,6 +34401,31 @@ int ds4_gpu_mtl4_wide_tile_audit_q2_K(uint32_t M, uint32_t K, uint32_t R) {
             R, ok_n32 ? "PASS" : "FAIL", ok_n64 ? "PASS" : "FAIL",
             ok_n128 ? "PASS" : "FAIL");
     return (ok_n32 && ok_n64 && ok_n128) ? 1 : 0;
+}
+
+/* silv 2026-05-28 I-1 wiring probe: call ds4_gpu_routed_mm_pipeline_for_tile
+ * for each (type, tile_n) and print which pipeline got selected. Pair with
+ * DS4_METAL_LOG_ROUTED_MM=1 env to see the per-pick log lines. This is the
+ * smoke test for the MTL4-redirect — confirms n64/n128 picks the fixed
+ * kernels not antirez. */
+int ds4_gpu_mtl4_routed_mm_dispatch_probe(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t types[3] = { DS4_METAL_TENSOR_IQ2_XXS, DS4_METAL_TENSOR_Q4_K, DS4_METAL_TENSOR_Q2_K };
+    const char *type_names[3] = { "IQ2_XXS", "Q4_K", "Q2_K" };
+    const uint32_t tiles[3] = { 32, 64, 128 };
+    int total_ok = 0, total = 0;
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            id<MTLComputePipelineState> p = ds4_gpu_routed_mm_pipeline_for_tile(types[i], tiles[j]);
+            const int ok = (p != nil) ? 1 : 0;
+            fprintf(stderr, "ds4: routed_mm probe type=%s tile_n=%u → pipeline=%s\n",
+                    type_names[i], tiles[j], ok ? "OK" : "NIL");
+            total += 1;
+            total_ok += ok;
+        }
+    }
+    fprintf(stderr, "ds4: routed_mm probe %d/%d pipelines selected non-nil\n", total_ok, total);
+    return (total_ok == total) ? 1 : 0;
 }
 
 /* ============================================================ */

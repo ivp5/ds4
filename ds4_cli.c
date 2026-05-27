@@ -2319,6 +2319,12 @@ int main(int argc, char **argv) {
         const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
         return ds4_gpu_mtl4_mul_mm_id_q2_K_f32_canary(m, n, k, e) ? 0 : 1;
     }
+    /* --routed-mm-dispatch-probe : silv 2026-05-28 I-1 wiring smoke test.
+     * Pair with DS4_METAL_LOG_ROUTED_MM=1 to see per-pick log lines confirming
+     * the MTL4 redirect for wide-tile (n64/n128) fires correctly. */
+    if (argc >= 2 && !strcmp(argv[1], "--routed-mm-dispatch-probe")) {
+        return ds4_gpu_mtl4_routed_mm_dispatch_probe() ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);
