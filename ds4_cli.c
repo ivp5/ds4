@@ -1725,6 +1725,17 @@ int main(int argc, char **argv) {
         uint32_t act_rows  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 16;
         return ds4_gpu_mtl4_vq_real_canary(dir, layer, expert, down_rows, act_rows) ? 0 : 1;
     }
+    /* --softplus-sqrt-canary [n_rows [n_cols]] : silv 2026-05-27 task #670
+     * MTL4 port of kernel_dsv4_softplus_sqrt_f32_4 (metal/unary.metal:290).
+     * Feeds deterministic input through both MTL4 pipeline + CPU reference;
+     * passes if max abs diff < 1e-4. First of 74-kernel classic → MTL4
+     * sweep; validates the storage-class migration pattern (constant →
+     * device const args_ptr) on the smallest viable kernel. */
+    if (argc >= 2 && !strcmp(argv[1], "--softplus-sqrt-canary")) {
+        const uint32_t n_rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
+        const uint32_t n_cols = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_softplus_sqrt_canary(n_rows, n_cols) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {

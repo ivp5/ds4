@@ -16504,6 +16504,233 @@ int ds4_gpu_mtl4_hadamard16_canary(uint32_t n_rows, uint32_t n_in) {
 }
 
 /* ============================================================ */
+/* MTL4 port: kernel_dsv4_softplus_sqrt_f32_4                   */
+/* silv 2026-05-27 task #670 — first of the 74-kernel MTL4 sweep.
+ *
+ * Smallest blast radius port: 1 args struct + 2 buffers + simple math.
+ * Classic-MTL version is at metal/unary.metal:290 (already ICB-captured
+ * as Phase 4 #558). The MTL4 port duplicates the pipeline against the
+ * MTL4 compiler so it can be MTL4-dispatched with ArgumentTable bindings.
+ *
+ * Storage-class migration (R1 lesson from Hadamard):
+ *   classic: constant ds4_metal_args_unary & args
+ *   MTL4:    device const ds4_metal_args_unary *args_ptr
+ *
+ * The classic kernel can't be reused because MTL4 ArgumentTable bindings
+ * go via gpuAddress + setAddress, which require device storage class.
+ *
+ * Reduced struct: this kernel only reads ne00, ne01, ne0, nb01, nb1 —
+ * we only declare the fields it actually uses. The classic version
+ * shares the full ds4_metal_args_unary struct with other unary kernels;
+ * for MTL4 we just need this kernel's subset.
+ * ============================================================ */
+static id<MTLComputePipelineState> g_softplus_sqrt_mtl4_pipeline;
+static int g_softplus_sqrt_mtl4_init_attempted;
+static int g_softplus_sqrt_mtl4_init_ok;
+
+static int ds4_softplus_sqrt_mtl4_pipeline_init(void) {
+    if (g_softplus_sqrt_mtl4_init_attempted) return g_softplus_sqrt_mtl4_init_ok;
+    g_softplus_sqrt_mtl4_init_attempted = 1;
+
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct ds4_softplus_sqrt_args {\n"
+         "  int32_t  ne00;\n"
+         "  int32_t  ne01;\n"
+         "  int32_t  ne0;\n"
+         "  uint64_t nb01;\n"
+         "  uint64_t nb1;\n"
+         "};\n"
+         "kernel void softplus_sqrt_f32_4_mtl4(\n"
+         "    device const ds4_softplus_sqrt_args *args_ptr [[buffer(0)]],\n"
+         "    device const char *src [[buffer(1)]],\n"
+         "    device char *dst [[buffer(2)]],\n"
+         "    uint3 tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort3 tpitg [[thread_position_in_threadgroup]],\n"
+         "    ushort3 ntg [[threads_per_threadgroup]]) {\n"
+         "  const int ne01 = args_ptr->ne01;\n"
+         "  const int ne0 = args_ptr->ne0;\n"
+         "  const uint64_t nb01 = args_ptr->nb01;\n"
+         "  const uint64_t nb1 = args_ptr->nb1;\n"
+         "  const int k0 = (int)tgpig.x / ne01;\n"
+         "  const int i01 = (int)tgpig.x - k0 * ne01;\n"
+         "  const int i0 = k0 * (int)ntg.x + (int)tpitg.x;\n"
+         "  if (i0 >= ne0) return;\n"
+         "  device const float4 *s = (device const float4 *)(src + i01 * nb01);\n"
+         "  device float4 *d = (device float4 *)(dst + i01 * nb1);\n"
+         "  const float4 x = s[i0];\n"
+         "  const float4 sp = select(log(1.0f + exp(x)), x, x > 20.0f);\n"
+         "  d[i0] = sqrt(sp);\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_softplus_sqrt_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: softplus_sqrt MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"softplus_sqrt_f32_4_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_softplus_sqrt_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil
+                                                         error:&err];
+    if (!g_softplus_sqrt_mtl4_pipeline) {
+        fprintf(stderr, "ds4: softplus_sqrt MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: softplus_sqrt MTL4 pipeline initialized "
+                    "(threadExecutionWidth=%lu maxThreadsPerTg=%lu)\n",
+            (unsigned long)g_softplus_sqrt_mtl4_pipeline.threadExecutionWidth,
+            (unsigned long)g_softplus_sqrt_mtl4_pipeline.maxTotalThreadsPerThreadgroup);
+    g_softplus_sqrt_mtl4_init_ok = 1;
+    return 1;
+}
+
+/* Canary: feed deterministic input, verify softplus(x) followed by sqrt
+ * matches CPU reference within FP32 precision. */
+int ds4_gpu_mtl4_softplus_sqrt_canary(uint32_t n_rows, uint32_t n_cols) {
+    if (n_cols % 4u != 0u) {
+        fprintf(stderr, "ds4: softplus_sqrt canary requires n_cols %% 4 == 0 (got %u)\n", n_cols);
+        return 0;
+    }
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_softplus_sqrt_mtl4_pipeline_init()) return 0;
+
+    const uint64_t n_elems = (uint64_t)n_rows * n_cols;
+    float *host_in = (float *)calloc(n_elems, sizeof(float));
+    float *host_out = (float *)calloc(n_elems, sizeof(float));
+    float *host_ref = (float *)calloc(n_elems, sizeof(float));
+    if (!host_in || !host_out || !host_ref) {
+        free(host_in); free(host_out); free(host_ref); return 0;
+    }
+    /* Deterministic test pattern: spans softplus's domain — negative,
+     * zero, small positive, the > 20 fast-path. */
+    for (uint64_t i = 0; i < n_elems; i++) {
+        host_in[i] = -3.0f + (float)(i % 256) * 0.1f;
+    }
+    /* CPU reference */
+    for (uint64_t i = 0; i < n_elems; i++) {
+        const float x = host_in[i];
+        const float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));
+        host_ref[i] = sqrtf(sp);
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:32 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> srcBuf = [g_device newBufferWithLength:n_elems * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:n_elems * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        memcpy(srcBuf.contents, host_in, n_elems * sizeof(float));
+
+        struct {
+            int32_t ne00, ne01, ne0;
+            uint64_t nb01, nb1;
+        } args = {
+            .ne00 = (int32_t)n_cols,
+            .ne01 = (int32_t)n_rows,
+            .ne0  = (int32_t)(n_cols / 4),  /* float4 lane count */
+            .nb01 = (uint64_t)n_cols * sizeof(float),
+            .nb1  = (uint64_t)n_cols * sizeof(float),
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[3] = {
+                (id<MTLAllocation>)argsBuf, (id<MTLAllocation>)srcBuf, (id<MTLAllocation>)dstBuf,
+            };
+            [residency addAllocations:allocs count:3];
+            [residency commit];
+            [residency requestResidency];
+
+            MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+            atDesc.maxBufferBindCount = 4;
+            atDesc.initializeBindings = YES;
+            id<MTL4ArgumentTable> argTable = [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:srcBuf.gpuAddress atIndex:1];
+                [argTable setAddress:dstBuf.gpuAddress atIndex:2];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_softplus_sqrt_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                const MTLSize grid = MTLSizeMake(n_rows, 1, 1);
+                const MTLSize tg = MTLSizeMake(n_cols / 4, 1, 1);
+                [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+                    (void)feedback; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_out, dstBuf.contents, n_elems * sizeof(float));
+                    rc = 1;
+                } else {
+                    fprintf(stderr, "ds4: softplus_sqrt canary timeout\n");
+                }
+            } else {
+                fprintf(stderr, "ds4: softplus_sqrt argument table: %s\n",
+                        err ? err.localizedDescription.UTF8String : "(no error)");
+            }
+        } else {
+            fprintf(stderr, "ds4: softplus_sqrt residency set: %s\n",
+                    err ? err.localizedDescription.UTF8String : "(no error)");
+        }
+    }
+    if (!rc) { free(host_in); free(host_out); free(host_ref); return 0; }
+
+    /* Compare host_out vs host_ref */
+    double max_abs_diff = 0.0;
+    double sum_sq = 0.0;
+    for (uint64_t i = 0; i < n_elems; i++) {
+        const double d = (double)(host_out[i] - host_ref[i]);
+        if (fabs(d) > max_abs_diff) max_abs_diff = fabs(d);
+        sum_sq += d * d;
+    }
+    const double rms = sqrt(sum_sq / (double)n_elems);
+    fprintf(stderr,
+        "ds4: softplus_sqrt MTL4 canary n_rows=%u n_cols=%u "
+        "max_abs_diff=%.6e rms=%.6e\n",
+        n_rows, n_cols, max_abs_diff, rms);
+    const int ok = (max_abs_diff < 1.0e-4) ? 1 : 0;
+
+    free(host_in); free(host_out); free(host_ref);
+    return ok;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +
@@ -18323,7 +18550,22 @@ extern const uint8_t ksigns_iq2xs[128];
 extern const uint64_t iq2xxs_grid[256];
 
 /* Convert one block_iq2_xxs (66 bytes) → 256 float32 values.
- * Matches dequantize_row_iq2_xxs(ggml/llama.cpp): scale = d * 0.125 * (0.5 + (aux32[1]>>28)). */
+ *
+ * silv 2026-05-27 codex H2086 fix: align with CPU/hot-store IQ2_XXS
+ * dequant path in ds4.c:2112-2113:
+ *   ls = 2 * (aux32[1] >> 28) + 1
+ *   bscale = d * (float)ls * 0.125f
+ *
+ * Previous formula `d * 0.125 * (0.5 + h)` = `d * (2h+1)/16` was
+ * SYSTEMATICALLY 2× SMALLER than the reference `d * (2h+1)/8`. This
+ * affected every IQ2_XXS expert dequant in the MTL4 path → all expert
+ * weights were half-magnitude → routed-MoE outputs scaled wrong.
+ *
+ * Math verification: NEON path at ds4.c:2049-2056 uses `(0.5+h)` and
+ * multiplies by 0.25 at the end → `(0.5+h)/4 = (1+2h)/8` ✓ matches
+ * non-NEON `(2h+1) * 0.125 = (1+2h)/8` ✓. MTL4 OLD was using
+ * `(0.5+h) * 0.125 = (1+2h)/16` ✗ — half of reference.
+ */
 static void ds4_mtl4_dequant_iq2_xxs_block(const uint8_t *src66, float *dst256) {
  const uint16_t d_f16 = ((const uint16_t *)src66)[0];
  /* Inline F16 → F32 (ARM half-precision intrinsic if available). */
@@ -18334,7 +18576,8 @@ static void ds4_mtl4_dequant_iq2_xxs_block(const uint8_t *src66, float *dst256) 
  const uint8_t *aux8 = (const uint8_t *)aux32;
  for (int ib32 = 0; ib32 < 8; ib32++) {
  memcpy(aux32, qs_u16 + 4 * ib32, 8);
- const float db = d * 0.125f * (0.5f + (float)(aux32[1] >> 28));
+ const uint32_t scale_nibble = aux32[1] >> 28;
+ const float db = d * 0.125f * (float)(2u * scale_nibble + 1u);
  for (int l = 0; l < 4; l++) {
  const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
  const uint8_t signs = ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];

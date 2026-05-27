@@ -1092,3 +1092,11 @@ int ds4_gpu_hadamard16_fp16_batched_tensor(ds4_gpu_tensor *tensor,
  * overrides remain in effect for layers that have them set. */
 void ds4_set_current_layer_idx(int il);
 void ds4_set_attn_scale_mult_runtime(float v);
+
+/* silv 2026-05-27 task #670 — first of 74-kernel MTL4 sweep.
+ *
+ * kernel_dsv4_softplus_sqrt_f32_4 ported to MTL4 path. Public canary
+ * tests the pipeline against a CPU reference; returns 1 if max abs
+ * diff < 1e-4. Used by the MTL4-port test harness to validate the
+ * port pattern before scaling to MoE-matmul. */
+int ds4_gpu_mtl4_softplus_sqrt_canary(uint32_t n_rows, uint32_t n_cols);
