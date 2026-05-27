@@ -1545,6 +1545,16 @@ int ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_n64_canary(uint32_t M, uint32_t N, uint32
  * amortization point. Same shape, NR1=128. */
 int ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_n128_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
 
+/* silv 2026-05-28 tasks #742-#747 — wide-tile variants for Q8_0/Q4_K/Q2_K.
+ * Each is a {n64, n128} variant of the n32 baseline (#734/#736/#737).
+ * Antirez wide-token MoE prefill amortization pattern. */
+int ds4_gpu_mtl4_mul_mm_id_q8_0_f32_n64_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
+int ds4_gpu_mtl4_mul_mm_id_q8_0_f32_n128_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
+int ds4_gpu_mtl4_mul_mm_id_q4_K_f32_n64_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
+int ds4_gpu_mtl4_mul_mm_id_q4_K_f32_n128_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
+int ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n64_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
+int ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n128_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
+
 /* silv 2026-05-28 task #736 — mul_mm_id_q4_K_f32 MTL4.
  * Routed MoE Q4_K prefill matmul. 144-byte 256-element blocks with
  * 6-bit packed scales+mins (get_scale_min_k4_just2) and 4-bit qs.

@@ -2227,6 +2227,49 @@ int main(int argc, char **argv) {
         const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
         return ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_n128_canary(m, n, k, e) ? 0 : 1;
     }
+    /* #742-#747 wide-tile canaries for Q8_0 / Q4_K / Q2_K × {n64, n128} */
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q8-0-n64-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
+        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
+        return ds4_gpu_mtl4_mul_mm_id_q8_0_f32_n64_canary(m, n, k, e) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q8-0-n128-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
+        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
+        return ds4_gpu_mtl4_mul_mm_id_q8_0_f32_n128_canary(m, n, k, e) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q4-k-n64-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
+        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
+        return ds4_gpu_mtl4_mul_mm_id_q4_K_f32_n64_canary(m, n, k, e) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q4-k-n128-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
+        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
+        return ds4_gpu_mtl4_mul_mm_id_q4_K_f32_n128_canary(m, n, k, e) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q2-k-n64-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
+        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
+        return ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n64_canary(m, n, k, e) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q2-k-n128-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
+        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
+        return ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n128_canary(m, n, k, e) ? 0 : 1;
+    }
     /* --mul-mm-id-q4-k-canary [M [N [K [E]]]] : #736 Q4_K routed MoE matmul */
     if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q4-k-canary")) {
         const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
