@@ -1468,3 +1468,10 @@ int ds4_gpu_mtl4_dsv4_q8_hc_expand4_q8_0_canary(uint32_t M, uint32_t N);
  * mul_mv_f32_f32; src0 element type is half. FC pattern via the
  * refactored ds4_mtl4_build_kernel_pipeline helper. */
 int ds4_gpu_mtl4_mul_mv_f16_f32_canary(uint32_t M, uint32_t N);
+
+/* silv 2026-05-28 task #728 — dsv4_shared_down_hc_expand4_q8_0 MTL4.
+ * Q8_0 shared-down matvec + routed_out add + 4-channel HC expansion.
+ * block_v = shared_v + routed_out[d]; dst[d,c] = block_v * post[c]
+ * + Σ_k comb[c,k] * residual[d,k]. 10 buffers. Hardcoded n_hc=4,
+ * n_tokens=1 (decode path). NR0=2, NSG=4 via FC. */
+int ds4_gpu_mtl4_dsv4_shared_down_hc_expand4_q8_0_canary(uint32_t M, uint32_t N);

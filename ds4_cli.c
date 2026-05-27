@@ -2125,6 +2125,12 @@ int main(int argc, char **argv) {
         const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
         return ds4_gpu_mtl4_mul_mv_f16_f32_canary(m, n) ? 0 : 1;
     }
+    /* --shared-down-hc-expand4-canary [M [N]] : task #728 */
+    if (argc >= 2 && !strcmp(argv[1], "--shared-down-hc-expand4-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_dsv4_shared_down_hc_expand4_q8_0_canary(m, n) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);
