@@ -1293,3 +1293,13 @@ int ds4_gpu_mtl4_moe_swiglu_weight_canary(uint32_t rows, uint32_t width);
 /* silv 2026-05-27 task #688 — dsv4_moe_sum6_f32 MTL4. Routed-MoE
  * finalize: sum of 6 contiguous expert outputs per token. */
 int ds4_gpu_mtl4_moe_sum6_canary(uint32_t tokens, uint32_t width);
+
+/* silv 2026-05-27 task #689 — dsv4_moe_swiglu_weight_f16 MTL4. FP16 mid
+ * variant of #687: SiLU(g)×u×route_weight stored as half. */
+int ds4_gpu_mtl4_moe_swiglu_weight_f16_canary(uint32_t rows, uint32_t width);
+
+/* silv 2026-05-27 task #690 — dsv4_hc_split_sinkhorn MTL4 (HC=4).
+ * Splits HC mixer row into pre/post sigmoids + Sinkhorn-normalized
+ * 4×4 combination matrix. NEW patterns: stable row-softmax (max-shift),
+ * iterative col/row normalization for sinkhorn_iters steps. */
+int ds4_gpu_mtl4_hc_split_sinkhorn_canary(uint32_t n_rows, uint32_t sinkhorn_iters);

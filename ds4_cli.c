@@ -1893,6 +1893,18 @@ int main(int argc, char **argv) {
         const uint32_t width = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 512;
         return ds4_gpu_mtl4_moe_sum6_canary(tokens, width) ? 0 : 1;
     }
+    /* --moe-swiglu-weight-f16-canary [rows [width]] : task #689 FP16 mid variant */
+    if (argc >= 2 && !strcmp(argv[1], "--moe-swiglu-weight-f16-canary")) {
+        const uint32_t rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
+        const uint32_t width = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_moe_swiglu_weight_f16_canary(rows, width) ? 0 : 1;
+    }
+    /* --hc-split-sinkhorn-canary [n_rows [iters]] : task #690 Sinkhorn 4×4 */
+    if (argc >= 2 && !strcmp(argv[1], "--hc-split-sinkhorn-canary")) {
+        const uint32_t n_rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t iters = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 1;
+        return ds4_gpu_mtl4_hc_split_sinkhorn_canary(n_rows, iters) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);
