@@ -1284,3 +1284,12 @@ int ds4_gpu_mtl4_indexer_hadamard_fp4_canary(uint32_t n_rows);
  * non-RoPE region, plus FP16-rounded raw_cache mirror used by
  * FlashAttention. Per-token dispatch (64 threads). */
 int ds4_gpu_mtl4_kv_fp8_store_canary(uint32_t head_dim, uint32_t n_rot);
+
+/* silv 2026-05-27 task #687 — dsv4_moe_swiglu_weight MTL4. Routed-MoE
+ * activation: mid[i] = SiLU(g) × u × route_weight with optional clamp.
+ * Per (expert, token) row dispatch. */
+int ds4_gpu_mtl4_moe_swiglu_weight_canary(uint32_t rows, uint32_t width);
+
+/* silv 2026-05-27 task #688 — dsv4_moe_sum6_f32 MTL4. Routed-MoE
+ * finalize: sum of 6 contiguous expert outputs per token. */
+int ds4_gpu_mtl4_moe_sum6_canary(uint32_t tokens, uint32_t width);

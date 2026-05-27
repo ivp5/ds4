@@ -1881,6 +1881,18 @@ int main(int argc, char **argv) {
         const uint32_t n_rot = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 64;
         return ds4_gpu_mtl4_kv_fp8_store_canary(head_dim, n_rot) ? 0 : 1;
     }
+    /* --moe-swiglu-weight-canary [rows [width]] : task #687 routed MoE activation */
+    if (argc >= 2 && !strcmp(argv[1], "--moe-swiglu-weight-canary")) {
+        const uint32_t rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
+        const uint32_t width = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_moe_swiglu_weight_canary(rows, width) ? 0 : 1;
+    }
+    /* --moe-sum6-canary [tokens [width]] : task #688 6-buffer MoE finalize */
+    if (argc >= 2 && !strcmp(argv[1], "--moe-sum6-canary")) {
+        const uint32_t tokens = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4;
+        const uint32_t width = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 512;
+        return ds4_gpu_mtl4_moe_sum6_canary(tokens, width) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);
