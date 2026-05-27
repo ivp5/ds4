@@ -16128,6 +16128,82 @@ static int ds4_polar_pipeline_init(void) {
     return 1;
 }
 
+/* ============================================================ */
+/* Shared MTL4 pipeline-build helper (silv 2026-05-27 refactor) */
+/* ============================================================ */
+/* Eliminates the ~25-line boilerplate at every kernel's
+ * pipeline-init function. Handles BOTH the plain (no FC) and
+ * the function-constant path via the same code path:
+ *
+ *   - libDesc.source = source; lib = compiler.newLibraryWithDescriptor
+ *   - baseDesc = MTL4LibraryFunctionDescriptor(library=lib, name=kernel_name)
+ *   - if fcs supplied, wrap base in MTL4SpecializedFunctionDescriptor
+ *     with MTLFunctionConstantValues populated from fcs
+ *   - pipeDesc.computeFunctionDescriptor = (specialized or base)
+ *   - return computePipelineStateWithDescriptor result
+ *
+ * All errors logged via fprintf to stderr with `name` as the label.
+ * Returns nil on any failure. */
+typedef struct {
+    int16_t  value;
+    uint32_t index;
+} ds4_mtl4_fc_short;
+
+static id<MTLComputePipelineState> ds4_mtl4_build_kernel_pipeline(
+        NSString *source,
+        NSString *lib_name,
+        NSString *kernel_name,
+        NSUInteger max_threads_per_tg,
+        const ds4_mtl4_fc_short *fcs,
+        int n_fcs) {
+    if (!ds4_polar_pipeline_init()) return nil;
+    NSError *err = nil;
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = lib_name;
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: %s MTL4 library compile failed: %s\n",
+                lib_name.UTF8String,
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return nil;
+    }
+
+    MTL4LibraryFunctionDescriptor *baseDesc = [MTL4LibraryFunctionDescriptor new];
+    baseDesc.library = lib;
+    baseDesc.name = kernel_name;
+
+    MTL4FunctionDescriptor *funcDesc = baseDesc;
+    if (fcs && n_fcs > 0) {
+        MTLFunctionConstantValues *fcVals = [[MTLFunctionConstantValues alloc] init];
+        for (int i = 0; i < n_fcs; i++) {
+            int16_t v = fcs[i].value;
+            [fcVals setConstantValue:&v type:MTLDataTypeShort atIndex:fcs[i].index];
+        }
+        MTL4SpecializedFunctionDescriptor *specDesc = [MTL4SpecializedFunctionDescriptor new];
+        specDesc.functionDescriptor = baseDesc;
+        specDesc.constantValues = fcVals;
+        funcDesc = specDesc;
+    }
+
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = funcDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = max_threads_per_tg;
+    id<MTLComputePipelineState> pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!pipeline) {
+        fprintf(stderr, "ds4: %s MTL4 pipeline failed: %s\n",
+                lib_name.UTF8String,
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return nil;
+    }
+    fprintf(stderr, "ds4: %s MTL4 pipeline initialized\n", lib_name.UTF8String);
+    return pipeline;
+}
+
 /* Polar canary: dispatch the polar_dot kernel on deterministic synthetic inputs
  * (all-ones hidden, level[0]=1.0, mag code 0, phase code 0 → angle 0 in 9-entry
  * LUT). Expected output per packet = pairs × 1.0. Reports GPU elapsed via
@@ -16664,10 +16740,8 @@ static int g_softplus_sqrt_mtl4_init_ok;
 static int ds4_softplus_sqrt_mtl4_pipeline_init(void) {
     if (g_softplus_sqrt_mtl4_init_attempted) return g_softplus_sqrt_mtl4_init_ok;
     g_softplus_sqrt_mtl4_init_attempted = 1;
-
-    if (!ds4_polar_pipeline_init()) return 0;
-
     NSError *err = nil;
+
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -16876,9 +16950,6 @@ static int g_router_weights_one_mtl4_init_ok;
 static int ds4_router_weights_one_mtl4_pipeline_init(void) {
     if (g_router_weights_one_mtl4_init_attempted) return g_router_weights_one_mtl4_init_ok;
     g_router_weights_one_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -16894,33 +16965,10 @@ static int ds4_router_weights_one_mtl4_pipeline_init(void) {
          "  weights[tid] = probs[selected[tid]] / sum * 1.5f;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_router_weights_one_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: router_weights_one MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"router_weights_one_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 32;
-    g_router_weights_one_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_router_weights_one_mtl4_pipeline) {
-        fprintf(stderr, "ds4: router_weights_one MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: router_weights_one MTL4 pipeline initialized\n");
-    g_router_weights_one_mtl4_init_ok = 1;
-    return 1;
+    g_router_weights_one_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_router_weights_one_mtl4", @"router_weights_one_mtl4", 32, NULL, 0);
+    g_router_weights_one_mtl4_init_ok = (g_router_weights_one_mtl4_pipeline != nil) ? 1 : 0;
+    return g_router_weights_one_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_router_weights_one_canary(void) {
@@ -17151,9 +17199,6 @@ static int g_topk_mask_mtl4_init_ok;
 static int ds4_topk_mask_mtl4_pipeline_init(void) {
     if (g_topk_mask_mtl4_init_attempted) return g_topk_mask_mtl4_init_ok;
     g_topk_mask_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -17176,33 +17221,10 @@ static int ds4_topk_mask_mtl4_pipeline_init(void) {
          "  *((device float *)(dst + ic * args_ptr->nb0 + it * args_ptr->nb1)) = -INFINITY;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_topk_mask_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: topk_mask MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"topk_mask_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_topk_mask_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_topk_mask_mtl4_pipeline) {
-        fprintf(stderr, "ds4: topk_mask MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: topk_mask MTL4 pipeline initialized\n");
-    g_topk_mask_mtl4_init_ok = 1;
-    return 1;
+    g_topk_mask_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_topk_mask_mtl4", @"topk_mask_mtl4", 256, NULL, 0);
+    g_topk_mask_mtl4_init_ok = (g_topk_mask_mtl4_pipeline != nil) ? 1 : 0;
+    return g_topk_mask_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_topk_mask_canary(uint32_t ne0, uint32_t ne1) {
@@ -17320,9 +17342,6 @@ static int g_topk_mask_scatter_mtl4_init_ok;
 static int ds4_topk_mask_scatter_mtl4_pipeline_init(void) {
     if (g_topk_mask_scatter_mtl4_init_attempted) return g_topk_mask_scatter_mtl4_init_ok;
     g_topk_mask_scatter_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -17347,33 +17366,10 @@ static int ds4_topk_mask_scatter_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_topk_mask_scatter_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: topk_mask_scatter MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"topk_mask_scatter_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_topk_mask_scatter_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_topk_mask_scatter_mtl4_pipeline) {
-        fprintf(stderr, "ds4: topk_mask_scatter MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: topk_mask_scatter MTL4 pipeline initialized\n");
-    g_topk_mask_scatter_mtl4_init_ok = 1;
-    return 1;
+    g_topk_mask_scatter_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_topk_mask_scatter_mtl4", @"topk_mask_scatter_mtl4", 256, NULL, 0);
+    g_topk_mask_scatter_mtl4_init_ok = (g_topk_mask_scatter_mtl4_pipeline != nil) ? 1 : 0;
+    return g_topk_mask_scatter_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_topk_mask_scatter_canary(uint32_t n_topk, uint32_t n_tokens, uint32_t n_comp) {
@@ -17513,9 +17509,6 @@ static int g_indexer_weighted_sum_mtl4_init_ok;
 static int ds4_indexer_weighted_sum_mtl4_pipeline_init(void) {
     if (g_indexer_weighted_sum_mtl4_init_attempted) return g_indexer_weighted_sum_mtl4_init_ok;
     g_indexer_weighted_sum_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -17547,33 +17540,10 @@ static int ds4_indexer_weighted_sum_mtl4_pipeline_init(void) {
          "  *((device float *)(dst + ic * args_ptr->nb0 + it * args_ptr->nb1)) = acc;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_indexer_weighted_sum_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: indexer_weighted_sum MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"indexer_weighted_sum_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_indexer_weighted_sum_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_indexer_weighted_sum_mtl4_pipeline) {
-        fprintf(stderr, "ds4: indexer_weighted_sum MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: indexer_weighted_sum MTL4 pipeline initialized\n");
-    g_indexer_weighted_sum_mtl4_init_ok = 1;
-    return 1;
+    g_indexer_weighted_sum_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_indexer_weighted_sum_mtl4", @"indexer_weighted_sum_mtl4", 256, NULL, 0);
+    g_indexer_weighted_sum_mtl4_init_ok = (g_indexer_weighted_sum_mtl4_pipeline != nil) ? 1 : 0;
+    return g_indexer_weighted_sum_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_indexer_weighted_sum_canary(uint32_t ne0, uint32_t ne1, uint32_t n_heads) {
@@ -17739,9 +17709,6 @@ static int g_dir_steering_mtl4_init_ok;
 static int ds4_dir_steering_mtl4_pipeline_init(void) {
     if (g_dir_steering_mtl4_init_attempted) return g_dir_steering_mtl4_init_ok;
     g_dir_steering_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -17775,33 +17742,10 @@ static int ds4_dir_steering_mtl4_pipeline_init(void) {
          "  for (uint i = tid; i < args_ptr->width; i += nth) xr[i] -= coeff * dir[i];\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_dir_steering_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: dir_steering MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"dir_steering_project_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_dir_steering_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_dir_steering_mtl4_pipeline) {
-        fprintf(stderr, "ds4: dir_steering MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: dir_steering MTL4 pipeline initialized\n");
-    g_dir_steering_mtl4_init_ok = 1;
-    return 1;
+    g_dir_steering_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_dir_steering_mtl4", @"dir_steering_project_mtl4", 256, NULL, 0);
+    g_dir_steering_mtl4_init_ok = (g_dir_steering_mtl4_pipeline != nil) ? 1 : 0;
+    return g_dir_steering_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_dir_steering_canary(uint32_t width, uint32_t rows) {
@@ -17953,9 +17897,6 @@ static int g_sort_i32_rows_mtl4_init_ok;
 static int ds4_sort_i32_rows_mtl4_pipeline_init(void) {
     if (g_sort_i32_rows_mtl4_init_attempted) return g_sort_i32_rows_mtl4_init_ok;
     g_sort_i32_rows_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -17994,33 +17935,10 @@ static int ds4_sort_i32_rows_mtl4_pipeline_init(void) {
          "  *((device int32_t *)(dst + (uint64_t)tid * args_ptr->nb00 + (uint64_t)row * args_ptr->nb01)) = row_tmp[tid];\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_sort_i32_rows_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: sort_i32_rows MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"sort_i32_rows_asc_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_sort_i32_rows_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_sort_i32_rows_mtl4_pipeline) {
-        fprintf(stderr, "ds4: sort_i32_rows MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: sort_i32_rows MTL4 pipeline initialized\n");
-    g_sort_i32_rows_mtl4_init_ok = 1;
-    return 1;
+    g_sort_i32_rows_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_sort_i32_rows_mtl4", @"sort_i32_rows_asc_mtl4", 256, NULL, 0);
+    g_sort_i32_rows_mtl4_init_ok = (g_sort_i32_rows_mtl4_pipeline != nil) ? 1 : 0;
+    return g_sort_i32_rows_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_sort_i32_rows_canary(uint32_t top_k, uint32_t n_rows) {
@@ -18161,9 +18079,6 @@ static int g_router_remap_mtl4_init_ok;
 static int ds4_router_remap_mtl4_pipeline_init(void) {
     if (g_router_remap_mtl4_init_attempted) return g_router_remap_mtl4_init_ok;
     g_router_remap_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -18198,33 +18113,10 @@ static int ds4_router_remap_mtl4_pipeline_init(void) {
          "  weights[slot] = w;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_router_remap_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: router_remap MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"router_weights_with_remap_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 32;
-    g_router_remap_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_router_remap_mtl4_pipeline) {
-        fprintf(stderr, "ds4: router_remap MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: router_remap MTL4 pipeline initialized\n");
-    g_router_remap_mtl4_init_ok = 1;
-    return 1;
+    g_router_remap_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_router_remap_mtl4", @"router_weights_with_remap_mtl4", 32, NULL, 0);
+    g_router_remap_mtl4_init_ok = (g_router_remap_mtl4_pipeline != nil) ? 1 : 0;
+    return g_router_remap_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_router_remap_canary(uint32_t n_tokens) {
@@ -18500,9 +18392,6 @@ static int g_ratio4_shift_mtl4_init_ok;
 static int ds4_ratio4_shift_mtl4_pipeline_init(void) {
     if (g_ratio4_shift_mtl4_init_attempted) return g_ratio4_shift_mtl4_init_ok;
     g_ratio4_shift_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -18518,33 +18407,10 @@ static int ds4_ratio4_shift_mtl4_pipeline_init(void) {
          "  state_score[gid] = state_score[n + gid];\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_ratio4_shift_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: ratio4_shift MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"ratio4_shift_f32_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_ratio4_shift_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_ratio4_shift_mtl4_pipeline) {
-        fprintf(stderr, "ds4: ratio4_shift MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: ratio4_shift MTL4 pipeline initialized\n");
-    g_ratio4_shift_mtl4_init_ok = 1;
-    return 1;
+    g_ratio4_shift_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_ratio4_shift_mtl4", @"ratio4_shift_f32_mtl4", 256, NULL, 0);
+    g_ratio4_shift_mtl4_init_ok = (g_ratio4_shift_mtl4_pipeline != nil) ? 1 : 0;
+    return g_ratio4_shift_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_ratio4_shift_canary(uint32_t width) {
@@ -18663,9 +18529,6 @@ static int g_compressor_store_one_mtl4_init_ok;
 static int ds4_compressor_store_one_mtl4_pipeline_init(void) {
     if (g_compressor_store_one_mtl4_init_attempted) return g_compressor_store_one_mtl4_init_ok;
     g_compressor_store_one_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -18693,33 +18556,10 @@ static int ds4_compressor_store_one_mtl4_pipeline_init(void) {
          "  state_score[dst] = score[gid] + ape_v;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_compressor_store_one_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: compressor_store_one MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"compressor_store_one_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_compressor_store_one_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_compressor_store_one_mtl4_pipeline) {
-        fprintf(stderr, "ds4: compressor_store_one MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: compressor_store_one MTL4 pipeline initialized\n");
-    g_compressor_store_one_mtl4_init_ok = 1;
-    return 1;
+    g_compressor_store_one_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_compressor_store_one_mtl4", @"compressor_store_one_mtl4", 256, NULL, 0);
+    g_compressor_store_one_mtl4_init_ok = (g_compressor_store_one_mtl4_pipeline != nil) ? 1 : 0;
+    return g_compressor_store_one_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_compressor_store_one_canary(uint32_t width) {
@@ -18867,9 +18707,6 @@ static int g_softmax_pool_mtl4_init_ok;
 static int ds4_softmax_pool_mtl4_pipeline_init(void) {
     if (g_softmax_pool_mtl4_init_attempted) return g_softmax_pool_mtl4_init_ok;
     g_softmax_pool_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -18907,33 +18744,10 @@ static int ds4_softmax_pool_mtl4_pipeline_init(void) {
          "  *((device float *)(dst + id_ * args_ptr->nb0 + ic * args_ptr->nb1)) = acc / sum;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_softmax_pool_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: softmax_pool MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"softmax_pool_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_softmax_pool_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_softmax_pool_mtl4_pipeline) {
-        fprintf(stderr, "ds4: softmax_pool MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: softmax_pool MTL4 pipeline initialized\n");
-    g_softmax_pool_mtl4_init_ok = 1;
-    return 1;
+    g_softmax_pool_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_softmax_pool_mtl4", @"softmax_pool_mtl4", 256, NULL, 0);
+    g_softmax_pool_mtl4_init_ok = (g_softmax_pool_mtl4_pipeline != nil) ? 1 : 0;
+    return g_softmax_pool_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_softmax_pool_canary(uint32_t ne0, uint32_t ne1, uint32_t n_rows) {
@@ -19108,8 +18922,6 @@ static int g_moe_matmul_mtl4_init_ok;
 static int ds4_moe_matmul_mtl4_pipeline_init(void) {
     if (g_moe_matmul_mtl4_init_attempted) return g_moe_matmul_mtl4_init_ok;
     g_moe_matmul_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
     NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
@@ -19716,9 +19528,6 @@ static int g_hc_weighted_sum_mtl4_init_ok;
 static int ds4_hc_weighted_sum_mtl4_pipeline_init(void) {
     if (g_hc_weighted_sum_mtl4_init_attempted) return g_hc_weighted_sum_mtl4_init_ok;
     g_hc_weighted_sum_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -19747,33 +19556,10 @@ static int ds4_hc_weighted_sum_mtl4_pipeline_init(void) {
          "  *((device float *)(dst + d * args_ptr->nb0 + t * args_ptr->nb1)) = acc;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_hc_weighted_sum_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: hc_weighted_sum MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"hc_weighted_sum_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_hc_weighted_sum_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_hc_weighted_sum_mtl4_pipeline) {
-        fprintf(stderr, "ds4: hc_weighted_sum MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: hc_weighted_sum MTL4 pipeline initialized\n");
-    g_hc_weighted_sum_mtl4_init_ok = 1;
-    return 1;
+    g_hc_weighted_sum_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_hc_weighted_sum_mtl4", @"hc_weighted_sum_mtl4", 256, NULL, 0);
+    g_hc_weighted_sum_mtl4_init_ok = (g_hc_weighted_sum_mtl4_pipeline != nil) ? 1 : 0;
+    return g_hc_weighted_sum_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_hc_weighted_sum_canary(uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens) {
@@ -19936,8 +19722,6 @@ static int g_router_finalize_one_mtl4_init_ok;
 static int ds4_router_finalize_one_mtl4_pipeline_init(void) {
     if (g_router_finalize_one_mtl4_init_attempted) return g_router_finalize_one_mtl4_init_ok;
     g_router_finalize_one_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
     NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
@@ -20156,9 +19940,6 @@ static int g_qkv_rms_norm_mtl4_init_ok;
 static int ds4_qkv_rms_norm_mtl4_pipeline_init(void) {
     if (g_qkv_rms_norm_mtl4_init_attempted) return g_qkv_rms_norm_mtl4_init_ok;
     g_qkv_rms_norm_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -20205,33 +19986,10 @@ static int ds4_qkv_rms_norm_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_qkv_rms_norm_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: qkv_rms_norm MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"qkv_rms_norm_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_qkv_rms_norm_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_qkv_rms_norm_mtl4_pipeline) {
-        fprintf(stderr, "ds4: qkv_rms_norm MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: qkv_rms_norm MTL4 pipeline initialized\n");
-    g_qkv_rms_norm_mtl4_init_ok = 1;
-    return 1;
+    g_qkv_rms_norm_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_qkv_rms_norm_mtl4", @"qkv_rms_norm_mtl4", 256, NULL, 0);
+    g_qkv_rms_norm_mtl4_init_ok = (g_qkv_rms_norm_mtl4_pipeline != nil) ? 1 : 0;
+    return g_qkv_rms_norm_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_qkv_rms_norm_canary(uint32_t q_n, uint32_t kv_n) {
@@ -20407,9 +20165,6 @@ static int g_soft_max_4_mtl4_init_ok;
 static int ds4_soft_max_4_mtl4_pipeline_init(void) {
     if (g_soft_max_4_mtl4_init_attempted) return g_soft_max_4_mtl4_init_ok;
     g_soft_max_4_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -20473,33 +20228,10 @@ static int ds4_soft_max_4_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_soft_max_4_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: soft_max_4 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"soft_max_4_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_soft_max_4_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_soft_max_4_mtl4_pipeline) {
-        fprintf(stderr, "ds4: soft_max_4 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: soft_max_4 MTL4 pipeline initialized\n");
-    g_soft_max_4_mtl4_init_ok = 1;
-    return 1;
+    g_soft_max_4_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_soft_max_4_mtl4", @"soft_max_4_mtl4", 256, NULL, 0);
+    g_soft_max_4_mtl4_init_ok = (g_soft_max_4_mtl4_pipeline != nil) ? 1 : 0;
+    return g_soft_max_4_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_soft_max_4_canary(uint32_t n) {
@@ -20650,9 +20382,6 @@ static int g_hc_expand4_mtl4_init_ok;
 static int ds4_hc_expand4_mtl4_pipeline_init(void) {
     if (g_hc_expand4_mtl4_init_attempted) return g_hc_expand4_mtl4_init_ok;
     g_hc_expand4_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -20706,33 +20435,10 @@ static int ds4_hc_expand4_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_hc_expand4_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: hc_expand4 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"hc_expand4_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_hc_expand4_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_hc_expand4_mtl4_pipeline) {
-        fprintf(stderr, "ds4: hc_expand4 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: hc_expand4 MTL4 pipeline initialized\n");
-    g_hc_expand4_mtl4_init_ok = 1;
-    return 1;
+    g_hc_expand4_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_hc_expand4_mtl4", @"hc_expand4_mtl4", 256, NULL, 0);
+    g_hc_expand4_mtl4_init_ok = (g_hc_expand4_mtl4_pipeline != nil) ? 1 : 0;
+    return g_hc_expand4_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_hc_expand4_canary(uint32_t n_embd, uint32_t n_tokens) {
@@ -20942,9 +20648,6 @@ static int g_indexer_score_one_direct_mtl4_init_ok;
 static int ds4_indexer_score_one_direct_mtl4_pipeline_init(void) {
     if (g_indexer_score_one_direct_mtl4_init_attempted) return g_indexer_score_one_direct_mtl4_init_ok;
     g_indexer_score_one_direct_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -20998,33 +20701,10 @@ static int ds4_indexer_score_one_direct_mtl4_pipeline_init(void) {
          "  if (tid == 0) scores[row] = acc;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_indexer_score_one_direct_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: indexer_score_one_direct MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"indexer_score_one_direct_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 128;
-    g_indexer_score_one_direct_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_indexer_score_one_direct_mtl4_pipeline) {
-        fprintf(stderr, "ds4: indexer_score_one_direct MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: indexer_score_one_direct MTL4 pipeline initialized\n");
-    g_indexer_score_one_direct_mtl4_init_ok = 1;
-    return 1;
+    g_indexer_score_one_direct_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_indexer_score_one_direct_mtl4", @"indexer_score_one_direct_mtl4", 128, NULL, 0);
+    g_indexer_score_one_direct_mtl4_init_ok = (g_indexer_score_one_direct_mtl4_pipeline != nil) ? 1 : 0;
+    return g_indexer_score_one_direct_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_indexer_score_one_direct_canary(uint32_t n_comp) {
@@ -21187,9 +20867,6 @@ static int g_soft_max_mtl4_init_ok;
 static int ds4_soft_max_mtl4_pipeline_init(void) {
     if (g_soft_max_mtl4_init_attempted) return g_soft_max_mtl4_init_ok;
     g_soft_max_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -21241,33 +20918,10 @@ static int ds4_soft_max_mtl4_pipeline_init(void) {
          "  for (int i = tpitg.x; i < n; i += ntg.x) q[i] *= inv;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_soft_max_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: soft_max MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"soft_max_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_soft_max_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_soft_max_mtl4_pipeline) {
-        fprintf(stderr, "ds4: soft_max MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: soft_max MTL4 pipeline initialized\n");
-    g_soft_max_mtl4_init_ok = 1;
-    return 1;
+    g_soft_max_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_soft_max_mtl4", @"soft_max_mtl4", 256, NULL, 0);
+    g_soft_max_mtl4_init_ok = (g_soft_max_mtl4_pipeline != nil) ? 1 : 0;
+    return g_soft_max_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_soft_max_canary(uint32_t n) {
@@ -21409,9 +21063,6 @@ static int g_fp8_kv_quantize_mtl4_init_ok;
 static int ds4_fp8_kv_quantize_mtl4_pipeline_init(void) {
     if (g_fp8_kv_quantize_mtl4_init_attempted) return g_fp8_kv_quantize_mtl4_init_ok;
     g_fp8_kv_quantize_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -21488,33 +21139,10 @@ static int ds4_fp8_kv_quantize_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_fp8_kv_quantize_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: fp8_kv_quantize MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"fp8_kv_quantize_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 64;
-    g_fp8_kv_quantize_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_fp8_kv_quantize_mtl4_pipeline) {
-        fprintf(stderr, "ds4: fp8_kv_quantize MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: fp8_kv_quantize MTL4 pipeline initialized\n");
-    g_fp8_kv_quantize_mtl4_init_ok = 1;
-    return 1;
+    g_fp8_kv_quantize_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_fp8_kv_quantize_mtl4", @"fp8_kv_quantize_mtl4", 64, NULL, 0);
+    g_fp8_kv_quantize_mtl4_init_ok = (g_fp8_kv_quantize_mtl4_pipeline != nil) ? 1 : 0;
+    return g_fp8_kv_quantize_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_fp8_kv_quantize_canary(uint32_t n_rows, uint32_t n_full, uint32_t n_rot) {
@@ -21670,9 +21298,6 @@ static int g_indexer_hadamard_fp4_mtl4_init_ok;
 static int ds4_indexer_hadamard_fp4_mtl4_pipeline_init(void) {
     if (g_indexer_hadamard_fp4_mtl4_init_attempted) return g_indexer_hadamard_fp4_mtl4_init_ok;
     g_indexer_hadamard_fp4_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -21735,33 +21360,10 @@ static int ds4_indexer_hadamard_fp4_mtl4_pipeline_init(void) {
          "  xr[tid] = dsv4_e2m1fn_dequant(clamp(v / scale, -6.0f, 6.0f)) * scale;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_indexer_hadamard_fp4_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: indexer_hadamard_fp4 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"indexer_hadamard_fp4_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 128;
-    g_indexer_hadamard_fp4_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_indexer_hadamard_fp4_mtl4_pipeline) {
-        fprintf(stderr, "ds4: indexer_hadamard_fp4 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: indexer_hadamard_fp4 MTL4 pipeline initialized\n");
-    g_indexer_hadamard_fp4_mtl4_init_ok = 1;
-    return 1;
+    g_indexer_hadamard_fp4_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_indexer_hadamard_fp4_mtl4", @"indexer_hadamard_fp4_mtl4", 128, NULL, 0);
+    g_indexer_hadamard_fp4_mtl4_init_ok = (g_indexer_hadamard_fp4_mtl4_pipeline != nil) ? 1 : 0;
+    return g_indexer_hadamard_fp4_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_indexer_hadamard_fp4_canary(uint32_t n_rows) {
@@ -21902,9 +21504,6 @@ static int g_kv_fp8_store_mtl4_init_ok;
 static int ds4_kv_fp8_store_mtl4_pipeline_init(void) {
     if (g_kv_fp8_store_mtl4_init_attempted) return g_kv_fp8_store_mtl4_init_ok;
     g_kv_fp8_store_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -21980,33 +21579,10 @@ static int ds4_kv_fp8_store_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_kv_fp8_store_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: kv_fp8_store MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"kv_fp8_store_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 64;
-    g_kv_fp8_store_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_kv_fp8_store_mtl4_pipeline) {
-        fprintf(stderr, "ds4: kv_fp8_store MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: kv_fp8_store MTL4 pipeline initialized\n");
-    g_kv_fp8_store_mtl4_init_ok = 1;
-    return 1;
+    g_kv_fp8_store_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_kv_fp8_store_mtl4", @"kv_fp8_store_mtl4", 64, NULL, 0);
+    g_kv_fp8_store_mtl4_init_ok = (g_kv_fp8_store_mtl4_pipeline != nil) ? 1 : 0;
+    return g_kv_fp8_store_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_kv_fp8_store_canary(uint32_t head_dim, uint32_t n_rot) {
@@ -22159,9 +21735,6 @@ static int g_moe_swiglu_weight_mtl4_init_ok;
 static int ds4_moe_swiglu_weight_mtl4_pipeline_init(void) {
     if (g_moe_swiglu_weight_mtl4_init_attempted) return g_moe_swiglu_weight_mtl4_init_ok;
     g_moe_swiglu_weight_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -22204,33 +21777,10 @@ static int ds4_moe_swiglu_weight_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_moe_swiglu_weight_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: moe_swiglu_weight MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"moe_swiglu_weight_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_moe_swiglu_weight_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_moe_swiglu_weight_mtl4_pipeline) {
-        fprintf(stderr, "ds4: moe_swiglu_weight MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: moe_swiglu_weight MTL4 pipeline initialized\n");
-    g_moe_swiglu_weight_mtl4_init_ok = 1;
-    return 1;
+    g_moe_swiglu_weight_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_moe_swiglu_weight_mtl4", @"moe_swiglu_weight_mtl4", 256, NULL, 0);
+    g_moe_swiglu_weight_mtl4_init_ok = (g_moe_swiglu_weight_mtl4_pipeline != nil) ? 1 : 0;
+    return g_moe_swiglu_weight_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_moe_swiglu_weight_canary(uint32_t rows, uint32_t width) {
@@ -22387,9 +21937,6 @@ static int g_moe_sum6_mtl4_init_ok;
 static int ds4_moe_sum6_mtl4_pipeline_init(void) {
     if (g_moe_sum6_mtl4_init_attempted) return g_moe_sum6_mtl4_init_ok;
     g_moe_sum6_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -22421,33 +21968,10 @@ static int ds4_moe_sum6_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_moe_sum6_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: moe_sum6 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"moe_sum6_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_moe_sum6_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_moe_sum6_mtl4_pipeline) {
-        fprintf(stderr, "ds4: moe_sum6 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: moe_sum6 MTL4 pipeline initialized\n");
-    g_moe_sum6_mtl4_init_ok = 1;
-    return 1;
+    g_moe_sum6_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_moe_sum6_mtl4", @"moe_sum6_mtl4", 256, NULL, 0);
+    g_moe_sum6_mtl4_init_ok = (g_moe_sum6_mtl4_pipeline != nil) ? 1 : 0;
+    return g_moe_sum6_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_moe_sum6_canary(uint32_t tokens, uint32_t width) {
@@ -22577,9 +22101,6 @@ static int g_moe_swiglu_weight_f16_mtl4_init_ok;
 static int ds4_moe_swiglu_weight_f16_mtl4_pipeline_init(void) {
     if (g_moe_swiglu_weight_f16_mtl4_init_attempted) return g_moe_swiglu_weight_f16_mtl4_init_ok;
     g_moe_swiglu_weight_f16_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -22622,33 +22143,10 @@ static int ds4_moe_swiglu_weight_f16_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_moe_swiglu_weight_f16_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: moe_swiglu_weight_f16 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"moe_swiglu_weight_f16_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_moe_swiglu_weight_f16_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_moe_swiglu_weight_f16_mtl4_pipeline) {
-        fprintf(stderr, "ds4: moe_swiglu_weight_f16 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: moe_swiglu_weight_f16 MTL4 pipeline initialized\n");
-    g_moe_swiglu_weight_f16_mtl4_init_ok = 1;
-    return 1;
+    g_moe_swiglu_weight_f16_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_moe_swiglu_weight_f16_mtl4", @"moe_swiglu_weight_f16_mtl4", 256, NULL, 0);
+    g_moe_swiglu_weight_f16_mtl4_init_ok = (g_moe_swiglu_weight_f16_mtl4_pipeline != nil) ? 1 : 0;
+    return g_moe_swiglu_weight_f16_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_moe_swiglu_weight_f16_canary(uint32_t rows, uint32_t width) {
@@ -22809,9 +22307,6 @@ static int g_hc_split_sinkhorn_mtl4_init_ok;
 static int ds4_hc_split_sinkhorn_mtl4_pipeline_init(void) {
     if (g_hc_split_sinkhorn_mtl4_init_attempted) return g_hc_split_sinkhorn_mtl4_init_ok;
     g_hc_split_sinkhorn_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -22879,33 +22374,10 @@ static int ds4_hc_split_sinkhorn_mtl4_pipeline_init(void) {
          "  *((device float4 *)(out + 20)) = r3;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_hc_split_sinkhorn_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: hc_split_sinkhorn MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"hc_split_sinkhorn_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_hc_split_sinkhorn_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_hc_split_sinkhorn_mtl4_pipeline) {
-        fprintf(stderr, "ds4: hc_split_sinkhorn MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: hc_split_sinkhorn MTL4 pipeline initialized\n");
-    g_hc_split_sinkhorn_mtl4_init_ok = 1;
-    return 1;
+    g_hc_split_sinkhorn_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_hc_split_sinkhorn_mtl4", @"hc_split_sinkhorn_mtl4", 256, NULL, 0);
+    g_hc_split_sinkhorn_mtl4_init_ok = (g_hc_split_sinkhorn_mtl4_pipeline != nil) ? 1 : 0;
+    return g_hc_split_sinkhorn_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_hc_split_sinkhorn_canary(uint32_t n_rows, uint32_t sinkhorn_iters) {
@@ -23074,9 +22546,6 @@ static int g_get_rows_f32_mtl4_init_ok;
 static int ds4_get_rows_f32_mtl4_pipeline_init(void) {
     if (g_get_rows_f32_mtl4_init_attempted) return g_get_rows_f32_mtl4_init_ok;
     g_get_rows_f32_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -23117,33 +22586,10 @@ static int ds4_get_rows_f32_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_get_rows_f32_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: get_rows_f32 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"get_rows_f32_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_get_rows_f32_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_get_rows_f32_mtl4_pipeline) {
-        fprintf(stderr, "ds4: get_rows_f32 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: get_rows_f32 MTL4 pipeline initialized\n");
-    g_get_rows_f32_mtl4_init_ok = 1;
-    return 1;
+    g_get_rows_f32_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_get_rows_f32_mtl4", @"get_rows_f32_mtl4", 256, NULL, 0);
+    g_get_rows_f32_mtl4_init_ok = (g_get_rows_f32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_get_rows_f32_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_get_rows_f32_canary(uint32_t n_table_rows, uint32_t row_width, uint32_t n_ids) {
@@ -23316,9 +22762,6 @@ static int g_argsort_f32_i32_desc_mtl4_init_ok;
 static int ds4_argsort_f32_i32_desc_mtl4_pipeline_init(void) {
     if (g_argsort_f32_i32_desc_mtl4_init_attempted) return g_argsort_f32_i32_desc_mtl4_init_ok;
     g_argsort_f32_i32_desc_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -23381,33 +22824,10 @@ static int ds4_argsort_f32_i32_desc_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_argsort_f32_i32_desc_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: argsort_f32_i32_desc MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"argsort_f32_i32_desc_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 1024;
-    g_argsort_f32_i32_desc_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_argsort_f32_i32_desc_mtl4_pipeline) {
-        fprintf(stderr, "ds4: argsort_f32_i32_desc MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: argsort_f32_i32_desc MTL4 pipeline initialized\n");
-    g_argsort_f32_i32_desc_mtl4_init_ok = 1;
-    return 1;
+    g_argsort_f32_i32_desc_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_argsort_f32_i32_desc_mtl4", @"argsort_f32_i32_desc_mtl4", 1024, NULL, 0);
+    g_argsort_f32_i32_desc_mtl4_init_ok = (g_argsort_f32_i32_desc_mtl4_pipeline != nil) ? 1 : 0;
+    return g_argsort_f32_i32_desc_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_argsort_f32_i32_desc_canary(uint32_t row_n, uint32_t top_k) {
@@ -23548,9 +22968,6 @@ static int g_cpy_f32_f32_mtl4_init_ok;
 static int ds4_cpy_f32_f32_mtl4_pipeline_init(void) {
     if (g_cpy_f32_f32_mtl4_init_attempted) return g_cpy_f32_f32_mtl4_init_ok;
     g_cpy_f32_f32_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -23593,33 +23010,10 @@ static int ds4_cpy_f32_f32_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_cpy_f32_f32_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: cpy_f32_f32 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"cpy_f32_f32_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_cpy_f32_f32_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_cpy_f32_f32_mtl4_pipeline) {
-        fprintf(stderr, "ds4: cpy_f32_f32 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: cpy_f32_f32 MTL4 pipeline initialized\n");
-    g_cpy_f32_f32_mtl4_init_ok = 1;
-    return 1;
+    g_cpy_f32_f32_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_cpy_f32_f32_mtl4", @"cpy_f32_f32_mtl4", 256, NULL, 0);
+    g_cpy_f32_f32_mtl4_init_ok = (g_cpy_f32_f32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_cpy_f32_f32_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_cpy_f32_f32_canary(uint32_t n_rows, uint32_t row_width) {
@@ -23768,9 +23162,6 @@ static int g_hc_split_weighted_sum_mtl4_init_ok;
 static int ds4_hc_split_weighted_sum_mtl4_pipeline_init(void) {
     if (g_hc_split_weighted_sum_mtl4_init_attempted) return g_hc_split_weighted_sum_mtl4_init_ok;
     g_hc_split_weighted_sum_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -23857,33 +23248,10 @@ static int ds4_hc_split_weighted_sum_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_hc_split_weighted_sum_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: hc_split_weighted_sum MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"hc_split_weighted_sum_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_hc_split_weighted_sum_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_hc_split_weighted_sum_mtl4_pipeline) {
-        fprintf(stderr, "ds4: hc_split_weighted_sum MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: hc_split_weighted_sum MTL4 pipeline initialized\n");
-    g_hc_split_weighted_sum_mtl4_init_ok = 1;
-    return 1;
+    g_hc_split_weighted_sum_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_hc_split_weighted_sum_mtl4", @"hc_split_weighted_sum_mtl4", 256, NULL, 0);
+    g_hc_split_weighted_sum_mtl4_init_ok = (g_hc_split_weighted_sum_mtl4_pipeline != nil) ? 1 : 0;
+    return g_hc_split_weighted_sum_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_hc_split_weighted_sum_canary(uint32_t n_rows, uint32_t n_embd) {
@@ -24092,9 +23460,6 @@ static int g_rope_tail_f32_mtl4_init_ok;
 static int ds4_rope_tail_f32_mtl4_pipeline_init(void) {
     if (g_rope_tail_f32_mtl4_init_attempted) return g_rope_tail_f32_mtl4_init_ok;
     g_rope_tail_f32_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -24200,33 +23565,10 @@ static int ds4_rope_tail_f32_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_rope_tail_f32_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: rope_tail_f32 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"rope_tail_f32_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_rope_tail_f32_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_rope_tail_f32_mtl4_pipeline) {
-        fprintf(stderr, "ds4: rope_tail_f32 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: rope_tail_f32 MTL4 pipeline initialized\n");
-    g_rope_tail_f32_mtl4_init_ok = 1;
-    return 1;
+    g_rope_tail_f32_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_rope_tail_f32_mtl4", @"rope_tail_f32_mtl4", 256, NULL, 0);
+    g_rope_tail_f32_mtl4_init_ok = (g_rope_tail_f32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_rope_tail_f32_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_rope_tail_f32_canary(uint32_t head_dim, uint32_t n_rot, uint32_t mode) {
@@ -24389,9 +23731,6 @@ static int g_concat_mtl4_init_ok;
 static int ds4_concat_mtl4_pipeline_init(void) {
     if (g_concat_mtl4_init_attempted) return g_concat_mtl4_init_ok;
     g_concat_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -24432,33 +23771,10 @@ static int ds4_concat_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_concat_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: concat MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"concat_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_concat_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_concat_mtl4_pipeline) {
-        fprintf(stderr, "ds4: concat MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: concat MTL4 pipeline initialized\n");
-    g_concat_mtl4_init_ok = 1;
-    return 1;
+    g_concat_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_concat_mtl4", @"concat_mtl4", 256, NULL, 0);
+    g_concat_mtl4_init_ok = (g_concat_mtl4_pipeline != nil) ? 1 : 0;
+    return g_concat_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_concat_canary(uint32_t n0, uint32_t n1, uint32_t n_rows) {
@@ -24632,9 +23948,6 @@ static int g_hc_split_weighted_sum_norm4_mtl4_init_ok;
 static int ds4_hc_split_weighted_sum_norm4_mtl4_pipeline_init(void) {
     if (g_hc_split_weighted_sum_norm4_mtl4_init_attempted) return g_hc_split_weighted_sum_norm4_mtl4_init_ok;
     g_hc_split_weighted_sum_norm4_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -24750,33 +24063,10 @@ static int ds4_hc_split_weighted_sum_norm4_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_hc_split_weighted_sum_norm4_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: hc_split_weighted_sum_norm4 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"hc_split_weighted_sum_norm4_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 1024;
-    g_hc_split_weighted_sum_norm4_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_hc_split_weighted_sum_norm4_mtl4_pipeline) {
-        fprintf(stderr, "ds4: hc_split_weighted_sum_norm4 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: hc_split_weighted_sum_norm4 MTL4 pipeline initialized\n");
-    g_hc_split_weighted_sum_norm4_mtl4_init_ok = 1;
-    return 1;
+    g_hc_split_weighted_sum_norm4_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_hc_split_weighted_sum_norm4_mtl4", @"hc_split_weighted_sum_norm4_mtl4", 1024, NULL, 0);
+    g_hc_split_weighted_sum_norm4_mtl4_init_ok = (g_hc_split_weighted_sum_norm4_mtl4_pipeline != nil) ? 1 : 0;
+    return g_hc_split_weighted_sum_norm4_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_hc_split_weighted_sum_norm4_canary(uint32_t n_rows) {
@@ -24986,9 +24276,6 @@ static int g_hc_expand_mtl4_init_ok;
 static int ds4_hc_expand_mtl4_pipeline_init(void) {
     if (g_hc_expand_mtl4_init_attempted) return g_hc_expand_mtl4_init_ok;
     g_hc_expand_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -25028,33 +24315,10 @@ static int ds4_hc_expand_mtl4_pipeline_init(void) {
          "  dst[d + dst_hc * n_embd + t * n_hc * n_embd] = acc;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_hc_expand_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: hc_expand MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"hc_expand_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_hc_expand_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_hc_expand_mtl4_pipeline) {
-        fprintf(stderr, "ds4: hc_expand MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: hc_expand MTL4 pipeline initialized\n");
-    g_hc_expand_mtl4_init_ok = 1;
-    return 1;
+    g_hc_expand_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_hc_expand_mtl4", @"hc_expand_mtl4", 256, NULL, 0);
+    g_hc_expand_mtl4_init_ok = (g_hc_expand_mtl4_pipeline != nil) ? 1 : 0;
+    return g_hc_expand_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_hc_expand_canary(uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens) {
@@ -25232,9 +24496,6 @@ static int g_hadamard16_wide_mtl4_init_ok;
 static int ds4_hadamard16_wide_mtl4_pipeline_init(void) {
     if (g_hadamard16_wide_mtl4_init_attempted) return g_hadamard16_wide_mtl4_init_ok;
     g_hadamard16_wide_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -25278,33 +24539,10 @@ static int ds4_hadamard16_wide_mtl4_pipeline_init(void) {
          "  if (active) block_ptr[elem] = (half)((float)sub[elem] * kHadamard16InvSqrt16);\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_hadamard16_wide_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: hadamard16_wide MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"hadamard16_wide_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_hadamard16_wide_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_hadamard16_wide_mtl4_pipeline) {
-        fprintf(stderr, "ds4: hadamard16_wide MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: hadamard16_wide MTL4 pipeline initialized\n");
-    g_hadamard16_wide_mtl4_init_ok = 1;
-    return 1;
+    g_hadamard16_wide_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_hadamard16_wide_mtl4", @"hadamard16_wide_mtl4", 256, NULL, 0);
+    g_hadamard16_wide_mtl4_init_ok = (g_hadamard16_wide_mtl4_pipeline != nil) ? 1 : 0;
+    return g_hadamard16_wide_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_hadamard16_wide_canary(uint32_t n_rows, uint32_t blocks_per_row) {
@@ -25462,9 +24700,6 @@ static int g_argsort_merge_f32_i32_desc_mtl4_init_ok;
 static int ds4_argsort_merge_f32_i32_desc_mtl4_pipeline_init(void) {
     if (g_argsort_merge_f32_i32_desc_mtl4_init_attempted) return g_argsort_merge_f32_i32_desc_mtl4_init_ok;
     g_argsort_merge_f32_i32_desc_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -25553,33 +24788,10 @@ static int ds4_argsort_merge_f32_i32_desc_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_argsort_merge_f32_i32_desc_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: argsort_merge_f32_i32_desc MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"argsort_merge_f32_i32_desc_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_argsort_merge_f32_i32_desc_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_argsort_merge_f32_i32_desc_mtl4_pipeline) {
-        fprintf(stderr, "ds4: argsort_merge_f32_i32_desc MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: argsort_merge_f32_i32_desc MTL4 pipeline initialized\n");
-    g_argsort_merge_f32_i32_desc_mtl4_init_ok = 1;
-    return 1;
+    g_argsort_merge_f32_i32_desc_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_argsort_merge_f32_i32_desc_mtl4", @"argsort_merge_f32_i32_desc_mtl4", 256, NULL, 0);
+    g_argsort_merge_f32_i32_desc_mtl4_init_ok = (g_argsort_merge_f32_i32_desc_mtl4_pipeline != nil) ? 1 : 0;
+    return g_argsort_merge_f32_i32_desc_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_argsort_merge_f32_i32_desc_canary(uint32_t len, uint32_t top_k) {
@@ -25725,9 +24937,6 @@ static int g_cpy_f32_f16_mtl4_init_ok;
 static int ds4_cpy_f32_f16_mtl4_pipeline_init(void) {
     if (g_cpy_f32_f16_mtl4_init_attempted) return g_cpy_f32_f16_mtl4_init_ok;
     g_cpy_f32_f16_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -25770,33 +24979,10 @@ static int ds4_cpy_f32_f16_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_cpy_f32_f16_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: cpy_f32_f16 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"cpy_f32_f16_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_cpy_f32_f16_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_cpy_f32_f16_mtl4_pipeline) {
-        fprintf(stderr, "ds4: cpy_f32_f16 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: cpy_f32_f16 MTL4 pipeline initialized\n");
-    g_cpy_f32_f16_mtl4_init_ok = 1;
-    return 1;
+    g_cpy_f32_f16_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_cpy_f32_f16_mtl4", @"cpy_f32_f16_mtl4", 256, NULL, 0);
+    g_cpy_f32_f16_mtl4_init_ok = (g_cpy_f32_f16_mtl4_pipeline != nil) ? 1 : 0;
+    return g_cpy_f32_f16_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_cpy_f32_f16_canary(uint32_t n_rows, uint32_t row_width) {
@@ -25930,9 +25116,6 @@ static int g_cpy_f16_f32_mtl4_init_ok;
 static int ds4_cpy_f16_f32_mtl4_pipeline_init(void) {
     if (g_cpy_f16_f32_mtl4_init_attempted) return g_cpy_f16_f32_mtl4_init_ok;
     g_cpy_f16_f32_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -25975,33 +25158,10 @@ static int ds4_cpy_f16_f32_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_cpy_f16_f32_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: cpy_f16_f32 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"cpy_f16_f32_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_cpy_f16_f32_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_cpy_f16_f32_mtl4_pipeline) {
-        fprintf(stderr, "ds4: cpy_f16_f32 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: cpy_f16_f32 MTL4 pipeline initialized\n");
-    g_cpy_f16_f32_mtl4_init_ok = 1;
-    return 1;
+    g_cpy_f16_f32_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_cpy_f16_f32_mtl4", @"cpy_f16_f32_mtl4", 256, NULL, 0);
+    g_cpy_f16_f32_mtl4_init_ok = (g_cpy_f16_f32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_cpy_f16_f32_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_cpy_f16_f32_canary(uint32_t n_rows, uint32_t row_width) {
@@ -26138,9 +25298,6 @@ static int g_sum_rows_f32_f32_mtl4_init_ok;
 static int ds4_sum_rows_f32_f32_mtl4_pipeline_init(void) {
     if (g_sum_rows_f32_f32_mtl4_init_attempted) return g_sum_rows_f32_f32_mtl4_init_ok;
     g_sum_rows_f32_f32_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -26181,33 +25338,10 @@ static int ds4_sum_rows_f32_f32_mtl4_pipeline_init(void) {
          "  if (tpitg.x == 0) dst_row[0] = sumf;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_sum_rows_f32_f32_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: sum_rows_f32_f32 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"sum_rows_f32_f32_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 1024;
-    g_sum_rows_f32_f32_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_sum_rows_f32_f32_mtl4_pipeline) {
-        fprintf(stderr, "ds4: sum_rows_f32_f32 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: sum_rows_f32_f32 MTL4 pipeline initialized\n");
-    g_sum_rows_f32_f32_mtl4_init_ok = 1;
-    return 1;
+    g_sum_rows_f32_f32_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_sum_rows_f32_f32_mtl4", @"sum_rows_f32_f32_mtl4", 1024, NULL, 0);
+    g_sum_rows_f32_f32_mtl4_init_ok = (g_sum_rows_f32_f32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_sum_rows_f32_f32_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_sum_rows_f32_f32_canary(uint32_t n_rows, uint32_t row_width) {
@@ -26350,9 +25484,6 @@ static int g_set_rows_f32_i32_mtl4_init_ok;
 static int ds4_set_rows_f32_i32_mtl4_pipeline_init(void) {
     if (g_set_rows_f32_i32_mtl4_init_attempted) return g_set_rows_f32_i32_mtl4_init_ok;
     g_set_rows_f32_i32_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -26390,33 +25521,10 @@ static int ds4_set_rows_f32_i32_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_set_rows_f32_i32_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: set_rows_f32_i32 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"set_rows_f32_i32_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_set_rows_f32_i32_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_set_rows_f32_i32_mtl4_pipeline) {
-        fprintf(stderr, "ds4: set_rows_f32_i32 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: set_rows_f32_i32 MTL4 pipeline initialized\n");
-    g_set_rows_f32_i32_mtl4_init_ok = 1;
-    return 1;
+    g_set_rows_f32_i32_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_set_rows_f32_i32_mtl4", @"set_rows_f32_i32_mtl4", 256, NULL, 0);
+    g_set_rows_f32_i32_mtl4_init_ok = (g_set_rows_f32_i32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_set_rows_f32_i32_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_set_rows_f32_i32_canary(uint32_t n_src_rows, uint32_t row_width) {
@@ -26579,9 +25687,6 @@ static int g_mul_mm_id_map0_ne20_8_mtl4_init_ok;
 static int ds4_mul_mm_id_map0_ne20_8_mtl4_pipeline_init(void) {
     if (g_mul_mm_id_map0_ne20_8_mtl4_init_attempted) return g_mul_mm_id_map0_ne20_8_mtl4_init_ok;
     g_mul_mm_id_map0_ne20_8_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -26623,33 +25728,10 @@ static int ds4_mul_mm_id_map0_ne20_8_mtl4_pipeline_init(void) {
          "  tpe_u32[ide] = n_all;\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_mul_mm_id_map0_ne20_8_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: mul_mm_id_map0_ne20_8 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"mul_mm_id_map0_ne20_8_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 1024;
-    g_mul_mm_id_map0_ne20_8_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_mul_mm_id_map0_ne20_8_mtl4_pipeline) {
-        fprintf(stderr, "ds4: mul_mm_id_map0_ne20_8 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: mul_mm_id_map0_ne20_8 MTL4 pipeline initialized\n");
-    g_mul_mm_id_map0_ne20_8_mtl4_init_ok = 1;
-    return 1;
+    g_mul_mm_id_map0_ne20_8_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_mul_mm_id_map0_ne20_8_mtl4", @"mul_mm_id_map0_ne20_8_mtl4", 1024, NULL, 0);
+    g_mul_mm_id_map0_ne20_8_mtl4_init_ok = (g_mul_mm_id_map0_ne20_8_mtl4_pipeline != nil) ? 1 : 0;
+    return g_mul_mm_id_map0_ne20_8_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_mul_mm_id_map0_ne20_8_canary(uint32_t n_experts, uint32_t n_tokens) {
@@ -26807,9 +25889,6 @@ static int g_repeat_f32_mtl4_init_ok;
 static int ds4_repeat_f32_mtl4_pipeline_init(void) {
     if (g_repeat_f32_mtl4_init_attempted) return g_repeat_f32_mtl4_init_ok;
     g_repeat_f32_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -26841,33 +25920,10 @@ static int ds4_repeat_f32_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_repeat_f32_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: repeat_f32 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"repeat_f32_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_repeat_f32_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_repeat_f32_mtl4_pipeline) {
-        fprintf(stderr, "ds4: repeat_f32 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: repeat_f32 MTL4 pipeline initialized\n");
-    g_repeat_f32_mtl4_init_ok = 1;
-    return 1;
+    g_repeat_f32_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_repeat_f32_mtl4", @"repeat_f32_mtl4", 256, NULL, 0);
+    g_repeat_f32_mtl4_init_ok = (g_repeat_f32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_repeat_f32_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_repeat_f32_canary(uint32_t src_rows, uint32_t src_cols, uint32_t row_factor, uint32_t col_factor) {
@@ -27002,9 +26058,7 @@ static int g_swiglu_f32_mtl4_init_ok;
 static int ds4_swiglu_f32_mtl4_pipeline_init(void) {
     if (g_swiglu_f32_mtl4_init_attempted) return g_swiglu_f32_mtl4_init_ok;
     g_swiglu_f32_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
 
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -27046,33 +26100,10 @@ static int ds4_swiglu_f32_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_swiglu_f32_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: swiglu_f32 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"swiglu_f32_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_swiglu_f32_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_swiglu_f32_mtl4_pipeline) {
-        fprintf(stderr, "ds4: swiglu_f32 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: swiglu_f32 MTL4 pipeline initialized\n");
-    g_swiglu_f32_mtl4_init_ok = 1;
-    return 1;
+    g_swiglu_f32_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_swiglu_f32_mtl4", @"swiglu_f32_mtl4", 256, NULL, 0);
+    g_swiglu_f32_mtl4_init_ok = (g_swiglu_f32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_swiglu_f32_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_swiglu_f32_canary(uint32_t n_rows, uint32_t row_width, float alpha, float limit) {
@@ -27288,33 +26319,10 @@ static int ds4_rms_norm_mul_f32_4_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_rms_norm_mul_f32_4_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: rms_norm_mul_f32_4 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"rms_norm_mul_f32_4_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 1024;
-    g_rms_norm_mul_f32_4_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_rms_norm_mul_f32_4_mtl4_pipeline) {
-        fprintf(stderr, "ds4: rms_norm_mul_f32_4 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: rms_norm_mul_f32_4 MTL4 pipeline initialized\n");
-    g_rms_norm_mul_f32_4_mtl4_init_ok = 1;
-    return 1;
+    g_rms_norm_mul_f32_4_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_rms_norm_mul_f32_4_mtl4", @"rms_norm_mul_f32_4_mtl4", 1024, NULL, 0);
+    g_rms_norm_mul_f32_4_mtl4_init_ok = (g_rms_norm_mul_f32_4_mtl4_pipeline != nil) ? 1 : 0;
+    return g_rms_norm_mul_f32_4_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_rms_norm_mul_f32_4_canary(uint32_t n_rows, uint32_t row_width, float eps) {
@@ -27486,9 +26494,6 @@ static int g_rms_norm_f32_4_mtl4_init_ok;
 static int ds4_rms_norm_f32_4_mtl4_pipeline_init(void) {
     if (g_rms_norm_f32_4_mtl4_init_attempted) return g_rms_norm_f32_4_mtl4_init_ok;
     g_rms_norm_f32_4_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -27535,33 +26540,10 @@ static int ds4_rms_norm_f32_4_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_rms_norm_f32_4_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: rms_norm_f32_4 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"rms_norm_f32_4_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 1024;
-    g_rms_norm_f32_4_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_rms_norm_f32_4_mtl4_pipeline) {
-        fprintf(stderr, "ds4: rms_norm_f32_4 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: rms_norm_f32_4 MTL4 pipeline initialized\n");
-    g_rms_norm_f32_4_mtl4_init_ok = 1;
-    return 1;
+    g_rms_norm_f32_4_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_rms_norm_f32_4_mtl4", @"rms_norm_f32_4_mtl4", 1024, NULL, 0);
+    g_rms_norm_f32_4_mtl4_init_ok = (g_rms_norm_f32_4_mtl4_pipeline != nil) ? 1 : 0;
+    return g_rms_norm_f32_4_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_rms_norm_f32_4_canary(uint32_t n_rows, uint32_t row_width, float eps) {
@@ -27712,9 +26694,6 @@ static int g_get_rows_f16_mtl4_init_ok;
 static int ds4_get_rows_f16_mtl4_pipeline_init(void) {
     if (g_get_rows_f16_mtl4_init_attempted) return g_get_rows_f16_mtl4_init_ok;
     g_get_rows_f16_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -27748,33 +26727,10 @@ static int ds4_get_rows_f16_mtl4_pipeline_init(void) {
          "  if (ind < args->ne00t) pdst[ind] = (float)psrc[ind];\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_get_rows_f16_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: get_rows_f16 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"get_rows_f16_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_get_rows_f16_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_get_rows_f16_mtl4_pipeline) {
-        fprintf(stderr, "ds4: get_rows_f16 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: get_rows_f16 MTL4 pipeline initialized\n");
-    g_get_rows_f16_mtl4_init_ok = 1;
-    return 1;
+    g_get_rows_f16_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_get_rows_f16_mtl4", @"get_rows_f16_mtl4", 256, NULL, 0);
+    g_get_rows_f16_mtl4_init_ok = (g_get_rows_f16_mtl4_pipeline != nil) ? 1 : 0;
+    return g_get_rows_f16_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_get_rows_f16_canary(uint32_t n_table_rows, uint32_t row_width, uint32_t n_ids) {
@@ -27901,9 +26857,6 @@ static int g_get_rows_i32_mtl4_init_ok;
 static int ds4_get_rows_i32_mtl4_pipeline_init(void) {
     if (g_get_rows_i32_mtl4_init_attempted) return g_get_rows_i32_mtl4_init_ok;
     g_get_rows_i32_mtl4_init_attempted = 1;
-    if (!ds4_polar_pipeline_init()) return 0;
-
-    NSError *err = nil;
     NSString *source =
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -27937,33 +26890,10 @@ static int ds4_get_rows_i32_mtl4_pipeline_init(void) {
          "  if (ind < args->ne00t) pdst[ind] = psrc[ind];\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_get_rows_i32_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: get_rows_i32 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"get_rows_i32_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_get_rows_i32_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_get_rows_i32_mtl4_pipeline) {
-        fprintf(stderr, "ds4: get_rows_i32 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: get_rows_i32 MTL4 pipeline initialized\n");
-    g_get_rows_i32_mtl4_init_ok = 1;
-    return 1;
+    g_get_rows_i32_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_get_rows_i32_mtl4", @"get_rows_i32_mtl4", 256, NULL, 0);
+    g_get_rows_i32_mtl4_init_ok = (g_get_rows_i32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_get_rows_i32_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_get_rows_i32_canary(uint32_t n_table_rows, uint32_t row_width, uint32_t n_ids) {
@@ -28144,33 +27074,10 @@ static int ds4_bin_fuse_add_f32_mtl4_pipeline_init(void) {
          "  }\n"
          "}\n";
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_bin_fuse_add_f32_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: bin_fuse_add_f32 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
-    fnDesc.library = lib;
-    fnDesc.name = @"bin_fuse_add_f32_mtl4";
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = fnDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
-    g_bin_fuse_add_f32_mtl4_pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!g_bin_fuse_add_f32_mtl4_pipeline) {
-        fprintf(stderr, "ds4: bin_fuse_add_f32 MTL4 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return 0;
-    }
-    fprintf(stderr, "ds4: bin_fuse_add_f32 MTL4 pipeline initialized\n");
-    g_bin_fuse_add_f32_mtl4_init_ok = 1;
-    return 1;
+    g_bin_fuse_add_f32_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_bin_fuse_add_f32_mtl4", @"bin_fuse_add_f32_mtl4", 256, NULL, 0);
+    g_bin_fuse_add_f32_mtl4_init_ok = (g_bin_fuse_add_f32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_bin_fuse_add_f32_mtl4_init_ok;
 }
 
 int ds4_gpu_mtl4_bin_fuse_add_f32_canary(uint32_t n_rows, uint32_t row_width) {
@@ -29022,9 +27929,6 @@ int ds4_gpu_mtl4_mul_mm_id_map0_ne20_22_canary(uint32_t n_experts, uint32_t n_to
  * r2, r3). */
 
 static id<MTLComputePipelineState> ds4_mul_mv_f32_f32_build_pipeline(short nsg_value) {
-    if (!ds4_polar_pipeline_init()) return nil;
-    NSError *err = nil;
-
     /* MSL source: full mul_mv_t_t<float, float, NR0=4> impl + helper.
      * NR0 is hardcoded to 4 (template); NSG comes from FC.
      * NR0 = compile-time tile rows per threadgroup. */
@@ -29121,45 +28025,14 @@ static id<MTLComputePipelineState> ds4_mul_mv_f32_f32_build_pipeline(short nsg_v
          "  reduce_write(dst_f32, sumf, r0, args->ne01, tiisg, sgitg, shmem);\n"
          "}\n"];
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_mul_mv_f32_f32_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: mul_mv_f32_f32 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return nil;
-    }
-    /* Base function descriptor */
-    MTL4LibraryFunctionDescriptor *baseDesc = [MTL4LibraryFunctionDescriptor new];
-    baseDesc.library = lib;
-    baseDesc.name = @"mul_mv_f32_f32_mtl4";
-
-    /* Wrap in specialized descriptor with FC values */
-    MTLFunctionConstantValues *fcVals = [[MTLFunctionConstantValues alloc] init];
-    [fcVals setConstantValue:&nsg_value type:MTLDataTypeShort atIndex:600];
-    MTL4SpecializedFunctionDescriptor *specDesc = [MTL4SpecializedFunctionDescriptor new];
-    specDesc.functionDescriptor = baseDesc;
-    specDesc.constantValues = fcVals;
-    char spec_name[64];
-    snprintf(spec_name, sizeof(spec_name), "mul_mv_f32_f32_nsg%d", (int)nsg_value);
-    specDesc.specializedName = [NSString stringWithUTF8String:spec_name];
-
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = specDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 1024;
-    id<MTLComputePipelineState> pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!pipeline) {
-        fprintf(stderr, "ds4: mul_mv_f32_f32 MTL4 pipeline (NSG=%d) failed: %s\n",
-                (int)nsg_value, err ? err.localizedDescription.UTF8String : "(no error)");
-        return nil;
-    }
-    fprintf(stderr, "ds4: mul_mv_f32_f32 MTL4 pipeline initialized (NSG=%d, NR0=4)\n",
-            (int)nsg_value);
-    return pipeline;
+    /* silv 2026-05-27 refactor: use shared ds4_mtl4_build_kernel_pipeline */
+    const ds4_mtl4_fc_short fcs[] = {{nsg_value, 600}};
+    return ds4_mtl4_build_kernel_pipeline(
+        source,
+        @"ds4_mul_mv_f32_f32_mtl4",
+        @"mul_mv_f32_f32_mtl4",
+        1024,
+        fcs, 1);
 }
 
 static id<MTLComputePipelineState> g_mul_mv_f32_f32_nsg4_mtl4_pipeline;
@@ -29325,9 +28198,6 @@ int ds4_gpu_mtl4_mul_mv_f32_f32_canary(uint32_t M, uint32_t N) {
  * (saves QK8_0 muls per block — Q8_0 amortized dequant). */
 
 static id<MTLComputePipelineState> ds4_mul_mv_q8_0_f32_build_pipeline(short nsg_value) {
-    if (!ds4_polar_pipeline_init()) return nil;
-    NSError *err = nil;
-
     NSString *source = [NSString stringWithFormat:
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -29419,43 +28289,13 @@ static id<MTLComputePipelineState> ds4_mul_mv_q8_0_f32_build_pipeline(short nsg_
          "  reduce_write_nr2(dst_f32, sumf, r0, args->ne01, tiisg, sgitg, shmem);\n"
          "}\n"];
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_mul_mv_q8_0_f32_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: mul_mv_q8_0_f32 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return nil;
-    }
-    MTL4LibraryFunctionDescriptor *baseDesc = [MTL4LibraryFunctionDescriptor new];
-    baseDesc.library = lib;
-    baseDesc.name = @"mul_mv_q8_0_f32_mtl4";
-
-    MTLFunctionConstantValues *fcVals = [[MTLFunctionConstantValues alloc] init];
-    [fcVals setConstantValue:&nsg_value type:MTLDataTypeShort atIndex:600];
-    MTL4SpecializedFunctionDescriptor *specDesc = [MTL4SpecializedFunctionDescriptor new];
-    specDesc.functionDescriptor = baseDesc;
-    specDesc.constantValues = fcVals;
-    char spec_name[64];
-    snprintf(spec_name, sizeof(spec_name), "mul_mv_q8_0_f32_nsg%d", (int)nsg_value);
-    specDesc.specializedName = [NSString stringWithUTF8String:spec_name];
-
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = specDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 1024;
-    id<MTLComputePipelineState> pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!pipeline) {
-        fprintf(stderr, "ds4: mul_mv_q8_0_f32 MTL4 pipeline (NSG=%d) failed: %s\n",
-                (int)nsg_value, err ? err.localizedDescription.UTF8String : "(no error)");
-        return nil;
-    }
-    fprintf(stderr, "ds4: mul_mv_q8_0_f32 MTL4 pipeline initialized (NSG=%d, NR0=2)\n",
-            (int)nsg_value);
-    return pipeline;
+    const ds4_mtl4_fc_short fcs[] = {{nsg_value, 600}};
+    return ds4_mtl4_build_kernel_pipeline(
+        source,
+        @"ds4_mul_mv_q8_0_f32_mtl4",
+        @"mul_mv_q8_0_f32_mtl4",
+        1024,
+        fcs, 1);
 }
 
 static id<MTLComputePipelineState> g_mul_mv_q8_0_f32_nsg4_mtl4_pipeline;
@@ -29673,9 +28513,6 @@ int ds4_gpu_mtl4_mul_mv_q8_0_f32_canary(uint32_t M, uint32_t N) {
  * NR0=2, NSG=4. */
 
 static id<MTLComputePipelineState> ds4_dsv4_shared_gate_up_swiglu_q8_0_build_pipeline(short nsg_value) {
-    if (!ds4_polar_pipeline_init()) return nil;
-    NSError *err = nil;
-
     NSString *source = [NSString stringWithFormat:
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -29785,43 +28622,13 @@ static id<MTLComputePipelineState> ds4_dsv4_shared_gate_up_swiglu_q8_0_build_pip
          "  }\n"
          "}\n"];
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_dsv4_shared_gate_up_swiglu_q8_0_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: dsv4_shared_gate_up_swiglu_q8_0 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return nil;
-    }
-    MTL4LibraryFunctionDescriptor *baseDesc = [MTL4LibraryFunctionDescriptor new];
-    baseDesc.library = lib;
-    baseDesc.name = @"dsv4_shared_gate_up_swiglu_q8_0_mtl4";
-
-    MTLFunctionConstantValues *fcVals = [[MTLFunctionConstantValues alloc] init];
-    [fcVals setConstantValue:&nsg_value type:MTLDataTypeShort atIndex:600];
-    MTL4SpecializedFunctionDescriptor *specDesc = [MTL4SpecializedFunctionDescriptor new];
-    specDesc.functionDescriptor = baseDesc;
-    specDesc.constantValues = fcVals;
-    char spec_name[80];
-    snprintf(spec_name, sizeof(spec_name), "dsv4_shared_gate_up_swiglu_q8_0_nsg%d", (int)nsg_value);
-    specDesc.specializedName = [NSString stringWithUTF8String:spec_name];
-
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = specDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 1024;
-    id<MTLComputePipelineState> pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!pipeline) {
-        fprintf(stderr, "ds4: dsv4_shared_gate_up_swiglu_q8_0 MTL4 pipeline (NSG=%d) failed: %s\n",
-                (int)nsg_value, err ? err.localizedDescription.UTF8String : "(no error)");
-        return nil;
-    }
-    fprintf(stderr, "ds4: dsv4_shared_gate_up_swiglu_q8_0 MTL4 pipeline initialized (NSG=%d, NR0=2)\n",
-            (int)nsg_value);
-    return pipeline;
+    const ds4_mtl4_fc_short fcs[] = {{nsg_value, 600}};
+    return ds4_mtl4_build_kernel_pipeline(
+        source,
+        @"ds4_dsv4_shared_gate_up_swiglu_q8_0_mtl4",
+        @"dsv4_shared_gate_up_swiglu_q8_0_mtl4",
+        1024,
+        fcs, 1);
 }
 
 static id<MTLComputePipelineState> g_dsv4_shared_gate_up_swiglu_q8_0_nsg4_mtl4_pipeline;
@@ -30050,9 +28857,6 @@ cleanup:
  * Uses FC_mul_mv_nsg via the established pattern. NR0=2, NSG=4. */
 
 static id<MTLComputePipelineState> ds4_dsv4_q8_hc_expand4_q8_0_build_pipeline(short nsg_value) {
-    if (!ds4_polar_pipeline_init()) return nil;
-    NSError *err = nil;
-
     NSString *source = [NSString stringWithFormat:
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -30154,43 +28958,13 @@ static id<MTLComputePipelineState> ds4_dsv4_q8_hc_expand4_q8_0_build_pipeline(sh
          "  }\n"
          "}\n"];
 
-    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
-    libDesc.source = source;
-    libDesc.name = @"ds4_dsv4_q8_hc_expand4_q8_0_mtl4";
-    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
-    if (!lib) {
-        fprintf(stderr, "ds4: dsv4_q8_hc_expand4_q8_0 MTL4 library compile failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "(no error)");
-        return nil;
-    }
-    MTL4LibraryFunctionDescriptor *baseDesc = [MTL4LibraryFunctionDescriptor new];
-    baseDesc.library = lib;
-    baseDesc.name = @"dsv4_q8_hc_expand4_q8_0_mtl4";
-
-    MTLFunctionConstantValues *fcVals = [[MTLFunctionConstantValues alloc] init];
-    [fcVals setConstantValue:&nsg_value type:MTLDataTypeShort atIndex:600];
-    MTL4SpecializedFunctionDescriptor *specDesc = [MTL4SpecializedFunctionDescriptor new];
-    specDesc.functionDescriptor = baseDesc;
-    specDesc.constantValues = fcVals;
-    char spec_name[80];
-    snprintf(spec_name, sizeof(spec_name), "dsv4_q8_hc_expand4_q8_0_nsg%d", (int)nsg_value);
-    specDesc.specializedName = [NSString stringWithUTF8String:spec_name];
-
-    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
-    pipeDesc.computeFunctionDescriptor = specDesc;
-    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-    pipeDesc.maxTotalThreadsPerThreadgroup = 1024;
-    id<MTLComputePipelineState> pipeline =
-        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
-                                           compilerTaskOptions:nil error:&err];
-    if (!pipeline) {
-        fprintf(stderr, "ds4: dsv4_q8_hc_expand4_q8_0 MTL4 pipeline (NSG=%d) failed: %s\n",
-                (int)nsg_value, err ? err.localizedDescription.UTF8String : "(no error)");
-        return nil;
-    }
-    fprintf(stderr, "ds4: dsv4_q8_hc_expand4_q8_0 MTL4 pipeline initialized (NSG=%d, NR0=2)\n",
-            (int)nsg_value);
-    return pipeline;
+    const ds4_mtl4_fc_short fcs[] = {{nsg_value, 600}};
+    return ds4_mtl4_build_kernel_pipeline(
+        source,
+        @"ds4_dsv4_q8_hc_expand4_q8_0_mtl4",
+        @"dsv4_q8_hc_expand4_q8_0_mtl4",
+        1024,
+        fcs, 1);
 }
 
 static id<MTLComputePipelineState> g_dsv4_q8_hc_expand4_q8_0_nsg4_mtl4_pipeline;
