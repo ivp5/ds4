@@ -1246,3 +1246,9 @@ int ds4_gpu_mtl4_qkv_rms_norm_canary(uint32_t q_n, uint32_t kv_n);
  * Per-attention dispatch density. Tests simd reductions + threadgroup
  * scratch over vectorized inputs. */
 int ds4_gpu_mtl4_soft_max_4_canary(uint32_t n);
+
+/* silv 2026-05-27 task #679 — dsv4_hc_expand4 MTL4. HC=4 specialization
+ * of per-layer block-expansion. 5 input buffers (block_out, residual,
+ * post, comb, block_add) + dst. One thread per (d, t) → 4 outputs.
+ * Per-layer dispatch density (43× per token). */
+int ds4_gpu_mtl4_hc_expand4_canary(uint32_t n_embd, uint32_t n_tokens);

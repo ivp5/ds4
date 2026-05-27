@@ -1847,6 +1847,12 @@ int main(int argc, char **argv) {
         const uint32_t n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 512;
         return ds4_gpu_mtl4_soft_max_4_canary(n) ? 0 : 1;
     }
+    /* --hc-expand4-canary [n_embd [n_tokens]] : task #679 HC=4 block-expand */
+    if (argc >= 2 && !strcmp(argv[1], "--hc-expand4-canary")) {
+        const uint32_t n_embd = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
+        const uint32_t n_tokens = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 4;
+        return ds4_gpu_mtl4_hc_expand4_canary(n_embd, n_tokens) ? 0 : 1;
+    }
     /* --hc-weighted-sum-canary [n_embd [n_hc [n_tokens]]] : task #683 */
     if (argc >= 2 && !strcmp(argv[1], "--hc-weighted-sum-canary")) {
         const uint32_t n_embd = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
