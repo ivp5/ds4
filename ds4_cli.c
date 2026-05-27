@@ -1930,6 +1930,20 @@ int main(int argc, char **argv) {
         const uint32_t ne = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 512;
         return ds4_gpu_mtl4_hc_split_weighted_sum_canary(nr, ne) ? 0 : 1;
     }
+    /* --rope-tail-f32-canary [head_dim [n_rot [mode]]] : task #695 partial RoPE+YaRN */
+    if (argc >= 2 && !strcmp(argv[1], "--rope-tail-f32-canary")) {
+        const uint32_t hd = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 192;
+        const uint32_t nr = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 64;
+        const uint32_t m  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 2;  /* default NeoX */
+        return ds4_gpu_mtl4_rope_tail_f32_canary(hd, nr, m) ? 0 : 1;
+    }
+    /* --concat-canary [n0 [n1 [n_rows]]] : task #696 concat along dim 0 */
+    if (argc >= 2 && !strcmp(argv[1], "--concat-canary")) {
+        const uint32_t n0 = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n1 = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 128;
+        const uint32_t nr = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
+        return ds4_gpu_mtl4_concat_canary(n0, n1, nr) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

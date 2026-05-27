@@ -1325,3 +1325,16 @@ int ds4_gpu_mtl4_cpy_f32_f32_canary(uint32_t n_rows, uint32_t row_width);
  * tid 0 runs the Sinkhorn split path (#690), stashes pre[0..3] in
  * shared mem; all threads then compute dst[d] = sum_h x[d,h] × pre[h]. */
 int ds4_gpu_mtl4_hc_split_weighted_sum_canary(uint32_t n_rows, uint32_t n_embd);
+
+/* silv 2026-05-27 task #695 — dsv4_rope_tail_f32 MTL4. DeepSeek V4
+ * partial RoPE with YaRN scaling. First n_nope = ne00 - n_dims
+ * elements copied unchanged; rotated tail transformed via YaRN-scaled
+ * cos/sin. Two variants: interleaved (mode != 2) + NeoX (mode == 2).
+ * NEW patterns: inlined YaRN helpers (ramp, corr_dims, yarn), optional
+ * freq_factor table (src2), inverse rotation support. */
+int ds4_gpu_mtl4_rope_tail_f32_canary(uint32_t head_dim, uint32_t n_rot, uint32_t mode);
+
+/* silv 2026-05-27 task #696 — concat MTL4. Graph utility: concatenates
+ * two float tensors along a chosen dim. Used to assemble attention
+ * inputs with the exact tensor layout downstream kernels expect. */
+int ds4_gpu_mtl4_concat_canary(uint32_t n0, uint32_t n1, uint32_t n_rows);
