@@ -20593,6 +20593,33 @@ static bool engine_restore_gen_routing(ds4_engine *e, ds4_gpu_graph *g) {
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  ds4_neon_i8mm_init();
+ /* silv 2026-05-27 task #656 — auto-load DS4_ORGAN_SKIP env var so any
+  * binary (ds4, ds4-logitlens, ds4-bench, ds4-server) that opens an
+  * engine picks up the organ-skip flags without per-binary plumbing.
+  * Silent no-op if env unset; logs cell count if set. */
+ {
+ const char *skip_env = getenv("DS4_ORGAN_SKIP");
+ if (skip_env && *skip_env) {
+ const int loaded = ds4_load_organ_skip_env(NULL);
+ if (loaded > 0) {
+ fprintf(stderr, "ds4: DS4_ORGAN_SKIP active — %d cells loaded "
+                 "(harm-scorer ablation; --cpu-moe required for effect)\n",
+ loaded);
+ } else if (loaded < 0) {
+ fprintf(stderr, "ds4: DS4_ORGAN_SKIP parse error — ignored\n");
+ }
+ }
+ const char *skip_csv = getenv("DS4_ORGAN_SKIP_CSV");
+ if (skip_csv && *skip_csv) {
+ const int loaded = ds4_load_organ_skip_csv(skip_csv);
+ if (loaded > 0) {
+ fprintf(stderr, "ds4: DS4_ORGAN_SKIP_CSV=%s — %d cells loaded\n",
+ skip_csv, loaded);
+ } else {
+ fprintf(stderr, "ds4: DS4_ORGAN_SKIP_CSV=%s failed to load\n", skip_csv);
+ }
+ }
+ }
  if (opt->n_cpu_moe_layers < 0 || opt->n_cpu_moe_layers > DS4_N_LAYER) {
  fprintf(stderr, "ds4: n_cpu_moe_layers must be between 0 and %d\n", DS4_N_LAYER);
  *out = NULL;

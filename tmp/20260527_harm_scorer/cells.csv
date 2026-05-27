@@ -1,0 +1,36 @@
+# silv 2026-05-27 — pilot cells.csv for harm scorer Phase B
+# Format: layer,expert,organ (organ: 0=gate, 1=up, 2=down)
+#
+# This is the minimum viable cell set: one DOWN-skip (full-expert
+# ablation) per representative layer band, so we get per-expert
+# importance signal across the model's depth.
+#
+# DS4-V4-Flash IQ2_XXS: 61 routed layers, 256 experts/layer.
+# Bands chosen to span: early (L3), mid-early (L13), mid (L25,
+# the codex H1849 "scope" layer), mid-late (L42), late (L55, the
+# layer the rescue mechanism Conjecture #23 names).
+#
+# Pilot focuses on expert id 52, 87, 231 (cited as prune candidates
+# by codex H2068's greedy_minimax_case_weight); + expert 0 and 100
+# as controls.
+#
+# After the pilot validates the wire, swap in route-pressure
+# strata from codex H1739 / H2040 per DEPLOYMENT_RULES Rule 1.
+
+3,52,2
+3,231,2
+13,52,2
+13,231,2
+25,52,2
+25,231,2
+25,87,2
+42,0,2
+42,52,2
+55,100,2
+55,231,2
+
+# Subset of cells with per-organ split for the same expert — to test
+# whether GATE/UP/DOWN produce distinct signed-harm signatures as
+# the SwiGLU-coupling discovery from #651 predicted.
+25,52,0
+25,52,1
