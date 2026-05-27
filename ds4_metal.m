@@ -16142,6 +16142,138 @@ static int ds4_hadamard_mtl4_pipeline_init(void) {
     return 1;
 }
 
+/* silv 2026-05-27 task #654 next-level: reusable MTL4 Hadamard apply.
+ *
+ * Encode `n_apply` consecutive forward H passes on a caller-owned MTLBuffer.
+ * `tensor` must hold n_rows × n_in halves at offset 0. n_in must be % 16.
+ *
+ * The widened kernel processes 16 blocks per threadgroup (256 threads).
+ * Each application: dispatch (n_rows, ceil(blocks_per_row/16), 1) threadgroups.
+ * Between applications: barrierAfterEncoderStages(Dispatch) so the second
+ * H reads what the first wrote (R1 fix proven on the canary, rel_L2=6.22e-4
+ * for the round-trip H×H=I).
+ *
+ * `tensor` and `argsBuf` MUST be in the residency set passed in (caller
+ * owns residency lifecycle so multiple apply()s in one pass share it).
+ * The argsBuf contents (n_rows, blocks_per_row, row_stride_bytes) must
+ * be written by the caller before this is called.
+ *
+ * Returns 1 on success, 0 on failure (pipeline not initialized).
+ *
+ * The canary wraps this with synthetic data + round-trip verification;
+ * runtime callers (basis-aware sidecar dispatch, encode-time validators)
+ * use this directly. */
+static int ds4_gpu_mtl4_hadamard16_apply_encoder(
+        id<MTL4ComputeCommandEncoder> enc,
+        id<MTLBuffer> tensor,
+        id<MTLBuffer> argsBuf,
+        id<MTL4ArgumentTable> argTable,
+        uint32_t n_rows,
+        uint32_t blocks_per_row,
+        uint32_t n_apply) {
+    if (!enc || !tensor || !argsBuf || !argTable) return 0;
+    if (!g_hadamard_mtl4_pipeline) return 0;
+    if (n_rows == 0u || blocks_per_row == 0u || n_apply == 0u) return 0;
+
+    [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+    [argTable setAddress:tensor.gpuAddress atIndex:1];
+
+    const uint32_t tg_y = (blocks_per_row + 15u) / 16u;
+    const MTLSize grid = MTLSizeMake(n_rows, tg_y, 1);
+    const MTLSize tg   = MTLSizeMake(256, 1, 1);
+    /* 16 blocks × 16 halves × 2 bytes = 512 B threadgroup scratch. */
+    [enc setComputePipelineState:g_hadamard_mtl4_pipeline];
+    [enc setArgumentTable:argTable];
+    [enc setThreadgroupMemoryLength:(NSUInteger)(16 * 16 * sizeof(uint16_t)) atIndex:0];
+
+    for (uint32_t i = 0; i < n_apply; i++) {
+        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        if (i + 1 < n_apply) {
+            /* Same-encoder sequential dispatches need explicit barrier per R1. */
+            [enc barrierAfterEncoderStages:MTLStageDispatch
+                       beforeEncoderStages:MTLStageDispatch
+                         visibilityOptions:MTL4VisibilityOptionDevice];
+        }
+    }
+    return 1;
+}
+
+/* Public-facing API: apply H once to an n_rows × n_in FP16 buffer.
+ * Standalone — allocates residency / args / encoder / queue internally.
+ * For multi-apply sequences (encode pipeline composing multiple
+ * transforms) callers should drive the encoder directly via the
+ * static helper above + the residency set they manage.
+ *
+ * Returns 1 on success, 0 on failure (e.g. pipeline init failed or n_in
+ * not divisible by 16). */
+int ds4_gpu_mtl4_hadamard16_apply(_Float16 *host_buf, uint32_t n_rows, uint32_t n_in) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_hadamard_mtl4_pipeline_init()) return 0;
+    if (!host_buf || n_rows == 0u || n_in == 0u || (n_in % 16u) != 0u) return 0;
+    const uint32_t blocks_per_row = n_in / 16u;
+    const NSUInteger n_halves = (NSUInteger)n_rows * (NSUInteger)n_in;
+    const NSUInteger byte_count = n_halves * sizeof(uint16_t);
+
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> tensor = [g_device newBufferWithLength:byte_count
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:sizeof(ds4_gpu_hadamard16_batched_args)
+                                                     options:MTLResourceStorageModeShared];
+        if (!tensor || !argsBuf) return 0;
+
+        memcpy(tensor.contents, host_buf, byte_count);
+        ds4_gpu_hadamard16_batched_args *args = (ds4_gpu_hadamard16_batched_args *)argsBuf.contents;
+        args->n_rows = n_rows;
+        args->blocks_per_row = blocks_per_row;
+        args->row_stride_bytes = (uint64_t)n_in * sizeof(uint16_t);
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (!residency) return 0;
+        id<MTLAllocation> allocs[2] = { (id<MTLAllocation>)tensor, (id<MTLAllocation>)argsBuf };
+        [residency addAllocations:allocs count:2];
+        [residency commit];
+        [residency requestResidency];
+
+        MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+        atDesc.maxBufferBindCount = 2;
+        atDesc.initializeBindings = YES;
+        id<MTL4ArgumentTable> argTable = [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+        if (!argTable) return 0;
+
+        id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+        [cb beginCommandBufferWithAllocator:g_polar_allocator];
+        [cb useResidencySet:residency];
+        id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) return 0;
+        if (!ds4_gpu_mtl4_hadamard16_apply_encoder(enc, tensor, argsBuf, argTable,
+                                                    n_rows, blocks_per_row, 1u)) {
+            return 0;
+        }
+        [enc endEncoding];
+        [cb endCommandBuffer];
+
+        [g_polar_queue addResidencySet:residency];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block NSError *fbErr = nil;
+        MTL4CommitOptions *opts = [MTL4CommitOptions new];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            fbErr = feedback.error;
+            dispatch_semaphore_signal(sem);
+        }];
+        id<MTL4CommandBuffer> bufs[1] = { cb };
+        [g_polar_queue commit:bufs count:1 options:opts];
+        long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+        [residency endResidency];
+        if (waitRes != 0 || fbErr) return 0;
+
+        memcpy(host_buf, tensor.contents, byte_count);
+        return 1;
+    }
+}
+
 /* MTL4 Hadamard canary: fill an n_rows×n_in FP16 buffer with deterministic
  * random values, dispatch H twice (H*H=I), check max|err| against FP16
  * precision floor. n_in must be divisible by 16. Reports per-tensor GPU
@@ -16207,33 +16339,20 @@ int ds4_gpu_mtl4_hadamard16_canary(uint32_t n_rows, uint32_t n_in) {
                     err ? err.localizedDescription.UTF8String : "(no error)");
             return 0;
         }
-        [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-        [argTable setAddress:tensor.gpuAddress atIndex:1];
-
-        /* Grid: (n_rows, ceil(blocks_per_row / 16), 1). Threadgroup: 256 = 16×16. */
-        const uint32_t tg_y = (blocks_per_row + 15u) / 16u;
-
         id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
         [cb beginCommandBufferWithAllocator:g_polar_allocator];
         [cb useResidencySet:residency];
         id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
         if (!enc) return 0;
-        [enc setComputePipelineState:g_hadamard_mtl4_pipeline];
-        [enc setArgumentTable:argTable];
-        /* 16 blocks × 16 halves × 2 bytes = 512 B of threadgroup scratch. */
-        [enc setThreadgroupMemoryLength:(NSUInteger)(16 * 16 * sizeof(uint16_t)) atIndex:0];
 
-        /* Apply H twice: H × H = I orthogonally, so the buffer round-trips.
-         * R1 fix: same-encoder sequential dispatches need an explicit memory
-         * barrier in MTL4 — there's no implicit ordering between the writes
-         * of dispatch #1 and the reads of dispatch #2. */
-        [enc dispatchThreadgroups:MTLSizeMake(n_rows, tg_y, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [enc barrierAfterEncoderStages:MTLStageDispatch
-                   beforeEncoderStages:MTLStageDispatch
-                     visibilityOptions:MTL4VisibilityOptionDevice];
-        [enc dispatchThreadgroups:MTLSizeMake(n_rows, tg_y, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        /* Apply H twice via the reusable encoder helper. R1 barrier between
+         * dispatches is handled inside (n_apply > 1). */
+        if (!ds4_gpu_mtl4_hadamard16_apply_encoder(enc, tensor, argsBuf, argTable,
+                                                    n_rows, blocks_per_row, 2u)) {
+            [residency endResidency];
+            return 0;
+        }
+        const uint32_t tg_y = (blocks_per_row + 15u) / 16u;
 
         [enc endEncoding];
         [cb endCommandBuffer];

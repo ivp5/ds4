@@ -923,6 +923,20 @@ int ds4_gpu_mtl4_polar_dot_canary(uint32_t packets, uint32_t pairs);
 int ds4_gpu_mtl4_polar_tile_canary(uint32_t tiles, uint32_t rows,
                                     uint32_t batches, uint32_t pairs);
 
+/* silv 2026-05-27 task #654 — MTL4 Hadamard-16 widened apply (deployable
+ * fast path). Applies one orthogonal H_16 transform (with 1/sqrt(16)
+ * normalization) to an n_rows × n_in FP16 buffer using the widened
+ * 256-thread kernel via the MTL4 dispatch path. n_in must be divisible
+ * by 16.
+ *
+ * Synchronous: host_buf is read once at entry, written once at exit.
+ * For multi-apply sequences (encode pipeline with multiple transforms)
+ * or runtime dispatch-site pre-pass integration, drive the encoder
+ * directly via the internal helper.
+ *
+ * Returns 1 on success, 0 on failure. */
+int ds4_gpu_mtl4_hadamard16_apply(_Float16 *host_buf, uint32_t n_rows, uint32_t n_in);
+
 /* silv 2026-05-27 task #653 — MTL4 Hadamard-16 widened-dispatch canary.
  * Allocates an n_rows × n_in FP16 buffer, fills with deterministic random
  * values, applies the widened Hadamard kernel twice (H×H=I), checks
