@@ -1759,6 +1759,21 @@ int main(int argc, char **argv) {
         const uint32_t n_comp = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
         return ds4_gpu_mtl4_topk_mask_scatter_canary(n_topk, n_tokens, n_comp) ? 0 : 1;
     }
+    /* --indexer-weighted-sum-canary [ne0 [ne1 [n_heads]]] : task #674
+     * MTL4 port of kernel_dsv4_indexer_weighted_sum (dsv4_misc.metal:1340). */
+    if (argc >= 2 && !strcmp(argv[1], "--indexer-weighted-sum-canary")) {
+        const uint32_t ne0 = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
+        const uint32_t ne1 = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
+        const uint32_t n_heads = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
+        return ds4_gpu_mtl4_indexer_weighted_sum_canary(ne0, ne1, n_heads) ? 0 : 1;
+    }
+    /* --dir-steering-canary [width [rows]] : task #675 MTL4 port of
+     * kernel_dsv4_directional_steering_project_f32 (dsv4_misc.metal:106). */
+    if (argc >= 2 && !strcmp(argv[1], "--dir-steering-canary")) {
+        const uint32_t width = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4096;
+        const uint32_t rows = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
+        return ds4_gpu_mtl4_dir_steering_canary(width, rows) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {

@@ -1114,3 +1114,13 @@ int ds4_gpu_mtl4_softplus_sqrt_canary(uint32_t n_rows, uint32_t n_cols);
 int ds4_gpu_mtl4_router_weights_one_canary(void);
 int ds4_gpu_mtl4_topk_mask_canary(uint32_t ne0, uint32_t ne1);
 int ds4_gpu_mtl4_topk_mask_scatter_canary(uint32_t n_topk, uint32_t n_tokens, uint32_t n_comp);
+
+/* silv 2026-05-27 tasks #674, #675 — batch 3 of MTL4 ports.
+ *
+ * indexer_weighted_sum: weighted sum over indexer head scores with neg-clip
+ * and per-head weights × scale. Per-(token, comp_row) dispatch.
+ *
+ * dir_steering_project: project x onto a steering direction and subtract
+ * scaled projection. Uses threadgroup scratch for parallel reduction. */
+int ds4_gpu_mtl4_indexer_weighted_sum_canary(uint32_t ne0, uint32_t ne1, uint32_t n_heads);
+int ds4_gpu_mtl4_dir_steering_canary(uint32_t width, uint32_t rows);

@@ -17248,6 +17248,446 @@ int ds4_gpu_mtl4_topk_mask_scatter_canary(uint32_t n_topk, uint32_t n_tokens, ui
 }
 
 /* ============================================================ */
+/* MTL4 port: kernel_dsv4_indexer_weighted_sum (task #674)      */
+/* metal/dsv4_misc.metal:1340. Weighted sum over indexer head    */
+/* scores with negative-clip + scale. 1 args + 3 buffers.        */
+/* ============================================================ */
+static id<MTLComputePipelineState> g_indexer_weighted_sum_mtl4_pipeline;
+static int g_indexer_weighted_sum_mtl4_init_attempted;
+static int g_indexer_weighted_sum_mtl4_init_ok;
+
+static int ds4_indexer_weighted_sum_mtl4_pipeline_init(void) {
+    if (g_indexer_weighted_sum_mtl4_init_attempted) return g_indexer_weighted_sum_mtl4_init_ok;
+    g_indexer_weighted_sum_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct iws_args {\n"
+         "  int64_t ne00; int64_t ne01; int64_t ne02;\n"
+         "  uint64_t nb00; uint64_t nb01; uint64_t nb02;\n"
+         "  int64_t ne10; int64_t ne11;\n"
+         "  uint64_t nb10; uint64_t nb11;\n"
+         "  int64_t ne0; int64_t ne1;\n"
+         "  uint64_t nb0; uint64_t nb1;\n"
+         "  float scale;\n"
+         "};\n"
+         "kernel void indexer_weighted_sum_mtl4(\n"
+         "    device const iws_args *args_ptr [[buffer(0)]],\n"
+         "    device const char *scores [[buffer(1)]],\n"
+         "    device const char *weights [[buffer(2)]],\n"
+         "    device char *dst [[buffer(3)]],\n"
+         "    uint gid [[thread_position_in_grid]]) {\n"
+         "  const int64_t n = args_ptr->ne0 * args_ptr->ne1;\n"
+         "  if ((int64_t)gid >= n) return;\n"
+         "  const int64_t ic = (int64_t)gid % args_ptr->ne0;\n"
+         "  const int64_t it = (int64_t)gid / args_ptr->ne0;\n"
+         "  float acc = 0.0f;\n"
+         "  for (int64_t ih = 0; ih < args_ptr->ne02; ++ih) {\n"
+         "    const float s = *((device const float *)(scores + ic * args_ptr->nb00 + it * args_ptr->nb01 + ih * args_ptr->nb02));\n"
+         "    const float w = *((device const float *)(weights + ih * args_ptr->nb10 + it * args_ptr->nb11));\n"
+         "    acc += max(s, 0.0f) * (w * args_ptr->scale);\n"
+         "  }\n"
+         "  *((device float *)(dst + ic * args_ptr->nb0 + it * args_ptr->nb1)) = acc;\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_indexer_weighted_sum_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: indexer_weighted_sum MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"indexer_weighted_sum_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_indexer_weighted_sum_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_indexer_weighted_sum_mtl4_pipeline) {
+        fprintf(stderr, "ds4: indexer_weighted_sum MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: indexer_weighted_sum MTL4 pipeline initialized\n");
+    g_indexer_weighted_sum_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_indexer_weighted_sum_canary(uint32_t ne0, uint32_t ne1, uint32_t n_heads) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_indexer_weighted_sum_mtl4_pipeline_init()) return 0;
+
+    /* Synthetic: scores[ic, it, ih] = (ic + it + ih) - 5 (some negative for clip);
+     * weights[ih, it] = 1.0; scale = 0.5.
+     * Expected: dst[ic, it] = sum_ih max(score, 0) * (1.0 * 0.5). */
+    const uint64_t scores_n = (uint64_t)ne0 * ne1 * n_heads;
+    const uint64_t weights_n = (uint64_t)n_heads * ne1;
+    const uint64_t dst_n = (uint64_t)ne0 * ne1;
+
+    float *host_scores = (float *)calloc(scores_n, sizeof(float));
+    float *host_weights = (float *)calloc(weights_n, sizeof(float));
+    float *host_dst_gpu = (float *)calloc(dst_n, sizeof(float));
+    float *host_dst_ref = (float *)calloc(dst_n, sizeof(float));
+    if (!host_scores || !host_weights || !host_dst_gpu || !host_dst_ref) {
+        free(host_scores); free(host_weights); free(host_dst_gpu); free(host_dst_ref);
+        return 0;
+    }
+    const float scale = 0.5f;
+    for (uint32_t it = 0; it < ne1; it++) {
+        for (uint32_t ic = 0; ic < ne0; ic++) {
+            for (uint32_t ih = 0; ih < n_heads; ih++) {
+                const float s = (float)(int)((int)ic + (int)it + (int)ih - 5);
+                host_scores[ic + it * ne0 + ih * ne0 * ne1] = s;
+            }
+        }
+        for (uint32_t ih = 0; ih < n_heads; ih++) host_weights[ih + it * n_heads] = 1.0f;
+    }
+    /* CPU reference */
+    for (uint32_t it = 0; it < ne1; it++) {
+        for (uint32_t ic = 0; ic < ne0; ic++) {
+            float acc = 0.0f;
+            for (uint32_t ih = 0; ih < n_heads; ih++) {
+                const float s = host_scores[ic + it * ne0 + ih * ne0 * ne1];
+                const float w = host_weights[ih + it * n_heads];
+                acc += fmaxf(s, 0.0f) * (w * scale);
+            }
+            host_dst_ref[ic + it * ne0] = acc;
+        }
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> scoresBuf = [g_device newBufferWithBytes:host_scores
+                                                        length:scores_n * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weightsBuf = [g_device newBufferWithBytes:host_weights
+                                                         length:weights_n * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:dst_n * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+
+        struct {
+            int64_t ne00, ne01, ne02;
+            uint64_t nb00, nb01, nb02;
+            int64_t ne10, ne11;
+            uint64_t nb10, nb11;
+            int64_t ne0_, ne1_;
+            uint64_t nb0_, nb1_;
+            float scale_;
+            char pad[4];
+        } args = {
+            .ne00 = (int64_t)ne0, .ne01 = (int64_t)ne1, .ne02 = (int64_t)n_heads,
+            .nb00 = sizeof(float), .nb01 = (uint64_t)ne0 * sizeof(float),
+            .nb02 = (uint64_t)ne0 * ne1 * sizeof(float),
+            .ne10 = (int64_t)n_heads, .ne11 = (int64_t)ne1,
+            .nb10 = sizeof(float), .nb11 = (uint64_t)n_heads * sizeof(float),
+            .ne0_ = (int64_t)ne0, .ne1_ = (int64_t)ne1,
+            .nb0_ = sizeof(float), .nb1_ = (uint64_t)ne0 * sizeof(float),
+            .scale_ = scale,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[4] = {
+                (id<MTLAllocation>)argsBuf, (id<MTLAllocation>)scoresBuf,
+                (id<MTLAllocation>)weightsBuf, (id<MTLAllocation>)dstBuf,
+            };
+            [residency addAllocations:allocs count:4];
+            [residency commit];
+            [residency requestResidency];
+
+            MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+            atDesc.maxBufferBindCount = 4;
+            atDesc.initializeBindings = YES;
+            id<MTL4ArgumentTable> argTable =
+                [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:scoresBuf.gpuAddress atIndex:1];
+                [argTable setAddress:weightsBuf.gpuAddress atIndex:2];
+                [argTable setAddress:dstBuf.gpuAddress atIndex:3];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_indexer_weighted_sum_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                const NSUInteger tg = 256;
+                const NSUInteger n_tgs = (dst_n + tg - 1) / tg;
+                [enc dispatchThreadgroups:MTLSizeMake(n_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_dst_gpu, dstBuf.contents, dst_n * sizeof(float));
+                    rc = 1;
+                }
+            }
+        }
+    }
+    if (!rc) {
+        free(host_scores); free(host_weights); free(host_dst_gpu); free(host_dst_ref);
+        return 0;
+    }
+
+    double max_abs = 0.0;
+    for (uint64_t i = 0; i < dst_n; i++) {
+        double d = fabs((double)(host_dst_gpu[i] - host_dst_ref[i]));
+        if (d > max_abs) max_abs = d;
+    }
+    fprintf(stderr,
+        "ds4: indexer_weighted_sum MTL4 canary ne0=%u ne1=%u n_heads=%u "
+        "expected[0]=%.4f gpu[0]=%.4f max_abs=%.4e\n",
+        ne0, ne1, n_heads,
+        (double)host_dst_ref[0], (double)host_dst_gpu[0], max_abs);
+    free(host_scores); free(host_weights); free(host_dst_gpu); free(host_dst_ref);
+    return max_abs < 1.0e-4 ? 1 : 0;
+}
+
+/* ============================================================ */
+/* MTL4 port: kernel_dsv4_directional_steering_project_f32 (#675)*/
+/* metal/dsv4_misc.metal:106. Project x against a steering       */
+/* direction; subtract scaled projection. Uses threadgroup       */
+/* scratch for parallel reduction.                               */
+/* ============================================================ */
+static id<MTLComputePipelineState> g_dir_steering_mtl4_pipeline;
+static int g_dir_steering_mtl4_init_attempted;
+static int g_dir_steering_mtl4_init_ok;
+
+static int ds4_dir_steering_mtl4_pipeline_init(void) {
+    if (g_dir_steering_mtl4_init_attempted) return g_dir_steering_mtl4_init_ok;
+    g_dir_steering_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct dir_steering_args {\n"
+         "  uint32_t width;\n"
+         "  uint32_t rows;\n"
+         "  uint32_t layer;\n"
+         "  uint32_t n_threads;\n"
+         "  float scale;\n"
+         "};\n"
+         "kernel void dir_steering_project_mtl4(\n"
+         "    device const dir_steering_args *args_ptr [[buffer(0)]],\n"
+         "    device float *x [[buffer(1)]],\n"
+         "    device const float *directions [[buffer(2)]],\n"
+         "    threadgroup float *scratch [[threadgroup(0)]],\n"
+         "    uint row [[threadgroup_position_in_grid]],\n"
+         "    uint tid [[thread_position_in_threadgroup]]) {\n"
+         "  if (row >= args_ptr->rows || args_ptr->width == 0) return;\n"
+         "  device float *xr = x + (uint64_t)row * args_ptr->width;\n"
+         "  device const float *dir = directions + (uint64_t)args_ptr->layer * args_ptr->width;\n"
+         "  const uint nth = args_ptr->n_threads;\n"
+         "  float sum = 0.0f;\n"
+         "  for (uint i = tid; i < args_ptr->width; i += nth) sum += xr[i] * dir[i];\n"
+         "  scratch[tid] = sum;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (uint step = nth >> 1; step > 0; step >>= 1) {\n"
+         "    if (tid < step) scratch[tid] += scratch[tid + step];\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  const float coeff = args_ptr->scale * scratch[0];\n"
+         "  for (uint i = tid; i < args_ptr->width; i += nth) xr[i] -= coeff * dir[i];\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_dir_steering_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: dir_steering MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"dir_steering_project_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_dir_steering_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_dir_steering_mtl4_pipeline) {
+        fprintf(stderr, "ds4: dir_steering MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: dir_steering MTL4 pipeline initialized\n");
+    g_dir_steering_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_dir_steering_canary(uint32_t width, uint32_t rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_dir_steering_mtl4_pipeline_init()) return 0;
+
+    /* Synthetic: x[row, i] = sin(i*0.1)+row*0.01; direction = unit-along axis 0
+     * (length 1.0 at i=0, 0 elsewhere); scale = 0.5.
+     * Expected: dot = x[row, 0]; coeff = 0.5 * dot;
+     *           x[row, 0] -= coeff * 1.0 = x[row, 0] - 0.5 * x[row, 0] = 0.5 * x[row, 0].
+     *           x[row, i!=0] unchanged. */
+    const uint32_t n_threads = 64;
+    const uint32_t n_layers = 4;
+    const uint32_t layer = 1;
+    const float scale = 0.5f;
+
+    const uint64_t x_n = (uint64_t)rows * width;
+    const uint64_t dir_n = (uint64_t)n_layers * width;
+    float *host_x = (float *)calloc(x_n, sizeof(float));
+    float *host_x_ref = (float *)calloc(x_n, sizeof(float));
+    float *host_dir = (float *)calloc(dir_n, sizeof(float));
+    if (!host_x || !host_x_ref || !host_dir) {
+        free(host_x); free(host_x_ref); free(host_dir);
+        return 0;
+    }
+    for (uint64_t i = 0; i < x_n; i++) {
+        const uint32_t row = (uint32_t)(i / width);
+        const uint32_t col = (uint32_t)(i % width);
+        host_x[i] = sinf((float)col * 0.1f) + (float)row * 0.01f;
+        host_x_ref[i] = host_x[i];
+    }
+    /* layer=1 direction: 1.0 at index 0, 0 elsewhere */
+    for (uint32_t i = 0; i < width; i++) {
+        host_dir[(uint64_t)layer * width + i] = (i == 0) ? 1.0f : 0.0f;
+    }
+    /* CPU reference */
+    for (uint32_t r = 0; r < rows; r++) {
+        float dot = 0.0f;
+        for (uint32_t i = 0; i < width; i++) {
+            dot += host_x_ref[(uint64_t)r * width + i] *
+                   host_dir[(uint64_t)layer * width + i];
+        }
+        const float coeff = scale * dot;
+        for (uint32_t i = 0; i < width; i++) {
+            host_x_ref[(uint64_t)r * width + i] -=
+                coeff * host_dir[(uint64_t)layer * width + i];
+        }
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:32
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> xBuf = [g_device newBufferWithBytes:host_x
+                                                   length:x_n * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dirBuf = [g_device newBufferWithBytes:host_dir
+                                                     length:dir_n * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+        struct {
+            uint32_t width, rows, layer, n_threads;
+            float scale;
+        } args = {
+            .width = width, .rows = rows, .layer = layer,
+            .n_threads = n_threads, .scale = scale,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[3] = {
+                (id<MTLAllocation>)argsBuf, (id<MTLAllocation>)xBuf, (id<MTLAllocation>)dirBuf,
+            };
+            [residency addAllocations:allocs count:3];
+            [residency commit];
+            [residency requestResidency];
+
+            MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+            atDesc.maxBufferBindCount = 4;
+            atDesc.initializeBindings = YES;
+            id<MTL4ArgumentTable> argTable =
+                [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:xBuf.gpuAddress atIndex:1];
+                [argTable setAddress:dirBuf.gpuAddress atIndex:2];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_dir_steering_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                /* scratch: n_threads * sizeof(float) bytes per threadgroup */
+                [enc setThreadgroupMemoryLength:n_threads * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(n_threads, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_x, xBuf.contents, x_n * sizeof(float));
+                    rc = 1;
+                }
+            }
+        }
+    }
+    if (!rc) {
+        free(host_x); free(host_x_ref); free(host_dir);
+        return 0;
+    }
+
+    double max_abs = 0.0;
+    for (uint64_t i = 0; i < x_n; i++) {
+        double d = fabs((double)(host_x[i] - host_x_ref[i]));
+        if (d > max_abs) max_abs = d;
+    }
+    fprintf(stderr,
+        "ds4: dir_steering MTL4 canary width=%u rows=%u "
+        "x[0]=%.4f gpu=%.4f ref=%.4f max_abs=%.4e\n",
+        width, rows, (double)host_x[0], (double)host_x[0], (double)host_x_ref[0], max_abs);
+    free(host_x); free(host_x_ref); free(host_dir);
+    return max_abs < 1.0e-4 ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +
