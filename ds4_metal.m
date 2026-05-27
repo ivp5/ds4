@@ -15625,6 +15625,7 @@ int ds4_gpu_routed_moe_batch_tensor(
  * write/read. --quality keeps the older F32 intermediate.
  */
  const bool request_mid_f16 = !g_quality_mode;
+ uint32_t moe_mm_tile_n = 32u;
  if (use_mm_id) {
  gate_map_args =
  ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, 256, 1, n_expert, n_tokens);
@@ -15638,12 +15639,16 @@ int ds4_gpu_routed_moe_batch_tensor(
  n_expert, n_expert, n_tokens,
  request_mid_f16 ? sizeof(uint16_t) : sizeof(float));
 
+ /* silv merge 2026-05-27: wire antirez wide-tile selector at call site.
+  * Default 32; widens to 64/128 when n_tokens aligns and gate_type is
+  * Q2_K/Q4_K/IQ2_XXS. Capped via DS4_METAL_MOE_TILE_MAX env. */
+ moe_mm_tile_n = ds4_gpu_moe_mm_tile_n(gate_type, n_tokens);
  map_pipeline = ds4_gpu_get_pipeline(ds4_gpu_mul_mm_id_map0_name(n_expert));
- gate_mm_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
- up_mm_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
+ gate_mm_pipeline = ds4_gpu_routed_mm_pipeline_for_tile(gate_type, moe_mm_tile_n);
+ up_mm_pipeline = ds4_gpu_routed_mm_pipeline_for_tile(gate_type, moe_mm_tile_n);
  down_mm_pipeline = request_mid_f16 ?
- ds4_gpu_routed_mm_f16_rhs_pipeline(down_type) :
- ds4_gpu_routed_mm_pipeline(down_type);
+ ds4_gpu_routed_mm_f16_rhs_pipeline_for_tile(down_type, moe_mm_tile_n) :
+ ds4_gpu_routed_mm_pipeline_for_tile(down_type, moe_mm_tile_n);
  if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline) {
  return 0;
  }
@@ -15757,7 +15762,7 @@ int ds4_gpu_routed_moe_batch_tensor(
  ds4_gpu_tensor_offset(x),
  gatebuf,
  ds4_gpu_tensor_offset(gate),
- 32u);
+ moe_mm_tile_n);
  DS4_METAL_PROFILE_MOE_STAGE("gate");
  }
  if (ok) {
@@ -15770,7 +15775,7 @@ int ds4_gpu_routed_moe_batch_tensor(
  ds4_gpu_tensor_offset(x),
  upbuf,
  ds4_gpu_tensor_offset(up),
- 32u);
+ moe_mm_tile_n);
  DS4_METAL_PROFILE_MOE_STAGE("up");
  }
  } else if (!fp16_simdgroup_used && use_tiny_pair_mv) {
@@ -15952,7 +15957,7 @@ int ds4_gpu_routed_moe_batch_tensor(
  ds4_gpu_tensor_offset(mid),
  down_dst,
  down_dst_off,
- 32u);
+ moe_mm_tile_n);
  } else {
  ok = ds4_gpu_encode_mul_mv_id(cb,
  down_mv_pipeline,
