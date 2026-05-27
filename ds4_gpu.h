@@ -1443,3 +1443,16 @@ int ds4_gpu_mtl4_mul_mm_id_map0_ne20_22_canary(uint32_t n_experts, uint32_t n_to
  * NSG=4 (FC). Unlocks the function-constant pattern for future ports
  * (mul_mv_f16_f32, Q8_0 dequant kernels, full bin_fuse). */
 int ds4_gpu_mtl4_mul_mv_f32_f32_canary(uint32_t M, uint32_t N);
+
+/* silv 2026-05-27 task #723 — mul_mv_q8_0_f32 MTL4.
+ * Q8_0 quantized matrix × FP32 vector. Uses FC pattern from #722.
+ * NR0=2 (Q8_0 default), NSG=4. Production Q8_0 matvec for shared
+ * experts and small dense projections. */
+int ds4_gpu_mtl4_mul_mv_q8_0_f32_canary(uint32_t M, uint32_t N);
+
+/* silv 2026-05-27 task #724 — dsv4_shared_gate_up_swiglu_q8_0 MTL4.
+ * Fused gate+up Q8_0 matvecs + SwiGLU. Replaces 3 separate dispatches
+ * with one Q8_0 read of the activation vector (read once, broadcast to
+ * both gate and up dequant lanes). NR0=2, NSG=4 via FC. Used at shared
+ * expert head every layer. */
+int ds4_gpu_mtl4_dsv4_shared_gate_up_swiglu_q8_0_canary(uint32_t M, uint32_t N, float clamp_value);

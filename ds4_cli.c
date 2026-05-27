@@ -2100,6 +2100,19 @@ int main(int argc, char **argv) {
         const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
         return ds4_gpu_mtl4_mul_mv_f32_f32_canary(m, n) ? 0 : 1;
     }
+    /* --mul-mv-q8-0-canary [M [N]] : task #723 Q8_0 matvec */
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mv-q8-0-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_mul_mv_q8_0_f32_canary(m, n) ? 0 : 1;
+    }
+    /* --gate-up-swiglu-q8-0-canary [M [N [clamp]]] : task #724 fused Q8_0 SwiGLU */
+    if (argc >= 2 && !strcmp(argv[1], "--gate-up-swiglu-q8-0-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        const float cv = (argc >= 5) ? (float)atof(argv[4]) : 0.0f;
+        return ds4_gpu_mtl4_dsv4_shared_gate_up_swiglu_q8_0_canary(m, n, cv) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);
