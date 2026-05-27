@@ -2014,6 +2014,20 @@ int main(int argc, char **argv) {
         const float li = (argc >= 6) ? (float)atof(argv[5]) : 0.0f;
         return ds4_gpu_mtl4_swiglu_f32_canary(nr, rw, al, li) ? 0 : 1;
     }
+    /* --rms-norm-mul-canary [n_rows [row_width [eps]]] : task #709 RMSNorm + weight */
+    if (argc >= 2 && !strcmp(argv[1], "--rms-norm-mul-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        const float ep = (argc >= 5) ? (float)atof(argv[4]) : 1.0e-5f;
+        return ds4_gpu_mtl4_rms_norm_mul_f32_4_canary(nr, rw, ep) ? 0 : 1;
+    }
+    /* --rms-norm-canary [n_rows [row_width [eps]]] : task #710 RMSNorm only */
+    if (argc >= 2 && !strcmp(argv[1], "--rms-norm-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        const float ep = (argc >= 5) ? (float)atof(argv[4]) : 1.0e-5f;
+        return ds4_gpu_mtl4_rms_norm_f32_4_canary(nr, rw, ep) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

@@ -1395,3 +1395,13 @@ int ds4_gpu_mtl4_repeat_f32_canary(uint32_t src_rows, uint32_t src_cols, uint32_
  * SiLU(x0) * x1 * alpha with optional clamp limit. Shared-expert
  * activation. Non-MMA elementwise. */
 int ds4_gpu_mtl4_swiglu_f32_canary(uint32_t n_rows, uint32_t row_width, float alpha, float limit);
+
+/* silv 2026-05-27 task #709 — rms_norm_mul_f32_4 MTL4.
+ * RMSNorm with fused weight multiply (F=2 variant of fuse_impl). Used
+ * before attention + before FFN at every layer. float4-vectorized
+ * with simd_sum + threadgroup combine. Non-MMA. */
+int ds4_gpu_mtl4_rms_norm_mul_f32_4_canary(uint32_t n_rows, uint32_t row_width, float eps);
+
+/* silv 2026-05-27 task #710 — rms_norm_f32_4 MTL4.
+ * F=1 variant: norm only, no weight multiply. Diagnostic variant. */
+int ds4_gpu_mtl4_rms_norm_f32_4_canary(uint32_t n_rows, uint32_t row_width, float eps);
