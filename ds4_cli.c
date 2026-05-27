@@ -1853,6 +1853,11 @@ int main(int argc, char **argv) {
         const uint32_t n_tokens = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 4;
         return ds4_gpu_mtl4_hc_expand4_canary(n_embd, n_tokens) ? 0 : 1;
     }
+    /* --indexer-score-one-direct-canary [n_comp] : task #680 decode-only DS4 indexer */
+    if (argc >= 2 && !strcmp(argv[1], "--indexer-score-one-direct-canary")) {
+        const uint32_t n_comp = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 32;
+        return ds4_gpu_mtl4_indexer_score_one_direct_canary(n_comp) ? 0 : 1;
+    }
     /* --hc-weighted-sum-canary [n_embd [n_hc [n_tokens]]] : task #683 */
     if (argc >= 2 && !strcmp(argv[1], "--hc-weighted-sum-canary")) {
         const uint32_t n_embd = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;

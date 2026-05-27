@@ -1252,3 +1252,11 @@ int ds4_gpu_mtl4_soft_max_4_canary(uint32_t n);
  * post, comb, block_add) + dst. One thread per (d, t) → 4 outputs.
  * Per-layer dispatch density (43× per token). */
 int ds4_gpu_mtl4_hc_expand4_canary(uint32_t n_embd, uint32_t n_tokens);
+
+/* silv 2026-05-27 task #680 — dsv4_indexer_score_one_direct MTL4.
+ * Decode-only DS4 ratio-4 indexer score builder. Hardcoded n_head=64,
+ * head_dim=128. 128-thread threadgroup × 4 simdgroups parallel over
+ * head groups. Per-attention dispatch (fires once per decode call).
+ * Exercises threadgroup shared mem + simd_sum reductions + 2-stage
+ * tg accumulation. */
+int ds4_gpu_mtl4_indexer_score_one_direct_canary(uint32_t n_comp);
