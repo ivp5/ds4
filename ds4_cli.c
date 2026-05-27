@@ -1962,6 +1962,12 @@ int main(int argc, char **argv) {
         const uint32_t bpr = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
         return ds4_gpu_mtl4_hadamard16_wide_canary(nr, bpr) ? 0 : 1;
     }
+    /* --argsort-merge-desc-canary [len [top_k]] : task #700 multi-block merge */
+    if (argc >= 2 && !strcmp(argv[1], "--argsort-merge-desc-canary")) {
+        const uint32_t len = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 32;
+        const uint32_t top_k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
+        return ds4_gpu_mtl4_argsort_merge_f32_i32_desc_canary(len, top_k) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

@@ -25344,6 +25344,278 @@ int ds4_gpu_mtl4_hadamard16_wide_canary(uint32_t n_rows, uint32_t blocks_per_row
 }
 
 /* ============================================================ */
+/* argsort_merge_f32_i32_desc MTL4 port (silv 2026-05-27 #700)    */
+/* ============================================================ */
+/* MTL4 port of kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>.
+ * Merges two pre-sorted index runs produced by #692 argsort_f32_i32.
+ * Used to finish top-k over router scores when ne00 exceeds one
+ * threadgroup's bitonic-sort capacity — successive merge passes
+ * combine adjacent runs of size `len` into runs of size `2*len`.
+ *
+ * NEW patterns:
+ *   - Binary-search partition: find (i, j) such that i+j=k0 splits
+ *     the merged stream evenly between two pre-sorted halves
+ *   - Per-thread merge-front advance: each thread emits a chunk of
+ *     [k0, k1) outputs by stepping (i, j) registers
+ *   - Sentinel handling: one half running out short-circuits to a
+ *     fast tail copy of the other half
+ *
+ * Pairs with #692 argsort_f32_i32_desc. */
+
+static id<MTLComputePipelineState> g_argsort_merge_f32_i32_desc_mtl4_pipeline;
+static int g_argsort_merge_f32_i32_desc_mtl4_init_attempted;
+static int g_argsort_merge_f32_i32_desc_mtl4_init_ok;
+
+static int ds4_argsort_merge_f32_i32_desc_mtl4_pipeline_init(void) {
+    if (g_argsort_merge_f32_i32_desc_mtl4_init_attempted) return g_argsort_merge_f32_i32_desc_mtl4_init_ok;
+    g_argsort_merge_f32_i32_desc_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct am_args {\n"
+         "  int64_t  ne00; int64_t  ne01; int64_t  ne02; int64_t  ne03;\n"
+         "  uint64_t nb00; uint64_t nb01; uint64_t nb02; uint64_t nb03;\n"
+         "  int32_t  ne0;  int32_t  ne1;  int32_t  ne2;  int32_t  ne3;\n"
+         "  int32_t  top_k; int32_t len;\n"
+         "};\n"
+         "kernel void argsort_merge_f32_i32_desc_mtl4(\n"
+         "    device const am_args  *args [[buffer(0)]],\n"
+         "    device const char     *src0 [[buffer(1)]],\n"
+         "    device const int32_t  *tmp  [[buffer(2)]],\n"
+         "    device       int32_t  *dst  [[buffer(3)]],\n"
+         "    uint3   tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort3 tpitg [[thread_position_in_threadgroup]],\n"
+         "    ushort3 ntg   [[threads_per_threadgroup]]) {\n"
+         "  const int im  = tgpig[0] / (int)args->ne01;\n"
+         "  const int i01 = tgpig[0] % (int)args->ne01;\n"
+         "  const int i02 = tgpig[1];\n"
+         "  const int i03 = tgpig[2];\n"
+         "  const int start = im * (2 * args->len);\n"
+         "  const int len0 = min((int)args->len, max(0, args->ne0 - start));\n"
+         "  const int len1 = min((int)args->len, max(0, args->ne0 - (start + args->len)));\n"
+         "  const int total = len0 + len1;\n"
+         "  device const int32_t *tmp0 = tmp + start\n"
+         "    + i01*args->ne0\n"
+         "    + i02*args->ne0*(int)args->ne01\n"
+         "    + i03*args->ne0*(int)args->ne01*(int)args->ne02;\n"
+         "  device const int32_t *tmp1 = tmp0 + args->len;\n"
+         "  dst += start\n"
+         "    + i01*args->top_k\n"
+         "    + i02*args->top_k*(int)args->ne01\n"
+         "    + i03*args->top_k*(int)args->ne01*(int)args->ne02;\n"
+         "  device const float *src0_row = (device const float *)(src0\n"
+         "    + args->nb01*i01\n"
+         "    + args->nb02*i02\n"
+         "    + args->nb03*i03);\n"
+         "  if (total == 0) return;\n"
+         "  const int chunk = (total + ntg.x - 1) / ntg.x;\n"
+         "  const int k0 = tpitg.x * chunk;\n"
+         "  const int k1 = min(min(k0 + chunk, total), args->top_k);\n"
+         "  if (k0 >= args->top_k || k0 >= total) return;\n"
+         "  /* Binary-search partition: find i such that merging tmp0[0..i)\n"
+         "   * and tmp1[0..k0-i) produces the top-k0 elements. */\n"
+         "  int low  = k0 > len1 ? k0 - len1 : 0;\n"
+         "  int high = min(k0, len0);\n"
+         "  while (low < high) {\n"
+         "    const int mid = (low + high) >> 1;\n"
+         "    const int32_t idx0 = tmp0[mid];\n"
+         "    const int32_t idx1 = tmp1[k0 - mid - 1];\n"
+         "    const float val0 = src0_row[idx0];\n"
+         "    const float val1 = src0_row[idx1];\n"
+         "    /* descending: take_left iff val0 >= val1 */\n"
+         "    const bool take_left = (val0 >= val1);\n"
+         "    if (take_left) low = mid + 1; else high = mid;\n"
+         "  }\n"
+         "  int i = low;\n"
+         "  int j = k0 - i;\n"
+         "  /* Pre-load merge-front registers */\n"
+         "  int32_t idx0 = 0;\n"
+         "  float   val0 = 0.0f;\n"
+         "  if (i < len0) { idx0 = tmp0[i]; val0 = src0_row[idx0]; }\n"
+         "  int32_t idx1 = 0;\n"
+         "  float   val1 = 0.0f;\n"
+         "  if (j < len1) { idx1 = tmp1[j]; val1 = src0_row[idx1]; }\n"
+         "  for (int k = k0; k < k1; ++k) {\n"
+         "    int32_t out_idx;\n"
+         "    if (i >= len0) {\n"
+         "      while (k < k1) { dst[k++] = tmp1[j++]; }\n"
+         "      break;\n"
+         "    } else if (j >= len1) {\n"
+         "      while (k < k1) { dst[k++] = tmp0[i++]; }\n"
+         "      break;\n"
+         "    } else {\n"
+         "      const bool take_left = (val0 >= val1);\n"
+         "      if (take_left) {\n"
+         "        out_idx = idx0; ++i;\n"
+         "        if (i < len0) { idx0 = tmp0[i]; val0 = src0_row[idx0]; }\n"
+         "      } else {\n"
+         "        out_idx = idx1; ++j;\n"
+         "        if (j < len1) { idx1 = tmp1[j]; val1 = src0_row[idx1]; }\n"
+         "      }\n"
+         "    }\n"
+         "    dst[k] = out_idx;\n"
+         "  }\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_argsort_merge_f32_i32_desc_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: argsort_merge_f32_i32_desc MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"argsort_merge_f32_i32_desc_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_argsort_merge_f32_i32_desc_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_argsort_merge_f32_i32_desc_mtl4_pipeline) {
+        fprintf(stderr, "ds4: argsort_merge_f32_i32_desc MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: argsort_merge_f32_i32_desc MTL4 pipeline initialized\n");
+    g_argsort_merge_f32_i32_desc_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_argsort_merge_f32_i32_desc_canary(uint32_t len, uint32_t top_k) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_argsort_merge_f32_i32_desc_mtl4_pipeline_init()) return 0;
+    if (len == 0 || top_k == 0) {
+        fprintf(stderr, "ds4: argsort_merge canary requires len>0, top_k>0\n");
+        return 0;
+    }
+
+    /* Canary: src0_row of length 2*len with values [2L-1, 2L-2, ..., 1, 0]
+     * (descending values; index i has value 2L-1-i).
+     * Pre-sorted halves (descending):
+     *   tmp0 = [0, 1, 2, ..., L-1]            (positions of largest L values)
+     *   tmp1 = [L, L+1, ..., 2L-1]            (positions of smaller L values)
+     * Merged descending should yield: [0, 1, 2, ..., min(2L, top_k) - 1]. */
+    const uint32_t total = 2 * len;
+    float *host_src = (float *)calloc(total, sizeof(float));
+    int32_t *host_tmp = (int32_t *)calloc(total, sizeof(int32_t));
+    int32_t *host_dst = (int32_t *)calloc(top_k, sizeof(int32_t));
+    if (!host_src || !host_tmp || !host_dst) {
+        free(host_src); free(host_tmp); free(host_dst); return 0;
+    }
+    for (uint32_t i = 0; i < total; i++) host_src[i] = (float)(total - 1 - i);
+    for (uint32_t i = 0; i < len; i++) host_tmp[i] = (int32_t)i;
+    for (uint32_t i = 0; i < len; i++) host_tmp[len + i] = (int32_t)(len + i);
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:96
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> srcBuf = [g_device newBufferWithBytes:host_src
+                                                     length:total * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> tmpBuf = [g_device newBufferWithBytes:host_tmp
+                                                     length:total * sizeof(int32_t)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:top_k * sizeof(int32_t)
+                                                     options:MTLResourceStorageModeShared];
+
+        struct {
+            int64_t ne00, ne01, ne02, ne03;
+            uint64_t nb00, nb01, nb02, nb03;
+            int32_t ne0, ne1, ne2, ne3;
+            int32_t top_k_, len_;
+        } args = {
+            .ne00 = total, .ne01 = 1, .ne02 = 1, .ne03 = 1,
+            .nb00 = sizeof(float),
+            .nb01 = (uint64_t)total * sizeof(float),
+            .nb02 = (uint64_t)total * sizeof(float),
+            .nb03 = (uint64_t)total * sizeof(float),
+            .ne0 = (int32_t)total, .ne1 = 1, .ne2 = 1, .ne3 = 1,
+            .top_k_ = (int32_t)top_k,
+            .len_ = (int32_t)len,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[4] = {
+                (id<MTLAllocation>)argsBuf,
+                (id<MTLAllocation>)srcBuf,
+                (id<MTLAllocation>)tmpBuf,
+                (id<MTLAllocation>)dstBuf,
+            };
+            [residency addAllocations:allocs count:4];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(4);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:srcBuf.gpuAddress atIndex:1];
+                [argTable setAddress:tmpBuf.gpuAddress atIndex:2];
+                [argTable setAddress:dstBuf.gpuAddress atIndex:3];
+
+                /* Single merge group: im=0, threadgroup grid (1, 1, 1) */
+                NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)top_k));
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_argsort_merge_f32_i32_desc_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_dst, dstBuf.contents, top_k * sizeof(int32_t));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 4);
+            }
+        }
+    }
+    if (!rc) { free(host_src); free(host_tmp); free(host_dst); return 0; }
+
+    /* Verify: dst[i] = i for i in [0, top_k) (positions of largest values, descending) */
+    int mismatch = 0;
+    for (uint32_t i = 0; i < top_k; i++) {
+        if (host_dst[i] != (int32_t)i) mismatch++;
+    }
+    fprintf(stderr,
+        "ds4: argsort_merge_f32_i32_desc MTL4 canary len=%u top_k=%u "
+        "dst[0]=%d (ref=0) dst[1]=%d (ref=1) dst[end]=%d (ref=%u) mismatch=%d\n",
+        len, top_k, host_dst[0], host_dst[1],
+        host_dst[top_k - 1], top_k - 1, mismatch);
+    free(host_src); free(host_tmp); free(host_dst);
+    return (mismatch == 0) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +

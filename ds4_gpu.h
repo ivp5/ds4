@@ -1357,3 +1357,9 @@ int ds4_gpu_mtl4_hc_expand_canary(uint32_t n_embd, uint32_t n_hc, uint32_t n_tok
  * All blocks' butterfly stages run in lockstep with tg-barriers
  * between stride doublings. Per-block early-out for tail groups. */
 int ds4_gpu_mtl4_hadamard16_wide_canary(uint32_t n_rows, uint32_t blocks_per_row);
+
+/* silv 2026-05-27 task #700 — argsort_merge_f32_i32_desc MTL4.
+ * Merges two pre-sorted index runs (descending). Pairs with #692.
+ * NEW patterns: binary-search partition + per-thread merge-front
+ * advance + sentinel tail copy. */
+int ds4_gpu_mtl4_argsort_merge_f32_i32_desc_canary(uint32_t len, uint32_t top_k);
