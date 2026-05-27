@@ -2349,6 +2349,14 @@ int main(int argc, char **argv) {
         extern int ds4_cli_vqb2_pack_layer_tour(const char *pack, const char *index, uint32_t layer);
         return ds4_cli_vqb2_pack_layer_tour(argv[2], argv[3], (uint32_t)atoi(argv[4]));
     }
+    /* --vqb2-decode-fp16-canary [N [K]] : silv 2026-05-28 GPU-side VQB2 decoder.
+     * Default N=4096, K=16. K∈{4,16,64,256}. Synthetic packet → GPU decode →
+     * compare against ground truth. Foundation for pack-direct dispatch. */
+    if (argc >= 2 && !strcmp(argv[1], "--vqb2-decode-fp16-canary")) {
+        const uint32_t n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4096;
+        const uint32_t k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
+        return ds4_gpu_mtl4_vqb2_decode_fp16_canary(n, k) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

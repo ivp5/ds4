@@ -1560,6 +1560,13 @@ int ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n128_canary(uint32_t M, uint32_t N, uint32_t
  * Pair with DS4_METAL_LOG_ROUTED_MM=1 to see per-pick instrumentation. */
 int ds4_gpu_mtl4_routed_mm_dispatch_probe(void);
 
+/* silv 2026-05-28 VQB2 GPU-side decoder kernel — the primitive that unblocks
+ * pack-direct dispatch (codex H2125 layer-major decode). One thread per
+ * code; reads codebook + packed codes from GPU memory, outputs fp16 pairs.
+ * k ∈ {4, 16, 64, 256} → bit_width ∈ {2, 4, 6, 8}. Canary builds a synthetic
+ * packet, decodes, and cross-checks against expected (re, im) values. */
+int ds4_gpu_mtl4_vqb2_decode_fp16_canary(uint32_t n_codes, uint32_t k_val);
+
 /* silv 2026-05-28 task #742 — wide-tile audit canary.
  * Routes R tokens to a single expert (htpe[0]=R, hids[0..R-1]={0..R-1}),
  * runs each of n32/n64/n128 pipelines, reports per-token mismatch
