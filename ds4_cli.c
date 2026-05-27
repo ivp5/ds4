@@ -1949,6 +1949,19 @@ int main(int argc, char **argv) {
         const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
         return ds4_gpu_mtl4_hc_split_weighted_sum_norm4_canary(nr) ? 0 : 1;
     }
+    /* --hc-expand-canary [n_embd [n_hc [n_tokens]]] : task #698 generic-HC variant */
+    if (argc >= 2 && !strcmp(argv[1], "--hc-expand-canary")) {
+        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
+        const uint32_t nh = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 8;
+        const uint32_t nt = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 4;
+        return ds4_gpu_mtl4_hc_expand_canary(ne, nh, nt) ? 0 : 1;
+    }
+    /* --hadamard16-wide-canary [n_rows [blocks_per_row]] : task #699 wide batched Hadamard */
+    if (argc >= 2 && !strcmp(argv[1], "--hadamard16-wide-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4;
+        const uint32_t bpr = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        return ds4_gpu_mtl4_hadamard16_wide_canary(nr, bpr) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

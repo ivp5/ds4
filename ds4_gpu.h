@@ -1345,3 +1345,15 @@ int ds4_gpu_mtl4_concat_canary(uint32_t n0, uint32_t n1, uint32_t n_rows);
  * n_hc=4, n_embd=4096 (DS4 production shape). 16.5KB threadgroup memory.
  * Saves 2 dispatches per token vs separate split + sum + RMSNorm. */
 int ds4_gpu_mtl4_hc_split_weighted_sum_norm4_canary(uint32_t n_rows);
+
+/* silv 2026-05-27 task #698 — dsv4_hc_expand MTL4. Generic-HC variant
+ * of #679 hc_expand4. One thread per (d, dst_hc, t) → 1 output. Inner
+ * loop over n_hc src_hc values. Pairs with the HC=4 unrolled #679
+ * specialization for the production hot path. */
+int ds4_gpu_mtl4_hc_expand_canary(uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens);
+
+/* silv 2026-05-27 task #699 — hadamard16_fp16_batched_wide MTL4.
+ * 16 Hadamard-16 blocks per threadgroup (256 threads = 16 × 16).
+ * All blocks' butterfly stages run in lockstep with tg-barriers
+ * between stride doublings. Per-block early-out for tail groups. */
+int ds4_gpu_mtl4_hadamard16_wide_canary(uint32_t n_rows, uint32_t blocks_per_row);

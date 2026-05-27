@@ -24876,6 +24876,474 @@ int ds4_gpu_mtl4_hc_split_weighted_sum_norm4_canary(uint32_t n_rows) {
 }
 
 /* ============================================================ */
+/* dsv4_hc_expand MTL4 port (silv 2026-05-27 task #698)           */
+/* ============================================================ */
+/* Generic-HC variant of kernel_dsv4_hc_expand. Pairs with #679
+ * hc_expand4 (HC=4 specialization). One thread per (d, dst_hc, t)
+ * tuple → 1 output. Inner loop runs over n_hc src_hc values.
+ *
+ * Used for diagnostics and any non-HC=4 deployment. The HC=4 path
+ * (#679) is the production hot path; this scalar path is the
+ * fallback for arbitrary n_hc. */
+
+static id<MTLComputePipelineState> g_hc_expand_mtl4_pipeline;
+static int g_hc_expand_mtl4_init_attempted;
+static int g_hc_expand_mtl4_init_ok;
+
+static int ds4_hc_expand_mtl4_pipeline_init(void) {
+    if (g_hc_expand_mtl4_init_attempted) return g_hc_expand_mtl4_init_ok;
+    g_hc_expand_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct hce_args {\n"
+         "  int32_t n_embd;\n"
+         "  int32_t n_hc;\n"
+         "  int32_t n_tokens;\n"
+         "  int32_t has_add;\n"
+         "};\n"
+         "kernel void hc_expand_mtl4(\n"
+         "    device const hce_args *args [[buffer(0)]],\n"
+         "    device const float    *block_out [[buffer(1)]],\n"
+         "    device const float    *residual  [[buffer(2)]],\n"
+         "    device const float    *post      [[buffer(3)]],\n"
+         "    device const float    *comb      [[buffer(4)]],\n"
+         "    device const float    *block_add [[buffer(5)]],\n"
+         "    device       float    *dst       [[buffer(6)]],\n"
+         "    uint gid [[thread_position_in_grid]]) {\n"
+         "  const int32_t n_embd = args->n_embd;\n"
+         "  const int32_t n_hc = args->n_hc;\n"
+         "  const int32_t n_tokens = args->n_tokens;\n"
+         "  const int64_t n_elem = (int64_t)n_embd * (int64_t)n_hc * (int64_t)n_tokens;\n"
+         "  if ((int64_t)gid >= n_elem) return;\n"
+         "  const int64_t d      = (int64_t)gid % n_embd;\n"
+         "  const int64_t tmp    = (int64_t)gid / n_embd;\n"
+         "  const int64_t dst_hc = tmp % n_hc;\n"
+         "  const int64_t t      = tmp / n_hc;\n"
+         "  float block_v = block_out[d + t * n_embd];\n"
+         "  if (args->has_add) block_v += block_add[d + t * n_embd];\n"
+         "  const float post_v = post[dst_hc + t * n_hc];\n"
+         "  float acc = block_v * post_v;\n"
+         "  for (int64_t src_hc = 0; src_hc < n_hc; ++src_hc) {\n"
+         "    const float comb_v = comb[dst_hc + src_hc * n_hc + t * n_hc * n_hc];\n"
+         "    const float res_v  = residual[d + src_hc * n_embd + t * n_hc * n_embd];\n"
+         "    acc += comb_v * res_v;\n"
+         "  }\n"
+         "  dst[d + dst_hc * n_embd + t * n_hc * n_embd] = acc;\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_hc_expand_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: hc_expand MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"hc_expand_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_hc_expand_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_hc_expand_mtl4_pipeline) {
+        fprintf(stderr, "ds4: hc_expand MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: hc_expand MTL4 pipeline initialized\n");
+    g_hc_expand_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_hc_expand_canary(uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_hc_expand_mtl4_pipeline_init()) return 0;
+    if (n_embd == 0 || n_hc == 0 || n_tokens == 0) {
+        fprintf(stderr, "ds4: hc_expand canary needs n_embd>0, n_hc>0, n_tokens>0\n");
+        return 0;
+    }
+
+    /* Canary (same setup as #679 hc_expand4 but with arbitrary n_hc):
+     *   block_out[d, t]            = 1.0
+     *   residual[d, src_hc, t]     = (src_hc + 1) * 0.5
+     *   post[dst_hc, t]            = 1.0
+     *   comb[dst_hc, src_hc, t]    = (dst_hc == src_hc) ? 2.0 : 0.0
+     *   has_add                    = 0
+     *
+     * Expected dst[d, dst_hc, t] = 1.0 + 2.0 * (dst_hc + 1) * 0.5 = dst_hc + 2 */
+    const uint64_t block_n = (uint64_t)n_embd * n_tokens;
+    const uint64_t res_n = (uint64_t)n_embd * n_hc * n_tokens;
+    const uint64_t post_n = (uint64_t)n_hc * n_tokens;
+    const uint64_t comb_n = (uint64_t)n_hc * n_hc * n_tokens;
+    const uint64_t dst_n = (uint64_t)n_embd * n_hc * n_tokens;
+
+    float *host_block = (float *)calloc(block_n, sizeof(float));
+    float *host_res = (float *)calloc(res_n, sizeof(float));
+    float *host_post = (float *)calloc(post_n, sizeof(float));
+    float *host_comb = (float *)calloc(comb_n, sizeof(float));
+    float *host_dst = (float *)calloc(dst_n, sizeof(float));
+    if (!host_block || !host_res || !host_post || !host_comb || !host_dst) {
+        free(host_block); free(host_res); free(host_post); free(host_comb); free(host_dst);
+        return 0;
+    }
+    for (uint64_t i = 0; i < block_n; i++) host_block[i] = 1.0f;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+            const float r = (float)(src_hc + 1) * 0.5f;
+            for (uint32_t d = 0; d < n_embd; d++) {
+                host_res[(uint64_t)d + src_hc * n_embd + (uint64_t)t * n_hc * n_embd] = r;
+            }
+        }
+        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            host_post[(uint64_t)dst_hc + (uint64_t)t * n_hc] = 1.0f;
+        }
+        for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+            for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+                host_comb[(uint64_t)dst_hc + src_hc * n_hc + (uint64_t)t * n_hc * n_hc] =
+                    (dst_hc == src_hc) ? 2.0f : 0.0f;
+            }
+        }
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:16
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> blockBuf = [g_device newBufferWithBytes:host_block length:block_n*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> resBuf = [g_device newBufferWithBytes:host_res length:res_n*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> postBuf = [g_device newBufferWithBytes:host_post length:post_n*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> combBuf = [g_device newBufferWithBytes:host_comb length:comb_n*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:dst_n*sizeof(float) options:MTLResourceStorageModeShared];
+
+        struct { int32_t n_embd_, n_hc_, n_tokens_, has_add_; } args = {
+            .n_embd_ = (int32_t)n_embd, .n_hc_ = (int32_t)n_hc,
+            .n_tokens_ = (int32_t)n_tokens, .has_add_ = 0,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[7] = {
+                (id<MTLAllocation>)argsBuf, (id<MTLAllocation>)blockBuf,
+                (id<MTLAllocation>)resBuf, (id<MTLAllocation>)postBuf,
+                (id<MTLAllocation>)combBuf, (id<MTLAllocation>)blockBuf,  /* alias */
+                (id<MTLAllocation>)dstBuf,
+            };
+            [residency addAllocations:allocs count:7];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:blockBuf.gpuAddress atIndex:1];
+                [argTable setAddress:resBuf.gpuAddress atIndex:2];
+                [argTable setAddress:postBuf.gpuAddress atIndex:3];
+                [argTable setAddress:combBuf.gpuAddress atIndex:4];
+                [argTable setAddress:blockBuf.gpuAddress atIndex:5];  /* block_add */
+                [argTable setAddress:dstBuf.gpuAddress atIndex:6];
+
+                const uint64_t n_elem = (uint64_t)n_embd * n_hc * n_tokens;
+                NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
+                NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_hc_expand_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_dst, dstBuf.contents, dst_n * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 8);
+            }
+        }
+    }
+    if (!rc) {
+        free(host_block); free(host_res); free(host_post); free(host_comb); free(host_dst);
+        return 0;
+    }
+
+    double max_abs = 0.0;
+    int mismatch = 0;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            const float ref = (float)(dst_hc + 2);
+            for (uint32_t d = 0; d < n_embd; d++) {
+                const float v = host_dst[(uint64_t)d + dst_hc * n_embd + (uint64_t)t * n_hc * n_embd];
+                const double diff = fabs((double)(v - ref));
+                if (diff > max_abs) max_abs = diff;
+                if (diff > 1.0e-5) mismatch++;
+            }
+        }
+    }
+    fprintf(stderr,
+        "ds4: hc_expand MTL4 canary n_embd=%u n_hc=%u n_tokens=%u "
+        "dst[0,0,0]=%.2f (ref=2.0) dst[0,%u,0]=%.2f (ref=%.2f) "
+        "mismatch=%d max_abs=%.4e\n",
+        n_embd, n_hc, n_tokens,
+        (double)host_dst[0],
+        n_hc - 1,
+        (double)host_dst[(uint64_t)(n_hc - 1) * n_embd],
+        (double)(n_hc + 1),
+        mismatch, max_abs);
+    free(host_block); free(host_res); free(host_post); free(host_comb); free(host_dst);
+    return (mismatch == 0) ? 1 : 0;
+}
+
+/* ============================================================ */
+/* hadamard16_fp16_batched_wide MTL4 port (silv 2026-05-27 #699) */
+/* ============================================================ */
+/* MTL4 port of kernel_hadamard16_fp16_batched_wide. Processes 16
+ * Hadamard-16 blocks per threadgroup (256 threads = 16 blocks × 16
+ * elements). All blocks' butterfly stages run in lockstep with
+ * threadgroup_barrier between stride doublings.
+ *
+ * Per-block early-out for tail groups via active flag.
+ * Output normalized × 1/sqrt(16) = 0.25. */
+
+static id<MTLComputePipelineState> g_hadamard16_wide_mtl4_pipeline;
+static int g_hadamard16_wide_mtl4_init_attempted;
+static int g_hadamard16_wide_mtl4_init_ok;
+
+static int ds4_hadamard16_wide_mtl4_pipeline_init(void) {
+    if (g_hadamard16_wide_mtl4_init_attempted) return g_hadamard16_wide_mtl4_init_ok;
+    g_hadamard16_wide_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "constant float kHadamard16InvSqrt16 = 0.25f;\n"
+         "constant uint  kBlocksPerTg = 16u;\n"
+         "struct h16w_args {\n"
+         "  uint32_t n_rows;\n"
+         "  uint32_t blocks_per_row;\n"
+         "  uint64_t row_stride_bytes;\n"
+         "};\n"
+         "kernel void hadamard16_wide_mtl4(\n"
+         "    device const h16w_args *args [[buffer(0)]],\n"
+         "    device       half      *x [[buffer(1)]],\n"
+         "    threadgroup  half      *scratch [[threadgroup(0)]],\n"
+         "    uint2  tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort tid   [[thread_index_in_threadgroup]]) {\n"
+         "  const uint row = tgpig.x;\n"
+         "  const uint tg_block = tgpig.y;\n"
+         "  const ushort block_in_tg = tid / 16;\n"
+         "  const ushort elem = tid % 16;\n"
+         "  const uint global_block = tg_block * kBlocksPerTg + (uint)block_in_tg;\n"
+         "  if (row >= args->n_rows) return;\n"
+         "  const bool active = (global_block < args->blocks_per_row);\n"
+         "  device half *row_ptr = (device half *)((device char *)x +\n"
+         "                                          (uint64_t)row * args->row_stride_bytes);\n"
+         "  device half *block_ptr = row_ptr + (uint64_t)global_block * 16u;\n"
+         "  threadgroup half *sub = scratch + (uint)block_in_tg * 16u;\n"
+         "  if (active) sub[elem] = block_ptr[elem];\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  /* Walsh-Hadamard butterfly, 4 stages (log2(16)=4) */\n"
+         "  for (uint stride = 1u; stride < 16u; stride <<= 1u) {\n"
+         "    if (active && ((elem & stride) == 0u)) {\n"
+         "      const ushort base = (elem & ~(2u * stride - 1u)) + (elem & (stride - 1u));\n"
+         "      const float a = (float)sub[base];\n"
+         "      const float b = (float)sub[base + stride];\n"
+         "      sub[base]          = (half)(a + b);\n"
+         "      sub[base + stride] = (half)(a - b);\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  if (active) block_ptr[elem] = (half)((float)sub[elem] * kHadamard16InvSqrt16);\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_hadamard16_wide_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: hadamard16_wide MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"hadamard16_wide_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_hadamard16_wide_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_hadamard16_wide_mtl4_pipeline) {
+        fprintf(stderr, "ds4: hadamard16_wide MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: hadamard16_wide MTL4 pipeline initialized\n");
+    g_hadamard16_wide_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_hadamard16_wide_canary(uint32_t n_rows, uint32_t blocks_per_row) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_hadamard16_wide_mtl4_pipeline_init()) return 0;
+    if (n_rows == 0 || blocks_per_row == 0) {
+        fprintf(stderr, "ds4: hadamard16_wide canary requires n_rows>0 and blocks_per_row>0\n");
+        return 0;
+    }
+
+    /* Canary: all rows × all blocks filled with 1.0 (half precision).
+     * WHT of (1, 1, ..., 1) = (16, 0, 0, ..., 0) since H[0,:] sums all,
+     * other rows have equal +/-1 that cancel.
+     * × 1/sqrt(16) normalization = 0.25:
+     *   output[0]  = 16 × 0.25 = 4.0
+     *   output[1..15] = 0 */
+    const uint32_t elems_per_row = blocks_per_row * 16;
+    const uint64_t total = (uint64_t)n_rows * elems_per_row;
+    uint16_t *host_x = (uint16_t *)calloc(total, sizeof(uint16_t));  /* half */
+    if (!host_x) return 0;
+    {
+        _Float16 one_h = (_Float16)1.0f;
+        uint16_t one_bits;
+        memcpy(&one_bits, &one_h, sizeof(one_bits));
+        for (uint64_t i = 0; i < total; i++) host_x[i] = one_bits;
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:24
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> xBuf = [g_device newBufferWithBytes:host_x
+                                                   length:total * sizeof(uint16_t)
+                                                  options:MTLResourceStorageModeShared];
+
+        struct { uint32_t n_rows_, blocks_per_row_; uint64_t row_stride_bytes_; } args = {
+            .n_rows_ = n_rows,
+            .blocks_per_row_ = blocks_per_row,
+            .row_stride_bytes_ = (uint64_t)elems_per_row * sizeof(uint16_t),
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[2] = {
+                (id<MTLAllocation>)argsBuf,
+                (id<MTLAllocation>)xBuf,
+            };
+            [residency addAllocations:allocs count:2];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(4);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:xBuf.gpuAddress atIndex:1];
+
+                const uint32_t blocks_per_tg = 16;
+                const uint32_t tg_y = (blocks_per_row + blocks_per_tg - 1) / blocks_per_tg;
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_hadamard16_wide_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                /* shmem: 16 blocks × 16 half = 256 half = 512 bytes */
+                [enc setThreadgroupMemoryLength:512 atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(n_rows, tg_y, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_x, xBuf.contents, total * sizeof(uint16_t));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 4);
+            }
+        }
+    }
+    if (!rc) { free(host_x); return 0; }
+
+    /* Validate: per 16-block, [0]=4.0, [1..15]=0 */
+    double zero_dev = 0.0, first_dev = 0.0;
+    int mismatch_first = 0, mismatch_zero = 0;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
+            const uint64_t base = (uint64_t)r * elems_per_row + (uint64_t)blk * 16;
+            _Float16 v0_h;
+            memcpy(&v0_h, &host_x[base], sizeof(v0_h));
+            const float v0 = (float)v0_h;
+            const double d0 = fabs((double)(v0 - 4.0));
+            if (d0 > first_dev) first_dev = d0;
+            if (d0 > 1.0e-3) mismatch_first++;
+            for (uint32_t e = 1; e < 16; e++) {
+                _Float16 v_h;
+                memcpy(&v_h, &host_x[base + e], sizeof(v_h));
+                const float v = (float)v_h;
+                const double d = fabs((double)v);
+                if (d > zero_dev) zero_dev = d;
+                if (d > 1.0e-3) mismatch_zero++;
+            }
+        }
+    }
+    fprintf(stderr,
+        "ds4: hadamard16_wide MTL4 canary n_rows=%u blocks_per_row=%u "
+        "block[0][0]=%.4f (ref=4.0) block[0][1]=%.4f (ref=0) "
+        "first_dev=%.4e zero_dev=%.4e mismatch_first=%d mismatch_zero=%d\n",
+        n_rows, blocks_per_row,
+        (double)({ _Float16 h; memcpy(&h, &host_x[0], sizeof(h)); (float)h; }),
+        (double)({ _Float16 h; memcpy(&h, &host_x[1], sizeof(h)); (float)h; }),
+        first_dev, zero_dev, mismatch_first, mismatch_zero);
+    free(host_x);
+    return (mismatch_first == 0 && mismatch_zero == 0) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +
