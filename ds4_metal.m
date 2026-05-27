@@ -30666,6 +30666,300 @@ int ds4_gpu_mtl4_indexer_scores_tiled_canary(uint32_t n_tokens, uint32_t n_comp,
 }
 
 /* ============================================================ */
+/* mul_mm_f16_f32 MTL4 port (silv 2026-05-28 #732 — production matmul) */
+/* ============================================================ */
+/* Dense f16-weight × f16-input → float-output GEMM at 64×32×32 tile.
+ * Uses simdgroup_half8x8 MMA in 8-tile spilled output (NR0=64, NR1=32,
+ * NK=32 per loop). 4 simdgroups × 32 lanes = 128 threads/tg. Threadgroup
+ * memory: 4 KB for B-side tile (sa) + 2 KB for A-side tile (sb) = 6 KB
+ * minimum (helper uses 4096-byte stride). Specialized for FP16 with
+ * is_same<T0_4x4, block_q> compile-time true → no dequant needed at all.
+ * FCs hardcoded: FC_mul_mm_bc_inp=true, FC_mul_mm_bc_out=true (full
+ * bounds-checked path) so dimensions that aren't multiples of NR0/NR1
+ * also work. */
+
+static id<MTLComputePipelineState> g_mul_mm_f16_f32_mtl4_pipeline;
+static int g_mul_mm_f16_f32_mtl4_init_attempted;
+static int g_mul_mm_f16_f32_mtl4_init_ok;
+
+static int ds4_mul_mm_f16_f32_mtl4_pipeline_init(void) {
+    if (g_mul_mm_f16_f32_mtl4_init_attempted) return g_mul_mm_f16_f32_mtl4_init_ok;
+    g_mul_mm_f16_f32_mtl4_init_attempted = 1;
+
+    /* The template uses simdgroup_half8x8 for both A and B sides at FP16
+     * and simdgroup_float8x8 for accumulators. FC values 700/701 are set
+     * via the FC pattern. Inline the dequantize_f16 as the identity
+     * since for FP16 the block_q == T0_4x4 = half4x4. */
+    NSString *source = [NSString stringWithFormat:
+        @"#include <metal_stdlib>\n"
+         "#include <metal_simdgroup_matrix>\n"
+         "using namespace metal;\n"
+         "#define FC_MUL_MM 700\n"
+         "constant short FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];\n"
+         "constant short FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];\n"
+         "struct mm_args {\n"
+         "  int ne00; int ne02;\n"
+         "  ulong nb01; ulong nb02; ulong nb03;\n"
+         "  int ne12;\n"
+         "  ulong nb10; ulong nb11; ulong nb12; ulong nb13;\n"
+         "  int ne0; int ne1;\n"
+         "  short r2; short r3;\n"
+         "};\n"
+         "kernel void mul_mm_f16_f32_mtl4(\n"
+         "    device const mm_args *args [[buffer(0)]],\n"
+         "    device const char    *src0 [[buffer(1)]],\n"
+         "    device const char    *src1 [[buffer(2)]],\n"
+         "    device       char    *dst  [[buffer(3)]],\n"
+         "    threadgroup  char    *shmem [[threadgroup(0)]],\n"
+         "    uint3   tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort  tiitg [[thread_index_in_threadgroup]],\n"
+         "    ushort  sgitg [[simdgroup_index_in_threadgroup]]) {\n"
+         "  threadgroup half *sa = (threadgroup half *)(shmem);\n"
+         "  threadgroup half *sb = (threadgroup half *)(shmem + 4096);\n"
+         "  constexpr int NR0 = 64;\n"
+         "  constexpr int NR1 = 32;\n"
+         "  constexpr int NK  = 32;\n"
+         "  constexpr int NL0 = NK/16;\n"
+         "  constexpr int NL1 = NK/8;\n"
+         "  const int im = tgpig.z;\n"
+         "  const int r0 = tgpig.y*NR0;\n"
+         "  const int r1 = tgpig.x*NR1;\n"
+         "  const short nr0 = (args->ne0 - r0 < NR0) ? (args->ne0 - r0) : NR0;\n"
+         "  const short nr1 = (args->ne1 - r1 < NR1) ? (args->ne1 - r1) : NR1;\n"
+         "  const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;\n"
+         "  const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;\n"
+         "  const short il0 = (tiitg %% NL0);\n"
+         "  short il = il0;\n"
+         "  const int i12 = im %% args->ne12;\n"
+         "  const int i13 = im / args->ne12;\n"
+         "  const ulong offset0 = (i12/args->r2)*args->nb02 + (i13/args->r3)*args->nb03;\n"
+         "  const short offset1 = il0/1;\n"
+         "  device const half4x4 *x = (device const half4x4 *)\n"
+         "    (src0 + args->nb01*(r0 + lr0) + offset0) + offset1;\n"
+         "  const short iy = 8*(tiitg %% NL1);\n"
+         "  device const half *y = (device const half *)(src1\n"
+         "    + args->nb13*i13 + args->nb12*i12 + args->nb11*(r1 + lr1) + args->nb10*iy);\n"
+         "  simdgroup_half8x8 ma[4];\n"
+         "  simdgroup_half8x8 mb[2];\n"
+         "  simdgroup_float8x8 mc[8];\n"
+         "  for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+         "  for (int loop_k = 0; loop_k < args->ne00; loop_k += NK) {\n"
+         "    /* FP16: is_same<half4x4, block_q> == true compile-time. Use direct half4x4 read. */\n"
+         "    if (FC_mul_mm_bc_inp) {\n"
+         "      threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "      for (short i = 0; i < 16; i++) {\n"
+         "        const short sx = 2*il0 + i/8;\n"
+         "        const short sy = (tiitg/NL0)/8;\n"
+         "        const short lx = (tiitg/NL0)%%8;\n"
+         "        const short ly = i%%8;\n"
+         "        const short ib = 8*sx + sy;\n"
+         "        *(sa + 64*ib + 8*ly + lx) = loop_k + 16*il + i < args->ne00 ? *((device half *)x + i) : half(0);\n"
+         "      }\n"
+         "    } else {\n"
+         "      half4x4 temp_a = *x;\n"
+         "      threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "      for (short i = 0; i < 16; i++) {\n"
+         "        const short sx = 2*il0 + i/8;\n"
+         "        const short sy = (tiitg/NL0)/8;\n"
+         "        const short lx = (tiitg/NL0)%%8;\n"
+         "        const short ly = i%%8;\n"
+         "        const short ib = 8*sx + sy;\n"
+         "        *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%%4];\n"
+         "      }\n"
+         "    }\n"
+         "    if (FC_mul_mm_bc_inp) {\n"
+         "      for (short i = 0; i < 8; ++i) {\n"
+         "        const short sx = (tiitg%%NL1);\n"
+         "        const short sy = (tiitg/NL1)/8;\n"
+         "        const short lx = i;\n"
+         "        const short ly = (tiitg/NL1)%%8;\n"
+         "        const short ib = 4*sx + sy;\n"
+         "        *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args->ne00 ? *((device half *)y + i) : half(0);\n"
+         "      }\n"
+         "    } else {\n"
+         "      const short sx = (tiitg%%NL1);\n"
+         "      const short sy = (tiitg/NL1)/8;\n"
+         "      const short ly = (tiitg/NL1)%%8;\n"
+         "      const short ib = 4*sx + sy;\n"
+         "      *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *)y);\n"
+         "    }\n"
+         "    il = (il + 2 < 1) ? il + 2 : il %% 2;\n"
+         "    x = (il < 2) ? x + 2 : x;\n"
+         "    y += NK;\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    threadgroup const half *lsma = (sa + 4*64*(sgitg%%2));\n"
+         "    threadgroup const half *lsmb = (sb + 2*64*(sgitg/2));\n"
+         "    for (short ik = 0; ik < NK/8; ik++) {\n"
+         "      simdgroup_barrier(mem_flags::mem_none);\n"
+         "      for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, ulong2(0, 0), false);\n"
+         "      simdgroup_barrier(mem_flags::mem_none);\n"
+         "      for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, ulong2(0, 0), false);\n"
+         "      simdgroup_barrier(mem_flags::mem_none);\n"
+         "      for (short i = 0; i < 8; i++) simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%%4], mc[i]);\n"
+         "      lsma += 8*64;\n"
+         "      lsmb += 4*64;\n"
+         "    }\n"
+         "  }\n"
+         "  if (!FC_mul_mm_bc_out || (r0 + NR0 <= args->ne0 && r1 + NR1 <= args->ne1)) {\n"
+         "    device float *C = (device float *)dst +\n"
+         "      (r0 + 32*(sgitg & 1)) +\n"
+         "      (r1 + 16*(sgitg >> 1)) * args->ne0 + im*args->ne1*args->ne0;\n"
+         "    for (short i = 0; i < 8; i++) {\n"
+         "      simdgroup_store(mc[i], C + 8*(i%%4) + 8*args->ne0*(i/4), args->ne0, ulong2(0, 0), false);\n"
+         "    }\n"
+         "  } else {\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    threadgroup float *temp_str = ((threadgroup float *)shmem)\n"
+         "      + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;\n"
+         "    for (short i = 0; i < 8; i++) {\n"
+         "      simdgroup_store(mc[i], temp_str + 8*(i%%4) + 8*NR0*(i/4), NR0, ulong2(0, 0), false);\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    if (sgitg == 0) {\n"
+         "      for (int j = tiitg; j < nr1; j += NR1) {\n"
+         "        device float *D = (device float *)dst + r0 + (r1 + j)*args->ne0 + im*args->ne1*args->ne0;\n"
+         "        threadgroup float *C = temp_str + (j*NR0);\n"
+         "        for (int i = 0; i < nr0; i++) D[i] = C[i];\n"
+         "      }\n"
+         "    }\n"
+         "  }\n"
+         "}\n"];
+
+    /* Set both FCs to false: bounds-check disabled. Canary uses clean dims. */
+    const ds4_mtl4_fc_short fcs[] = {{0, 700}, {0, 701}};
+    g_mul_mm_f16_f32_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_mul_mm_f16_f32_mtl4", @"mul_mm_f16_f32_mtl4", 1024, fcs, 2);
+    g_mul_mm_f16_f32_mtl4_init_ok = (g_mul_mm_f16_f32_mtl4_pipeline != nil) ? 1 : 0;
+    return g_mul_mm_f16_f32_mtl4_init_ok;
+}
+
+int ds4_gpu_mtl4_mul_mm_f16_f32_canary(uint32_t M, uint32_t N, uint32_t K) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_mul_mm_f16_f32_mtl4_pipeline_init()) return 0;
+    if (M == 0 || N == 0 || K == 0 || (M % 64) != 0 || (N % 32) != 0 || (K % 32) != 0) {
+        fprintf(stderr, "ds4: mul_mm canary needs M%%64==0, N%%32==0, K%%32==0 (got %u, %u, %u)\n", M, N, K);
+        return 0;
+    }
+    const uint64_t b_total = (uint64_t)M * K;
+    const uint64_t a_total = (uint64_t)N * K;
+    const uint64_t c_total = (uint64_t)M * N;
+    uint16_t *host_b = (uint16_t *)calloc(b_total, sizeof(uint16_t));  /* M × K half */
+    uint16_t *host_a = (uint16_t *)calloc(a_total, sizeof(uint16_t));  /* N × K half */
+    float *host_c = (float *)calloc(c_total, sizeof(float));
+    if (!host_b || !host_a || !host_c) {
+        free(host_b); free(host_a); free(host_c); return 0;
+    }
+    /* All-ones pattern: each C[m, n] = K. */
+    _Float16 one = (_Float16)1.0f;
+    for (uint64_t i = 0; i < b_total; i++) memcpy(&host_b[i], &one, sizeof(one));
+    for (uint64_t i = 0; i < a_total; i++) memcpy(&host_a[i], &one, sizeof(one));
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:b_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
+
+        struct {
+            int ne00, ne02;
+            uint64_t nb01, nb02, nb03;
+            int ne12;
+            uint64_t nb10, nb11, nb12, nb13;
+            int ne0, ne1;
+            int16_t r2, r3;
+        } args;
+        memset(&args, 0, sizeof(args));
+        args.ne00 = K;
+        args.ne02 = 1;
+        args.nb01 = (uint64_t)K * sizeof(uint16_t);  /* B row stride */
+        args.nb02 = (uint64_t)M * K * sizeof(uint16_t);
+        args.nb03 = args.nb02;
+        args.ne12 = 1;
+        args.nb10 = sizeof(uint16_t);
+        args.nb11 = (uint64_t)K * sizeof(uint16_t);  /* A row stride */
+        args.nb12 = (uint64_t)N * K * sizeof(uint16_t);
+        args.nb13 = args.nb12;
+        args.ne0 = M; args.ne1 = N;
+        args.r2 = 1; args.r3 = 1;
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 6;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[4] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)cBuf};
+            [residency addAllocations:allocs count:4];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:bBuf.gpuAddress atIndex:1];
+                [argTable setAddress:aBuf.gpuAddress atIndex:2];
+                [argTable setAddress:cBuf.gpuAddress atIndex:3];
+
+                /* Threadgroup memory: sa offset = 0, sb offset = 4096 bytes.
+                 * sa size = NR0×NK×sizeof(half) = 64×32×2 = 4096
+                 * sb size = NR1×NK×sizeof(half) = 32×32×2 = 2048
+                 * total: 6144 bytes minimum. Helper adds spillover so be safe. */
+                NSUInteger shmem_bytes = 8192;  /* NR0 × NK × float for the bc_out spill */
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_mul_mm_f16_f32_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(N / 32, M / 64, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 8);
+            }
+        }
+    }
+    if (!rc) { free(host_b); free(host_a); free(host_c); return 0; }
+
+    /* All-ones: every cell = K */
+    const float expected = (float)K;
+    int n_match = 0, n_other = 0;
+    double max_rel = 0.0;
+    int first_other = -1;
+    float first_other_v = 0.0f;
+    for (uint64_t i = 0; i < c_total; i++) {
+        const double d = fabs((double)(host_c[i] - expected));
+        const double rel = d / (fabs((double)expected) + 1e-7);
+        if (rel > max_rel) max_rel = rel;
+        if (rel < 1e-3) n_match++;
+        else { n_other++; if (first_other < 0) { first_other = (int)i; first_other_v = host_c[i]; } }
+    }
+    fprintf(stderr,
+        "ds4: mul_mm_f16_f32 MTL4 canary M=%u N=%u K=%u expected=%.1f "
+        "match=%d other=%d max_rel=%.4e first_other=%d first_other_v=%.4f c[0]=%.2f c[end]=%.2f\n",
+        M, N, K, (double)expected, n_match, n_other, max_rel,
+        first_other, (double)first_other_v, (double)host_c[0], (double)host_c[c_total - 1]);
+    free(host_b); free(host_a); free(host_c);
+    return (n_match == (int)c_total) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +

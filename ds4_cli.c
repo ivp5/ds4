@@ -2181,6 +2181,13 @@ int main(int argc, char **argv) {
         const uint32_t nh = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 1;
         return ds4_gpu_mtl4_indexer_scores_tiled_canary(nt, nc, nh) ? 0 : 1;
     }
+    /* --mul-mm-f16-canary [M [N [K]]] : #732 dense FP16 matmul */
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-f16-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
+        return ds4_gpu_mtl4_mul_mm_f16_f32_canary(m, n, k) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

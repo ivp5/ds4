@@ -1505,3 +1505,10 @@ int ds4_gpu_mtl4_indexer_scores_tiled_f32_canary(uint32_t n_tokens, uint32_t n_c
  * Same as #730 but Q/K tiles downcast to half for ~2× MMA throughput.
  * Dot accumulator stays float. shmem: 11 KB at D=128. */
 int ds4_gpu_mtl4_indexer_scores_tiled_canary(uint32_t n_tokens, uint32_t n_comp, uint32_t n_head);
+
+/* silv 2026-05-28 task #732 — mul_mm_f16_f32 MTL4 (BIG SWING).
+ * Dense f16-weight × f16-input → float-output GEMM at 64×32×32 tile.
+ * Uses simdgroup_half8x8 MMA + 8 output tiles per simdgroup, 4 simdgroups,
+ * 128 threads. Hardcoded FCs (bc_inp=false, bc_out=false). 6 KB shmem
+ * minimum. Production matmul: covers all dense FP16 prefill matmuls. */
+int ds4_gpu_mtl4_mul_mm_f16_f32_canary(uint32_t M, uint32_t N, uint32_t K);
