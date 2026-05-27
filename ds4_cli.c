@@ -1804,6 +1804,18 @@ int main(int argc, char **argv) {
         const uint32_t n_iter = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 100;
         return ds4_gpu_mtl4_router_weights_one_amortized_canary(n_iter) ? 0 : 1;
     }
+    /* --compressor-store-one-canary [width] : task #680 MTL4 port. */
+    if (argc >= 2 && !strcmp(argv[1], "--compressor-store-one-canary")) {
+        const uint32_t width = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 256;
+        return ds4_gpu_mtl4_compressor_store_one_canary(width) ? 0 : 1;
+    }
+    /* --softmax-pool-canary [ne0 [ne1 [n_rows]]] : task #681 MTL4 port. */
+    if (argc >= 2 && !strcmp(argv[1], "--softmax-pool-canary")) {
+        const uint32_t ne0 = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        const uint32_t ne1 = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 8;
+        const uint32_t n_rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 32;
+        return ds4_gpu_mtl4_softmax_pool_canary(ne0, ne1, n_rows) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {

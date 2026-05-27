@@ -1170,3 +1170,9 @@ void ds4_gpu_mtl4_pool_stats(uint64_t *out_acquire,
  * dispatches and reports pool acquire / alloc counts. Demonstrates the
  * amortization: alloc stays at 1 (or pool warm-up size); acquire scales N. */
 int ds4_gpu_mtl4_router_weights_one_amortized_canary(uint32_t n_iterations);
+
+/* silv 2026-05-27 tasks #680, #681 — batch 7 ports.
+ * compressor_store_one: one-token KV-state append (kv, score, ape → state).
+ * softmax_pool: fused softmax-weighted pool of KV rows. */
+int ds4_gpu_mtl4_compressor_store_one_canary(uint32_t width);
+int ds4_gpu_mtl4_softmax_pool_canary(uint32_t ne0, uint32_t ne1, uint32_t n_rows);

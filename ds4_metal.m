@@ -18518,6 +18518,443 @@ int ds4_gpu_mtl4_ratio4_shift_canary(uint32_t width) {
 }
 
 /* ============================================================ */
+/* MTL4 port: kernel_dsv4_compressor_store_one (task #680)      */
+/* metal/dsv4_kv.metal:288. One-token compressor frontier        */
+/* update: append projected KV+score+APE into recurrent state.   */
+/* 1 args + 5 buffers (kv, score, ape, state_kv, state_score).   */
+/* ============================================================ */
+static id<MTLComputePipelineState> g_compressor_store_one_mtl4_pipeline;
+static int g_compressor_store_one_mtl4_init_attempted;
+static int g_compressor_store_one_mtl4_init_ok;
+
+static int ds4_compressor_store_one_mtl4_pipeline_init(void) {
+    if (g_compressor_store_one_mtl4_init_attempted) return g_compressor_store_one_mtl4_init_ok;
+    g_compressor_store_one_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct csa { uint32_t width; uint32_t ratio; uint32_t pos; uint32_t ape_type; };\n"
+         "kernel void compressor_store_one_mtl4(\n"
+         "    device const csa *args_ptr [[buffer(0)]],\n"
+         "    device const float *kv [[buffer(1)]],\n"
+         "    device const float *score [[buffer(2)]],\n"
+         "    device const char *ape [[buffer(3)]],\n"
+         "    device float *state_kv [[buffer(4)]],\n"
+         "    device float *state_score [[buffer(5)]],\n"
+         "    uint gid [[thread_position_in_grid]]) {\n"
+         "  if (gid >= args_ptr->width || args_ptr->width == 0 || args_ptr->ratio == 0) return;\n"
+         "  const uint pos_mod = args_ptr->pos % args_ptr->ratio;\n"
+         "  const uint dst_row = args_ptr->ratio == 4u ? args_ptr->ratio + pos_mod : pos_mod;\n"
+         "  const uint dst = dst_row * args_ptr->width + gid;\n"
+         "  const uint ape_i = pos_mod * args_ptr->width + gid;\n"
+         "  float ape_v;\n"
+         "  if (args_ptr->ape_type == 1u) {\n"
+         "    ape_v = (float)(((device const half *)ape)[ape_i]);\n"
+         "  } else {\n"
+         "    ape_v = ((device const float *)ape)[ape_i];\n"
+         "  }\n"
+         "  state_kv[dst] = kv[gid];\n"
+         "  state_score[dst] = score[gid] + ape_v;\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_compressor_store_one_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: compressor_store_one MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"compressor_store_one_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_compressor_store_one_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_compressor_store_one_mtl4_pipeline) {
+        fprintf(stderr, "ds4: compressor_store_one MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: compressor_store_one MTL4 pipeline initialized\n");
+    g_compressor_store_one_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_compressor_store_one_canary(uint32_t width) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_compressor_store_one_mtl4_pipeline_init()) return 0;
+
+    const uint32_t ratio = 4;
+    const uint32_t pos = 5;
+    const uint32_t pos_mod = pos % ratio;
+    const uint32_t dst_row = ratio + pos_mod;  /* = 4 + 1 = 5 */
+    const uint32_t state_n = 2 * ratio * width;  /* old + new halves */
+
+    float *host_kv = (float *)calloc(width, sizeof(float));
+    float *host_score = (float *)calloc(width, sizeof(float));
+    float *host_ape = (float *)calloc(ratio * width, sizeof(float));  /* ape_type=0 → float */
+    float *host_state_kv = (float *)calloc(state_n, sizeof(float));
+    float *host_state_score = (float *)calloc(state_n, sizeof(float));
+    if (!host_kv || !host_score || !host_ape || !host_state_kv || !host_state_score) {
+        free(host_kv); free(host_score); free(host_ape);
+        free(host_state_kv); free(host_state_score);
+        return 0;
+    }
+    for (uint32_t i = 0; i < width; i++) {
+        host_kv[i] = (float)i * 0.1f;
+        host_score[i] = (float)i * 0.01f;
+    }
+    /* APE at pos_mod=1 row: per-element offset 0.5 */
+    for (uint32_t i = 0; i < width; i++) {
+        host_ape[pos_mod * width + i] = 0.5f;
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:16
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kvBuf = [g_device newBufferWithBytes:host_kv
+                                                    length:width * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> scoreBuf = [g_device newBufferWithBytes:host_score
+                                                       length:width * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> apeBuf = [g_device newBufferWithBytes:host_ape
+                                                     length:ratio * width * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> stateKvBuf = [g_device newBufferWithLength:state_n * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> stateScoreBuf = [g_device newBufferWithLength:state_n * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+
+        struct { uint32_t width, ratio, pos, ape_type; } args = {
+            .width = width, .ratio = ratio, .pos = pos, .ape_type = 0,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[6] = {
+                (id<MTLAllocation>)argsBuf, (id<MTLAllocation>)kvBuf, (id<MTLAllocation>)scoreBuf,
+                (id<MTLAllocation>)apeBuf, (id<MTLAllocation>)stateKvBuf, (id<MTLAllocation>)stateScoreBuf,
+            };
+            [residency addAllocations:allocs count:6];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(6);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:kvBuf.gpuAddress atIndex:1];
+                [argTable setAddress:scoreBuf.gpuAddress atIndex:2];
+                [argTable setAddress:apeBuf.gpuAddress atIndex:3];
+                [argTable setAddress:stateKvBuf.gpuAddress atIndex:4];
+                [argTable setAddress:stateScoreBuf.gpuAddress atIndex:5];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_compressor_store_one_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                const NSUInteger tg = 256;
+                const NSUInteger n_tgs = (width + tg - 1) / tg;
+                [enc dispatchThreadgroups:MTLSizeMake(n_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_state_kv, stateKvBuf.contents, state_n * sizeof(float));
+                    memcpy(host_state_score, stateScoreBuf.contents, state_n * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 6);
+            }
+        }
+    }
+    if (!rc) {
+        free(host_kv); free(host_score); free(host_ape);
+        free(host_state_kv); free(host_state_score);
+        return 0;
+    }
+
+    /* Verify: state_kv[dst_row * width + i] = host_kv[i] = i*0.1 */
+    /*         state_score[dst_row * width + i] = host_score[i] + 0.5 = i*0.01 + 0.5 */
+    uint32_t n_correct_kv = 0;
+    uint32_t n_correct_score = 0;
+    for (uint32_t i = 0; i < width; i++) {
+        const uint32_t idx = dst_row * width + i;
+        const float exp_kv = (float)i * 0.1f;
+        const float exp_score = (float)i * 0.01f + 0.5f;
+        if (fabsf(host_state_kv[idx] - exp_kv) < 1.0e-4f) n_correct_kv++;
+        if (fabsf(host_state_score[idx] - exp_score) < 1.0e-4f) n_correct_score++;
+    }
+    fprintf(stderr,
+        "ds4: compressor_store_one MTL4 canary width=%u pos=%u dst_row=%u "
+        "kv_correct=%u/%u score_correct=%u/%u\n",
+        width, pos, dst_row, n_correct_kv, width, n_correct_score, width);
+    free(host_kv); free(host_score); free(host_ape);
+    free(host_state_kv); free(host_state_score);
+    return (n_correct_kv == width && n_correct_score == width) ? 1 : 0;
+}
+
+/* ============================================================ */
+/* MTL4 port: kernel_dsv4_softmax_pool (task #681)              */
+/* metal/dsv4_misc.metal:1367. Fused softmax-weighted KV pool   */
+/* — exp-sum-mul-divide in one kernel. 1 args + 3 buffers.       */
+/* ============================================================ */
+static id<MTLComputePipelineState> g_softmax_pool_mtl4_pipeline;
+static int g_softmax_pool_mtl4_init_attempted;
+static int g_softmax_pool_mtl4_init_ok;
+
+static int ds4_softmax_pool_mtl4_pipeline_init(void) {
+    if (g_softmax_pool_mtl4_init_attempted) return g_softmax_pool_mtl4_init_ok;
+    g_softmax_pool_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct smp_args {\n"
+         "  int64_t ne00; int64_t ne01; int64_t ne02;\n"
+         "  uint64_t nb00; uint64_t nb01; uint64_t nb02;\n"
+         "  uint64_t nb10; uint64_t nb11; uint64_t nb12;\n"
+         "  int64_t ne0; int64_t ne1;\n"
+         "  uint64_t nb0; uint64_t nb1;\n"
+         "};\n"
+         "kernel void softmax_pool_mtl4(\n"
+         "    device const smp_args *args_ptr [[buffer(0)]],\n"
+         "    device const char *kv [[buffer(1)]],\n"
+         "    device const char *score [[buffer(2)]],\n"
+         "    device char *dst [[buffer(3)]],\n"
+         "    uint gid [[thread_position_in_grid]]) {\n"
+         "  const int64_t n = args_ptr->ne0 * args_ptr->ne1;\n"
+         "  if ((int64_t)gid >= n) return;\n"
+         "  const int64_t id_ = (int64_t)gid % args_ptr->ne0;\n"
+         "  const int64_t ic = (int64_t)gid / args_ptr->ne0;\n"
+         "  float max_s = -INFINITY;\n"
+         "  for (int64_t ir = 0; ir < args_ptr->ne00; ++ir) {\n"
+         "    const float s = *((device const float *)(score + ir * args_ptr->nb10 + id_ * args_ptr->nb11 + ic * args_ptr->nb12));\n"
+         "    max_s = max(max_s, s);\n"
+         "  }\n"
+         "  float sum = 0.0f;\n"
+         "  float acc = 0.0f;\n"
+         "  for (int64_t ir = 0; ir < args_ptr->ne00; ++ir) {\n"
+         "    const float s = *((device const float *)(score + ir * args_ptr->nb10 + id_ * args_ptr->nb11 + ic * args_ptr->nb12));\n"
+         "    const float w = exp(s - max_s);\n"
+         "    const float v = *((device const float *)(kv + ir * args_ptr->nb00 + id_ * args_ptr->nb01 + ic * args_ptr->nb02));\n"
+         "    sum += w;\n"
+         "    acc += v * w;\n"
+         "  }\n"
+         "  *((device float *)(dst + id_ * args_ptr->nb0 + ic * args_ptr->nb1)) = acc / sum;\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_softmax_pool_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: softmax_pool MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"softmax_pool_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_softmax_pool_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_softmax_pool_mtl4_pipeline) {
+        fprintf(stderr, "ds4: softmax_pool MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: softmax_pool MTL4 pipeline initialized\n");
+    g_softmax_pool_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_softmax_pool_canary(uint32_t ne0, uint32_t ne1, uint32_t n_rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_softmax_pool_mtl4_pipeline_init()) return 0;
+
+    /* Synthetic: kv[ir, id, ic] = ic*ne0+id (constant per row), scores[ir, id, ic] = ir
+     * (rising along row axis). Softmax-pool with max-shift gives weighted average
+     * dominated by max score row. For our pattern: scores rise linearly, so the
+     * highest-ir row dominates; pooled output ≈ kv at row=ne00-1 = ic*ne0+id. */
+    const uint64_t kv_n = (uint64_t)n_rows * ne0 * ne1;
+    const uint64_t dst_n = (uint64_t)ne0 * ne1;
+    float *host_kv = (float *)calloc(kv_n, sizeof(float));
+    float *host_score = (float *)calloc(kv_n, sizeof(float));
+    float *host_dst_gpu = (float *)calloc(dst_n, sizeof(float));
+    float *host_dst_ref = (float *)calloc(dst_n, sizeof(float));
+    if (!host_kv || !host_score || !host_dst_gpu || !host_dst_ref) {
+        free(host_kv); free(host_score); free(host_dst_gpu); free(host_dst_ref);
+        return 0;
+    }
+    for (uint32_t ic = 0; ic < ne1; ic++) {
+        for (uint32_t id = 0; id < ne0; id++) {
+            for (uint32_t ir = 0; ir < n_rows; ir++) {
+                /* layout: stride along ir (nb*0), then id (nb*1), then ic (nb*2) */
+                const uint64_t idx = ir + (uint64_t)id * n_rows + (uint64_t)ic * n_rows * ne0;
+                host_kv[idx] = (float)(ic * ne0 + id);  /* constant per (id, ic) */
+                host_score[idx] = (float)ir;  /* rising along ir */
+            }
+        }
+    }
+    /* CPU reference */
+    for (uint32_t ic = 0; ic < ne1; ic++) {
+        for (uint32_t id = 0; id < ne0; id++) {
+            float max_s = -INFINITY;
+            for (uint32_t ir = 0; ir < n_rows; ir++) {
+                const uint64_t idx = ir + (uint64_t)id * n_rows + (uint64_t)ic * n_rows * ne0;
+                if (host_score[idx] > max_s) max_s = host_score[idx];
+            }
+            float sum = 0.0f, acc = 0.0f;
+            for (uint32_t ir = 0; ir < n_rows; ir++) {
+                const uint64_t idx = ir + (uint64_t)id * n_rows + (uint64_t)ic * n_rows * ne0;
+                const float w = expf(host_score[idx] - max_s);
+                sum += w;
+                acc += host_kv[idx] * w;
+            }
+            host_dst_ref[id + (uint64_t)ic * ne0] = acc / sum;
+        }
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kvBuf = [g_device newBufferWithBytes:host_kv
+                                                    length:kv_n * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> scoreBuf = [g_device newBufferWithBytes:host_score
+                                                       length:kv_n * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:dst_n * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+
+        struct {
+            int64_t ne00, ne01, ne02;
+            uint64_t nb00, nb01, nb02;
+            uint64_t nb10, nb11, nb12;
+            int64_t ne0_, ne1_;
+            uint64_t nb0_, nb1_;
+        } args = {
+            .ne00 = (int64_t)n_rows, .ne01 = (int64_t)ne0, .ne02 = (int64_t)ne1,
+            .nb00 = sizeof(float),
+            .nb01 = (uint64_t)n_rows * sizeof(float),
+            .nb02 = (uint64_t)n_rows * ne0 * sizeof(float),
+            .nb10 = sizeof(float),
+            .nb11 = (uint64_t)n_rows * sizeof(float),
+            .nb12 = (uint64_t)n_rows * ne0 * sizeof(float),
+            .ne0_ = (int64_t)ne0, .ne1_ = (int64_t)ne1,
+            .nb0_ = sizeof(float),
+            .nb1_ = (uint64_t)ne0 * sizeof(float),
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[4] = {
+                (id<MTLAllocation>)argsBuf, (id<MTLAllocation>)kvBuf,
+                (id<MTLAllocation>)scoreBuf, (id<MTLAllocation>)dstBuf,
+            };
+            [residency addAllocations:allocs count:4];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(4);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:kvBuf.gpuAddress atIndex:1];
+                [argTable setAddress:scoreBuf.gpuAddress atIndex:2];
+                [argTable setAddress:dstBuf.gpuAddress atIndex:3];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_softmax_pool_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                const NSUInteger tg = 256;
+                const NSUInteger n_tgs = (dst_n + tg - 1) / tg;
+                [enc dispatchThreadgroups:MTLSizeMake(n_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_dst_gpu, dstBuf.contents, dst_n * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 4);
+            }
+        }
+    }
+    if (!rc) {
+        free(host_kv); free(host_score); free(host_dst_gpu); free(host_dst_ref);
+        return 0;
+    }
+
+    double max_abs = 0.0;
+    for (uint64_t i = 0; i < dst_n; i++) {
+        double d = fabs((double)(host_dst_gpu[i] - host_dst_ref[i]));
+        if (d > max_abs) max_abs = d;
+    }
+    fprintf(stderr,
+        "ds4: softmax_pool MTL4 canary ne0=%u ne1=%u n_rows=%u "
+        "expected[0]=%.4f gpu[0]=%.4f max_abs=%.4e\n",
+        ne0, ne1, n_rows,
+        (double)host_dst_ref[0], (double)host_dst_gpu[0], max_abs);
+    free(host_kv); free(host_score); free(host_dst_gpu); free(host_dst_ref);
+    return max_abs < 1.0e-3 ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +
