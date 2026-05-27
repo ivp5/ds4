@@ -2078,6 +2078,22 @@ int main(int argc, char **argv) {
         const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
         return ds4_gpu_mtl4_bin_fuse_mul_cb_f32_canary(nr, rw) ? 0 : 1;
     }
+    /* --map0-ne20-{10,16,22}-canary [n_experts [n_tokens]] : tasks #719/#720/#721 */
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-10-canary")) {
+        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_10_canary(ne, nt) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-16-canary")) {
+        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_16_canary(ne, nt) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-22-canary")) {
+        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_22_canary(ne, nt) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

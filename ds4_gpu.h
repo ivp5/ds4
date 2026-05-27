@@ -1429,3 +1429,10 @@ int ds4_gpu_mtl4_bin_fuse_div_f32_canary(uint32_t n_rows, uint32_t row_width);
  * per-channel-scale path. Non-MMA. */
 int ds4_gpu_mtl4_bin_fuse_add_cb_f32_canary(uint32_t n_rows, uint32_t row_width);
 int ds4_gpu_mtl4_bin_fuse_mul_cb_f32_canary(uint32_t n_rows, uint32_t row_width);
+
+/* silv 2026-05-27 tasks #719/#720/#721 — mul_mm_id_map0_ne20_{10,16,22} MTL4.
+ * Companion variants to #706 ne20_8 for batch-routing at NE20 ∈ {10, 16, 22}.
+ * Mechanical clones via shared ds4_mul_mm_id_map0_build_pipeline helper. */
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_10_canary(uint32_t n_experts, uint32_t n_tokens);
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_16_canary(uint32_t n_experts, uint32_t n_tokens);
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_22_canary(uint32_t n_experts, uint32_t n_tokens);

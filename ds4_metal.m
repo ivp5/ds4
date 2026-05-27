@@ -28746,6 +28746,263 @@ int ds4_gpu_mtl4_bin_fuse_div_f32_canary(uint32_t n_rows, uint32_t row_width) {
 }
 
 /* ============================================================ */
+/* mul_mm_id_map0_ne20_{10,16,22} MTL4 ports (silv 2026-05-27 #719/#720/#721) */
+/* ============================================================ */
+/* Companion variants to #706 mul_mm_id_map0_ne20_8. Same kernel
+ * skeleton, only the NE20 constant differs. Used for batch sizes
+ * 10/16/22 where the routed-expert count per token differs from
+ * production-8. Mechanical clones via helper that splices NE20
+ * value into the MSL source. Non-MMA. */
+
+static id<MTLComputePipelineState> ds4_mul_mm_id_map0_build_pipeline(int ne20) {
+    if (!ds4_polar_pipeline_init()) return nil;
+    NSError *err = nil;
+    char kernel_name[64];
+    char lib_name[80];
+    snprintf(kernel_name, sizeof(kernel_name), "mul_mm_id_map0_ne20_%d_mtl4", ne20);
+    snprintf(lib_name, sizeof(lib_name), "ds4_mul_mm_id_map0_ne20_%d_mtl4", ne20);
+
+    NSString *source = [NSString stringWithFormat:
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "#define NE20 %d\n"
+         "struct map0_args {\n"
+         "  int32_t  ne21;\n"
+         "  uint64_t nb21;\n"
+         "};\n"
+         "kernel void %s(\n"
+         "    device const map0_args *args [[buffer(0)]],\n"
+         "    device const char      *src2 [[buffer(1)]],\n"
+         "    device       char      *htpe [[buffer(2)]],\n"
+         "    device       char      *hids [[buffer(3)]],\n"
+         "    threadgroup  char      *shmem [[threadgroup(0)]],\n"
+         "    ushort tpitg [[thread_position_in_threadgroup]],\n"
+         "    ushort ntg   [[threads_per_threadgroup]]) {\n"
+         "  const short ide = tpitg;\n"
+         "  uint32_t n_all = 0;\n"
+         "  device int32_t *ids_i32 = (device int32_t *)hids + ide*args->ne21;\n"
+         "  for (int i21 = 0; i21 < args->ne21; i21 += ntg) {\n"
+         "    if (i21 + tpitg < args->ne21) {\n"
+         "      device const int32_t *src2_i32 = (device const int32_t *)\n"
+         "        (src2 + (i21 + tpitg)*args->nb21);\n"
+         "      threadgroup uint16_t *sids = (threadgroup uint16_t *)shmem + tpitg*NE20;\n"
+         "      for (short i20 = 0; i20 < NE20; i20++) sids[i20] = src2_i32[i20];\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    for (short t = 0; t < ntg; t++) {\n"
+         "      if (i21 + t >= args->ne21) break;\n"
+         "      threadgroup const uint16_t *sids = (threadgroup const uint16_t *)shmem + t*NE20;\n"
+         "      short sel = 0;\n"
+         "      for (short i20 = 0; i20 < NE20; i20++) sel += (sids[i20] == ide)*(i20 + 1);\n"
+         "      ids_i32[n_all] = (i21 + t)*NE20 + sel - 1;\n"
+         "      n_all += (sel > 0) ? 1u : 0u;\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  device uint32_t *tpe_u32 = (device uint32_t *)htpe;\n"
+         "  tpe_u32[ide] = n_all;\n"
+         "}\n",
+        ne20, kernel_name];
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = [NSString stringWithUTF8String:lib_name];
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: %s MTL4 library compile failed: %s\n",
+                lib_name, err ? err.localizedDescription.UTF8String : "(no error)");
+        return nil;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = [NSString stringWithUTF8String:kernel_name];
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 1024;
+    id<MTLComputePipelineState> pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!pipeline) {
+        fprintf(stderr, "ds4: %s MTL4 pipeline failed: %s\n",
+                lib_name, err ? err.localizedDescription.UTF8String : "(no error)");
+        return nil;
+    }
+    fprintf(stderr, "ds4: %s MTL4 pipeline initialized\n", lib_name);
+    return pipeline;
+}
+
+static id<MTLComputePipelineState> g_mul_mm_id_map0_ne20_10_mtl4_pipeline;
+static id<MTLComputePipelineState> g_mul_mm_id_map0_ne20_16_mtl4_pipeline;
+static id<MTLComputePipelineState> g_mul_mm_id_map0_ne20_22_mtl4_pipeline;
+static int g_mul_mm_id_map0_ne20_10_mtl4_init_attempted;
+static int g_mul_mm_id_map0_ne20_16_mtl4_init_attempted;
+static int g_mul_mm_id_map0_ne20_22_mtl4_init_attempted;
+static int g_mul_mm_id_map0_ne20_10_mtl4_init_ok;
+static int g_mul_mm_id_map0_ne20_16_mtl4_init_ok;
+static int g_mul_mm_id_map0_ne20_22_mtl4_init_ok;
+
+#define DS4_DEFINE_MAP0_NE20_INIT(K) \
+    static int ds4_mul_mm_id_map0_ne20_##K##_mtl4_pipeline_init(void) { \
+        if (g_mul_mm_id_map0_ne20_##K##_mtl4_init_attempted) return g_mul_mm_id_map0_ne20_##K##_mtl4_init_ok; \
+        g_mul_mm_id_map0_ne20_##K##_mtl4_init_attempted = 1; \
+        g_mul_mm_id_map0_ne20_##K##_mtl4_pipeline = ds4_mul_mm_id_map0_build_pipeline(K); \
+        g_mul_mm_id_map0_ne20_##K##_mtl4_init_ok = (g_mul_mm_id_map0_ne20_##K##_mtl4_pipeline != nil) ? 1 : 0; \
+        return g_mul_mm_id_map0_ne20_##K##_mtl4_init_ok; \
+    }
+
+DS4_DEFINE_MAP0_NE20_INIT(10)
+DS4_DEFINE_MAP0_NE20_INIT(16)
+DS4_DEFINE_MAP0_NE20_INIT(22)
+#undef DS4_DEFINE_MAP0_NE20_INIT
+
+/* Shared canary helper — works for any NE20. */
+static int ds4_mul_mm_id_map0_run_canary(
+        id<MTLComputePipelineState> pipeline,
+        int ne20,
+        uint32_t n_experts, uint32_t n_tokens) {
+    if (!pipeline || n_experts == 0 || n_tokens == 0) return 0;
+    if (n_experts > 1024) n_experts = 1024;
+    const uint32_t NE20 = (uint32_t)ne20;
+
+    int32_t *host_src2 = (int32_t *)calloc((uint64_t)n_tokens * NE20, sizeof(int32_t));
+    int32_t *host_hids = (int32_t *)calloc((uint64_t)n_experts * n_tokens, sizeof(int32_t));
+    uint32_t *host_htpe = (uint32_t *)calloc(n_experts, sizeof(uint32_t));
+    uint32_t *expected_count = (uint32_t *)calloc(n_experts, sizeof(uint32_t));
+    int32_t *expected_hids = (int32_t *)calloc((uint64_t)n_experts * n_tokens, sizeof(int32_t));
+    if (!host_src2 || !host_hids || !host_htpe || !expected_count || !expected_hids) {
+        free(host_src2); free(host_hids); free(host_htpe);
+        free(expected_count); free(expected_hids); return 0;
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t s = 0; s < NE20; s++) {
+            host_src2[(uint64_t)t * NE20 + s] = (int32_t)((t + s) % n_experts);
+        }
+    }
+    for (uint32_t e = 0; e < n_experts; e++) {
+        uint32_t n_all = 0;
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            int16_t sel = 0;
+            for (uint32_t s = 0; s < NE20; s++) {
+                if (host_src2[(uint64_t)t * NE20 + s] == (int32_t)e) sel += (int16_t)(s + 1);
+            }
+            if (sel > 0) {
+                expected_hids[(uint64_t)e * n_tokens + n_all] = (int32_t)(t * NE20 + (uint32_t)(sel - 1));
+                n_all++;
+            }
+        }
+        expected_count[e] = n_all;
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:32 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src2Buf = [g_device newBufferWithBytes:host_src2 length:(uint64_t)n_tokens*NE20*sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> tpeBuf = [g_device newBufferWithLength:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> idsBuf = [g_device newBufferWithLength:(uint64_t)n_experts*n_tokens*sizeof(int32_t) options:MTLResourceStorageModeShared];
+
+        struct {
+            int32_t ne21;
+            uint64_t nb21;
+        } args = {
+            .ne21 = n_tokens,
+            .nb21 = NE20 * sizeof(int32_t),
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 6;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[4] = {(id)argsBuf, (id)src2Buf, (id)tpeBuf, (id)idsBuf};
+            [residency addAllocations:allocs count:4];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:src2Buf.gpuAddress atIndex:1];
+                [argTable setAddress:tpeBuf.gpuAddress atIndex:2];
+                [argTable setAddress:idsBuf.gpuAddress atIndex:3];
+
+                NSUInteger nth = n_experts;
+                NSUInteger shmem_bytes = nth * NE20 * sizeof(uint16_t);
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:pipeline];
+                [enc setArgumentTable:argTable];
+                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_htpe, tpeBuf.contents, n_experts * sizeof(uint32_t));
+                    memcpy(host_hids, idsBuf.contents, (uint64_t)n_experts * n_tokens * sizeof(int32_t));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 8);
+            }
+        }
+    }
+    if (!rc) {
+        free(host_src2); free(host_hids); free(host_htpe);
+        free(expected_count); free(expected_hids); return 0;
+    }
+
+    int count_mismatch = 0, hids_mismatch = 0;
+    for (uint32_t e = 0; e < n_experts; e++) {
+        if (host_htpe[e] != expected_count[e]) count_mismatch++;
+        for (uint32_t k = 0; k < expected_count[e]; k++) {
+            if (host_hids[(uint64_t)e * n_tokens + k] != expected_hids[(uint64_t)e * n_tokens + k]) hids_mismatch++;
+        }
+    }
+    uint64_t total_routed = 0;
+    for (uint32_t e = 0; e < n_experts; e++) total_routed += host_htpe[e];
+    fprintf(stderr,
+        "ds4: mul_mm_id_map0_ne20_%d MTL4 canary n_experts=%u n_tokens=%u "
+        "total_routed=%llu (ref=%u) count_mismatch=%d hids_mismatch=%d\n",
+        ne20, n_experts, n_tokens,
+        (unsigned long long)total_routed, n_tokens * NE20,
+        count_mismatch, hids_mismatch);
+    free(host_src2); free(host_hids); free(host_htpe);
+    free(expected_count); free(expected_hids);
+    return (count_mismatch == 0 && hids_mismatch == 0) ? 1 : 0;
+}
+
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_10_canary(uint32_t n_experts, uint32_t n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_mul_mm_id_map0_ne20_10_mtl4_pipeline_init()) return 0;
+    return ds4_mul_mm_id_map0_run_canary(g_mul_mm_id_map0_ne20_10_mtl4_pipeline, 10, n_experts, n_tokens);
+}
+
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_16_canary(uint32_t n_experts, uint32_t n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_mul_mm_id_map0_ne20_16_mtl4_pipeline_init()) return 0;
+    return ds4_mul_mm_id_map0_run_canary(g_mul_mm_id_map0_ne20_16_mtl4_pipeline, 16, n_experts, n_tokens);
+}
+
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_22_canary(uint32_t n_experts, uint32_t n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_mul_mm_id_map0_ne20_22_mtl4_pipeline_init()) return 0;
+    return ds4_mul_mm_id_map0_run_canary(g_mul_mm_id_map0_ne20_22_mtl4_pipeline, 22, n_experts, n_tokens);
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +
