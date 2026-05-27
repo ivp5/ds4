@@ -8,6 +8,7 @@
  * Output: top-K tokens with text + logprob at the next-token position.
  */
 #include "ds4.h"
+#include "ds4_expert_table.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,6 +90,52 @@ static int sync_and_dump(ds4_session *session, ds4_engine *engine,
     return 0;
 }
 
+/* silv 2026-05-27 task #659 — variant of sync_and_dump that emits the
+ * top-K CSV (rank,token_id,logprob,logit,text) to a NAMED FILE instead
+ * of stdout. The daemon batched-organ-skip mode uses this so each
+ * config writes structured CSV the harm_score.py driver can read.
+ * Mirrors the stdout emit branch above; returns 0 on success. */
+static int sync_and_dump_csv_to_file(ds4_session *session, ds4_engine *engine,
+                                      const ds4_tokens *prompt,
+                                      const char *out_csv_path, int top_k) {
+    char err[256];
+    ds4_session_invalidate(session);
+    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+        fprintf(stderr, "[logitlens] sync failed: %s\n", err);
+        return 1;
+    }
+    FILE *fp = fopen(out_csv_path, "w");
+    if (!fp) { fprintf(stderr, "cannot open %s\n", out_csv_path); return 1; }
+    ds4_token_score *scores = (ds4_token_score *)calloc((size_t)top_k, sizeof(scores[0]));
+    int got = ds4_session_top_logprobs(session, scores, top_k);
+    if (got <= 0) {
+        fprintf(stderr, "top_logprobs returned %d\n", got);
+        free(scores); fclose(fp); return 1;
+    }
+    fprintf(fp, "rank,token_id,logprob,logit,text\n");
+    for (int i = 0; i < got; i++) {
+        size_t tlen = 0;
+        char *t = ds4_token_text(engine, scores[i].id, &tlen);
+        char buf[256]; size_t out = 0;
+        for (size_t j = 0; j < tlen && out + 4 < sizeof(buf); j++) {
+            unsigned char c = (unsigned char)t[j];
+            if (c == '\n') { buf[out++] = '\\'; buf[out++] = 'n'; }
+            else if (c == '\t') { buf[out++] = '\\'; buf[out++] = 't'; }
+            else if (c == '\r') { buf[out++] = '\\'; buf[out++] = 'r'; }
+            else if (c < 0x20 || c == '"' || c == ',') {
+                out += snprintf(buf+out, sizeof(buf)-out, "\\x%02x", c);
+            }
+            else buf[out++] = (char)c;
+        }
+        buf[out] = '\0';
+        fprintf(fp, "%d,%d,%.4f,%.4f,\"%s\"\n", i, scores[i].id, scores[i].logprob, scores[i].logit, buf);
+        free(t);
+    }
+    free(scores);
+    fclose(fp);
+    return 0;
+}
+
 /* Parse a comma-separated list of unsigned integers into out[], up to max_n.
  * Returns the number parsed. */
 static int parse_uint_list(const char *s, uint32_t *out, int max_n) {
@@ -117,6 +164,7 @@ int main(int argc, char **argv) {
     const char *dump_kv_out_path = NULL;
     const char *dump_logits_out_path = NULL;
     const char *skip_configs_file = NULL;
+    const char *organ_skip_configs_file = NULL;  /* silv 2026-05-27 task #659 */
     bool quiet = false;
 
     for (int i = 1; i < argc; i++) {
@@ -133,6 +181,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--dump-kv-out")) dump_kv_out_path = argv[++i];
         else if (!strcmp(a, "--dump-logits-out")) dump_logits_out_path = argv[++i];
         else if (!strcmp(a, "--skip-configs-file")) skip_configs_file = argv[++i];
+        else if (!strcmp(a, "--organ-skip-configs-file")) organ_skip_configs_file = argv[++i];
         else if (!strcmp(a, "--quiet")) quiet = true;
         else if (!strcmp(a, "--prefill-metal-phases")) {
             const char *s = argv[++i];
@@ -193,6 +242,70 @@ int main(int argc, char **argv) {
         struct timespec tsE; clock_gettime(CLOCK_MONOTONIC, &tsE);
         double total = (tsE.tv_sec - ts0.tv_sec) + (tsE.tv_nsec - ts0.tv_nsec) / 1e9;
         fprintf(stderr, "[logitlens] batched %d configs in %.2fs (%.2fs/config)\n",
+                n_configs, total, total / (n_configs > 0 ? n_configs : 1));
+    } else if (organ_skip_configs_file) {
+        /* silv 2026-05-27 task #659 — daemon mode for organ-skip A/B sweeps.
+         *
+         * Config file format (one per line; '#' = comment, blanks ignored):
+         *   <name>  <cells_csv_path_or_-> <out_top_k_path>
+         *
+         * Where <cells_csv_path_or_-> is either:
+         *   - the path to a cells CSV ("L,E,K" rows, same as DS4_ORGAN_SKIP_CSV)
+         *   - "-" or "()" → baseline (no organ-skip)
+         *
+         * Per iteration:
+         *   1. ds4_organ_skip_reset() — clear any prior cells
+         *   2. ds4_load_organ_skip_csv(cells_path) — load new cells
+         *   3. ds4_session_invalidate + ds4_session_sync — re-prefill (cache reset
+         *      because routing differs per ablation)
+         *   4. ds4_session_top_logprobs → top-K written to <out_top_k_path>
+         *
+         * Model is loaded ONCE; per-config overhead is just re-prefill (~1s on
+         * warm pages for a 25-byte prompt). For a 13-config sweep, that's ~15
+         * seconds vs the 13-launch SLOW path's ~3 hours (cold model = ~5min/launch).
+         *
+         * This is the OOM speedup ladder's first lever from DESIGN.md (model-load
+         * amortization). KV-shared-prefix + structural-panel + batched-case
+         * remain follow-up levers if iteration count grows past ~100. */
+        FILE *cfp = fopen(organ_skip_configs_file, "r");
+        if (!cfp) { fprintf(stderr, "cannot open %s\n", organ_skip_configs_file); return 1; }
+        char line[1024];
+        int n_configs = 0;
+        struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+        while (fgets(line, sizeof(line), cfp)) {
+            line[strcspn(line, "\n")] = '\0';
+            if (line[0] == '\0' || line[0] == '#') continue;
+            char *name = strtok(line, " \t");
+            char *cells_path = strtok(NULL, " \t");
+            char *out_path = strtok(NULL, " \t");
+            if (!name || !cells_path || !out_path) {
+                fprintf(stderr, "[logitlens] bad organ-skip config line\n"); continue;
+            }
+            ds4_organ_skip_reset();
+            int n_cells = 0;
+            if (strcmp(cells_path, "-") != 0 && strcmp(cells_path, "()") != 0) {
+                n_cells = ds4_load_organ_skip_csv(cells_path);
+                if (n_cells < 0) {
+                    fprintf(stderr, "[logitlens] config %s: failed to load %s\n",
+                            name, cells_path);
+                    continue;
+                }
+            }
+            struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1);
+            double t1 = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) / 1e9;
+            if (!quiet) {
+                fprintf(stderr, "[logitlens] organ_config %s cells=%s (%d) out=%s t=%.2fs\n",
+                        name, cells_path, n_cells, out_path, t1);
+            }
+            if (sync_and_dump_csv_to_file(session, engine, &prompt, out_path, k) != 0) {
+                fprintf(stderr, "[logitlens] organ_config %s failed\n", name);
+            }
+            n_configs++;
+        }
+        fclose(cfp);
+        struct timespec tsE; clock_gettime(CLOCK_MONOTONIC, &tsE);
+        double total = (tsE.tv_sec - ts0.tv_sec) + (tsE.tv_nsec - ts0.tv_nsec) / 1e9;
+        fprintf(stderr, "[logitlens] organ-skip batched %d configs in %.2fs (%.2fs/config)\n",
                 n_configs, total, total / (n_configs > 0 ? n_configs : 1));
     } else {
         fprintf(stderr, "[logitlens] syncing session (prefill %d tokens)...\n", prompt.len);

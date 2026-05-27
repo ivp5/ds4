@@ -1,0 +1,18 @@
+ds4: cpu-moe: layers 0..42 run their routed MoE on the CPU (first 43 of 43)
+ds4: Metal device Apple M1 Max, 64.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal expert inverse table uploaded (44032 bytes, 43*256 int32)
+ds4: Metal model views created in 0.018 ms, residency requested in 0.238 ms, warmup 0.893 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.346 ms, residency requested in 176.824 ms, warmup 0.904 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.026 ms, warmup 0.308 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: metal backend initialized for graph diagnostics
+[logitlens] prompt bytes: 25
+[logitlens] tokenized to 6 tokens
+[logitlens] organ_config baseline cells=- (0) out=tmp/20260527_prune_ab/daemon_baseline.txt t=0.00s
+[logitlens] organ_config h2074_no_hub cells=tmp/20260527_prune_ab/cells_h2074_no_hub.csv (5) out=tmp/20260527_prune_ab/daemon_h2074.txt t=3.49s
+[logitlens] organ_config h2071_replay_best cells=tmp/20260527_prune_ab/cells_h2071_replay_best.csv (5) out=tmp/20260527_prune_ab/daemon_h2071.txt t=4.18s
+[logitlens] organ_config h2068_e52_included cells=tmp/20260527_prune_ab/cells_h2068_e52_included.csv (5) out=tmp/20260527_prune_ab/daemon_h2068.txt t=4.87s
+[logitlens] organ-skip batched 4 configs in 5.56s (1.39s/config)
