@@ -1,0 +1,1 @@
+Solve. Patrick, Tanya, and Jose run a marathon. Patrick runs at constant speed v_p; Tanya runs 2 m/s faster than Patrick; Jose runs 7 m/s faster than Tanya. They run for T seconds. Find d = v_j * T where v_j = v_p + 9. Final answer: oxed{

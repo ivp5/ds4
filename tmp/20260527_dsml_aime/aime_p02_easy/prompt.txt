@@ -1,0 +1,1 @@
+Two-digit palindrome p with digits ab where a+b=8 and a*b=15. Find p. Final answer: oxed{

@@ -1,0 +1,4 @@
+@dataclass
+class User:
+    name: str
+    age:

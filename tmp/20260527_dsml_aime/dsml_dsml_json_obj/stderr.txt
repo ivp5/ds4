@@ -1,0 +1,14 @@
+ds4: cpu-moe: layers 0..42 run their routed MoE on the CPU (first 43 of 43)
+ds4: Metal device Apple M1 Max, 64.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal expert inverse table uploaded (44032 bytes, 43*256 int32)
+ds4: Metal model views created in 0.016 ms, residency requested in 0.209 ms, warmup 0.920 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.404 ms, residency requested in 130.276 ms, warmup 0.894 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.040 ms, warmup 0.357 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: metal backend initialized for graph diagnostics
+[logitlens] prompt bytes: 36
+[logitlens] tokenized to 8 tokens
+[logitlens] organ-skip batched 4 configs in 6.06s (1.52s/config)

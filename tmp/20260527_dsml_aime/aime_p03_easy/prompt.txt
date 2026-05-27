@@ -1,0 +1,1 @@
+Compute 7 * 11 + 2. Final answer: oxed{

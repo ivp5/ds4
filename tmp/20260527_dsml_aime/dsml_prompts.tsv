@@ -1,0 +1,6 @@
+dsml_func_call	{"function":"get_weather","arguments":{"city":
+dsml_json_obj	The configuration as JSON: {"port":
+dsml_python_dec	@dataclass\nclass User:\n    name: str\n    age:
+dsml_typescript	interface Config { port: number; host:
+dsml_xml_tag	<response><status>ok</status><data>
+dsml_yaml_kv	version: 1\nservices:\n  web:\n    image:
