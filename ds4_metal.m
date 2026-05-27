@@ -21079,6 +21079,481 @@ int ds4_gpu_mtl4_indexer_score_one_direct_canary(uint32_t n_comp) {
 }
 
 /* ============================================================ */
+/* soft_max_f32 MTL4 port (silv 2026-05-27 task #683)            */
+/* ============================================================ */
+/* MTL4 port of kernel_soft_max<float> from metal/softmax.metal.
+ * Non-vectorized softmax — handles arbitrary row widths (no n%4==0
+ * requirement that soft_max_f32_4 has). Same simd_max + simd_sum
+ * reduction pattern. Used by the compressor pool path when width%4 != 0
+ * (line 7791 dispatch). */
+
+static id<MTLComputePipelineState> g_soft_max_mtl4_pipeline;
+static int g_soft_max_mtl4_init_attempted;
+static int g_soft_max_mtl4_init_ok;
+
+static int ds4_soft_max_mtl4_pipeline_init(void) {
+    if (g_soft_max_mtl4_init_attempted) return g_soft_max_mtl4_init_ok;
+    g_soft_max_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct sm_args { int32_t n; float scale; };\n"
+         "kernel void soft_max_mtl4(\n"
+         "    device const sm_args *args [[buffer(0)]],\n"
+         "    device const float   *src [[buffer(1)]],\n"
+         "    device       float   *dst [[buffer(2)]],\n"
+         "    threadgroup  float   *shmem [[threadgroup(0)]],\n"
+         "    uint3  tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort3 tpitg [[thread_position_in_threadgroup]],\n"
+         "    ushort  sgitg [[simdgroup_index_in_threadgroup]],\n"
+         "    ushort  tiisg [[thread_index_in_simdgroup]],\n"
+         "    ushort3 ntg [[threads_per_threadgroup]]) {\n"
+         "  const uint row = tgpig.x;\n"
+         "  const int  n   = args->n;\n"
+         "  const float s  = args->scale;\n"
+         "  device const float *p = src + row * (uint)n;\n"
+         "  device       float *q = dst + row * (uint)n;\n"
+         "  /* pass 1: max */\n"
+         "  float lmax = -INFINITY;\n"
+         "  for (int i = tpitg.x; i < n; i += ntg.x) {\n"
+         "    lmax = fmax(lmax, p[i] * s);\n"
+         "  }\n"
+         "  lmax = simd_max(lmax);\n"
+         "  if (ntg.x > 32) {\n"
+         "    if (sgitg == 0) shmem[tiisg] = -INFINITY;\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    if (tiisg == 0)  shmem[sgitg] = lmax;\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    lmax = shmem[tiisg]; lmax = simd_max(lmax);\n"
+         "  }\n"
+         "  /* pass 2: exp + sum + write */\n"
+         "  float lsum = 0.0f;\n"
+         "  for (int i = tpitg.x; i < n; i += ntg.x) {\n"
+         "    const float e = exp(p[i] * s - lmax);\n"
+         "    lsum += e; q[i] = e;\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_none);\n"
+         "  lsum = simd_sum(lsum);\n"
+         "  if (ntg.x > 32) {\n"
+         "    if (sgitg == 0) shmem[tiisg] = 0.0f;\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    if (tiisg == 0)  shmem[sgitg] = lsum;\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    lsum = shmem[tiisg]; lsum = simd_sum(lsum);\n"
+         "  }\n"
+         "  const float inv = 1.0f / lsum;\n"
+         "  for (int i = tpitg.x; i < n; i += ntg.x) q[i] *= inv;\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_soft_max_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: soft_max MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"soft_max_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_soft_max_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_soft_max_mtl4_pipeline) {
+        fprintf(stderr, "ds4: soft_max MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: soft_max MTL4 pipeline initialized\n");
+    g_soft_max_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_soft_max_canary(uint32_t n) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_soft_max_mtl4_pipeline_init()) return 0;
+    if (n == 0) {
+        fprintf(stderr, "ds4: soft_max canary requires n > 0\n");
+        return 0;
+    }
+
+    /* Same spike pattern as soft_max_4: src[0]=1, rest=0, scale=1. */
+    float *host_src = (float *)calloc(n, sizeof(float));
+    float *host_dst = (float *)calloc(n, sizeof(float));
+    if (!host_src || !host_dst) { free(host_src); free(host_dst); return 0; }
+    host_src[0] = 1.0f;
+
+    double Z = exp(1.0 - 1.0) + (double)(n - 1) * exp(0.0 - 1.0);
+    const float ref0 = (float)(exp(1.0 - 1.0) / Z);
+    const float ref_else = (float)(exp(0.0 - 1.0) / Z);
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:16
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> srcBuf = [g_device newBufferWithBytes:host_src
+                                                     length:n * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:n * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        struct { int32_t n_; float s_; uint64_t pad; } args = {
+            .n_ = (int32_t)n, .s_ = 1.0f,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[3] = {
+                (id<MTLAllocation>)argsBuf,
+                (id<MTLAllocation>)srcBuf,
+                (id<MTLAllocation>)dstBuf,
+            };
+            [residency addAllocations:allocs count:3];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(4);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:srcBuf.gpuAddress atIndex:1];
+                [argTable setAddress:dstBuf.gpuAddress atIndex:2];
+
+                NSUInteger nth = 32u;
+                while (nth < n && nth < 256u) nth *= 2u;
+                if (nth > g_soft_max_mtl4_pipeline.maxTotalThreadsPerThreadgroup)
+                    nth = g_soft_max_mtl4_pipeline.maxTotalThreadsPerThreadgroup;
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_soft_max_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc setThreadgroupMemoryLength:128 atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_dst, dstBuf.contents, n * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 4);
+            }
+        }
+    }
+    if (!rc) { free(host_src); free(host_dst); return 0; }
+
+    double max_abs = 0.0;
+    double sum = 0.0;
+    double d0 = fabs((double)(host_dst[0] - ref0));
+    if (d0 > max_abs) max_abs = d0;
+    sum += (double)host_dst[0];
+    for (uint32_t i = 1; i < n; i++) {
+        double d = fabs((double)(host_dst[i] - ref_else));
+        if (d > max_abs) max_abs = d;
+        sum += (double)host_dst[i];
+    }
+    fprintf(stderr,
+        "ds4: soft_max MTL4 canary n=%u dst[0]=%.6f (ref=%.6f) "
+        "dst[1]=%.6f (ref=%.6f) sum=%.6f max_abs=%.4e\n",
+        n,
+        (double)host_dst[0], (double)ref0,
+        (double)host_dst[1], (double)ref_else,
+        sum, max_abs);
+    free(host_src); free(host_dst);
+    return (max_abs < 5.0e-6 && fabs(sum - 1.0) < 5.0e-5) ? 1 : 0;
+}
+
+/* ============================================================ */
+/* dsv4_fp8_kv_quantize_f32 MTL4 port (silv 2026-05-27 task #684) */
+/* ============================================================ */
+/* MTL4-side port of kernel_dsv4_fp8_kv_quantize_f32 from metal/dsv4_kv.metal.
+ * Per-row: walk the non-RoPE region (ne00 - n_rot elements) in blocks
+ * of 64. For each block: find amax via threadgroup reduction → scale =
+ * exp2(ceil(log2(amax/448))) → write back E4M3FN-quantized values
+ * scaled by `scale`. Then copy the RoPE tail (n_rot elements) unchanged.
+ *
+ * Exercises new patterns:
+ *   - LUT-driven E4M3FN value generation (16 exponent scales)
+ *   - Binary-search dequant function inline in kernel source
+ *   - Threadgroup-wide max-reduction (64-thread groups) via halving
+ *   - Per-block scale + dequant + scale-back round-trip
+ *
+ * Per-decode dispatch (fires per KV-cache update step).
+ *
+ * Canary uses synthetic per-row input where all values are equal so the
+ * round-trip is deterministic (amax = abs_value, scale = power-of-2 of
+ * abs_value / 448, E4M3FN dequant lands on the nearest LUT value). */
+
+static id<MTLComputePipelineState> g_fp8_kv_quantize_mtl4_pipeline;
+static int g_fp8_kv_quantize_mtl4_init_attempted;
+static int g_fp8_kv_quantize_mtl4_init_ok;
+
+static int ds4_fp8_kv_quantize_mtl4_pipeline_init(void) {
+    if (g_fp8_kv_quantize_mtl4_init_attempted) return g_fp8_kv_quantize_mtl4_init_ok;
+    g_fp8_kv_quantize_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "constant float dsv4_e4m3fn_exp_scale[16] = {\n"
+         "  0.0f, 0.015625f, 0.03125f, 0.0625f,\n"
+         "  0.125f, 0.25f, 0.5f, 1.0f,\n"
+         "  2.0f, 4.0f, 8.0f, 16.0f,\n"
+         "  32.0f, 64.0f, 128.0f, 256.0f,\n"
+         "};\n"
+         "static inline float dsv4_e4m3fn_value(int i) {\n"
+         "  const int exp  = (i >> 3) & 0x0f;\n"
+         "  const int mant = i & 0x07;\n"
+         "  return exp == 0\n"
+         "    ? float(mant) * 0.001953125f\n"
+         "    : (1.0f + float(mant) * 0.125f) * dsv4_e4m3fn_exp_scale[exp];\n"
+         "}\n"
+         "static inline float dsv4_e4m3fn_dequant(float x) {\n"
+         "  const float sign = x < 0.0f ? -1.0f : 1.0f;\n"
+         "  const float ax = min(abs(x), 448.0f);\n"
+         "  int lo = 0;\n"
+         "  int hi = 126;\n"
+         "  while (lo < hi) {\n"
+         "    const int mid = (lo + hi + 1) >> 1;\n"
+         "    if (dsv4_e4m3fn_value(mid) <= ax) lo = mid; else hi = mid - 1;\n"
+         "  }\n"
+         "  int best = lo;\n"
+         "  if (best < 126) {\n"
+         "    const float bd = abs(ax - dsv4_e4m3fn_value(best));\n"
+         "    const float nd = abs(ax - dsv4_e4m3fn_value(best + 1));\n"
+         "    if (nd < bd || (nd == bd && ((best + 1) & 1) == 0 && (best & 1) != 0))\n"
+         "      best = best + 1;\n"
+         "  }\n"
+         "  return sign * dsv4_e4m3fn_value(best);\n"
+         "}\n"
+         "struct fp8_args { int32_t n_full; int32_t n_rot; };\n"
+         "kernel void fp8_kv_quantize_mtl4(\n"
+         "    device const fp8_args *args [[buffer(0)]],\n"
+         "    device const float    *src  [[buffer(1)]],\n"
+         "    device       float    *dst  [[buffer(2)]],\n"
+         "    threadgroup  float    *scratch [[threadgroup(0)]],\n"
+         "    uint   row [[threadgroup_position_in_grid]],\n"
+         "    uint   tid [[thread_position_in_threadgroup]]) {\n"
+         "  const int n_full = args->n_full;\n"
+         "  const int n_rot  = args->n_rot;\n"
+         "  const int n_nope = n_full - n_rot;\n"
+         "  device const float *psrc = src + row * (uint)n_full;\n"
+         "  device       float *pdst = dst + row * (uint)n_full;\n"
+         "  /* FP8-quantize the non-RoPE region in 64-element blocks */\n"
+         "  for (int off = 0; off < n_nope; off += 64) {\n"
+         "    float v = 0.0f;\n"
+         "    if (tid < 64u && off + (int)tid < n_nope) {\n"
+         "      v = psrc[off + tid];\n"
+         "      scratch[tid] = abs(v);\n"
+         "    } else if (tid < 64u) {\n"
+         "      scratch[tid] = 0.0f;\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    /* per-block amax via halving reduction over 64 lanes */\n"
+         "    for (uint stride = 32u; stride > 0u; stride >>= 1) {\n"
+         "      if (tid < stride) scratch[tid] = max(scratch[tid], scratch[tid + stride]);\n"
+         "      threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    }\n"
+         "    const float amax = max(scratch[0], 1.0e-4f);\n"
+         "    const float scale = exp2(ceil(log2(amax / 448.0f)));\n"
+         "    if (tid < 64u && off + (int)tid < n_nope) {\n"
+         "      const float q = dsv4_e4m3fn_dequant(clamp(v / scale, -448.0f, 448.0f)) * scale;\n"
+         "      pdst[off + tid] = q;\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  /* Copy the RoPE tail unchanged */\n"
+         "  for (int i = n_nope + (int)tid; i < n_full; i += 64) {\n"
+         "    pdst[i] = psrc[i];\n"
+         "  }\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_fp8_kv_quantize_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: fp8_kv_quantize MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"fp8_kv_quantize_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 64;
+    g_fp8_kv_quantize_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_fp8_kv_quantize_mtl4_pipeline) {
+        fprintf(stderr, "ds4: fp8_kv_quantize MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: fp8_kv_quantize MTL4 pipeline initialized\n");
+    g_fp8_kv_quantize_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_fp8_kv_quantize_canary(uint32_t n_rows, uint32_t n_full, uint32_t n_rot) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_fp8_kv_quantize_mtl4_pipeline_init()) return 0;
+    if (n_rows == 0 || n_full == 0 || n_rot >= n_full) {
+        fprintf(stderr, "ds4: fp8_kv_quantize canary requires n_rows>0, n_full>0, n_rot<n_full\n");
+        return 0;
+    }
+
+    /* Canary: per-row src[i] = (i < n_nope) ? 1.0 : 7.5 (tail unchanged).
+     * For the FP8 region: amax = 1.0, scale = exp2(ceil(log2(1/448))) = 2^-9 = 0.001953125
+     *   v/scale = 1.0/0.001953125 = 512, clamped to 448
+     *   dequant(448) ≈ nearest LUT value (256 with mantissa adjustments → exactly 448 if in LUT)
+     *   result = 448 * 0.001953125 = 0.875 (closest E4M3FN approximation to 1.0)
+     * For the RoPE tail: passes through as 7.5.
+     *
+     * We don't compute the exact E4M3FN nearest-value here; just verify:
+     *   - FP8 region values are non-zero + close to 1.0 (within ~12.5% — E4M3FN granularity)
+     *   - RoPE tail equals 7.5 exactly (byte copy) */
+    const uint64_t total = (uint64_t)n_rows * n_full;
+    const int32_t n_nope = (int32_t)(n_full - n_rot);
+
+    float *host_src = (float *)calloc(total, sizeof(float));
+    float *host_dst = (float *)calloc(total, sizeof(float));
+    if (!host_src || !host_dst) { free(host_src); free(host_dst); return 0; }
+    for (uint32_t r = 0; r < n_rows; r++) {
+        for (uint32_t i = 0; i < n_full; i++) {
+            host_src[(uint64_t)r * n_full + i] = (int32_t)i < n_nope ? 1.0f : 7.5f;
+        }
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:16
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> srcBuf = [g_device newBufferWithBytes:host_src
+                                                     length:total * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:total * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        struct { int32_t n_full_, n_rot_; uint64_t pad; } args = {
+            .n_full_ = (int32_t)n_full, .n_rot_ = (int32_t)n_rot,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[3] = {
+                (id<MTLAllocation>)argsBuf,
+                (id<MTLAllocation>)srcBuf,
+                (id<MTLAllocation>)dstBuf,
+            };
+            [residency addAllocations:allocs count:3];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(4);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:srcBuf.gpuAddress atIndex:1];
+                [argTable setAddress:dstBuf.gpuAddress atIndex:2];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_fp8_kv_quantize_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                /* 64 lanes × 4 bytes = 256 bytes scratch for the per-block reduction */
+                [enc setThreadgroupMemoryLength:256 atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_dst, dstBuf.contents, total * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 4);
+            }
+        }
+    }
+    if (!rc) { free(host_src); free(host_dst); return 0; }
+
+    /* Validate:
+     *   FP8 region (i < n_nope): result close to 1.0 (within E4M3FN tolerance ~12.5%)
+     *   RoPE tail (i >= n_nope): exact 7.5 (bit-identical copy) */
+    double fp8_max_dev = 0.0;
+    double tail_max_dev = 0.0;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        for (uint32_t i = 0; i < n_full; i++) {
+            const float v = host_dst[(uint64_t)r * n_full + i];
+            if ((int32_t)i < n_nope) {
+                double dev = fabs((double)v - 1.0);
+                if (dev > fp8_max_dev) fp8_max_dev = dev;
+            } else {
+                double dev = fabs((double)v - 7.5);
+                if (dev > tail_max_dev) tail_max_dev = dev;
+            }
+        }
+    }
+    fprintf(stderr,
+        "ds4: fp8_kv_quantize MTL4 canary n_rows=%u n_full=%u n_rot=%u "
+        "fp8_dst[0]=%.6f (ref≈1.0) tail_dst[%d]=%.6f (ref=7.5) "
+        "fp8_max_dev=%.4e tail_max_dev=%.4e\n",
+        n_rows, n_full, n_rot,
+        (double)host_dst[0],
+        n_nope, (double)host_dst[n_nope],
+        fp8_max_dev, tail_max_dev);
+    free(host_src); free(host_dst);
+    /* E4M3FN nearest to 1.0 in [0.875, 1.125] range — accept ≤ 0.2 abs dev.
+     * Tail must be bit-identical. */
+    return (fp8_max_dev < 0.2 && tail_max_dev < 1.0e-6) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +

@@ -1260,3 +1260,15 @@ int ds4_gpu_mtl4_hc_expand4_canary(uint32_t n_embd, uint32_t n_tokens);
  * Exercises threadgroup shared mem + simd_sum reductions + 2-stage
  * tg accumulation. */
 int ds4_gpu_mtl4_indexer_score_one_direct_canary(uint32_t n_comp);
+
+/* silv 2026-05-27 task #683 — soft_max_f32 MTL4 (non-vectorized variant
+ * of soft_max_f32_4). Handles arbitrary row widths via simd_max +
+ * simd_sum reductions; used by compressor pool when width%4 != 0. */
+int ds4_gpu_mtl4_soft_max_canary(uint32_t n);
+
+/* silv 2026-05-27 task #684 — dsv4_fp8_kv_quantize_f32 MTL4. Per-decode
+ * KV-cache write path: FP8 E4M3FN round-trip on non-RoPE region (block
+ * size 64, threadgroup-wide max reduction + LUT-driven dequant), passes
+ * RoPE tail unchanged. Exercises kernel-source-embedded LUT tables,
+ * binary-search FP8 dequant, halving-reduction amax. */
+int ds4_gpu_mtl4_fp8_kv_quantize_canary(uint32_t n_rows, uint32_t n_full, uint32_t n_rot);

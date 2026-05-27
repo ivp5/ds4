@@ -1858,6 +1858,18 @@ int main(int argc, char **argv) {
         const uint32_t n_comp = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 32;
         return ds4_gpu_mtl4_indexer_score_one_direct_canary(n_comp) ? 0 : 1;
     }
+    /* --soft-max-canary [n] : task #683 non-vectorized softmax */
+    if (argc >= 2 && !strcmp(argv[1], "--soft-max-canary")) {
+        const uint32_t n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 511;  /* odd width to differ from soft_max_4 */
+        return ds4_gpu_mtl4_soft_max_canary(n) ? 0 : 1;
+    }
+    /* --fp8-kv-quantize-canary [n_rows [n_full [n_rot]]] : task #684 FP8 KV round-trip */
+    if (argc >= 2 && !strcmp(argv[1], "--fp8-kv-quantize-canary")) {
+        const uint32_t n_rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4;
+        const uint32_t n_full = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 192;
+        const uint32_t n_rot = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
+        return ds4_gpu_mtl4_fp8_kv_quantize_canary(n_rows, n_full, n_rot) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);
