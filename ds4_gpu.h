@@ -1437,6 +1437,14 @@ int ds4_gpu_mtl4_mul_mm_id_map0_ne20_10_canary(uint32_t n_experts, uint32_t n_to
 int ds4_gpu_mtl4_mul_mm_id_map0_ne20_16_canary(uint32_t n_experts, uint32_t n_tokens);
 int ds4_gpu_mtl4_mul_mm_id_map0_ne20_22_canary(uint32_t n_experts, uint32_t n_tokens);
 
+/* silv 2026-05-28 tasks #729-#733 — mul_mm_id_map0_ne20_{1,2,4,5,6} MTL4.
+ * Fills out the full ne20 set antirez retained. Mechanical via helper. */
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_1_canary(uint32_t n_experts, uint32_t n_tokens);
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_2_canary(uint32_t n_experts, uint32_t n_tokens);
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_4_canary(uint32_t n_experts, uint32_t n_tokens);
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_5_canary(uint32_t n_experts, uint32_t n_tokens);
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_6_canary(uint32_t n_experts, uint32_t n_tokens);
+
 /* silv 2026-05-27 task #722 — mul_mv_f32_f32 MTL4 (FIRST FC-aware port).
  * Dense f32 matvec using MTL4SpecializedFunctionDescriptor with
  * MTLFunctionConstantValues to set FC_mul_mv_nsg. NR0=4 (template),

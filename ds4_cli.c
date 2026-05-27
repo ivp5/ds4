@@ -2094,6 +2094,32 @@ int main(int argc, char **argv) {
         const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
         return ds4_gpu_mtl4_mul_mm_id_map0_ne20_22_canary(ne, nt) ? 0 : 1;
     }
+    /* --map0-ne20-{1,2,4,5,6}-canary [n_experts [n_tokens]] : tasks #729-#733 */
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-1-canary")) {
+        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_1_canary(ne, nt) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-2-canary")) {
+        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_2_canary(ne, nt) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-4-canary")) {
+        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_4_canary(ne, nt) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-5-canary")) {
+        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_5_canary(ne, nt) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-6-canary")) {
+        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_6_canary(ne, nt) ? 0 : 1;
+    }
     /* --mul-mv-canary [M [N]] : task #722 first FC-aware MTL4 port (f32 matvec) */
     if (argc >= 2 && !strcmp(argv[1], "--mul-mv-canary")) {
         const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;

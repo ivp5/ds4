@@ -27739,12 +27739,30 @@ static id<MTLComputePipelineState> ds4_mul_mm_id_map0_build_pipeline(int ne20) {
     return pipeline;
 }
 
+/* silv 2026-05-28 (#729-733): adding ne20_{1,2,4,5,6} fills out the
+ * full set of routing-builder variants antirez retained. Each maps to
+ * a different routed-K configuration; production DS4 uses K=8 (#706). */
+static id<MTLComputePipelineState> g_mul_mm_id_map0_ne20_1_mtl4_pipeline;
+static id<MTLComputePipelineState> g_mul_mm_id_map0_ne20_2_mtl4_pipeline;
+static id<MTLComputePipelineState> g_mul_mm_id_map0_ne20_4_mtl4_pipeline;
+static id<MTLComputePipelineState> g_mul_mm_id_map0_ne20_5_mtl4_pipeline;
+static id<MTLComputePipelineState> g_mul_mm_id_map0_ne20_6_mtl4_pipeline;
 static id<MTLComputePipelineState> g_mul_mm_id_map0_ne20_10_mtl4_pipeline;
 static id<MTLComputePipelineState> g_mul_mm_id_map0_ne20_16_mtl4_pipeline;
 static id<MTLComputePipelineState> g_mul_mm_id_map0_ne20_22_mtl4_pipeline;
+static int g_mul_mm_id_map0_ne20_1_mtl4_init_attempted;
+static int g_mul_mm_id_map0_ne20_2_mtl4_init_attempted;
+static int g_mul_mm_id_map0_ne20_4_mtl4_init_attempted;
+static int g_mul_mm_id_map0_ne20_5_mtl4_init_attempted;
+static int g_mul_mm_id_map0_ne20_6_mtl4_init_attempted;
 static int g_mul_mm_id_map0_ne20_10_mtl4_init_attempted;
 static int g_mul_mm_id_map0_ne20_16_mtl4_init_attempted;
 static int g_mul_mm_id_map0_ne20_22_mtl4_init_attempted;
+static int g_mul_mm_id_map0_ne20_1_mtl4_init_ok;
+static int g_mul_mm_id_map0_ne20_2_mtl4_init_ok;
+static int g_mul_mm_id_map0_ne20_4_mtl4_init_ok;
+static int g_mul_mm_id_map0_ne20_5_mtl4_init_ok;
+static int g_mul_mm_id_map0_ne20_6_mtl4_init_ok;
 static int g_mul_mm_id_map0_ne20_10_mtl4_init_ok;
 static int g_mul_mm_id_map0_ne20_16_mtl4_init_ok;
 static int g_mul_mm_id_map0_ne20_22_mtl4_init_ok;
@@ -27758,6 +27776,11 @@ static int g_mul_mm_id_map0_ne20_22_mtl4_init_ok;
         return g_mul_mm_id_map0_ne20_##K##_mtl4_init_ok; \
     }
 
+DS4_DEFINE_MAP0_NE20_INIT(1)
+DS4_DEFINE_MAP0_NE20_INIT(2)
+DS4_DEFINE_MAP0_NE20_INIT(4)
+DS4_DEFINE_MAP0_NE20_INIT(5)
+DS4_DEFINE_MAP0_NE20_INIT(6)
 DS4_DEFINE_MAP0_NE20_INIT(10)
 DS4_DEFINE_MAP0_NE20_INIT(16)
 DS4_DEFINE_MAP0_NE20_INIT(22)
@@ -27907,6 +27930,36 @@ int ds4_gpu_mtl4_mul_mm_id_map0_ne20_22_canary(uint32_t n_experts, uint32_t n_to
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!ds4_mul_mm_id_map0_ne20_22_mtl4_pipeline_init()) return 0;
     return ds4_mul_mm_id_map0_run_canary(g_mul_mm_id_map0_ne20_22_mtl4_pipeline, 22, n_experts, n_tokens);
+}
+
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_1_canary(uint32_t n_experts, uint32_t n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_mul_mm_id_map0_ne20_1_mtl4_pipeline_init()) return 0;
+    return ds4_mul_mm_id_map0_run_canary(g_mul_mm_id_map0_ne20_1_mtl4_pipeline, 1, n_experts, n_tokens);
+}
+
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_2_canary(uint32_t n_experts, uint32_t n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_mul_mm_id_map0_ne20_2_mtl4_pipeline_init()) return 0;
+    return ds4_mul_mm_id_map0_run_canary(g_mul_mm_id_map0_ne20_2_mtl4_pipeline, 2, n_experts, n_tokens);
+}
+
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_4_canary(uint32_t n_experts, uint32_t n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_mul_mm_id_map0_ne20_4_mtl4_pipeline_init()) return 0;
+    return ds4_mul_mm_id_map0_run_canary(g_mul_mm_id_map0_ne20_4_mtl4_pipeline, 4, n_experts, n_tokens);
+}
+
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_5_canary(uint32_t n_experts, uint32_t n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_mul_mm_id_map0_ne20_5_mtl4_pipeline_init()) return 0;
+    return ds4_mul_mm_id_map0_run_canary(g_mul_mm_id_map0_ne20_5_mtl4_pipeline, 5, n_experts, n_tokens);
+}
+
+int ds4_gpu_mtl4_mul_mm_id_map0_ne20_6_canary(uint32_t n_experts, uint32_t n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_mul_mm_id_map0_ne20_6_mtl4_pipeline_init()) return 0;
+    return ds4_mul_mm_id_map0_run_canary(g_mul_mm_id_map0_ne20_6_mtl4_pipeline, 6, n_experts, n_tokens);
 }
 
 /* ============================================================ */
