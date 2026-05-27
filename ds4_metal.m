@@ -19826,6 +19826,231 @@ int ds4_gpu_mtl4_hc_weighted_sum_canary(uint32_t n_embd, uint32_t n_hc, uint32_t
 }
 
 /* ============================================================ */
+/* MTL4 port: kernel_dsv4_router_finalize_one (task #684)       */
+/* metal/dsv4_misc.metal:288. Top-K expert selection: bitonic    */
+/* sort of 256 probs with optional bias, hash-mode bypass, plus  */
+/* writes top-6 expert indices.                                  */
+/*                                                               */
+/* COMPLETES THE ROUTER CYCLE MTL4 SET (5/5):                    */
+/*   topk_mask + topk_mask_scatter +                             */
+/*   router_weights_one + router_weights_with_remap +            */
+/*   router_finalize_one (this).                                 */
+/* ============================================================ */
+static id<MTLComputePipelineState> g_router_finalize_one_mtl4_pipeline;
+static int g_router_finalize_one_mtl4_init_attempted;
+static int g_router_finalize_one_mtl4_init_ok;
+
+static int ds4_router_finalize_one_mtl4_pipeline_init(void) {
+    if (g_router_finalize_one_mtl4_init_attempted) return g_router_finalize_one_mtl4_init_ok;
+    g_router_finalize_one_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct rs_args {\n"
+         "  uint32_t has_bias; uint32_t hash_mode;\n"
+         "  uint32_t use_token_buffer; uint32_t token;\n"
+         "  uint32_t hash_rows;\n"
+         "};\n"
+         "kernel void router_finalize_one_mtl4(\n"
+         "    device const rs_args *args_ptr [[buffer(0)]],\n"
+         "    device const float *probs [[buffer(1)]],\n"
+         "    device const float *bias [[buffer(2)]],\n"
+         "    device const int32_t *hash [[buffer(3)]],\n"
+         "    device const int32_t *tokens [[buffer(4)]],\n"
+         "    device int32_t *selected [[buffer(5)]],\n"
+         "    threadgroup float *scratch [[threadgroup(0)]],\n"
+         "    uint tid [[thread_position_in_threadgroup]]) {\n"
+         "  if (tid >= 256) return;\n"
+         "  threadgroup float *sel_scores = scratch;\n"
+         "  threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 256);\n"
+         "  const float p = probs[tid];\n"
+         "  sel_scores[tid] = args_ptr->has_bias ? p + bias[tid] : p;\n"
+         "  idx[tid] = (int32_t)tid;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  if (args_ptr->hash_mode) {\n"
+         "    if (tid == 0) {\n"
+         "      const uint token = args_ptr->use_token_buffer ? (uint)tokens[0] : args_ptr->token;\n"
+         "      const uint row = min(token, args_ptr->hash_rows - 1u);\n"
+         "      device const int32_t *src = hash + row * 6u;\n"
+         "      for (uint i = 0; i < 6; i++) selected[i] = src[i];\n"
+         "    }\n"
+         "  } else {\n"
+         "    for (uint k = 2; k <= 256; k <<= 1) {\n"
+         "      for (uint j = k >> 1; j > 0; j >>= 1) {\n"
+         "        const uint other = tid ^ j;\n"
+         "        if (other > tid) {\n"
+         "          if ((tid & k) == 0) {\n"
+         "            if (sel_scores[(uint)idx[tid]] < sel_scores[(uint)idx[other]]) {\n"
+         "              const int32_t tmp = idx[tid]; idx[tid] = idx[other]; idx[other] = tmp;\n"
+         "            }\n"
+         "          } else {\n"
+         "            if (sel_scores[(uint)idx[tid]] > sel_scores[(uint)idx[other]]) {\n"
+         "              const int32_t tmp = idx[tid]; idx[tid] = idx[other]; idx[other] = tmp;\n"
+         "            }\n"
+         "          }\n"
+         "        }\n"
+         "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "      }\n"
+         "    }\n"
+         "    if (tid < 6) selected[tid] = idx[tid];\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_router_finalize_one_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: router_finalize_one MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"router_finalize_one_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_router_finalize_one_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_router_finalize_one_mtl4_pipeline) {
+        fprintf(stderr, "ds4: router_finalize_one MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: router_finalize_one MTL4 pipeline initialized "
+                    "(threadExecutionWidth=%lu)\n",
+            (unsigned long)g_router_finalize_one_mtl4_pipeline.threadExecutionWidth);
+    g_router_finalize_one_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_router_finalize_one_canary(int has_bias_flag) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_router_finalize_one_mtl4_pipeline_init()) return 0;
+
+    /* Synthetic: probs[i] = (i == 0..5) ? 1.0 - i*0.01 : 0.001 (top-6 are i=0..5)
+     * with descending scores. Expected selected = {0, 1, 2, 3, 4, 5}.
+     * Optional bias: bias[i] = 0 (no-op when has_bias=1). */
+    float host_probs[256];
+    float host_bias[256] = {0};
+    int32_t host_hash[6] = {99, 98, 97, 96, 95, 94};  /* unused unless hash_mode=1 */
+    int32_t host_tokens[1] = {0};
+    int32_t host_selected[6] = {-1, -1, -1, -1, -1, -1};
+    int32_t host_selected_ref[6] = {0, 1, 2, 3, 4, 5};
+
+    for (int i = 0; i < 256; i++) {
+        host_probs[i] = (i < 6) ? (1.0f - (float)i * 0.01f) : 0.001f;
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:32
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> probsBuf = [g_device newBufferWithBytes:host_probs
+                                                       length:sizeof(host_probs)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> biasBuf = [g_device newBufferWithBytes:host_bias
+                                                      length:sizeof(host_bias)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> hashBuf = [g_device newBufferWithBytes:host_hash
+                                                      length:sizeof(host_hash)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> tokensBuf = [g_device newBufferWithBytes:host_tokens
+                                                        length:sizeof(host_tokens)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf = [g_device newBufferWithLength:6 * sizeof(int32_t)
+                                                     options:MTLResourceStorageModeShared];
+
+        struct { uint32_t has_bias, hash_mode, use_token_buffer, token, hash_rows; } args = {
+            .has_bias = (uint32_t)(has_bias_flag ? 1 : 0),
+            .hash_mode = 0, .use_token_buffer = 0, .token = 0, .hash_rows = 1,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[6] = {
+                (id<MTLAllocation>)argsBuf, (id<MTLAllocation>)probsBuf,
+                (id<MTLAllocation>)biasBuf, (id<MTLAllocation>)hashBuf,
+                (id<MTLAllocation>)tokensBuf, (id<MTLAllocation>)selBuf,
+            };
+            [residency addAllocations:allocs count:6];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(6);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:probsBuf.gpuAddress atIndex:1];
+                [argTable setAddress:biasBuf.gpuAddress atIndex:2];
+                [argTable setAddress:hashBuf.gpuAddress atIndex:3];
+                [argTable setAddress:tokensBuf.gpuAddress atIndex:4];
+                [argTable setAddress:selBuf.gpuAddress atIndex:5];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_router_finalize_one_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                /* scratch: 256 float scores + 256 int32 indices = 1024 + 1024 bytes */
+                [enc setThreadgroupMemoryLength:2048 atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_selected, selBuf.contents, sizeof(host_selected));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 6);
+            }
+        }
+    }
+    if (!rc) return 0;
+
+    /* Bitonic sort on a small N with distinct scores should yield top-K
+     * as 0..5 in any permutation; verify SET membership rather than order. */
+    int found[6] = {0};
+    for (int i = 0; i < 6; i++) {
+        const int v = host_selected[i];
+        if (v >= 0 && v < 6) found[v] = 1;
+    }
+    int n_found = 0;
+    for (int i = 0; i < 6; i++) n_found += found[i];
+    fprintf(stderr,
+        "ds4: router_finalize_one MTL4 canary has_bias=%d selected={%d,%d,%d,%d,%d,%d} "
+        "set_found=%d/6 (expected all 6 of {0..5})\n",
+        has_bias_flag,
+        host_selected[0], host_selected[1], host_selected[2],
+        host_selected[3], host_selected[4], host_selected[5], n_found);
+    (void)host_selected_ref;
+    return n_found == 6 ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +

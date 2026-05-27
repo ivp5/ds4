@@ -1827,6 +1827,11 @@ int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--moe-matmul-full-canary")) {
         return ds4_gpu_mtl4_moe_matmul_full_canary() ? 0 : 1;
     }
+    /* --router-finalize-one-canary [has_bias=0|1] : task #684 */
+    if (argc >= 2 && !strcmp(argv[1], "--router-finalize-one-canary")) {
+        const int has_bias = (argc >= 3) ? atoi(argv[2]) : 0;
+        return ds4_gpu_mtl4_router_finalize_one_canary(has_bias) ? 0 : 1;
+    }
     /* --hc-weighted-sum-canary [n_embd [n_hc [n_tokens]]] : task #683 */
     if (argc >= 2 && !strcmp(argv[1], "--hc-weighted-sum-canary")) {
         const uint32_t n_embd = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;

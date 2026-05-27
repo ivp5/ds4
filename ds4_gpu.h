@@ -1231,3 +1231,8 @@ int ds4_gpu_moe_matmul_icb_status(uint32_t *out_recorded, uint32_t *out_slots);
 /* silv 2026-05-27 task #683 — hc_weighted_sum: HC weighted sum
  * dst[d,t] = sum_h x[d,h,t] * weights[h,t]. First port from dsv4_hc.metal. */
 int ds4_gpu_mtl4_hc_weighted_sum_canary(uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens);
+
+/* silv 2026-05-27 task #684 — router_finalize_one MTL4. Completes the
+ * 5-kernel router cycle MTL4 set. 256-thread bitonic sort with optional
+ * bias + hash-mode bypass. */
+int ds4_gpu_mtl4_router_finalize_one_canary(int has_bias_flag);
