@@ -589,10 +589,36 @@ int ds4_hot_dispatch_layer_cpu(const ds4_hot_expert_store *store,
     for (uint32_t s = 0; s < n_selected; s++) {
         const int32_t exp_id = selected[s];
         if (exp_id < 0) continue;
-        const _Float16 *gate_tile = (const _Float16 *)ds4_hot_get_gate_fp16(store, layer, (uint32_t)exp_id);
-        const _Float16 *up_tile   = (const _Float16 *)ds4_hot_get_up_fp16(store, layer, (uint32_t)exp_id);
+
+        /* silv 2026-05-27 task #651 — organ-skip hooks for harm scorer.
+         *
+         * SwiGLU's mid = silu(gate)*up*ew couples gate and up multiplicatively,
+         * so naive zero-organ-output collapses to per-expert zeroing. The
+         * honest per-organ semantics:
+         *
+         *  GATE skip: gate_out := 1.0 → mid = silu(1)*up*ew = 0.731*up*ew
+         *             (measures SwiGLU gating contribution holding up live)
+         *  UP   skip: up_out := 1.0 → mid = silu(gate)*ew
+         *             (measures up-projection holding gating non-linearity)
+         *  DOWN skip: continue (no expert contribution at all)
+         *             (per-expert importance baseline)
+         *
+         * All three give distinct readout signals. See
+         * tmp/20260527_harm_scorer/DESIGN.md for the falsification register.
+         */
+        const int skip_gate = ds4_organ_should_skip(layer, (uint32_t)exp_id, DS4_ORGAN_GATE);
+        const int skip_up   = ds4_organ_should_skip(layer, (uint32_t)exp_id, DS4_ORGAN_UP);
+        const int skip_down = ds4_organ_should_skip(layer, (uint32_t)exp_id, DS4_ORGAN_DOWN);
+
+        if (skip_down) continue; /* cheapest path — whole-expert ablation */
+
+        const _Float16 *gate_tile = NULL, *up_tile = NULL;
+        if (!skip_gate) gate_tile = (const _Float16 *)ds4_hot_get_gate_fp16(store, layer, (uint32_t)exp_id);
+        if (!skip_up)   up_tile   = (const _Float16 *)ds4_hot_get_up_fp16(store, layer, (uint32_t)exp_id);
         const _Float16 *down_tile = (const _Float16 *)ds4_hot_get_down_fp16(store, layer, (uint32_t)exp_id);
-        if (!gate_tile || !up_tile || !down_tile) return -1;
+        if (!down_tile) return -1;
+        if (!skip_gate && !gate_tile) return -1;
+        if (!skip_up && !up_tile)     return -1;
 
         /* For DS4-Flash: n_rows=128, n_pairs=2048 for gate/up; n_pairs=1024
          * for down. The values are encoded in the tile dimensions when the
@@ -604,26 +630,36 @@ int ds4_hot_dispatch_layer_cpu(const ds4_hot_expert_store *store,
         const uint32_t n_down  = 1024;     /* down n_pairs (half) */
 
         /* gate_out[p] = sum over rows: input[r*2+0] * gate[r*np+p][0] +
-         *                              input[r*2+1] * gate[r*np+p][1] */
-        for (uint32_t p = 0; p < n_pairs; p++) {
-            float acc = 0.0f;
-            for (uint32_t r = 0; r < n_rows; r++) {
-                const uint32_t base = (r * n_pairs + p) * 2;
-                acc += input_fp32[r * 2 + 0] * (float)gate_tile[base + 0]
-                     + input_fp32[r * 2 + 1] * (float)gate_tile[base + 1];
+         *                              input[r*2+1] * gate[r*np+p][1]
+         * SKIP semantics: replace with multiplicative identity (1.0). */
+        if (skip_gate) {
+            for (uint32_t p = 0; p < n_pairs; p++) gate_out[p] = 1.0f;
+        } else {
+            for (uint32_t p = 0; p < n_pairs; p++) {
+                float acc = 0.0f;
+                for (uint32_t r = 0; r < n_rows; r++) {
+                    const uint32_t base = (r * n_pairs + p) * 2;
+                    acc += input_fp32[r * 2 + 0] * (float)gate_tile[base + 0]
+                         + input_fp32[r * 2 + 1] * (float)gate_tile[base + 1];
+                }
+                gate_out[p] = acc;
             }
-            gate_out[p] = acc;
         }
 
-        /* up_out[p] = sum over rows: input · up[r*np+p] */
-        for (uint32_t p = 0; p < n_pairs; p++) {
-            float acc = 0.0f;
-            for (uint32_t r = 0; r < n_rows; r++) {
-                const uint32_t base = (r * n_pairs + p) * 2;
-                acc += input_fp32[r * 2 + 0] * (float)up_tile[base + 0]
-                     + input_fp32[r * 2 + 1] * (float)up_tile[base + 1];
+        /* up_out[p] = sum over rows: input · up[r*np+p]
+         * SKIP semantics: replace with multiplicative identity (1.0). */
+        if (skip_up) {
+            for (uint32_t p = 0; p < n_pairs; p++) up_out[p] = 1.0f;
+        } else {
+            for (uint32_t p = 0; p < n_pairs; p++) {
+                float acc = 0.0f;
+                for (uint32_t r = 0; r < n_rows; r++) {
+                    const uint32_t base = (r * n_pairs + p) * 2;
+                    acc += input_fp32[r * 2 + 0] * (float)up_tile[base + 0]
+                         + input_fp32[r * 2 + 1] * (float)up_tile[base + 1];
+                }
+                up_out[p] = acc;
             }
-            up_out[p] = acc;
         }
 
         /* SwiGLU fused with expert weight: mid[i] = swiglu(gate, up) * weight */

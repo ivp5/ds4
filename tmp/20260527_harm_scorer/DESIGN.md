@@ -212,16 +212,84 @@ static inline int ds4_organ_should_skip(uint32_t L, uint32_t E, uint32_t K) {
 }
 ```
 
-At the dispatch site (CPU path in ds4.c + Metal path in ds4_metal.m):
+### Ablation semantic — REVISED 2026-05-27 post-Phase-A
 
-```c
-if (ds4_organ_should_skip(layer, expert, GATE)) /* zero gate output */;
-if (ds4_organ_should_skip(layer, expert, UP))   /* zero up output */;
-if (ds4_organ_should_skip(layer, expert, DOWN)) /* zero down output */;
+**Initial naive plan**: "zero the organ output" per-(L, E, K). This is
+WRONG because SwiGLU couples gate and up multiplicatively:
+
+```
+mid[p] = silu(gate_out[p]) * up_out[p] * expert_weight
+       = gate_out[p] * sigmoid(gate_out[p]) * up_out[p] * ew
 ```
 
-The "zero output" semantics is the cleanest ablation. Alternatives
-(random output, mean output) are second-order; start with zero.
+Zero-ablation collapses:
+- GATE zero (gate_out := 0): silu(0) = 0 → mid = 0 → no expert contribution
+- UP zero   (up_out   := 0): mid = silu(gate)*0 = 0 → no expert contribution
+- DOWN zero (skip down dispatch): no expert contribution
+
+All three collapse to "expert is zeroed" — that's per-(L, E) granularity,
+not per-(L, E, K). The per-organ flags are then overkill for what zero
+actually measures.
+
+**Honest per-organ semantic**: replace the ablated organ with the
+MULTIPLICATIVE IDENTITY (1.0), keeping the other organs live:
+
+- **GATE skip**: gate_out := 1.0 broadcast → mid = silu(1) * up * ew
+  = 0.731 * up * ew. Measures "what does the SwiGLU gating modulation
+  contribute, holding up-projection live?"
+- **UP skip**: up_out := 1.0 broadcast → mid = silu(gate) * 1 * ew
+  = silu(gate) * ew. Measures "what does the up-projection contribute,
+  holding gate's non-linearity live?"
+- **DOWN skip**: skip down dispatch for this expert (no output add).
+  Equivalent to expert-zero. Measures "what does this expert contribute
+  to readout?" (per-expert importance baseline).
+
+These three are MATHEMATICALLY DISTINCT — they give different signed-harm
+signals per organ. GATE and UP both keep the expert active but ablate
+half the SwiGLU; DOWN ablates everything.
+
+silu(1) ≈ 0.731 (the multiplicative identity through SwiGLU). 1.0 is
+the cleanest principled replacement — it's the value that makes
+silu(x)*up = up (no gating effect) when x=1.
+
+Alternative replacements (left for future investigation, not Phase A.1):
+- Mean over experts at this organ (requires precomputed mean per layer)
+- Identity-projection (only works if organ matrix is square — none are)
+- Low-rank substitute (SVD-derived)
+- Source-baseline restoration (requires a higher-precision baseline run;
+  codex H2022's original methodology)
+
+At the dispatch site (CPU path):
+
+```c
+for (uint32_t s = 0; s < n_selected; s++) {
+    const int32_t E = selected[s];
+    if (E < 0) continue;
+
+    /* DOWN skip = full expert ablation; cheapest path. */
+    if (ds4_organ_should_skip(layer, E, DS4_ORGAN_DOWN)) continue;
+
+    /* gate matmul (or replace with 1.0) */
+    if (ds4_organ_should_skip(layer, E, DS4_ORGAN_GATE)) {
+        for (uint32_t p = 0; p < n_pairs; p++) gate_out[p] = 1.0f;
+    } else {
+        /* existing gate matmul */
+    }
+
+    /* up matmul (or replace with 1.0) */
+    if (ds4_organ_should_skip(layer, E, DS4_ORGAN_UP)) {
+        for (uint32_t p = 0; p < n_pairs; p++) up_out[p] = 1.0f;
+    } else {
+        /* existing up matmul */
+    }
+
+    /* SwiGLU + down: unchanged */
+}
+```
+
+The Metal kernel hook is separate (Phase A.2, deferred); the harm scorer
+runs with --cpu-moe forced for now. CPU dispatch is ~118 t/s single-thread;
+acceptable for 10-hour offline scoring runs.
 
 ### Phase B — harm-scoring driver
 
