@@ -2211,6 +2211,14 @@ int main(int argc, char **argv) {
         const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
         return ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_canary(m, n, k, e) ? 0 : 1;
     }
+    /* --mul-mm-id-iq2-xxs-n64-canary [M [N [K [E]]]] : #739 IQ2_XXS routed n64 */
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-iq2-xxs-n64-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
+        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
+        return ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_n64_canary(m, n, k, e) ? 0 : 1;
+    }
     /* --mul-mm-id-q4-k-canary [M [N [K [E]]]] : #736 Q4_K routed MoE matmul */
     if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q4-k-canary")) {
         const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;

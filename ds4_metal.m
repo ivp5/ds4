@@ -32053,6 +32053,442 @@ int ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_canary(uint32_t M, uint32_t N, uint32_t K
     return (mismatch == 0) ? 1 : 0;
 }
 
+/* mul_mm_id_iq2_xxs_f32_n64 MTL4 port (silv 2026-05-28 #739)         */
+/* ============================================================ */
+/* Routed MoE IQ2_XXS prefill matmul. DS4 production critical path.
+ * Sister of #734 routed Q8_0 with IQ2_XXS dequant + 2 KB grid table.
+ *
+ * IQ2_XXS layout: block_iq2_xxs = { half d; ushort qs[32]; } = 66 B
+ * per 256-element block. Dequant LUT: 256-entry ulong grid lookup
+ * via aux8 codes, ksigns_iq2xs[128] for sign decoding, kmask_iq2xs[8]
+ * bit-mask. dl = d * (0.5 + (aux32_s >> 28)) * 0.25 scale per ib32.
+ *
+ * Template params: NR1=32 (NR0=64, NK=32 fixed). nl=16 (QK_NL define).
+ * Each dequantize_iq2_xxs call produces 16 values; 16 calls per block.
+ *
+ * Same plumbing as #734: tpe[im] + hids[im*ne21 + r1 + lr1] routing;
+ * id = idt*ne20 + ide encoding; output write at r0 + ide*ne0 + idt*ne1*ne0.
+ */
+
+static id<MTLComputePipelineState> g_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline;
+static int g_mul_mm_id_iq2_xxs_f32_n64_mtl4_init_attempted;
+static int g_mul_mm_id_iq2_xxs_f32_n64_mtl4_init_ok;
+
+static int ds4_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline_init(void) {
+    if (g_mul_mm_id_iq2_xxs_f32_n64_mtl4_init_attempted) return g_mul_mm_id_iq2_xxs_f32_n64_mtl4_init_ok;
+    g_mul_mm_id_iq2_xxs_f32_n64_mtl4_init_attempted = 1;
+
+    NSString *source = [NSString stringWithFormat:
+        @"#include <metal_stdlib>\n"
+         "#include <metal_simdgroup_matrix>\n"
+         "using namespace metal;\n"
+         "#define FC_MUL_MM 700\n"
+         "#define QK_K 256\n"
+         "constant short FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];\n"
+         "constant short FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];\n"
+         "constant uchar kmask_iq2xs[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };\n"
+         "constant uchar ksigns_iq2xs[128] = {\n"
+         "    0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,\n"
+         "    144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,\n"
+         "    160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,\n"
+         "    48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,\n"
+         "    192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207,\n"
+         "    80, 209, 210, 83, 212, 85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95,\n"
+         "    96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,\n"
+         "    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,\n"
+         "};\n"
+         "constant ulong iq2xxs_grid[256] = {\n"
+         "    0x0808080808080808UL, 0x080808080808082bUL, 0x0808080808081919UL, 0x0808080808082b08UL,\n"
+         "    0x0808080808082b2bUL, 0x0808080808190819UL, 0x0808080808191908UL, 0x08080808082b0808UL,\n"
+         "    0x08080808082b082bUL, 0x08080808082b2b08UL, 0x08080808082b2b2bUL, 0x0808080819080819UL,\n"
+         "    0x0808080819081908UL, 0x0808080819190808UL, 0x0808080819192b08UL, 0x08080808192b0819UL,\n"
+         "    0x08080808192b1908UL, 0x080808082b080808UL, 0x080808082b08082bUL, 0x080808082b082b2bUL,\n"
+         "    0x080808082b2b082bUL, 0x0808081908080819UL, 0x0808081908081908UL, 0x0808081908190808UL,\n"
+         "    0x0808081908191919UL, 0x0808081919080808UL, 0x080808192b081908UL, 0x080808192b192b08UL,\n"
+         "    0x0808082b08080808UL, 0x0808082b0808082bUL, 0x0808082b082b082bUL, 0x0808082b2b08082bUL,\n"
+         "    0x0808190808080819UL, 0x0808190808081908UL, 0x0808190808190808UL, 0x08081908082b0819UL,\n"
+         "    0x08081908082b1908UL, 0x0808190819080808UL, 0x080819081908082bUL, 0x0808190819082b08UL,\n"
+         "    0x08081908192b0808UL, 0x080819082b080819UL, 0x080819082b081908UL, 0x080819082b190808UL,\n"
+         "    0x080819082b2b1908UL, 0x0808191908080808UL, 0x080819190808082bUL, 0x0808191908082b08UL,\n"
+         "    0x08081919082b0808UL, 0x080819191908192bUL, 0x08081919192b2b19UL, 0x080819192b080808UL,\n"
+         "    0x080819192b190819UL, 0x0808192b08082b19UL, 0x0808192b08190808UL, 0x0808192b19080808UL,\n"
+         "    0x0808192b2b081908UL, 0x0808192b2b2b1908UL, 0x08082b0808080808UL, 0x08082b0808081919UL,\n"
+         "    0x08082b0808082b08UL, 0x08082b0808191908UL, 0x08082b08082b2b08UL, 0x08082b0819080819UL,\n"
+         "    0x08082b0819081908UL, 0x08082b0819190808UL, 0x08082b081919082bUL, 0x08082b082b082b08UL,\n"
+         "    0x08082b1908081908UL, 0x08082b1919080808UL, 0x08082b2b0808082bUL, 0x08082b2b08191908UL,\n"
+         "    0x0819080808080819UL, 0x0819080808081908UL, 0x0819080808190808UL, 0x08190808082b0819UL,\n"
+         "    0x0819080819080808UL, 0x08190808192b0808UL, 0x081908082b081908UL, 0x081908082b190808UL,\n"
+         "    0x081908082b191919UL, 0x0819081908080808UL, 0x0819081908082b08UL, 0x08190819082b0808UL,\n"
+         "    0x0819081919190808UL, 0x0819081919192b2bUL, 0x081908192b080808UL, 0x0819082b082b1908UL,\n"
+         "    0x0819082b19081919UL, 0x0819190808080808UL, 0x0819190808082b08UL, 0x08191908082b0808UL,\n"
+         "    0x08191908082b1919UL, 0x0819190819082b19UL, 0x081919082b080808UL, 0x0819191908192b08UL,\n"
+         "    0x08191919192b082bUL, 0x0819192b08080808UL, 0x0819192b0819192bUL, 0x08192b0808080819UL,\n"
+         "    0x08192b0808081908UL, 0x08192b0808190808UL, 0x08192b0819080808UL, 0x08192b082b080819UL,\n"
+         "    0x08192b1908080808UL, 0x08192b1908081919UL, 0x08192b192b2b0808UL, 0x08192b2b19190819UL,\n"
+         "    0x082b080808080808UL, 0x082b08080808082bUL, 0x082b080808082b2bUL, 0x082b080819081908UL,\n"
+         "    0x082b0808192b0819UL, 0x082b08082b080808UL, 0x082b08082b08082bUL, 0x082b0819082b2b19UL,\n"
+         "    0x082b081919082b08UL, 0x082b082b08080808UL, 0x082b082b0808082bUL, 0x082b190808080819UL,\n"
+         "    0x082b190808081908UL, 0x082b190808190808UL, 0x082b190819080808UL, 0x082b19081919192bUL,\n"
+         "    0x082b191908080808UL, 0x082b191919080819UL, 0x082b1919192b1908UL, 0x082b192b2b190808UL,\n"
+         "    0x082b2b0808082b08UL, 0x082b2b08082b0808UL, 0x082b2b082b191908UL, 0x082b2b2b19081908UL,\n"
+         "    0x1908080808080819UL, 0x1908080808081908UL, 0x1908080808190808UL, 0x1908080808192b08UL,\n"
+         "    0x19080808082b0819UL, 0x19080808082b1908UL, 0x1908080819080808UL, 0x1908080819082b08UL,\n"
+         "    0x190808081919192bUL, 0x19080808192b0808UL, 0x190808082b080819UL, 0x190808082b081908UL,\n"
+         "    0x190808082b190808UL, 0x1908081908080808UL, 0x19080819082b0808UL, 0x19080819192b0819UL,\n"
+         "    0x190808192b080808UL, 0x190808192b081919UL, 0x1908082b08080819UL, 0x1908082b08190808UL,\n"
+         "    0x1908082b19082b08UL, 0x1908082b1919192bUL, 0x1908082b192b2b08UL, 0x1908190808080808UL,\n"
+         "    0x1908190808082b08UL, 0x19081908082b0808UL, 0x190819082b080808UL, 0x190819082b192b19UL,\n"
+         "    0x190819190819082bUL, 0x19081919082b1908UL, 0x1908192b08080808UL, 0x19082b0808080819UL,\n"
+         "    0x19082b0808081908UL, 0x19082b0808190808UL, 0x19082b0819080808UL, 0x19082b0819081919UL,\n"
+         "    0x19082b1908080808UL, 0x19082b1919192b08UL, 0x19082b19192b0819UL, 0x19082b192b08082bUL,\n"
+         "    0x19082b2b19081919UL, 0x19082b2b2b190808UL, 0x1919080808080808UL, 0x1919080808082b08UL,\n"
+         "    0x1919080808190819UL, 0x1919080808192b19UL, 0x19190808082b0808UL, 0x191908082b080808UL,\n"
+         "    0x191908082b082b08UL, 0x1919081908081908UL, 0x191908191908082bUL, 0x191908192b2b1908UL,\n"
+         "    0x1919082b2b190819UL, 0x191919082b190808UL, 0x191919082b19082bUL, 0x1919191908082b2bUL,\n"
+         "    0x1919192b08080819UL, 0x1919192b19191908UL, 0x19192b0808080808UL, 0x19192b0808190819UL,\n"
+         "    0x19192b0808192b19UL, 0x19192b08192b1908UL, 0x19192b1919080808UL, 0x19192b2b08082b08UL,\n"
+         "    0x192b080808081908UL, 0x192b080808190808UL, 0x192b080819080808UL, 0x192b0808192b2b08UL,\n"
+         "    0x192b081908080808UL, 0x192b081919191919UL, 0x192b082b08192b08UL, 0x192b082b192b0808UL,\n"
+         "    0x192b190808080808UL, 0x192b190808081919UL, 0x192b191908190808UL, 0x192b19190819082bUL,\n"
+         "    0x192b19192b081908UL, 0x192b2b081908082bUL, 0x2b08080808080808UL, 0x2b0808080808082bUL,\n"
+         "    0x2b08080808082b2bUL, 0x2b08080819080819UL, 0x2b0808082b08082bUL, 0x2b08081908081908UL,\n"
+         "    0x2b08081908192b08UL, 0x2b08081919080808UL, 0x2b08082b08190819UL, 0x2b08190808080819UL,\n"
+         "    0x2b08190808081908UL, 0x2b08190808190808UL, 0x2b08190808191919UL, 0x2b08190819080808UL,\n"
+         "    0x2b081908192b0808UL, 0x2b08191908080808UL, 0x2b0819191908192bUL, 0x2b0819192b191908UL,\n"
+         "    0x2b08192b08082b19UL, 0x2b08192b19080808UL, 0x2b08192b192b0808UL, 0x2b082b080808082bUL,\n"
+         "    0x2b082b1908081908UL, 0x2b082b2b08190819UL, 0x2b19080808081908UL, 0x2b19080808190808UL,\n"
+         "    0x2b190808082b1908UL, 0x2b19080819080808UL, 0x2b1908082b2b0819UL, 0x2b1908190819192bUL,\n"
+         "    0x2b1908192b080808UL, 0x2b19082b19081919UL, 0x2b19190808080808UL, 0x2b191908082b082bUL,\n"
+         "    0x2b19190819081908UL, 0x2b19191919190819UL, 0x2b192b082b080819UL, 0x2b192b19082b0808UL,\n"
+         "    0x2b2b08080808082bUL, 0x2b2b080819190808UL, 0x2b2b08082b081919UL, 0x2b2b081908082b19UL,\n"
+         "    0x2b2b082b08080808UL, 0x2b2b190808192b08UL, 0x2b2b2b0819190808UL, 0x2b2b2b1908081908UL,\n"
+         "};\n"
+         "struct block_iq2_xxs { half d; ushort qs[QK_K/8]; };\n"
+         "static inline void dequantize_iq2_xxs_4x4(device const block_iq2_xxs *xb, short il, thread half4x4 &reg) {\n"
+         "  const float d = (float)xb->d;\n"
+         "  const int ib32 = il/2;\n"
+         "  il = il%%2;\n"
+         "  device const ushort *q2 = xb->qs + 4*ib32;\n"
+         "  const uint aux32_g = (uint)q2[0] | ((uint)q2[1] << 16);\n"
+         "  const uint aux32_s = (uint)q2[2] | ((uint)q2[3] << 16);\n"
+         "  thread const uchar *aux8 = (thread const uchar *)&aux32_g;\n"
+         "  const float dl = d * (0.5f + (float)(aux32_s >> 28)) * 0.25f;\n"
+         "  constant uchar *grid_a = (constant uchar *)(iq2xxs_grid + aux8[2*il+0]);\n"
+         "  uchar signs_a = ksigns_iq2xs[(aux32_s >> (14*il)) & 127];\n"
+         "  for (int i = 0; i < 8; ++i) {\n"
+         "    reg[i/4][i%%4] = (half)(dl * (float)grid_a[i] * ((signs_a & kmask_iq2xs[i]) ? -1.0f : 1.0f));\n"
+         "  }\n"
+         "  constant uchar *grid_b = (constant uchar *)(iq2xxs_grid + aux8[2*il+1]);\n"
+         "  uchar signs_b = ksigns_iq2xs[(aux32_s >> (14*il+7)) & 127];\n"
+         "  for (int i = 0; i < 8; ++i) {\n"
+         "    reg[2+i/4][i%%4] = (half)(dl * (float)grid_b[i] * ((signs_b & kmask_iq2xs[i]) ? -1.0f : 1.0f));\n"
+         "  }\n"
+         "}\n"
+         "struct mm_id_args {\n"
+         "  int ne00; int ne02;\n"
+         "  ulong nb01; ulong nb02; ulong nb03;\n"
+         "  int ne11;\n"
+         "  ulong nb10; ulong nb11; ulong nb12; ulong nb13;\n"
+         "  int ne20; int ne21;\n"
+         "  int ne0; int ne1;\n"
+         "  short r2; short r3;\n"
+         "};\n"
+         "kernel void mul_mm_id_iq2_xxs_f32_n64_mtl4(\n"
+         "    device const mm_id_args *args [[buffer(0)]],\n"
+         "    device const char       *src0 [[buffer(1)]],\n"
+         "    device const char       *src1 [[buffer(2)]],\n"
+         "    device const char       *htpe [[buffer(3)]],\n"
+         "    device const char       *hids [[buffer(4)]],\n"
+         "    device       char       *dst  [[buffer(5)]],\n"
+         "    threadgroup  char       *shmem [[threadgroup(0)]],\n"
+         "    uint3   tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort  tiitg [[thread_index_in_threadgroup]],\n"
+         "    ushort  tiisg [[thread_index_in_simdgroup]],\n"
+         "    ushort  sgitg [[simdgroup_index_in_threadgroup]]) {\n"
+         "  threadgroup half *sa = (threadgroup half *)(shmem);\n"
+         "  threadgroup half *sb = (threadgroup half *)(shmem + 4096);\n"
+         "  constexpr int NR0 = 64;\n"
+         "  constexpr int NR1 = 64;\n"
+         "  constexpr int NK  = 32;\n"
+         "  constexpr int NL0 = NK/16;\n"
+         "  constexpr int NL1 = NK/8;\n"
+         "  constexpr int nl  = 16;\n"
+         "  const int im = tgpig.z;\n"
+         "  const int r0 = tgpig.y*NR0;\n"
+         "  const int r1 = tgpig.x*NR1;\n"
+         "  device const uint  *tpe_u32 = (device const uint *)htpe;\n"
+         "  device const int   *ids_i32 = (device const int  *)hids;\n"
+         "  const int neh1 = (int)tpe_u32[im];\n"
+         "  if (r1 >= neh1) return;\n"
+         "  const short nr0 = (args->ne0 - r0 < NR0) ? (args->ne0 - r0) : NR0;\n"
+         "  const short nr1 = (neh1 - r1 < NR1) ? (neh1 - r1) : NR1;\n"
+         "  const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;\n"
+         "  const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;\n"
+         "  const short il0 = (tiitg %% NL0);\n"
+         "  short il = il0;\n"
+         "  const int id = ids_i32[im*args->ne21 + r1 + lr1];\n"
+         "  const short i11 = (id %% args->ne20) %% args->ne11;\n"
+         "  const short i12 = (id / args->ne20);\n"
+         "  const short i13 = 0;\n"
+         "  const ulong offset0 = im*args->nb02 + i13*args->nb03;\n"
+         "  const short offset1 = il0/nl;\n"
+         "  device const block_iq2_xxs *x = (device const block_iq2_xxs *)\n"
+         "    (src0 + args->nb01*(r0 + lr0) + offset0) + offset1;\n"
+         "  const short iy = 8*(tiitg %% NL1);\n"
+         "  device const half *y = (device const half *)(src1\n"
+         "    + args->nb13*i13 + args->nb12*i12 + args->nb11*i11 + args->nb10*iy);\n"
+         "  simdgroup_half8x8 ma[4];\n"
+         "  simdgroup_half8x8 mb[2];\n"
+         "  simdgroup_float8x8 mc[8];\n"
+         "  for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+         "  for (int loop_k = 0; loop_k < args->ne00; loop_k += NK) {\n"
+         "    half4x4 temp_a;\n"
+         "    dequantize_iq2_xxs_4x4(x, il, temp_a);\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    for (short i = 0; i < 16; i++) {\n"
+         "      const short sx = 2*il0 + i/8;\n"
+         "      const short sy = (tiitg/NL0)/8;\n"
+         "      const short lx = (tiitg/NL0)%%8;\n"
+         "      const short ly = i%%8;\n"
+         "      const short ib = 8*sx + sy;\n"
+         "      *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%%4];\n"
+         "    }\n"
+         "    if (FC_mul_mm_bc_inp) {\n"
+         "      for (short i = 0; i < 8; ++i) {\n"
+         "        const short sx = (tiitg%%NL1);\n"
+         "        const short sy = (tiitg/NL1)/8;\n"
+         "        const short lx = i;\n"
+         "        const short ly = (tiitg/NL1)%%8;\n"
+         "        const short ib = 4*sx + sy;\n"
+         "        *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args->ne00 ? *((device half *)y + i) : half(0);\n"
+         "      }\n"
+         "    } else {\n"
+         "      const short sx = (tiitg%%NL1);\n"
+         "      const short sy = (tiitg/NL1)/8;\n"
+         "      const short ly = (tiitg/NL1)%%8;\n"
+         "      const short ib = 4*sx + sy;\n"
+         "      *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *)y);\n"
+         "    }\n"
+         "    il = (il + 2 < nl) ? il + 2 : il %% nl;\n"
+         "    x = (il < 2) ? x + (2 + nl - 1)/nl : x;\n"
+         "    y += NK;\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    threadgroup const half *lsma = (sa + 4*64*(sgitg%%2));\n"
+         "    threadgroup const half *lsmb = (sb + 2*64*(sgitg/2));\n"
+         "    for (short ik = 0; ik < NK/8; ik++) {\n"
+         "      simdgroup_barrier(mem_flags::mem_none);\n"
+         "      for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, ulong2(0, 0), false);\n"
+         "      simdgroup_barrier(mem_flags::mem_none);\n"
+         "      for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, ulong2(0, 0), false);\n"
+         "      simdgroup_barrier(mem_flags::mem_none);\n"
+         "      for (short i = 0; i < 8; i++) simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%%4], mc[i]);\n"
+         "      lsma += 8*64;\n"
+         "      lsmb += 4*64;\n"
+         "    }\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  threadgroup float *temp_str = ((threadgroup float *)shmem)\n"
+         "    + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;\n"
+         "  for (short i = 0; i < 8; i++) {\n"
+         "    simdgroup_store(mc[i], temp_str + 8*(i%%4) + 8*NR0*(i/4), NR0, ulong2(0, 0), false);\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (short j = sgitg; j < nr1; j += 4) {\n"
+         "    const int idj = ids_i32[im*args->ne21 + r1 + j];\n"
+         "    const short ide = idj %% args->ne20;\n"
+         "    const short idt = idj / args->ne20;\n"
+         "    device float *D = (device float *)dst + r0 + ide*args->ne0 + idt*args->ne1*args->ne0;\n"
+         "    threadgroup float *C = (threadgroup float *)shmem + j*NR0;\n"
+         "    int i = tiisg;\n"
+         "    for (; i < nr0; i += 32) D[i] = C[i];\n"
+         "  }\n"
+         "}\n"];
+
+    const ds4_mtl4_fc_short fcs[] = {{0, 700}, {0, 701}};
+    g_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_mul_mm_id_iq2_xxs_f32_n64_mtl4", @"mul_mm_id_iq2_xxs_f32_n64_mtl4", 1024, fcs, 2);
+    g_mul_mm_id_iq2_xxs_f32_n64_mtl4_init_ok = (g_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline != nil) ? 1 : 0;
+    return g_mul_mm_id_iq2_xxs_f32_n64_mtl4_init_ok;
+}
+
+
+int ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_n64_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline_init()) return 0;
+    if ((M % 64) != 0 || (N % 32) != 0 || (K % 256) != 0 || n_experts == 0) {
+        fprintf(stderr, "ds4: mul_mm_id_iq2_xxs canary needs M%%64==0, N%%32==0, K%%256==0, n_experts>0 "
+                "(got %u,%u,%u,%u)\n", M, N, K, n_experts);
+        return 0;
+    }
+    /* IQ2_XXS dequant chain (verified vs metal/moe.metal): per block_iq2_xxs (66 B):
+     *   aux32_g = qs[0] | (qs[1]<<16);  aux32_s = qs[2] | (qs[3]<<16);
+     *   aux8 = (uchar*)&aux32_g (low byte first)
+     *   dl = d * (0.5 + (aux32_s>>28)) * 0.25
+     *   For il in [0,1]: 8 vals via grid[aux8[2*il+0]] * sign(ksigns[(aux32_s>>(14*il))&127])
+     *                    8 vals via grid[aux8[2*il+1]] * sign(ksigns[(aux32_s>>(14*il+7))&127])
+     *
+     * Test design: set ALL qs bytes = 0. Then:
+     *   aux32_g=0, aux32_s=0, aux8=[0,0,0,0]
+     *   dl = d * 0.5 * 0.25 = d * 0.125
+     *   grid[0] = 0x0808080808080808 (all 8s as bytes)
+     *   signs[0] = 0 → all positive
+     *   each dequant val = dl * 8 = d * 1.0
+     *
+     * With d set per-expert via varying row: expected[e*M+m] = sum_k d_e_m = K * d_e_m. */
+    const uint64_t qs_per_block = 32;  /* QK_K/8 = 256/8 = 32 ushorts */
+    const uint64_t block_bytes = 2 + qs_per_block * 2;  /* half + 32 ushorts = 66 B */
+    const uint32_t n_blocks_per_row = K / 256u;
+    const uint64_t iq2_row_bytes = (uint64_t)n_blocks_per_row * block_bytes;
+    const uint64_t b_q8_total = (uint64_t)n_experts * M * iq2_row_bytes;
+    const uint64_t a_total = (uint64_t)n_experts * K;
+    const uint64_t c_per_token = (uint64_t)M;
+    const uint64_t c_total = (uint64_t)n_experts * c_per_token;
+
+    uint8_t *host_b = (uint8_t *)calloc(b_q8_total, 1);
+    uint16_t *host_a = (uint16_t *)calloc(a_total, sizeof(uint16_t));
+    float *host_c = (float *)calloc(c_total, sizeof(float));
+    uint32_t *host_tpe = (uint32_t *)calloc(n_experts, sizeof(uint32_t));
+    int32_t *host_ids = (int32_t *)calloc(n_experts, sizeof(int32_t));
+    float *expected = (float *)calloc(c_total, sizeof(float));
+    if (!host_b || !host_a || !host_c || !host_tpe || !host_ids || !expected) {
+        free(host_b); free(host_a); free(host_c); free(host_tpe); free(host_ids); free(expected);
+        return 0;
+    }
+
+    /* For each (expert, row): set d = 0.5 + (e * M + m) * 0.001 (small varying scales).
+     * qs all zeros → every dequant val = d. */
+    for (uint32_t e = 0; e < n_experts; e++) {
+        for (uint32_t m = 0; m < M; m++) {
+            const float d_f = 0.5f + (float)(e * M + m) * 0.001f;
+            const _Float16 d_h = (_Float16)d_f;
+            uint8_t *row = host_b + ((uint64_t)e * M + m) * iq2_row_bytes;
+            for (uint32_t b = 0; b < n_blocks_per_row; b++) {
+                uint8_t *blk = row + (uint64_t)b * block_bytes;
+                memcpy(blk, &d_h, sizeof(d_h));   /* d at offset 0 (2 bytes) */
+                /* qs[0..32] all zero already from calloc */
+            }
+            /* Expected: sum_k 1.0 * d = K * d (input all 1.0) */
+            expected[(uint64_t)e * c_per_token + m] = (float)K * (float)d_h;
+        }
+        host_tpe[e] = 1u;
+        host_ids[e] = (int32_t)e;
+    }
+    _Float16 one = (_Float16)1.0f;
+    for (uint64_t i = 0; i < a_total; i++) memcpy(&host_a[i], &one, sizeof(one));
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bBuf = [g_device newBufferWithBytes:host_b length:b_q8_total options:MTLResourceStorageModeShared];
+        id<MTLBuffer> aBuf = [g_device newBufferWithBytes:host_a length:a_total*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> tpeBuf = [g_device newBufferWithBytes:host_tpe length:n_experts*sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids length:n_experts*sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cBuf = [g_device newBufferWithLength:c_total*sizeof(float) options:MTLResourceStorageModeShared];
+
+        struct {
+            int ne00, ne02;
+            uint64_t nb01, nb02, nb03;
+            int ne11;
+            uint64_t nb10, nb11, nb12, nb13;
+            int ne20, ne21;
+            int ne0, ne1;
+            int16_t r2, r3;
+        } args;
+        memset(&args, 0, sizeof(args));
+        args.ne00 = K;
+        args.ne02 = n_experts;
+        args.nb01 = iq2_row_bytes;
+        args.nb02 = (uint64_t)M * iq2_row_bytes;
+        args.nb03 = args.nb02 * n_experts;
+        args.ne11 = 1;
+        args.nb10 = sizeof(uint16_t);
+        args.nb11 = (uint64_t)K * sizeof(uint16_t);
+        args.nb12 = args.nb11;
+        args.nb13 = args.nb12 * n_experts;
+        args.ne20 = 1;
+        args.ne21 = 1;
+        args.ne0 = M; args.ne1 = 1;
+        args.r2 = 1; args.r3 = 1;
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[6] = {(id)argsBuf, (id)bBuf, (id)aBuf, (id)tpeBuf, (id)idsBuf, (id)cBuf};
+            [residency addAllocations:allocs count:6];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:bBuf.gpuAddress atIndex:1];
+                [argTable setAddress:aBuf.gpuAddress atIndex:2];
+                [argTable setAddress:tpeBuf.gpuAddress atIndex:3];
+                [argTable setAddress:idsBuf.gpuAddress atIndex:4];
+                [argTable setAddress:cBuf.gpuAddress atIndex:5];
+                NSUInteger shmem_bytes = 8192;
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_mul_mm_id_iq2_xxs_f32_n64_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(1, M / 64, n_experts)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_c, cBuf.contents, c_total * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 8);
+            }
+        }
+    }
+    if (!rc) {
+        free(host_b); free(host_a); free(host_c);
+        free(host_tpe); free(host_ids); free(expected);
+        return 0;
+    }
+
+    /* IQ2_XXS dequant uses LUT precision so drift is mostly from FP16 staging:
+     * dl is float, intermediate is half (mb tile), accumulator is float.
+     * Bound: 2% relative on K=256 (single block per row) which is the minimum granularity. */
+    int mismatch = 0;
+    double max_rel = 0.0;
+    for (uint64_t i = 0; i < c_total; i++) {
+        const double d = fabs((double)(host_c[i] - expected[i]));
+        const double rel = d / (fabs((double)expected[i]) + 1e-3);
+        if (rel > max_rel) max_rel = rel;
+        if (rel > 5e-2) mismatch++;
+    }
+    fprintf(stderr,
+        "ds4: mul_mm_id_iq2_xxs_f32_n64 MTL4 canary M=%u N=%u K=%u E=%u mismatch=%d max_rel=%.4e "
+        "c[e0,0]=%.4f (ref=%.4f) c[e0,M-1]=%.4f c[eN-1,0]=%.4f\n",
+        M, N, K, n_experts, mismatch, max_rel,
+        (double)host_c[0], (double)expected[0],
+        (double)host_c[M - 1], (double)host_c[(uint64_t)(n_experts - 1) * c_per_token]);
+    free(host_b); free(host_a); free(host_c);
+    free(host_tpe); free(host_ids); free(expected);
+    return (mismatch == 0) ? 1 : 0;
+}
+
+/* ============================================================ */
+
 /* ============================================================ */
 /* mul_mm_id_q4_K_f32 MTL4 port (silv 2026-05-28 #736)            */
 /* ============================================================ */
