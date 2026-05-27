@@ -1124,3 +1124,8 @@ int ds4_gpu_mtl4_topk_mask_scatter_canary(uint32_t n_topk, uint32_t n_tokens, ui
  * scaled projection. Uses threadgroup scratch for parallel reduction. */
 int ds4_gpu_mtl4_indexer_weighted_sum_canary(uint32_t ne0, uint32_t ne1, uint32_t n_heads);
 int ds4_gpu_mtl4_dir_steering_canary(uint32_t width, uint32_t rows);
+
+/* silv 2026-05-27 task #676. sort_i32_rows_asc — bitonic-sort each row of
+ * top-K int32 indices into ascending order. top_k must be power-of-2,
+ * ≤ 256 (single-threadgroup constraint of bitonic sort). */
+int ds4_gpu_mtl4_sort_i32_rows_canary(uint32_t top_k, uint32_t n_rows);

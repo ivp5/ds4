@@ -1774,6 +1774,14 @@ int main(int argc, char **argv) {
         const uint32_t rows = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
         return ds4_gpu_mtl4_dir_steering_canary(width, rows) ? 0 : 1;
     }
+    /* --sort-i32-rows-canary [top_k [n_rows]] : task #676 MTL4 port of
+     * kernel_dsv4_sort_i32_rows_asc (dsv4_misc.metal:388). top_k must be
+     * power-of-2 and ≤ 256. */
+    if (argc >= 2 && !strcmp(argv[1], "--sort-i32-rows-canary")) {
+        const uint32_t top_k = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n_rows = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
+        return ds4_gpu_mtl4_sort_i32_rows_canary(top_k, n_rows) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
