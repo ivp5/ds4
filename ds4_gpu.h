@@ -1313,3 +1313,15 @@ int ds4_gpu_mtl4_get_rows_f32_canary(uint32_t n_table_rows, uint32_t row_width, 
  * of indices keyed by float values, descending order. Returns top_k
  * largest-value indices per row. Used by router top-K selection. */
 int ds4_gpu_mtl4_argsort_f32_i32_desc_canary(uint32_t row_n, uint32_t top_k);
+
+/* silv 2026-05-27 task #693 — cpy_f32_f32 MTL4. Generic f32→f32 typed
+ * copy/conversion between graph tensors. Used at graph boundaries for
+ * layout materialization. The templated MSL form also supports f32↔f16
+ * conversions which would be added as paired specializations. */
+int ds4_gpu_mtl4_cpy_f32_f32_canary(uint32_t n_rows, uint32_t row_width);
+
+/* silv 2026-05-27 task #694 — dsv4_hc_split_weighted_sum MTL4 (HC=4).
+ * Fused HC=4 split + HC-weighted embedding reduction per token row.
+ * tid 0 runs the Sinkhorn split path (#690), stashes pre[0..3] in
+ * shared mem; all threads then compute dst[d] = sum_h x[d,h] × pre[h]. */
+int ds4_gpu_mtl4_hc_split_weighted_sum_canary(uint32_t n_rows, uint32_t n_embd);

@@ -1918,6 +1918,18 @@ int main(int argc, char **argv) {
         const uint32_t top_k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 8;
         return ds4_gpu_mtl4_argsort_f32_i32_desc_canary(row_n, top_k) ? 0 : 1;
     }
+    /* --cpy-f32-f32-canary [n_rows [row_width]] : task #693 typed copy */
+    if (argc >= 2 && !strcmp(argv[1], "--cpy-f32-f32-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_cpy_f32_f32_canary(nr, rw) ? 0 : 1;
+    }
+    /* --hc-split-weighted-sum-canary [n_rows [n_embd]] : task #694 fused HC */
+    if (argc >= 2 && !strcmp(argv[1], "--hc-split-weighted-sum-canary")) {
+        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
+        const uint32_t ne = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 512;
+        return ds4_gpu_mtl4_hc_split_weighted_sum_canary(nr, ne) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);
