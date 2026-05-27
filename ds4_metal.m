@@ -80,6 +80,8 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
 /* silv 2026-05-27 — codec-aligned vanilla FP16 pair_swiglu (gated by DS4_HOT_FP16_KERNEL). */
 static id<MTLComputePipelineState> g_moe_mul_mv_id_fp16_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mm_id_fp16_pair_swiglu_pipeline;
+/* silv 2026-05-27 — Hadamard-16 batched FP16 (task #643, basis-transform unblocker). */
+static id<MTLComputePipelineState> g_hadamard16_fp16_batched_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q2_k_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q2_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pipeline;
@@ -1639,6 +1641,7 @@ static NSString *ds4_gpu_full_source(void) {
  @[@"DS4_METAL_NORM_SOURCE", @"metal/norm.metal"],
  @[@"DS4_METAL_BIN_SOURCE", @"metal/bin.metal"],
  @[@"DS4_METAL_SET_ROWS_SOURCE", @"metal/set_rows.metal"],
+ @[@"DS4_METAL_HADAMARD_SOURCE", @"metal/hadamard.metal"],
  ];
 
  NSMutableString *source = [NSMutableString stringWithString:base];
@@ -3106,6 +3109,14 @@ typedef struct {
  uint64_t dst_token_stride;
 } ds4_gpu_dsv4_moe_sum6_args;
 
+/* silv 2026-05-27 — Hadamard-16 batched FP16 args (task #643). Matches
+ * `ds4_metal_args_hadamard16_batched` in metal/hadamard.metal. */
+typedef struct {
+ uint32_t n_rows;
+ uint32_t blocks_per_row;
+ uint64_t row_stride_bytes;
+} ds4_gpu_hadamard16_batched_args;
+
 /* Compile the single in-repo Metal source and create the pipelines that every
  * session uses. Shape-dependent kernels with function constants are built
  * lazily by the small ds4_gpu_get_* caches, so startup stays predictable
@@ -3733,6 +3744,24 @@ int ds4_gpu_init(void) {
  }
  } else {
  g_moe_mul_mm_id_fp16_pair_swiglu_pipeline = nil;
+ }
+
+ /* silv 2026-05-27 — Hadamard-16 batched FP16 kernel (task #643). Best-effort
+  * compile + register; soft-fail when the kernel source is absent so older
+  * binaries still link. Used by basis-aware GGUF rewrite + codec runtime. */
+ error = nil;
+ fn = [library newFunctionWithName:@"kernel_hadamard16_fp16_batched"];
+ if (fn) {
+ g_hadamard16_fp16_batched_pipeline =
+ [g_device newComputePipelineStateWithFunction:fn error:&error];
+ if (!g_hadamard16_fp16_batched_pipeline) {
+ fprintf(stderr, "ds4: kernel_hadamard16_fp16_batched pipeline failed: %s "
+                 "(non-fatal; basis-aware codec stays inactive)\n",
+ [[error localizedDescription] UTF8String]);
+ g_hadamard16_fp16_batched_pipeline = nil;
+ }
+ } else {
+ g_hadamard16_fp16_batched_pipeline = nil;
  }
 
  error = nil;
@@ -13398,6 +13427,95 @@ static int ds4_gpu_dispatch_fp16_simdgroup_pair_swiglu(
   dispatched_once_logged = 1;
  }
  return rc;
+}
+
+/* silv 2026-05-27 task #643 — Hadamard-16 batched FP16 encoder.
+ *
+ * Dispatches kernel_hadamard16_fp16_batched on a buffer of FP16 activations.
+ * Each threadgroup applies a 16-point Walsh-Hadamard (orthogonal-normalized)
+ * to one 16-element block in threadgroup memory. Grid = (n_rows,
+ * blocks_per_row, 1). Threadgroup = (16, 1, 1). Threadgroup memory = 32 B
+ * (16 halves of scratch).
+ *
+ * Caller is responsible for n_rows × blocks_per_row × 16 halves of
+ * device-accessible FP16 storage starting at (buf + buf_off) with stride
+ * row_stride_bytes between consecutive rows. */
+static int ds4_gpu_encode_hadamard16_fp16_batched(
+ id<MTLCommandBuffer> cb,
+ id<MTLBuffer> buf,
+ NSUInteger buf_off,
+ const ds4_gpu_hadamard16_batched_args *args) {
+ if (!cb || !buf || !args) return 0;
+ if (args->n_rows == 0u || args->blocks_per_row == 0u) return 0;
+ if (!g_hadamard16_fp16_batched_pipeline) return 0;
+
+ id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+ [enc setComputePipelineState:g_hadamard16_fp16_batched_pipeline];
+ [enc setBytes:args length:sizeof(*args) atIndex:0];
+ [enc setBuffer:buf offset:buf_off atIndex:1];
+ /* 16 halves of scratch per threadgroup. */
+ [enc setThreadgroupMemoryLength:(NSUInteger)(16 * sizeof(uint16_t)) atIndex:0];
+ [enc dispatchThreadgroups:MTLSizeMake(args->n_rows, args->blocks_per_row, 1)
+       threadsPerThreadgroup:MTLSizeMake(16, 1, 1)];
+ ds4_gpu_end_compute_encoder(cb, enc);
+ return 1;
+}
+
+/* silv 2026-05-27 task #643 — public API for Hadamard-16 transform.
+ *
+ * Single-dispatch convenience wrapper. Opens a command buffer if no batch
+ * is active; otherwise hooks into the active batch. Returns 1 on success,
+ * 0 if pipeline absent or args invalid. */
+int ds4_gpu_hadamard16_fp16_batched_tensor(ds4_gpu_tensor *tensor,
+                                            uint32_t n_rows,
+                                            uint32_t blocks_per_row,
+                                            uint64_t row_stride_bytes) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (!tensor || n_rows == 0u || blocks_per_row == 0u) return 0;
+ if (!g_hadamard16_fp16_batched_pipeline) return 0;
+
+ const uint64_t need_bytes =
+  (uint64_t)(n_rows - 1u) * row_stride_bytes +
+  (uint64_t)blocks_per_row * 16u * sizeof(uint16_t);
+ if (ds4_gpu_tensor_bytes(tensor) < need_bytes) {
+  fprintf(stderr,
+          "ds4: hadamard16 batched: tensor too small (have=%llu, need=%llu)\n",
+          (unsigned long long)ds4_gpu_tensor_bytes(tensor),
+          (unsigned long long)need_bytes);
+  return 0;
+ }
+
+ @autoreleasepool {
+  id<MTLBuffer> buf = ds4_gpu_tensor_buffer(tensor);
+  if (!buf) return 0;
+
+  const bool had_batch = g_batch_cb != nil;
+  if (!had_batch && ds4_gpu_begin_commands() == 0) return 0;
+  int owned = 0;
+  id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+  if (!cb) {
+   if (!had_batch) ds4_gpu_end_commands();
+   return 0;
+  }
+
+  const ds4_gpu_hadamard16_batched_args args = {
+   .n_rows = n_rows,
+   .blocks_per_row = blocks_per_row,
+   .row_stride_bytes = row_stride_bytes,
+  };
+  const int rc = ds4_gpu_encode_hadamard16_fp16_batched(
+   cb, buf, ds4_gpu_tensor_offset(tensor), &args);
+  if (!rc) {
+   if (!had_batch) ds4_gpu_end_commands();
+   return 0;
+  }
+  if (!ds4_gpu_finish_command_buffer(cb, owned, "hadamard16 batched")) {
+   if (!had_batch) ds4_gpu_end_commands();
+   return 0;
+  }
+  if (!had_batch && ds4_gpu_end_commands() == 0) return 0;
+ }
+ return 1;
 }
 
 static int ds4_gpu_encode_mul_mv_id_sum6(

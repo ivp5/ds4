@@ -1028,3 +1028,23 @@ int ds4_gpu_mtl4_vq_real_canary(const char *vqb1_dir,
 int ds4_gpu_mtl4_polar_routed_moe_batch_stub(const void *pool,
                                               uint32_t layer,
                                               uint32_t n_tokens);
+
+/* silv 2026-05-27 task #643 — Hadamard-16 batched FP16 transform.
+ *
+ * Applies the 16-point Walsh-Hadamard transform (scaled by 1/sqrt(16) for
+ * orthogonal normalization) to each 16-element block of an FP16 activation
+ * buffer. Used by basis-aware codec paths to transform inputs into the
+ * same basis as the pre-transformed quantized weights, so the inner
+ * product matches the original-basis matmul.
+ *
+ * `tensor` must be FP16 storage with `n_rows × blocks_per_row × 16` halves,
+ * stride between rows = `row_stride_bytes`. Self-inverse: calling twice on
+ * the same tensor returns the original up to FP16 precision (because
+ * H × H = 16 I, scaled by (1/sqrt(16))^2 = 1/16 → identity).
+ *
+ * Returns 1 on success, 0 if the pipeline isn't registered (older builds
+ * without metal/hadamard.metal compiled in) or args are invalid. */
+int ds4_gpu_hadamard16_fp16_batched_tensor(ds4_gpu_tensor *tensor,
+                                            uint32_t n_rows,
+                                            uint32_t blocks_per_row,
+                                            uint64_t row_stride_bytes);
