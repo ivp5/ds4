@@ -11,6 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <mach/mach_time.h>
 #include "ds4_journal.h"
 
 #include <sys/sysctl.h>
@@ -203,6 +204,46 @@ typedef struct {
 } ds4_softplus_sqrt_icb_slot;
 #define DS4_SOFTPLUS_SQRT_ICB_SLOTS 2
 static ds4_softplus_sqrt_icb_slot g_softplus_sqrt_icb_slots[DS4_SOFTPLUS_SQRT_ICB_SLOTS];
+
+/* silv 2026-05-28 ICB Phase 8: VQB2 GPU decoder ICB.
+ *
+ * Captures the new VQB2 GPU decoder kernel (#751) into a classic-MTL ICB.
+ * Targets the H2125 layer-window dispatch shape: 64 packets per routed
+ * layer event, each decoded into fp16. With Phase 8 the engine records
+ * the layer's 64 decode commands ONCE, then per-token replays via
+ * executeCommandsInBuffer — skipping setComputePipelineState + 4 setBuffer
+ * + setThreadgroupMemoryLength × 64 = ~3 ms/layer at ~45 µs/encoder-setup.
+ *
+ * Per-slot signature: (codebook_ptr, codes_ptr, out_ptr, n_codes,
+ * bit_width, start_linear). Args are slot-local (vary across packets);
+ * codebook/codes/out are buffer-bound; dispatch grid is recorded into the
+ * command at signature-change time.
+ *
+ * Classic ICB requires a classic-MTL pipeline (cannot encode MTL4
+ * pipelines). g_vqb2_decode_fp16_classic_pipeline is built from the
+ * same MSL source as the MTL4 variant. Pipeline build sets
+ * supportIndirectCommandBuffers=YES.
+ *
+ * Opt-in via DS4_ICB_VQB2_DECODE=1. */
+#define DS4_VQB2_DECODE_ICB_SLOTS 64
+static id<MTLComputePipelineState> g_vqb2_decode_fp16_classic_pipeline;
+static int g_vqb2_decode_fp16_classic_init_attempted;
+static int g_vqb2_decode_fp16_classic_init_ok;
+static id<MTLIndirectCommandBuffer> g_vqb2_decode_fp16_icb;
+typedef struct {
+    void    *codebook_ptr;
+    void    *codes_ptr;
+    void    *out_ptr;
+    uint64_t codebook_off;
+    uint64_t codes_off;
+    uint64_t out_off;
+    uint32_t n_codes;
+    uint32_t bit_width;
+    uint32_t start_linear;
+    int      recorded;
+} ds4_vqb2_decode_icb_slot;
+static ds4_vqb2_decode_icb_slot g_vqb2_decode_icb_slots[DS4_VQB2_DECODE_ICB_SLOTS];
+static id<MTLBuffer> g_vqb2_decode_icb_args_buffers[DS4_VQB2_DECODE_ICB_SLOTS];
 static id<MTLBuffer> g_softplus_sqrt_icb_args_buffer;  /* one buffer shared across slots — args constant */
 
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
@@ -34487,6 +34528,358 @@ static int ds4_vqb2_decode_fp16_mtl4_pipeline_init(void) {
     g_vqb2_decode_fp16_mtl4_init_ok =
         (g_vqb2_decode_fp16_mtl4_pipeline != nil) ? 1 : 0;
     return g_vqb2_decode_fp16_mtl4_init_ok;
+}
+
+/* silv 2026-05-28 ICB Phase 8: classic-MTL VQB2 decoder pipeline. Same MSL
+ * source as the MTL4 variant; compiled via newLibraryWithSource so that
+ * supportIndirectCommandBuffers=YES can be set on the pipeline descriptor.
+ *
+ * Required for classic-MTL ICB recording. The MTL4 path (#751) uses the
+ * MTL4 compiler and is not ICB-encodable in classic mode. */
+static int ds4_vqb2_decode_fp16_classic_pipeline_init(void) {
+    if (g_vqb2_decode_fp16_classic_init_attempted) return g_vqb2_decode_fp16_classic_init_ok;
+    g_vqb2_decode_fp16_classic_init_attempted = 1;
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct args_t {\n"
+         "  uint bit_width;\n"
+         "  uint code_mask;\n"
+         "  uint n_codes;\n"
+         "  uint start_linear;\n"
+         "};\n"
+         "kernel void vqb2_decode_fp16_classic(\n"
+         "    device const args_t *args [[buffer(0)]],\n"
+         "    device const float  *codebook [[buffer(1)]],\n"
+         "    device const uchar  *codes [[buffer(2)]],\n"
+         "    device       half2  *out_fp16 [[buffer(3)]],\n"
+         "    uint gid [[thread_position_in_grid]]) {\n"
+         "  if (gid >= args->n_codes) return;\n"
+         "  const uint linear = args->start_linear + gid;\n"
+         "  const uint bit_off = linear * args->bit_width;\n"
+         "  const uint byte_off = bit_off >> 3;\n"
+         "  const uint shift = bit_off & 7u;\n"
+         "  const uint lo = (uint)codes[byte_off];\n"
+         "  const uint hi = (args->bit_width + shift > 8u) ? (uint)codes[byte_off + 1u] : 0u;\n"
+         "  const uint window = lo | (hi << 8);\n"
+         "  const uint code = (window >> shift) & args->code_mask;\n"
+         "  const float re = codebook[code * 2u + 0u];\n"
+         "  const float im = codebook[code * 2u + 1u];\n"
+         "  out_fp16[gid] = half2((half)re, (half)im);\n"
+         "}\n";
+    id<MTLLibrary> lib = [g_device newLibraryWithSource:source options:nil error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: vqb2_decode_fp16_classic library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    id<MTLFunction> fn = [lib newFunctionWithName:@"vqb2_decode_fp16_classic"];
+    if (!fn) {
+        fprintf(stderr, "ds4: vqb2_decode_fp16_classic function not found\n");
+        return 0;
+    }
+    MTLComputePipelineDescriptor *pdesc = [MTLComputePipelineDescriptor new];
+    pdesc.computeFunction = fn;
+    pdesc.supportIndirectCommandBuffers = YES;
+    g_vqb2_decode_fp16_classic_pipeline =
+        [g_device newComputePipelineStateWithDescriptor:pdesc
+                                                options:MTLPipelineOptionNone
+                                             reflection:nil
+                                                  error:&err];
+    if (!g_vqb2_decode_fp16_classic_pipeline) {
+        fprintf(stderr, "ds4: vqb2_decode_fp16_classic pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    g_vqb2_decode_fp16_classic_init_ok = 1;
+    fprintf(stderr, "ds4: vqb2_decode_fp16_classic pipeline initialized (ICB-compatible)\n");
+    return 1;
+}
+
+/* Record/replay one VQB2 decode dispatch via classic-MTL ICB. Per-slot
+ * signature: (codebook_ptr, codes_ptr, out_ptr, n_codes, bit_width,
+ * start_linear). Re-records on signature change. Args buffer is per-slot
+ * (vary independently per packet — n_codes/bit_width/start_linear).
+ *
+ * Returns 1 if dispatched via ICB (recording on first signature, replay
+ * otherwise); 0 on hard error or if slot_idx out of range. Caller is
+ * responsible for ensuring buffers have correct contents at execute time
+ * (ICB binds buffer+offset, not bytes). Opt-in via DS4_ICB_VQB2_DECODE=1. */
+static int ds4_gpu_vqb2_decode_fp16_icb_dispatch(
+        id<MTLCommandBuffer> cb,
+        uint32_t slot_idx,
+        id<MTLBuffer> codebook, NSUInteger codebook_off,
+        id<MTLBuffer> codes,    NSUInteger codes_off,
+        id<MTLBuffer> out_buf,  NSUInteger out_off,
+        uint32_t n_codes, uint32_t bit_width, uint32_t start_linear) {
+    static int s_env_checked = 0;
+    static int s_env_active = 0;
+    if (!s_env_checked) {
+        s_env_active = getenv("DS4_ICB_VQB2_DECODE") != NULL ? 1 : 0;
+        s_env_checked = 1;
+        if (s_env_active) {
+            fprintf(stderr, "ds4: DS4_ICB_VQB2_DECODE=1 — VQB2 decoder ICB engaged "
+                            "(64 slots, layer-window record/replay)\n");
+        }
+    }
+    if (!s_env_active) return 0;
+    if (slot_idx >= DS4_VQB2_DECODE_ICB_SLOTS) return 0;
+    if (!cb || !codebook || !codes || !out_buf) return 0;
+    if (!ds4_vqb2_decode_fp16_classic_pipeline_init()) return 0;
+
+    if (!g_vqb2_decode_fp16_icb) {
+        MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
+        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+        desc.inheritBuffers = NO;
+        desc.inheritPipelineState = NO;
+        desc.maxKernelBufferBindCount = 4;
+        g_vqb2_decode_fp16_icb =
+            [g_device newIndirectCommandBufferWithDescriptor:desc
+                                              maxCommandCount:DS4_VQB2_DECODE_ICB_SLOTS
+                                                      options:MTLResourceStorageModeShared];
+        if (!g_vqb2_decode_fp16_icb) {
+            fprintf(stderr, "ds4: VQB2 decoder ICB alloc failed\n");
+            return 0;
+        }
+    }
+    /* Lazy-allocate per-slot args buffer */
+    if (!g_vqb2_decode_icb_args_buffers[slot_idx]) {
+        g_vqb2_decode_icb_args_buffers[slot_idx] =
+            [g_device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        if (!g_vqb2_decode_icb_args_buffers[slot_idx]) return 0;
+    }
+
+    ds4_vqb2_decode_icb_slot *slot = &g_vqb2_decode_icb_slots[slot_idx];
+    const int sig_match = slot->recorded &&
+        slot->codebook_ptr == (__bridge void *)codebook && slot->codebook_off == (uint64_t)codebook_off &&
+        slot->codes_ptr    == (__bridge void *)codes    && slot->codes_off    == (uint64_t)codes_off &&
+        slot->out_ptr      == (__bridge void *)out_buf  && slot->out_off      == (uint64_t)out_off &&
+        slot->n_codes == n_codes && slot->bit_width == bit_width &&
+        slot->start_linear == start_linear;
+
+    if (!sig_match) {
+        /* Update args buffer first (sig-change might be only args, but rebind
+         * is harmless and keeps the slot consistent). */
+        uint32_t *args = (uint32_t *)g_vqb2_decode_icb_args_buffers[slot_idx].contents;
+        args[0] = bit_width;
+        args[1] = (1u << bit_width) - 1u;
+        args[2] = n_codes;
+        args[3] = start_linear;
+
+        id<MTLIndirectComputeCommand> cmd =
+            [g_vqb2_decode_fp16_icb indirectComputeCommandAtIndex:slot_idx];
+        [cmd setComputePipelineState:g_vqb2_decode_fp16_classic_pipeline];
+        [cmd setKernelBuffer:g_vqb2_decode_icb_args_buffers[slot_idx] offset:0 atIndex:0];
+        [cmd setKernelBuffer:codebook offset:codebook_off atIndex:1];
+        [cmd setKernelBuffer:codes    offset:codes_off    atIndex:2];
+        [cmd setKernelBuffer:out_buf  offset:out_off      atIndex:3];
+        const NSUInteger tg = (n_codes + 63u) / 64u;
+        [cmd concurrentDispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+                      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+
+        slot->codebook_ptr = (__bridge void *)codebook; slot->codebook_off = (uint64_t)codebook_off;
+        slot->codes_ptr    = (__bridge void *)codes;    slot->codes_off    = (uint64_t)codes_off;
+        slot->out_ptr      = (__bridge void *)out_buf;  slot->out_off      = (uint64_t)out_off;
+        slot->n_codes = n_codes;
+        slot->bit_width = bit_width;
+        slot->start_linear = start_linear;
+        slot->recorded = 1;
+    }
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc useResource:g_vqb2_decode_icb_args_buffers[slot_idx] usage:MTLResourceUsageRead];
+    [enc useResource:codebook usage:MTLResourceUsageRead];
+    [enc useResource:codes    usage:MTLResourceUsageRead];
+    [enc useResource:out_buf  usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    [enc executeCommandsInBuffer:g_vqb2_decode_fp16_icb
+                       withRange:NSMakeRange(slot_idx, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+/* ICB Phase 8 bench/canary: build N synthetic packets, dispatch via direct
+ * compute encoder vs ICB record-and-replay, measure both wall times.
+ *
+ * The bench runs ROUNDS iterations of (record + N executes) for ICB and N
+ * direct dispatches per round for the baseline; reports per-iter mean.
+ * Verifies ICB output bit-exact against direct decode for round 1.
+ *
+ * Returns 1 on success; 0 on failure. */
+int ds4_gpu_mtl4_vqb2_decode_icb_bench(uint32_t n_packets, uint32_t n_codes_per_packet,
+                                       uint32_t k_val, uint32_t rounds) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_vqb2_decode_fp16_classic_pipeline_init()) return 0;
+    if (n_packets == 0 || n_packets > DS4_VQB2_DECODE_ICB_SLOTS) {
+        fprintf(stderr, "ds4: vqb2_decode_icb_bench needs 1 ≤ n_packets ≤ %u (got %u)\n",
+                DS4_VQB2_DECODE_ICB_SLOTS, n_packets);
+        return 0;
+    }
+    if (n_codes_per_packet == 0 || rounds == 0) return 0;
+    uint32_t bit_width;
+    switch (k_val) {
+        case 4:   bit_width = 2; break;
+        case 16:  bit_width = 4; break;
+        case 64:  bit_width = 6; break;
+        case 256: bit_width = 8; break;
+        default:
+            fprintf(stderr, "ds4: vqb2_decode_icb_bench K must be 4|16|64|256 (got %u)\n", k_val);
+            return 0;
+    }
+    /* Force env active for the bench so we can observe ICB even when caller
+     * didn't pre-set DS4_ICB_VQB2_DECODE. */
+    setenv("DS4_ICB_VQB2_DECODE", "1", 1);
+
+    /* Synthetic packets: each has the same codebook + a synthetic codes stream.
+     * codebook[i] = (i*step, -i*step), step = 1/k.
+     * codes[i] = i % k → out_fp16[i] = (re, im) for centroid (i%k).
+     * All packets share a single codebook buffer to minimize bench noise; codes
+     * and out are per-packet to allow ICB slot-keyed binding. */
+    const float step = 1.0f / (float)k_val;
+    const size_t codes_bytes_per_packet = (size_t)((uint64_t)n_codes_per_packet * (uint64_t)bit_width + 7u) >> 3;
+    const size_t out_bytes_per_packet = (size_t)n_codes_per_packet * 2u * sizeof(_Float16);
+
+    int rc = 0;
+    double t_direct_ms = 0.0, t_icb_ms = 0.0;
+    int mismatch_total = 0;
+
+    @autoreleasepool {
+        /* Codebook */
+        id<MTLBuffer> cbBuf = [g_device newBufferWithLength:(NSUInteger)k_val * 2u * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+        if (!cbBuf) goto cleanup;
+        float *cb_data = (float *)cbBuf.contents;
+        for (uint32_t i = 0; i < k_val; i++) {
+            cb_data[i * 2u + 0u] =  (float)i * step;
+            cb_data[i * 2u + 1u] = -(float)i * step;
+        }
+
+        /* Per-packet codes + out buffers, packed into a single underlying
+         * buffer with per-packet offsets — closer to the pack-mmap shape. */
+        const NSUInteger codes_total = (NSUInteger)n_packets * (NSUInteger)codes_bytes_per_packet;
+        const NSUInteger out_total   = (NSUInteger)n_packets * (NSUInteger)out_bytes_per_packet;
+        id<MTLBuffer> codesBuf = [g_device newBufferWithLength:codes_total
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf   = [g_device newBufferWithLength:out_total
+                                                       options:MTLResourceStorageModeShared];
+        if (!codesBuf || !outBuf) goto cleanup;
+
+        /* Fill codes: per packet, code[i] = i % k */
+        for (uint32_t p = 0; p < n_packets; p++) {
+            uint8_t *base = (uint8_t *)codesBuf.contents + (size_t)p * codes_bytes_per_packet;
+            memset(base, 0, codes_bytes_per_packet);
+            for (uint32_t i = 0; i < n_codes_per_packet; i++) {
+                const uint32_t code = i % k_val;
+                const uint32_t bit_off = i * bit_width;
+                const uint32_t byte_off = bit_off >> 3;
+                const uint32_t shift = bit_off & 7u;
+                base[byte_off] |= (uint8_t)((code << shift) & 0xFFu);
+                if (bit_width + shift > 8u) {
+                    base[byte_off + 1u] |= (uint8_t)((code >> (8u - shift)) & 0xFFu);
+                }
+            }
+        }
+        /* Args buffer for direct path (shared, same args across packets). */
+        uint32_t args_direct[4] = { bit_width, (1u << bit_width) - 1u, n_codes_per_packet, 0 };
+        id<MTLBuffer> argsBufDirect = [g_device newBufferWithBytes:args_direct length:16
+                                                           options:MTLResourceStorageModeShared];
+
+        /* === BASELINE: N direct dispatches per round === */
+        const uint64_t t0_direct = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            for (uint32_t p = 0; p < n_packets; p++) {
+                [enc setComputePipelineState:g_vqb2_decode_fp16_classic_pipeline];
+                [enc setBuffer:argsBufDirect offset:0 atIndex:0];
+                [enc setBuffer:cbBuf offset:0 atIndex:1];
+                [enc setBuffer:codesBuf offset:(NSUInteger)p * codes_bytes_per_packet atIndex:2];
+                [enc setBuffer:outBuf offset:(NSUInteger)p * out_bytes_per_packet atIndex:3];
+                const NSUInteger tg = (n_codes_per_packet + 63u) / 64u;
+                [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            }
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+        const uint64_t t1_direct = mach_absolute_time();
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        t_direct_ms = (double)(t1_direct - t0_direct) * (double)tb.numer / (double)tb.denom / 1e6;
+
+        /* Capture direct output for cross-check */
+        _Float16 *direct_out = (_Float16 *)malloc(out_total);
+        if (direct_out) memcpy(direct_out, outBuf.contents, out_total);
+        memset(outBuf.contents, 0, out_total);
+
+        /* === ICB: record N slots ONCE; per round do ONE encoder + ONE
+         * executeCommandsInBuffer(range=N). This is the actual amortization
+         * shape: setComputePipelineState + 4 setBuffer × N = 0 (replaced by
+         * pre-recorded ICB commands); single encoder open/close per round. */
+        /* Reset ICB slot state for clean bench */
+        for (uint32_t p = 0; p < DS4_VQB2_DECODE_ICB_SLOTS; p++) {
+            g_vqb2_decode_icb_slots[p].recorded = 0;
+        }
+        /* Pre-record all N slots in one priming command buffer (not timed —
+         * one-time cost amortized across all future calls). */
+        {
+            id<MTLCommandBuffer> prime_cb = [g_queue commandBuffer];
+            for (uint32_t p = 0; p < n_packets; p++) {
+                ds4_gpu_vqb2_decode_fp16_icb_dispatch(prime_cb, p,
+                    cbBuf, 0,
+                    codesBuf, (NSUInteger)p * codes_bytes_per_packet,
+                    outBuf,   (NSUInteger)p * out_bytes_per_packet,
+                    n_codes_per_packet, bit_width, 0);
+            }
+            [prime_cb commit];
+            [prime_cb waitUntilCompleted];
+        }
+        /* Now time pure replay: per round, single encoder + single execute. */
+        const uint64_t t0_icb = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            /* Mark all buffers needed by the recorded commands as resident. */
+            [enc useResource:cbBuf usage:MTLResourceUsageRead];
+            [enc useResource:codesBuf usage:MTLResourceUsageRead];
+            [enc useResource:outBuf usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+            for (uint32_t p = 0; p < n_packets; p++) {
+                [enc useResource:g_vqb2_decode_icb_args_buffers[p] usage:MTLResourceUsageRead];
+            }
+            [enc executeCommandsInBuffer:g_vqb2_decode_fp16_icb
+                               withRange:NSMakeRange(0, n_packets)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+        const uint64_t t1_icb = mach_absolute_time();
+        t_icb_ms = (double)(t1_icb - t0_icb) * (double)tb.numer / (double)tb.denom / 1e6;
+
+        /* Cross-check ICB output against direct */
+        if (direct_out) {
+            const _Float16 *icb_out = (const _Float16 *)outBuf.contents;
+            const size_t n_halves = out_total / sizeof(_Float16);
+            for (size_t i = 0; i < n_halves; i++) {
+                if ((float)icb_out[i] != (float)direct_out[i]) mismatch_total++;
+            }
+            free(direct_out);
+        }
+
+        rc = 1;
+    }
+
+cleanup:
+    fprintf(stderr,
+        "ds4: vqb2_decode_icb_bench n_packets=%u n_codes=%u K=%u bw=%u rounds=%u "
+        "direct=%.3f ms (%.3f ms/round) icb=%.3f ms (%.3f ms/round) speedup=%.2fx "
+        "mismatch=%d rc=%d\n",
+        n_packets, n_codes_per_packet, k_val, bit_width, rounds,
+        t_direct_ms, t_direct_ms / (double)rounds,
+        t_icb_ms,    t_icb_ms    / (double)rounds,
+        t_direct_ms > 0.0 ? t_direct_ms / t_icb_ms : 0.0,
+        mismatch_total, rc);
+    return (rc && mismatch_total == 0) ? 1 : 0;
 }
 
 /* Standalone canary: provide a synthetic packet (codebook + codes), dispatch

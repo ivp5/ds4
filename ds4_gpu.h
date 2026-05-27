@@ -1567,6 +1567,14 @@ int ds4_gpu_mtl4_routed_mm_dispatch_probe(void);
  * packet, decodes, and cross-checks against expected (re, im) values. */
 int ds4_gpu_mtl4_vqb2_decode_fp16_canary(uint32_t n_codes, uint32_t k_val);
 
+/* silv 2026-05-28 ICB Phase 8: VQB2 decoder ICB record/replay bench.
+ * Runs `n_packets` decodes × `rounds` iterations via (a) direct compute
+ * dispatch and (b) classic-MTL ICB executeCommandsInBuffer; reports both
+ * wall times and the speedup. Cross-checks ICB output bit-exact against
+ * direct output. Forces DS4_ICB_VQB2_DECODE=1 internally during bench. */
+int ds4_gpu_mtl4_vqb2_decode_icb_bench(uint32_t n_packets, uint32_t n_codes_per_packet,
+                                       uint32_t k_val, uint32_t rounds);
+
 /* silv 2026-05-28 task #742 — wide-tile audit canary.
  * Routes R tokens to a single expert (htpe[0]=R, hids[0..R-1]={0..R-1}),
  * runs each of n32/n64/n128 pipelines, reports per-token mismatch
