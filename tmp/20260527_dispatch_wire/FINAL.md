@@ -116,6 +116,38 @@ Not pursued in this session because the dispatch wire was the asked-for
 deliverable; the end-to-end perf bench is a follow-up at silv's
 discretion.
 
+## UPDATE — end-to-end completion validated via phases=4
+
+silv: "go on" → followed up with `--prefill-metal-phases 4` test
+(`tmp/20260527_dispatch_wire/phases4_test.sh`). Result: full prefill +
+generation completed successfully:
+
+```
+ds4: --prefill-metal-phases: activated phase 0/4 (layers 0..9)
+ds4: --prefill-metal-phases: activated phase 1/4 (layers 10..19)
+ds4: --prefill-metal-phases: activated phase 2/4 (layers 20..29)
+ds4: --prefill-metal-phases: activated phase 3/4 (layers 30..42)
+ds4: FP16 simdgroup mat-mat DISPATCHED at layer=34 n_tokens=21 n_expert=6
+ds4: prefill: 0.51 t/s, generation: 1.21 t/s
+output: "We need to explain in two sentences why mathematical proof
+         matters in computer science. The"
+```
+
+Zero memory errors. Output matches the baseline (`The`) — top-1 token
+agreement under the FP16 dequant vs IQ2 path on this layer. RAM budget
+math confirmed: 23 GB per-phase + 12.88 GB pin + 8.4 GB non-routed =
+44.28 GB ≪ 64 GB cap.
+
+The wire is shipped, dispatched, completed, and output-equivalent.
+Task #631 done.
+
+The perf measurement isn't meaningful with only 1 layer pinned (1/43
+of compute), and the 4-phase overhead adds residency-swap cost so the
+gen rate is slightly below the 2-phase baseline. A real perf
+comparison needs MULTI-LAYER pin (which currently exceeds RAM cap) or
+the pair-AVG GGUF rewrite (which frees the IQ2 routed range for
+pinned layers, breaking the double-counting).
+
 ## What this unlocks for #631
 
 Task #631 was: "simdgroup_multiply matmul kernel for FP16 routed FFN".
