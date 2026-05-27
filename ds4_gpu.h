@@ -1540,6 +1540,11 @@ int ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_canary(uint32_t M, uint32_t N, uint32_t K
  * pattern. Production safe via per-expert ne21 ≤ 32 constraint. */
 int ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_n64_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
 
+/* silv 2026-05-28 task #740 — mul_mm_id_iq2_xxs_f32_n128 MTL4.
+ * Deepest wide-tile (NR1=128) variant of #735. Antirez's max
+ * amortization point. Same shape, NR1=128. */
+int ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_n128_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
+
 /* silv 2026-05-28 task #736 — mul_mm_id_q4_K_f32 MTL4.
  * Routed MoE Q4_K prefill matmul. 144-byte 256-element blocks with
  * 6-bit packed scales+mins (get_scale_min_k4_just2) and 4-bit qs.
