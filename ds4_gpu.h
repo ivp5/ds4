@@ -1518,3 +1518,10 @@ int ds4_gpu_mtl4_mul_mm_f16_f32_canary(uint32_t M, uint32_t N, uint32_t K);
  * nl=2 (2 sub-blocks per 32-element Q8_0 block). Sister of #732 with
  * block_q8_0 reads instead of half4x4. */
 int ds4_gpu_mtl4_mul_mm_q8_0_f32_canary(uint32_t M, uint32_t N, uint32_t K);
+
+/* silv 2026-05-28 task #734 — mul_mm_id_q8_0_f32 MTL4.
+ * Routed MoE Q8_0 prefill matmul. Same kernel shape as #733 but with
+ * tpe + ids buffers for per-expert routing-row counts + (slot, token)
+ * indirection. DS4 shared-expert prefill path for Q8_0 weights.
+ * Canary: n_experts experts × 1 routed token each. */
+int ds4_gpu_mtl4_mul_mm_id_q8_0_f32_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
