@@ -8,6 +8,7 @@
  */
 
 #include "ds4_vqb2_pack.h"
+#include "ds4_expert_table.h"  /* ds4_hot_pin_expert_from_vqb2 */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -270,6 +271,35 @@ bool ds4_vqb2_pack_view_from_entry(const ds4_vqb2_pack *p,
             (unsigned long long)e->pack_offset);
         return false;
     }
+    /* Cache-audit finding A2: re-parse the 40-byte packet header at base and
+     * verify it matches the CSV index entry. Catches CSV/pack drift cheaply. */
+    uint32_t hdr_version, hdr_n_experts, hdr_n_rows, hdr_n_pairs;
+    uint32_t hdr_layer, hdr_kind_id, hdr_k, hdr_bit_width, hdr_n_codes_lo;
+    memcpy(&hdr_version,   base + 4,  4);
+    memcpy(&hdr_n_experts, base + 8,  4);
+    memcpy(&hdr_n_rows,    base + 12, 4);
+    memcpy(&hdr_n_pairs,   base + 16, 4);
+    memcpy(&hdr_layer,     base + 20, 4);
+    memcpy(&hdr_kind_id,   base + 24, 4);
+    memcpy(&hdr_k,         base + 28, 4);
+    memcpy(&hdr_bit_width, base + 32, 4);
+    memcpy(&hdr_n_codes_lo,base + 36, 4);
+    if (hdr_n_experts != e->n_experts || hdr_n_rows != e->n_rows ||
+        hdr_n_pairs   != e->n_pairs   || hdr_layer != e->layer ||
+        hdr_kind_id   != e->kind_id   || hdr_k != e->k ||
+        hdr_bit_width != e->bit_width || hdr_n_codes_lo != (uint32_t)e->n_codes) {
+        fprintf(stderr,
+            "ds4_vqb2_pack: CSV vs header drift at entry %u\n"
+            "  CSV:    L%u kind=%u rs=%u K=%u bw=%u experts=%u rows=%u pairs=%u n_codes=%llu\n"
+            "  header: L%u kind=%u (no rs in header) K=%u bw=%u experts=%u rows=%u pairs=%u n_codes=%u\n",
+            entry_index,
+            e->layer, e->kind_id, e->row_start, e->k, e->bit_width,
+            e->n_experts, e->n_rows, e->n_pairs, (unsigned long long)e->n_codes,
+            hdr_layer, hdr_kind_id, hdr_k, hdr_bit_width,
+            hdr_n_experts, hdr_n_rows, hdr_n_pairs, hdr_n_codes_lo);
+        return false;
+    }
+    (void)hdr_version;
 
     memset(out_view, 0, sizeof(*out_view));
     out_view->fd = -1;
@@ -502,6 +532,48 @@ int ds4_cli_vqb2_pack_layer_tour(const char *pack_path, const char *index_csv_pa
     ds4_vqb2_pack_close(&pack);
     /* Standard DS4 V4 layer: 16 gate + 16 up + 32 down = 64 packets. */
     return (visited == 64 && s.n_decoded == 64) ? 0 : 1;
+}
+
+/* Cache-audit A1 fix: pack-aware loader. Iterates entries in layer-major
+ * order (preserves H2125 locality) and pins each expert × row_block. */
+int ds4_vqb2_pack_load_to_hot_store(struct ds4_hot_expert_store *store,
+                                    const ds4_vqb2_pack *p,
+                                    int layer_filter, int kind_filter) {
+    if (!store || !p) return -1;
+    int n_pinned = 0;
+    int n_errors = 0;
+    for (uint32_t i = 0; i < p->n_entries; i++) {
+        const ds4_vqb2_pack_entry *e = &p->entries[i];
+        if (layer_filter >= 0 && (int)e->layer != layer_filter) continue;
+        if (kind_filter >= 0  && (int)e->kind_id != kind_filter) continue;
+        if ((e->row_start % 128u) != 0) {
+            fprintf(stderr,
+                "ds4_vqb2_pack_load_to_hot_store: entry %u row_start=%u not multiple of 128\n",
+                i, e->row_start);
+            n_errors++;
+            continue;
+        }
+        const uint32_t row_block = e->row_start / 128u;
+        ds4_vqb2_file view;
+        if (!ds4_vqb2_pack_view_from_entry(p, i, &view)) {
+            n_errors++;
+            continue;
+        }
+        for (uint32_t expert = 0; expert < e->n_experts; expert++) {
+            if (ds4_hot_pin_expert_from_vqb2(store, e->layer, e->kind_id,
+                                              row_block, &view, expert) == 0) {
+                n_pinned++;
+            } else {
+                n_errors++;
+            }
+        }
+        /* view shares pack mmap — ds4_vqb2_close is safe no-op */
+    }
+    fprintf(stderr,
+        "ds4_vqb2_pack_load_to_hot_store: layer_filter=%d kind_filter=%d "
+        "pinned=%d errors=%d (of %u entries)\n",
+        layer_filter, kind_filter, n_pinned, n_errors, p->n_entries);
+    return n_errors == 0 ? n_pinned : -1;
 }
 
 void ds4_vqb2_pack_print_summary(const ds4_vqb2_pack *p) {

@@ -113,6 +113,24 @@ int ds4_vqb2_pack_for_layer(const ds4_vqb2_pack *p,
 /* Print summary to stderr: pack size, n_entries, K mix, kind mix, layer span. */
 void ds4_vqb2_pack_print_summary(const ds4_vqb2_pack *p);
 
+/* silv 2026-05-28 — pack-aware hot-store loader (cache-audit fix A1).
+ *
+ * Iterates the pack and pins all (layer, kind, expert, row_block) tiles
+ * into the hot store. The CSV index entry's row_start / 128 supplies the
+ * row_block parameter that ds4_hot_pin_expert_from_vqb2 needs to avoid
+ * the silent-overwrite bug captured in tmp/20260528_cache_audit/AUDIT.md.
+ *
+ * `layer_filter` = -1 pins all layers; else only the specified layer.
+ * `kind_filter`  = -1 pins all kinds; else only the specified kind (0/1/2).
+ *
+ * Returns number of (expert × row_block) pins performed, -1 on hard error.
+ *
+ * Forward-declares struct ds4_hot_expert_store to avoid header coupling. */
+struct ds4_hot_expert_store;
+int ds4_vqb2_pack_load_to_hot_store(struct ds4_hot_expert_store *store,
+                                    const ds4_vqb2_pack *p,
+                                    int layer_filter, int kind_filter);
+
 #ifdef __cplusplus
 }
 #endif

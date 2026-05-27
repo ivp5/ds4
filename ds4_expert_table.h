@@ -171,10 +171,31 @@ uint64_t ds4_hot_store_get_calibration_domain(const ds4_hot_expert_store *store)
 
 struct ds4_vqb2_file;  /* opaque forward decl */
 
-/* Pin one tile from a VQB2 packet. `kind` = 0/1/2 (gate/up/down). */
+/* Pin one tile from a VQB2 packet.
+ *
+ * `kind`      = 0/1/2 (gate/up/down).
+ * `row_block` = which row block this packet covers (0..15 for gate/up,
+ *               0..31 for down). For the legacy single-file format
+ *               (n_rows = full per-expert rows), row_block must be 0.
+ *               For H2116+ pack format (n_rows = 128 per packet), pass
+ *               the row_start / 128 of the source packet.
+ *
+ * Cache key: (layer, kind, expert, row_block). Failure to pass row_block
+ * correctly causes silent overwrite of earlier-pinned blocks
+ * (cache-audit finding A1, tmp/20260528_cache_audit/AUDIT.md). */
 int ds4_hot_pin_expert_from_vqb2(ds4_hot_expert_store *store,
-                                 uint32_t layer, uint32_t kind,
+                                 uint32_t layer, uint32_t kind, uint32_t row_block,
                                  const struct ds4_vqb2_file *vqb2, uint32_t expert);
+
+/* Legacy backwards-compat wrapper — equivalent to passing row_block=0.
+ * Sole appropriate use: the pre-H2116 .vqb2 format where each packet
+ * contained the full per-expert tile. New code MUST use the parameterized
+ * variant. */
+static inline int ds4_hot_pin_expert_from_vqb2_legacy(
+    ds4_hot_expert_store *store, uint32_t layer, uint32_t kind,
+    const struct ds4_vqb2_file *vqb2, uint32_t expert) {
+    return ds4_hot_pin_expert_from_vqb2(store, layer, kind, 0u, vqb2, expert);
+}
 
 /* Walk a directory recursively; pin every .vqb2 found. Diagnostic only —
  * Hazard: multiple K values per (layer, kind) cause silent overwrites. Use

@@ -792,7 +792,11 @@ static int ds4_candidate_manifest_pin_file(ds4_hot_expert_store *store,
     }
     int pinned = 0;
     for (uint32_t e = 0; e < f.n_experts; e++) {
-        if (ds4_hot_pin_expert_from_vqb2(store, f.layer, f.kind_id, &f, e) != 0) {
+        /* Candidate-manifest loader assumes legacy single-file format
+         * (one packet = full per-expert tile). For H2116+ pack-keyed
+         * packets, use ds4_hot_pin_from_pack instead. row_block=0
+         * matches the legacy behavior. */
+        if (ds4_hot_pin_expert_from_vqb2_legacy(store, f.layer, f.kind_id, &f, e) != 0) {
             fprintf(stderr,
                     "ds4_vqb2_candidate_manifest_load: pin failed path=%s expert=%u "
                     "after %d experts; aborting candidate load\n",
@@ -910,26 +914,70 @@ void ds4_hot_expert_store_print(const ds4_hot_expert_store *store) {
 int ds4_hot_pin_expert_from_vqb2(ds4_hot_expert_store *store,
                                  uint32_t layer,
                                  uint32_t kind,
+                                 uint32_t row_block,
                                  const struct ds4_vqb2_file *vqb2_opaque,
                                  uint32_t expert) {
     if (!store || !vqb2_opaque) return -1;
     if (layer >= DS4_N_LAYER || expert >= DS4_N_EXPERT) return -1;
     if (kind > 2) return -1;
+    /* row_block ∈ [0, 32). gate/up have 16 blocks, down has 32. We accept
+     * up to 32 here and trust caller for kind correctness; the row_blocks
+     * bitmask is uint64_t so bit (row_block) is always safe up to 63. */
+    if (row_block >= DS4_VQB2_DOWN_FULL_ROW_BLOCKS) return -1;
     const ds4_vqb2_file *f = (const ds4_vqb2_file *)vqb2_opaque;
     if (expert >= f->n_experts) return -1;
 
-    /* Compute the per-expert tile size in FP16 bytes:
-     *   n_rows × n_pairs × 2 (re, im) × sizeof(_Float16) */
-    const uint64_t per_expert_floats = (uint64_t)f->n_rows * f->n_pairs * 2;
-    const uint64_t per_expert_bytes  = per_expert_floats * 2; /* fp16 */
+    /* Per-block tile size in FP16 bytes (this packet's portion):
+     *   n_rows × n_pairs × 2 (re, im) × sizeof(_Float16)
+     * For the legacy format n_rows = full rows per expert, so a single
+     * packet covers the whole tile. For H2116+ n_rows = 128 per packet
+     * and the caller stitches blocks by passing row_block 0..15/0..31. */
+    const uint64_t per_block_floats = (uint64_t)f->n_rows * f->n_pairs * 2;
+    const uint64_t per_block_bytes  = per_block_floats * 2; /* fp16 */
 
-    /* Reserve space at the current heap tail. */
-    const uint64_t off = store->heap_bytes; /* before grow */
-    const uint64_t new_bytes = off + per_expert_bytes;
-    if (hot_store_grow_to(store, new_bytes) != 0) return -1;
+    /* Cache-audit finding A1: row_block was previously OMITTED. The fix
+     * places each block at its own heap-tail allocation and tracks the
+     * BASE offset (block 0) in offsets[idx]. For row_block > 0, the
+     * caller's downstream dispatch will index into the tile via
+     * row_block * per_block_bytes from this base. This matches the
+     * H2116 layer-window dispatch shape: all blocks are contiguous in
+     * dispatch order. */
+    int64_t *offsets = NULL;
+    uint64_t *row_blocks = NULL;
+    switch (kind) {
+        case 0: offsets = store->gate_offset; row_blocks = store->gate_row_blocks; break;
+        case 1: offsets = store->up_offset;   row_blocks = store->up_row_blocks;   break;
+        case 2: offsets = store->down_offset; row_blocks = store->down_row_blocks; break;
+    }
+    const uint64_t idx = (uint64_t)layer * DS4_N_EXPERT + expert;
 
-    /* Dequant: walk codes, look up codebook, write FP16 into heap. */
-    _Float16 *dst = (_Float16 *)((char *)store->fp16_heap + off);
+    uint64_t base_off;
+    if (offsets && offsets[idx] >= 0) {
+        /* Existing pin for this (layer, kind, expert) — reuse base offset.
+         * Caller is expected to call blocks in order; we don't grow the
+         * heap, we just write into the block-row slot. */
+        base_off = (uint64_t)offsets[idx];
+    } else {
+        /* First block for this expert — reserve full-tile space (we don't
+         * know yet how many blocks the caller will pin, but pre-reserving
+         * one block is safe; subsequent block pins will grow the heap).
+         * For legacy single-file format, this is the full tile. */
+        base_off = store->heap_bytes;
+        const uint64_t new_bytes = base_off + per_block_bytes;
+        if (hot_store_grow_to(store, new_bytes) != 0) return -1;
+        if (offsets) offsets[idx] = (int64_t)base_off;
+    }
+    /* Ensure heap covers (base_off + (row_block+1)*per_block_bytes). For
+     * row_block > 0, this grows; for row_block=0 it's already covered. */
+    const uint64_t block_tail = base_off + (uint64_t)(row_block + 1u) * per_block_bytes;
+    if (store->heap_bytes < block_tail) {
+        if (hot_store_grow_to(store, block_tail) != 0) return -1;
+    }
+    const uint64_t this_block_off = base_off + (uint64_t)row_block * per_block_bytes;
+
+    /* Dequant: walk codes for THIS expert in THIS packet, write FP16 into the
+     * row-block-indexed slot of the per-expert tile. */
+    _Float16 *dst = (_Float16 *)((char *)store->fp16_heap + this_block_off);
     const uint32_t bw = f->bit_width;
     const uint8_t mask = f->code_mask;
     const uint8_t *codes = f->codes;
@@ -948,23 +996,10 @@ int ds4_hot_pin_expert_from_vqb2(ds4_hot_expert_store *store,
         dst[i * 2 + 1] = (_Float16)cb[code * 2 + 1];
     }
 
-    /* Record offset in the appropriate kind's offset table. */
-    int64_t *offsets = NULL;
-    switch (kind) {
-        case 0: offsets = store->gate_offset; break;
-        case 1: offsets = store->up_offset;   break;
-        case 2: offsets = store->down_offset; break;
-    }
-    const uint64_t idx = (uint64_t)layer * DS4_N_EXPERT + expert;
-    if (offsets) {
-        offsets[idx] = (int64_t)off;
-    }
-    /* Current VQB2 format carries no row_start, and the encoder slices
-     * full[:rows_per_expert], so this packet is row block 0 only. */
-    switch (kind) {
-        case 0: if (store->gate_row_blocks) store->gate_row_blocks[idx] |= 1ULL; break;
-        case 1: if (store->up_row_blocks)   store->up_row_blocks[idx]   |= 1ULL; break;
-        case 2: if (store->down_row_blocks) store->down_row_blocks[idx] |= 1ULL; break;
+    /* Mark THIS row_block as covered. Multiple pins for different blocks
+     * accumulate the bitmask via OR. */
+    if (row_blocks) {
+        row_blocks[idx] |= (1ULL << row_block);
     }
     store->n_pinned++;
     return 0;
@@ -996,7 +1031,9 @@ static int corpus_load_file(ds4_hot_expert_store *store, const char *path) {
             path, f.layer, f.kind_id, f.n_experts);
     int n_pinned_this_file = 0;
     for (uint32_t e = 0; e < f.n_experts; e++) {
-        if (ds4_hot_pin_expert_from_vqb2(store, f.layer, f.kind_id, &f, e) == 0) {
+        /* Corpus walker assumes legacy single-file format. H2116+ pack
+         * data MUST go through the pack-aware loader (see audit A1). */
+        if (ds4_hot_pin_expert_from_vqb2_legacy(store, f.layer, f.kind_id, &f, e) == 0) {
             n_pinned_this_file++;
         } else {
             /* Budget overrun → stop trying further experts in this file. */
