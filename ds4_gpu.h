@@ -1100,3 +1100,17 @@ void ds4_set_attn_scale_mult_runtime(float v);
  * diff < 1e-4. Used by the MTL4-port test harness to validate the
  * port pattern before scaling to MoE-matmul. */
 int ds4_gpu_mtl4_softplus_sqrt_canary(uint32_t n_rows, uint32_t n_cols);
+
+/* silv 2026-05-27 tasks #671, #672 — second/third of 74-kernel MTL4 sweep.
+ *
+ * router_weights_one_canary: validates the 6-element weight normalization
+ * from the router cycle (already ICB-captured at classic-MTL level via
+ * Phase 6 #560). MTL4 port enables future MTL4-specific optimizations
+ * (e.g. ArgumentTable amortization across consecutive router dispatches).
+ *
+ * topk_mask_canary: validates the -INFINITY mask fill from the router
+ * cycle (already ICB-captured at classic-MTL level via Phase 3 #557).
+ * MTL4 port mirrors the storage-class migration pattern. */
+int ds4_gpu_mtl4_router_weights_one_canary(void);
+int ds4_gpu_mtl4_topk_mask_canary(uint32_t ne0, uint32_t ne1);
+int ds4_gpu_mtl4_topk_mask_scatter_canary(uint32_t n_topk, uint32_t n_tokens, uint32_t n_comp);

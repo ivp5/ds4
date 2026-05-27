@@ -1736,6 +1736,29 @@ int main(int argc, char **argv) {
         const uint32_t n_cols = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
         return ds4_gpu_mtl4_softplus_sqrt_canary(n_rows, n_cols) ? 0 : 1;
     }
+    /* --router-weights-one-canary : silv 2026-05-27 task #671. MTL4 port
+     * of kernel_dsv4_router_weights_one (metal/dsv4_misc.metal:263). */
+    if (argc >= 2 && !strcmp(argv[1], "--router-weights-one-canary")) {
+        return ds4_gpu_mtl4_router_weights_one_canary() ? 0 : 1;
+    }
+    /* --topk-mask-canary [ne0 [ne1]] : silv 2026-05-27 task #672. MTL4 port
+     * of kernel_dsv4_topk_mask (metal/dsv4_misc.metal:346). Verifies dst
+     * filled with -INFINITY at every position. */
+    if (argc >= 2 && !strcmp(argv[1], "--topk-mask-canary")) {
+        const uint32_t ne0 = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 256;
+        const uint32_t ne1 = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
+        return ds4_gpu_mtl4_topk_mask_canary(ne0, ne1) ? 0 : 1;
+    }
+    /* --topk-mask-scatter-canary [n_topk [n_tokens [n_comp]]] : silv 2026-05-27
+     * task #673. MTL4 port of kernel_dsv4_topk_mask_scatter
+     * (metal/dsv4_misc.metal:366). Scatters 0.0 at selected (idx, token)
+     * positions in dst mask. Expected 3 zeroed per token (3 valid topk indices). */
+    if (argc >= 2 && !strcmp(argv[1], "--topk-mask-scatter-canary")) {
+        const uint32_t n_topk = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 6;
+        const uint32_t n_tokens = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
+        const uint32_t n_comp = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
+        return ds4_gpu_mtl4_topk_mask_scatter_canary(n_topk, n_tokens, n_comp) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
