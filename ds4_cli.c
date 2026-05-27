@@ -1822,6 +1822,11 @@ int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--moe-matmul-init-canary")) {
         return ds4_gpu_mtl4_moe_matmul_init_canary() ? 0 : 1;
     }
+    /* --moe-matmul-full-canary : task #682 full output validation.
+     * 1-expert × 8-token × 16K test bench with identity weights. */
+    if (argc >= 2 && !strcmp(argv[1], "--moe-matmul-full-canary")) {
+        return ds4_gpu_mtl4_moe_matmul_full_canary() ? 0 : 1;
+    }
     /* --hc-weighted-sum-canary [n_embd [n_hc [n_tokens]]] : task #683 */
     if (argc >= 2 && !strcmp(argv[1], "--hc-weighted-sum-canary")) {
         const uint32_t n_embd = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;

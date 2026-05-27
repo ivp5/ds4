@@ -19124,13 +19124,275 @@ static int ds4_moe_matmul_mtl4_pipeline_init(void) {
 }
 
 /* Smoke test: confirms the pipeline compiles + initializes. Full output
- * canary deferred — needs synthetic 8-buffer test bench with single-expert
- * setup. Multi-turn item; this turn establishes the pipeline state exists. */
+ * canary follows below. */
 int ds4_gpu_mtl4_moe_matmul_init_canary(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!ds4_moe_matmul_mtl4_pipeline_init()) return 0;
     fprintf(stderr, "ds4: moe_matmul MTL4 pipeline canary — init OK\n");
     return 1;
+}
+
+/* FP32 → FP16 conversion via bit manipulation (no _Float16 dependency).
+ * Handles normal range; denormals + Inf clamp gracefully for canary use. */
+static inline uint16_t ds4_fp32_to_fp16(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    const uint32_t sign = (u >> 16) & 0x8000u;
+    int32_t exp = ((u >> 23) & 0xff) - 127 + 15;
+    uint32_t mant = (u >> 13) & 0x3ff;
+    if (exp <= 0) return (uint16_t)sign;
+    if (exp >= 31) return (uint16_t)(sign | (31u << 10));
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
+}
+
+/* silv 2026-05-27 task #682 — FULL output canary for MoE matmul MTL4.
+ *
+ * Test setup:
+ *   n_in       = 16 (K dim)
+ *   n_out      = 8  (one output column tile)
+ *   n_tokens   = 8  (one token tile)
+ *   n_expert   = 1  (single expert in this test)
+ *   nei0       = 1  (experts-per-token = 1)
+ *   nei1       = n_tokens
+ *   ids[t]     = 0 (all tokens select expert 0)
+ *   route_w[t] = 1.0 (no scaling)
+ *   clamp      = 0.0 (no clamp branch)
+ *   weights    = identity-padded: W[i,k] = 1.0 if i==k (i < 8), else 0
+ *
+ * Expected mid[pair_row, oc] = silu(x[t, oc]) * x[t, oc] * 1.0
+ * where pair_row = t * nei0 + idx = t * 1 + 0 = t.
+ *
+ * Validates: MTL4 pipeline produces correct FP16-simdgroup-matmul +
+ * SwiGLU + route-weight in one fused dispatch, matching CPU reference. */
+int ds4_gpu_mtl4_moe_matmul_full_canary(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_moe_matmul_mtl4_pipeline_init()) return 0;
+
+    const int n_in = 16;
+    const int n_out = 8;
+    const int n_tokens = 8;
+    const int n_expert = 1;  /* only one in weight buffer */
+    const int nei0 = 1;
+    const int nei1 = n_tokens;
+
+    /* Weights (FP16): n_expert × n_out × n_in, row-major within each expert.
+     * Identity-padded: gate[0][i][k] = up[0][i][k] = (i == k) ? 1.0 : 0.0. */
+    const size_t w_elems = (size_t)n_expert * n_out * n_in;
+    uint16_t *host_gate = (uint16_t *)calloc(w_elems, sizeof(uint16_t));
+    uint16_t *host_up = (uint16_t *)calloc(w_elems, sizeof(uint16_t));
+    if (!host_gate || !host_up) { free(host_gate); free(host_up); return 0; }
+    const uint16_t one_fp16 = ds4_fp32_to_fp16(1.0f);
+    for (int e = 0; e < n_expert; e++) {
+        for (int i = 0; i < n_out; i++) {
+            for (int k = 0; k < n_in; k++) {
+                if (i == k) {
+                    host_gate[e * n_out * n_in + i * n_in + k] = one_fp16;
+                    host_up[e * n_out * n_in + i * n_in + k] = one_fp16;
+                }
+            }
+        }
+    }
+
+    /* Activation (FP32): n_tokens × n_in, x[t, k] = (t + k) * 0.05 */
+    const size_t x_elems = (size_t)n_tokens * n_in;
+    float *host_x = (float *)calloc(x_elems, sizeof(float));
+    if (!host_x) { free(host_gate); free(host_up); return 0; }
+    for (int t = 0; t < n_tokens; t++) {
+        for (int k = 0; k < n_in; k++) {
+            host_x[t * n_in + k] = ((float)(t + k)) * 0.05f;
+        }
+    }
+
+    /* ids: n_tokens entries, each = 0 */
+    int32_t *host_ids = (int32_t *)calloc(n_tokens * nei0, sizeof(int32_t));
+    if (!host_ids) { free(host_gate); free(host_up); free(host_x); return 0; }
+    /* default 0 — selected expert is 0 */
+
+    /* Route weights: nei0 × nei1 = n_tokens entries, each = 1.0 */
+    float *host_weights = (float *)calloc(n_tokens, sizeof(float));
+    if (!host_weights) {
+        free(host_gate); free(host_up); free(host_x); free(host_ids);
+        return 0;
+    }
+    for (int t = 0; t < n_tokens; t++) host_weights[t] = 1.0f;
+
+    /* Output: n_tokens × n_out = n_tokens pair-rows × n_out floats each.
+     * pair_row = tok * nei0 + idx = tok * 1 + 0 = tok. */
+    const size_t mid_elems = (size_t)n_tokens * n_out;
+    float *host_mid_gpu = (float *)calloc(mid_elems, sizeof(float));
+    float *host_mid_ref = (float *)calloc(mid_elems, sizeof(float));
+    if (!host_mid_gpu || !host_mid_ref) {
+        free(host_gate); free(host_up); free(host_x); free(host_ids);
+        free(host_weights); free(host_mid_gpu); free(host_mid_ref);
+        return 0;
+    }
+    /* CPU reference: identity-weights make gate = up = x; SwiGLU + route. */
+    for (int t = 0; t < n_tokens; t++) {
+        for (int oc = 0; oc < n_out; oc++) {
+            const float g = host_x[t * n_in + oc];
+            const float u = host_x[t * n_in + oc];
+            const float silu = g / (1.0f + expf(-g));
+            host_mid_ref[t * n_out + oc] = silu * u * 1.0f;
+        }
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> actBuf = [g_device newBufferWithLength:64
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gateBuf = [g_device newBufferWithBytes:host_gate
+                                                      length:w_elems * sizeof(uint16_t)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> upBuf = [g_device newBufferWithBytes:host_up
+                                                    length:w_elems * sizeof(uint16_t)
+                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> xBuf = [g_device newBufferWithBytes:host_x
+                                                   length:x_elems * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> midBuf = [g_device newBufferWithLength:mid_elems * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> idsBuf = [g_device newBufferWithBytes:host_ids
+                                                     length:n_tokens * nei0 * sizeof(int32_t)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> wBuf = [g_device newBufferWithBytes:host_weights
+                                                   length:n_tokens * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+
+        /* mmid_args struct mirrors what the kernel reads. nb02 = per-expert
+         * weight stride. nbi1 = stride to next token's ids (1 idx × sizeof int). */
+        struct mmid_args {
+            int32_t nei0_, nei1_; uint64_t nbi1_;
+            int32_t ne00, ne01, ne02;
+            uint64_t nb00, nb01, nb02;
+            int32_t ne10, ne11, ne12, ne13;
+            uint64_t nb10, nb11, nb12;
+            int32_t ne0_, ne1_; uint64_t nb1_; int32_t nr0_;
+        } args = {
+            .nei0_ = nei0, .nei1_ = nei1, .nbi1_ = (uint64_t)nei0 * sizeof(int32_t),
+            .ne00 = n_in, .ne01 = n_out, .ne02 = n_expert,
+            .nb00 = sizeof(uint16_t),
+            .nb01 = (uint64_t)n_in * sizeof(uint16_t),
+            .nb02 = (uint64_t)n_in * n_out * sizeof(uint16_t),
+            .ne10 = n_in, .ne11 = n_tokens, .ne12 = 1, .ne13 = 1,
+            .nb10 = sizeof(float),
+            .nb11 = (uint64_t)n_in * sizeof(float),
+            .nb12 = 0, .ne0_ = n_out, .ne1_ = 0,
+            .nb1_ = 0, .nr0_ = 1,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        /* moe_swiglu_args: per-row strides + clamp config */
+        struct {
+            uint32_t width, rows;
+            uint64_t gate_row_stride, up_row_stride, mid_row_stride, weight_stride;
+            uint32_t write_clamped; float clamp_value;
+        } act = {
+            .width = (uint32_t)n_out,
+            .rows = (uint32_t)(n_tokens * nei0),
+            .gate_row_stride = 0,  /* unused in MTL4 port — no gate buffer write */
+            .up_row_stride = 0,
+            .mid_row_stride = (uint64_t)n_out * sizeof(float),
+            .weight_stride = sizeof(float),
+            .write_clamped = 0,
+            .clamp_value = 0.0f,
+        };
+        memcpy(actBuf.contents, &act, sizeof(act));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 16;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[8] = {
+                (id<MTLAllocation>)argsBuf, (id<MTLAllocation>)actBuf,
+                (id<MTLAllocation>)gateBuf, (id<MTLAllocation>)upBuf,
+                (id<MTLAllocation>)xBuf, (id<MTLAllocation>)midBuf,
+                (id<MTLAllocation>)idsBuf, (id<MTLAllocation>)wBuf,
+            };
+            [residency addAllocations:allocs count:8];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:actBuf.gpuAddress atIndex:1];
+                [argTable setAddress:gateBuf.gpuAddress atIndex:2];
+                [argTable setAddress:upBuf.gpuAddress atIndex:3];
+                [argTable setAddress:xBuf.gpuAddress atIndex:4];
+                [argTable setAddress:midBuf.gpuAddress atIndex:5];
+                [argTable setAddress:idsBuf.gpuAddress atIndex:6];
+                [argTable setAddress:wBuf.gpuAddress atIndex:7];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_moe_matmul_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc setThreadgroupMemoryLength:1024 atIndex:0];
+
+                /* Dispatch: (out_col_tiles, token_tiles, batch_id) where
+                 * out_col_tiles = ceil(n_out / 8) = 1
+                 * token_tiles = ceil(n_tokens / 8) = 1
+                 * batch_id = nei0 × nei1 = n_tokens (one batch per (idx, token)) */
+                const NSUInteger n_out_tiles = (n_out + 7) / 8;
+                const NSUInteger n_tok_tiles = (n_tokens + 7) / 8;
+                const NSUInteger n_batch = nei0 * nei1;
+                [enc dispatchThreadgroups:MTLSizeMake(n_out_tiles, n_tok_tiles, n_batch)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_mid_gpu, midBuf.contents, mid_elems * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 8);
+            }
+        }
+    }
+    if (!rc) {
+        free(host_gate); free(host_up); free(host_x); free(host_ids);
+        free(host_weights); free(host_mid_gpu); free(host_mid_ref);
+        return 0;
+    }
+
+    double max_abs = 0.0;
+    double sum_sq = 0.0;
+    for (size_t i = 0; i < mid_elems; i++) {
+        double d = (double)(host_mid_gpu[i] - host_mid_ref[i]);
+        if (fabs(d) > max_abs) max_abs = fabs(d);
+        sum_sq += d * d;
+    }
+    const double rms = sqrt(sum_sq / (double)mid_elems);
+    fprintf(stderr,
+        "ds4: moe_matmul MTL4 full canary n_tokens=%d n_out=%d n_in=%d\n"
+        "  mid_ref[0]=%.4f gpu[0]=%.4f mid_ref[7]=%.4f gpu[7]=%.4f\n"
+        "  max_abs=%.4e rms=%.4e (threshold 5e-3 for FP16 simdgroup matmul)\n",
+        n_tokens, n_out, n_in,
+        (double)host_mid_ref[0], (double)host_mid_gpu[0],
+        (double)host_mid_ref[7], (double)host_mid_gpu[7],
+        max_abs, rms);
+
+    free(host_gate); free(host_up); free(host_x); free(host_ids);
+    free(host_weights); free(host_mid_gpu); free(host_mid_ref);
+    /* FP16 simdgroup matmul has limited precision; 5e-3 is empirically loose
+     * but safe for identity-weight case with small magnitudes. */
+    return max_abs < 5.0e-3 ? 1 : 0;
 }
 
 /* ============================================================ */
