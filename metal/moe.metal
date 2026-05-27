@@ -1380,7 +1380,16 @@ kernel void kernel_mul_mm_id_fp16_pair_swiglu_f32(
     simdgroup_store(acc_up,   ts_Cu, 8, 0, false);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    /* SwiGLU + route_weight + store. Each lane handles one cell of the tile. */
+    /* SwiGLU + route_weight + store. Each lane handles one cell of the tile.
+     *
+     * Layout note (silv 2026-05-27 dispatch wire): mid buffer is consumed by
+     * the existing down-projection matmul with token-major pair-row layout
+     *   pair_row = tok * n_expert + idx   (n_expert = args.nei0)
+     *   cell offset = pair_row * mid_row_stride + out_col * sizeof(float)
+     * where mid_row_stride = expert_mid_dim * sizeof(float). This matches
+     * the existing ds4_gpu_encode_moe_swiglu_weight output layout that the
+     * down kernel reads, so the simdgroup mat-mat replaces gate+up+SwiGLU
+     * in-place. */
     if (tiitg < 64) {
         const uint trow = tiitg / 8;
         const uint tcol = tiitg % 8;
@@ -1397,10 +1406,11 @@ kernel void kernel_mul_mm_id_fp16_pair_swiglu_f32(
             const float silu = g / (1.0f + exp(-g));
             device const float *route_w =
                 (device const float *)(weights + (uint64_t)idx * act.weight_stride);
+            const uint64_t pair_row =
+                (uint64_t)tok * (uint64_t)args.nei0 + (uint64_t)idx;
             device float *dst_mid_f32 =
-                (device float *)(dst_mid + (uint64_t)idx * act.mid_row_stride);
-            dst_mid_f32[(uint64_t)tok * (uint64_t)n_out + (uint64_t)out_col] =
-                silu * u * route_w[0];
+                (device float *)(dst_mid + pair_row * act.mid_row_stride);
+            dst_mid_f32[(uint64_t)out_col] = silu * u * route_w[0];
         }
     }
 }

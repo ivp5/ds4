@@ -1,0 +1,74 @@
+=== run 2: FP16 simdgroup on layer 34 (DS4_HOT_PIN_LAYERS=34 + DS4_HOT_FP16_KERNEL=1) ===
+ds4: --prefill-metal-phases auto: resolved N=2 (total=72.56 GiB, cap=60.00 GiB, headroom=14.00 GiB, per-phase budget=46.00 GiB)
+ds4: cpu-moe: layers 0..42 run their routed MoE on the CPU (first 43 of 43)
+ds4: Metal device Apple M1 Max, 64.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal expert inverse table uploaded (44032 bytes, 43*256 int32)
+ds4: Metal model views created in 0.015 ms, residency requested in 0.158 ms, warmup 1.243 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.397 ms, residency requested in 120.086 ms, warmup 0.931 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.032 ms, warmup 0.329 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (72.56 GiB) from the Metal residency set
+ds4: metal backend initialized for graph diagnostics
+ds4: DS4_HOT_PIN_LAYERS=34 pairs=0 → budget=16.1 GB
+ds4_hot_pin_layer L34: pinning 256 experts × 3 tiles = 12.88 GB
+  L34: pinned 1/256 (0.01s)
+  L34: pinned 2/256 (0.02s)
+  L34: pinned 3/256 (0.03s)
+  L34: pinned 4/256 (0.04s)
+  L34: pinned 8/256 (0.08s)
+  L34: pinned 16/256 (0.17s)
+  L34: pinned 24/256 (0.26s)
+  L34: pinned 32/256 (0.36s)
+  L34: pinned 40/256 (0.44s)
+  L34: pinned 48/256 (0.52s)
+  L34: pinned 56/256 (0.63s)
+  L34: pinned 64/256 (0.77s)
+  L34: pinned 72/256 (1.14s)
+  L34: pinned 80/256 (1.28s)
+  L34: pinned 88/256 (1.44s)
+  L34: pinned 96/256 (1.61s)
+  L34: pinned 104/256 (1.77s)
+  L34: pinned 112/256 (1.89s)
+  L34: pinned 120/256 (2.04s)
+  L34: pinned 128/256 (2.25s)
+  L34: pinned 136/256 (2.39s)
+  L34: pinned 144/256 (2.54s)
+  L34: pinned 152/256 (2.71s)
+  L34: pinned 160/256 (2.87s)
+  L34: pinned 168/256 (3.00s)
+  L34: pinned 176/256 (3.17s)
+  L34: pinned 184/256 (3.36s)
+  L34: pinned 192/256 (3.51s)
+  L34: pinned 200/256 (3.58s)
+  L34: pinned 208/256 (3.69s)
+  L34: pinned 216/256 (3.82s)
+  L34: pinned 224/256 (3.97s)
+  L34: pinned 232/256 (4.12s)
+  L34: pinned 240/256 (4.30s)
+  L34: pinned 248/256 (4.45s)
+  L34: pinned 256/256 (4.62s)
+  L34: 256 experts pinned in 4.62s (55.40 experts/s)
+ds4: hot-store: 1 layers pinned, 12.88 GB heap
+ds4_hot_store_set_active: 256 tiles, heap 12884.9 MB ready for dispatch
+ds4_vqb2_fp16_init: 3 pipelines + queue + 3×8192B scratch + 2×16384B I/O
+bind_store: 12884.9 MB FP16 heap bound
+ds4: context buffers 579.64 MiB (ctx=32768, backend=metal, prefill_chunk=2048, raw_kv_rows=2304, compressed_kv_rows=8194)
+processing 21 input tokens: 0/21 (0.0%)
+ds4: Metal model views created in 1.530 ms, residency requested in 15747.268 ms, warmup 3.452 ms (mapped 36296.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.414 ms, residency requested in 3455.664 ms, warmup 1.642 ms (mapped 8384.80 MiB from offset 74317.95 MiB)
+ds4: Metal residency requested in 0.036 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (37.12 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 0/2 (layers 0..20)
+processing 21 input tokens: 21/21 (100.0%)
+ds4: Metal model views created in 0.047 ms, residency requested in 259.848 ms, warmup 3.139 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 32.979 ms, residency requested in 20013.167 ms, warmup 44.538 ms (mapped 46400.80 MiB from offset 36301.95 MiB)
+ds4: Metal residency requested in 0.059 ms, warmup -0.000 ms
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (35.44 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 1/2 (layers 21..42)
+ds4: FP16 simdgroup mat-mat DISPATCHED at layer=34 n_tokens=21 n_expert=6 per_expert_stride=50331648 bytes (first call)
+ds4: Metal command batch failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)
+ds4: prompt processing failed: metal prefill failed

@@ -165,6 +165,14 @@ ds4_hot_expert_store  *ds4_hot_store_get_active(void);
 int ds4_hot_layer_all_pinned(const ds4_hot_expert_store *store, uint32_t layer,
                              const int32_t *selected, uint32_t n_selected);
 
+/* O(DS4_N_EXPERT) check: all 256 experts of `layer` pinned with full row masks.
+ * Cheaper than ds4_hot_layer_all_pinned + CPU readback of router_selected when
+ * the pin function pinned the entire layer (the only currently-supported mode).
+ * silv 2026-05-27: enables Metal prefill dispatch to take the FP16 simdgroup
+ * path without syncing the GPU command buffer to read selected experts.
+ * Returns 1 iff every expert in `layer` is pinned. */
+int ds4_hot_layer_fully_pinned(const ds4_hot_expert_store *store, uint32_t layer);
+
 /* CPU FP16 routed-FFN dispatch. Fallback when Metal unavailable; also
  * correctness reference. Output is ADDED to output_fp32. ~118 t/s single
  * thread per vqb2_to_fp16_test.c. */

@@ -316,6 +316,23 @@ int ds4_hot_layer_all_pinned(const ds4_hot_expert_store *store,
     return 1;
 }
 
+int ds4_hot_layer_fully_pinned(const ds4_hot_expert_store *store, uint32_t layer) {
+    if (!store || layer >= DS4_N_LAYER) return 0;
+    if (!store->gate_offset || !store->up_offset || !store->down_offset) return 0;
+    if (!store->gate_row_blocks || !store->up_row_blocks || !store->down_row_blocks) return 0;
+    const uint64_t base = (uint64_t)layer * DS4_N_EXPERT;
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        const uint64_t idx = base + (uint64_t)e;
+        if (store->gate_offset[idx] < 0) return 0;
+        if (store->up_offset[idx]   < 0) return 0;
+        if (store->down_offset[idx] < 0) return 0;
+        if ((store->gate_row_blocks[idx] & DS4_VQB2_GATE_UP_FULL_ROW_MASK) != DS4_VQB2_GATE_UP_FULL_ROW_MASK) return 0;
+        if ((store->up_row_blocks[idx]   & DS4_VQB2_GATE_UP_FULL_ROW_MASK) != DS4_VQB2_GATE_UP_FULL_ROW_MASK) return 0;
+        if ((store->down_row_blocks[idx] & DS4_VQB2_DOWN_FULL_ROW_MASK)    != DS4_VQB2_DOWN_FULL_ROW_MASK) return 0;
+    }
+    return 1;
+}
+
 /* SwiGLU clamp (matches DS4_SWIGLU_CLAMP_EXP behavior in ds4.c — keep
  * synchronized with that value). For the dispatch fallback we use a
  * conservative default; ds4.c can override per layer if needed. */

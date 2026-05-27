@@ -13293,6 +13293,113 @@ static int ds4_gpu_encode_mul_mm_id_fp16_pair_swiglu(
  return 1;
 }
 
+/* silv 2026-05-27 — high-level dispatch wire for FP16 simdgroup mat-mat path.
+ *
+ * Conditions checked (returns 0 = "didn't dispatch, fall back to IQ2 path"):
+ *   (a) DS4_HOT_FP16_KERNEL env set (caller already filtered, but rechecked)
+ *   (b) g_moe_mul_mm_id_fp16_pair_swiglu_pipeline registered
+ *   (c) hot-store active AND `layer` fully pinned (all 256 experts gate+up+down)
+ *   (d) hot-store MTLBuffer wrapped (ds4_metal_vqb2_fp16_get_hot_buffer != NULL)
+ *   (e) n_tokens >= 8 (mat-mat tile width)
+ *
+ * Replaces gate+up+SwiGLU+weight in one fused encoder dispatch. The kernel
+ * writes directly to `dst_mid` with token-major pair-row layout that matches
+ * what the down-projection mm_id reads. Returns 1 on successful dispatch. */
+static int ds4_gpu_dispatch_fp16_simdgroup_pair_swiglu(
+ id<MTLCommandBuffer> cb,
+ uint32_t layer_index,
+ uint32_t expert_in_dim,
+ uint32_t expert_mid_dim,
+ uint32_t n_tokens,
+ uint32_t n_expert,
+ float clamp_value,
+ id<MTLBuffer> xbuf, NSUInteger x_off,
+ id<MTLBuffer> midbuf, NSUInteger mid_off,
+ id<MTLBuffer> selectedbuf, NSUInteger sel_off,
+ id<MTLBuffer> weightsbuf, NSUInteger weights_off) {
+ if (!cb || !xbuf || !midbuf || !selectedbuf || !weightsbuf) return 0;
+ if (n_tokens < 8u) return 0;
+ extern id<MTLComputePipelineState> g_moe_mul_mm_id_fp16_pair_swiglu_pipeline;
+ if (!g_moe_mul_mm_id_fp16_pair_swiglu_pipeline) return 0;
+ if (getenv("DS4_HOT_FP16_KERNEL") == NULL) return 0;
+
+ ds4_hot_expert_store *hot = ds4_hot_store_get_active();
+ if (!hot) return 0;
+ if (!ds4_hot_layer_fully_pinned(hot, layer_index)) return 0;
+
+ extern void *ds4_metal_vqb2_fp16_get_hot_buffer(void);
+ void *hot_buf_void = ds4_metal_vqb2_fp16_get_hot_buffer();
+ if (!hot_buf_void) return 0;
+ id<MTLBuffer> hot_buf = (__bridge id<MTLBuffer>)hot_buf_void;
+
+ /* Per-expert byte stride within the hot-store heap. The pin function lays
+  * out experts as [g0,u0,d0, g1,u1,d1, ...] consecutively per layer, so the
+  * stride is gate_offset[layer*N+1] - gate_offset[layer*N+0]. */
+ const uint64_t base0 = (uint64_t)layer_index * DS4_N_EXPERT;
+ const int64_t  gate_off_e0 = hot->gate_offset[base0];
+ const int64_t  up_off_e0   = hot->up_offset  [base0];
+ if (gate_off_e0 < 0 || up_off_e0 < 0) return 0;
+ int64_t per_expert_stride = -1;
+ if (n_expert > 1) {
+  const int64_t gate_off_e1 = hot->gate_offset[base0 + 1];
+  if (gate_off_e1 < 0) return 0;
+  per_expert_stride = gate_off_e1 - gate_off_e0;
+  if (per_expert_stride <= 0) return 0;
+ } else {
+  /* Single expert per token isn't the DS4 case (n_expert == 6 typically),
+   * but guard the math: stride is the per-expert gate+up+down bundle size,
+   * which equals the FP16 byte count for one expert's three tiles. We
+   * cannot infer that without the next expert; reject. */
+  return 0;
+ }
+
+ /* Build the mat-mat args. nei0 = experts-per-token (here `n_expert`),
+  * nei1 = n_tokens (the kernel uses pairs = nei0*nei1 dispatch). */
+ ds4_gpu_mul_mv_id_args args = ds4_gpu_make_mul_mv_id_args(
+  (int)expert_in_dim, (int)expert_mid_dim, 256,
+  /* row_bytes (placeholder, unused by mat-mat kernel) */
+  (int64_t)expert_in_dim * sizeof(uint16_t),
+  /* per-expert bytes — used by kernel as nb02 to stride across experts */
+  per_expert_stride,
+  1, (int)n_expert, (int)n_tokens, 1);
+
+ /* The activation rows + mid rows layout: the kernel reads src1 as
+  * `tok * n_in` floats (contiguous token-major activation) and writes mid
+  * at `pair_row * mid_row_stride`. */
+ ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
+  .width = expert_mid_dim,
+  .rows = (uint32_t)(n_tokens * n_expert),
+  .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+  .up_row_stride   = (uint64_t)expert_mid_dim * sizeof(float),
+  .mid_row_stride  = (uint64_t)expert_mid_dim * sizeof(float),
+  .weight_stride   = sizeof(float),
+  .write_clamped   = 0,
+  .clamp_value     = clamp_value,
+ };
+
+ const int rc = ds4_gpu_encode_mul_mm_id_fp16_pair_swiglu(
+  cb,
+  g_moe_mul_mm_id_fp16_pair_swiglu_pipeline,
+  &args, &act_args,
+  hot_buf,
+  (NSUInteger)gate_off_e0,
+  (NSUInteger)up_off_e0,
+  xbuf, x_off,
+  midbuf, mid_off,
+  selectedbuf, sel_off,
+  weightsbuf, weights_off);
+
+ static int dispatched_once_logged = 0;
+ if (rc && !dispatched_once_logged) {
+  fprintf(stderr,
+          "ds4: FP16 simdgroup mat-mat DISPATCHED at layer=%u "
+          "n_tokens=%u n_expert=%u per_expert_stride=%lld bytes (first call)\n",
+          layer_index, n_tokens, n_expert, (long long)per_expert_stride);
+  dispatched_once_logged = 1;
+ }
+ return rc;
+}
+
 static int ds4_gpu_encode_mul_mv_id_sum6(
  id<MTLCommandBuffer> cb,
  id<MTLComputePipelineState> pipeline,
@@ -15138,37 +15245,20 @@ int ds4_gpu_routed_moe_batch_tensor(
  n_expert, n_expert, n_tokens, down_nr0);
  const bool use_mm_id = n_tokens >= 32u && ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
 
- /* silv 2026-05-27 — prefill mat-mat FP16 dispatch readiness check.
-  * The simdgroup kernel kernel_mul_mm_id_fp16_pair_swiglu_f32 (registered
-  * via g_moe_mul_mm_id_fp16_pair_swiglu_pipeline) is now compiled-in
-  * and ready. To dispatch via it instead of the existing IQ2_XXS mat-mat
-  * path, the conditions are:
-  *   (a) DS4_HOT_FP16_KERNEL=1 (set by caller)
-  *   (b) hot-store has the active experts pinned (ds4_hot_layer_all_pinned)
-  *   (c) n_tokens >= 8 (mat-mat tile size — looser than IQ2 use_mm_id=32)
-  *   (d) gate_type is IQ2_XXS (the only codec hot-store currently dequants)
-  *
-  * Logs once on the first eligible call. Actual dispatch wire to follow
-  * (needs: hot-store weight pointers + per-expert offset table → new
-  * ds4_gpu_encode_mul_mm_id_fp16_pair_swiglu function). */
- {
-  static int prefill_matmul_ready_logged = 0;
-  extern id<MTLComputePipelineState> g_moe_mul_mm_id_fp16_pair_swiglu_pipeline;
-  if (!prefill_matmul_ready_logged &&
-      getenv("DS4_HOT_FP16_KERNEL") != NULL &&
-      g_moe_mul_mm_id_fp16_pair_swiglu_pipeline != nil &&
-      n_tokens >= 8u &&
-      gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
-   ds4_hot_expert_store *hot = ds4_hot_store_get_active();
-   if (hot && hot->n_pinned > 0) {
-    fprintf(stderr,
-            "ds4: prefill simdgroup mat-mat READY at n_tokens=%u, "
-            "%u hot-store experts pinned. Encoder TBD — IQ2 mat-mat path runs.\n",
-            n_tokens, hot->n_pinned);
-    prefill_matmul_ready_logged = 1;
-   }
-  }
- }
+ /* silv 2026-05-27 — prefill mat-mat FP16 dispatch precondition. Sets
+  * `try_fp16_simdgroup` only when env + pipeline + shape + codec line up;
+  * the actual dispatch + hot-store fully-pinned check fires after the
+  * command buffer is acquired below. Conditions:
+  *   (a) DS4_HOT_FP16_KERNEL=1
+  *   (b) g_moe_mul_mm_id_fp16_pair_swiglu_pipeline registered
+  *   (c) n_tokens >= 8 (mat-mat tile size)
+  *   (d) gate_type is IQ2_XXS (only codec hot-store currently dequants) */
+ extern id<MTLComputePipelineState> g_moe_mul_mm_id_fp16_pair_swiglu_pipeline;
+ const bool try_fp16_simdgroup =
+  getenv("DS4_HOT_FP16_KERNEL") != NULL &&
+  g_moe_mul_mm_id_fp16_pair_swiglu_pipeline != nil &&
+  n_tokens >= 8u &&
+  gate_type == DS4_METAL_TENSOR_IQ2_XXS;
 
  /*
  * MTP verification is neither normal decode nor large prefill: the
@@ -15286,7 +15376,27 @@ int ds4_gpu_routed_moe_batch_tensor(
  n_tokens <= 4u &&
  down_sum6_pipeline != nil;
  int ok = 0;
- if (use_mm_id) {
+ int fp16_simdgroup_used = 0;
+ /* silv 2026-05-27 — FP16 simdgroup mat-mat fused gate+up+SwiGLU dispatch.
+  * Replaces the gate matmul + up matmul + SwiGLU+weight steps with a single
+  * fused kernel reading FP16 weights from the hot-store. The down projection
+  * runs unchanged from `midbuf`. Returns 1 on successful dispatch; on 0 the
+  * IQ2_XXS path below runs as fallback. Hot-store fully-pinned check happens
+  * inside the helper (cheap layer-level check, no GPU sync needed). */
+ if (try_fp16_simdgroup) {
+ fp16_simdgroup_used = ds4_gpu_dispatch_fp16_simdgroup_pair_swiglu(
+  cb, layer_index, expert_in_dim, expert_mid_dim, n_tokens, n_expert,
+  clamp,
+  xbuf, ds4_gpu_tensor_offset(x),
+  midbuf, ds4_gpu_tensor_offset(mid),
+  selectedbuf, ds4_gpu_tensor_offset(selected),
+  weightsbuf, ds4_gpu_tensor_offset(weights));
+ if (fp16_simdgroup_used) {
+  ok = 1;
+  DS4_METAL_PROFILE_MOE_STAGE("fp16_simdgroup_fused");
+ }
+ }
+ if (!fp16_simdgroup_used && use_mm_id) {
  /*
  * The routed pair ids are the same for gate, up, and down. Build
  * the expert-major work map once, then reuse it for all three
@@ -15323,7 +15433,7 @@ int ds4_gpu_routed_moe_batch_tensor(
  ds4_gpu_tensor_offset(up));
  DS4_METAL_PROFILE_MOE_STAGE("up");
  }
- } else if (use_tiny_pair_mv) {
+ } else if (!fp16_simdgroup_used && use_tiny_pair_mv) {
  id<MTLComputePipelineState> pair_pipeline =
  gate_type == DS4_METAL_TENSOR_IQ2_XXS ?
  g_moe_mul_mv_id_iq2_xxs_pair_pipeline :
@@ -15346,7 +15456,7 @@ int ds4_gpu_routed_moe_batch_tensor(
  gate_smem,
  2,
  false);
- } else {
+ } else if (!fp16_simdgroup_used) {
  ok = ds4_gpu_encode_mul_mv_id(cb,
  gate_mv_pipeline,
  &gate_args,
@@ -15376,14 +15486,15 @@ int ds4_gpu_routed_moe_batch_tensor(
  2,
  false);
  }
- DS4_METAL_PROFILE_MOE_STAGE("gate_up");
+ if (!fp16_simdgroup_used) DS4_METAL_PROFILE_MOE_STAGE("gate_up");
  const bool use_fused_activation = !g_quality_mode;
  const bool use_mid_f16 =
+ !fp16_simdgroup_used &&
  use_mm_id &&
  use_fused_activation &&
  request_mid_f16;
  if (mid_is_f16) *mid_is_f16 = use_mid_f16;
- if (ok && use_fused_activation) {
+ if (ok && !fp16_simdgroup_used && use_fused_activation) {
  ok = ds4_gpu_encode_moe_swiglu_weight(cb,
  gatebuf,
  ds4_gpu_tensor_offset(gate),
@@ -15397,7 +15508,7 @@ int ds4_gpu_routed_moe_batch_tensor(
  pair_rows,
  clamp,
  use_mid_f16);
- } else if (ok && clamp > 1.0e-6f) {
+ } else if (ok && !fp16_simdgroup_used && clamp > 1.0e-6f) {
  ok = ds4_gpu_encode_unary_f32_rows(cb,
  g_unary_clamp_pipeline,
  gatebuf,
@@ -15448,7 +15559,7 @@ int ds4_gpu_routed_moe_batch_tensor(
  midbuf,
  ds4_gpu_tensor_offset(mid));
  }
- } else if (ok) {
+ } else if (ok && !fp16_simdgroup_used) {
  ok = ds4_gpu_encode_swiglu_flat(cb,
  gatebuf,
  ds4_gpu_tensor_offset(gate),
@@ -15458,7 +15569,7 @@ int ds4_gpu_routed_moe_batch_tensor(
  ds4_gpu_tensor_offset(mid),
  (uint32_t)((uint64_t)pair_rows * expert_mid_dim));
  }
- if (ok && !use_fused_activation) {
+ if (ok && !fp16_simdgroup_used && !use_fused_activation) {
  ds4_gpu_bin_args weight_args =
  ds4_gpu_make_bin_rowwise_scalar_args(expert_mid_dim, pair_rows);
  ok = ds4_gpu_encode_bin_f32_rows(cb,
@@ -15471,7 +15582,7 @@ int ds4_gpu_routed_moe_batch_tensor(
  midbuf,
  ds4_gpu_tensor_offset(mid));
  }
- DS4_METAL_PROFILE_MOE_STAGE("activation_weight");
+ if (!fp16_simdgroup_used) DS4_METAL_PROFILE_MOE_STAGE("activation_weight");
 
  id<MTLBuffer> down_dst = n_expert == 1 ? outbuf : (expertsbuf ? expertsbuf : g_moe_down_scratch_buffer);
  NSUInteger down_dst_off = n_expert == 1 ? ds4_gpu_tensor_offset(out) :
