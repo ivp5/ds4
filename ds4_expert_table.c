@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <errno.h>
 
 uint8_t g_expert_tier[DS4_N_LAYER * DS4_N_EXPERT] = {0};
 int g_expert_table_initialized = 0;
@@ -266,6 +267,124 @@ void ds4_hot_store_set_calibration_domain(ds4_hot_expert_store *store,
 
 uint64_t ds4_hot_store_get_calibration_domain(const ds4_hot_expert_store *store) {
     return store ? store->calibration_domain_id : 0;
+}
+
+/* ============================================================================
+ * ORGAN-SKIP implementation (task #649 Phase A).
+ *
+ * Storage: 43 × 256 × 3 = 33,024 bytes — tiny, BSS-resident, branch-free.
+ * Loaders are simple CSV / env parsers; they don't error on out-of-range
+ * cells (those become no-ops at query time). They DO error on malformed
+ * lines so the harness fails loud when its manifest is wrong.
+ * ============================================================================ */
+
+uint8_t g_organ_skip[DS4_N_LAYER * DS4_N_EXPERT * DS4_N_ORGAN];
+int     g_organ_skip_initialized = 0;
+uint32_t g_organ_skip_count = 0;
+
+static int organ_skip_apply(uint32_t L, uint32_t E, uint32_t K, int on) {
+    if (L >= DS4_N_LAYER || E >= DS4_N_EXPERT || K >= DS4_N_ORGAN) return -1;
+    size_t idx = ((size_t)L * DS4_N_EXPERT + E) * DS4_N_ORGAN + K;
+    int was_on = g_organ_skip[idx] ? 1 : 0;
+    g_organ_skip[idx] = on ? 1 : 0;
+    if (on && !was_on) g_organ_skip_count++;
+    if (!on && was_on) g_organ_skip_count--;
+    return 0;
+}
+
+int ds4_organ_skip_set(uint32_t layer, uint32_t expert, uint32_t kind, int on) {
+    g_organ_skip_initialized = 1;
+    return organ_skip_apply(layer, expert, kind, on);
+}
+
+void ds4_organ_skip_reset(void) {
+    memset(g_organ_skip, 0, sizeof(g_organ_skip));
+    g_organ_skip_count = 0;
+    /* g_organ_skip_initialized stays 1; harness may add new cells next. */
+}
+
+int ds4_load_organ_skip_csv(const char *csv_path) {
+    if (!csv_path) return -1;
+    FILE *fp = fopen(csv_path, "r");
+    if (!fp) {
+        fprintf(stderr, "ds4_load_organ_skip_csv: cannot open %s: %s\n",
+                csv_path, strerror(errno));
+        return -1;
+    }
+    ds4_organ_skip_reset();
+    g_organ_skip_initialized = 1;
+    char line[512];
+    int lineno = 0;
+    int loaded = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        lineno++;
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+        unsigned L, E, K;
+        if (sscanf(p, "%u,%u,%u", &L, &E, &K) != 3) {
+            fprintf(stderr, "ds4_load_organ_skip_csv: malformed line %d in %s\n",
+                    lineno, csv_path);
+            fclose(fp);
+            return -1;
+        }
+        if (organ_skip_apply(L, E, K, 1) != 0) {
+            fprintf(stderr, "ds4_load_organ_skip_csv: out-of-range (L=%u, E=%u, K=%u) line %d\n",
+                    L, E, K, lineno);
+            fclose(fp);
+            return -1;
+        }
+        loaded++;
+    }
+    fclose(fp);
+    return loaded;
+}
+
+int ds4_load_organ_skip_env(const char *override) {
+    const char *src = override ? override : getenv("DS4_ORGAN_SKIP");
+    if (!src || !*src) return 0;
+    ds4_organ_skip_reset();
+    g_organ_skip_initialized = 1;
+    int loaded = 0;
+    const char *p = src;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ';') p++;
+        if (!*p) break;
+        unsigned L, E, K;
+        int consumed = 0;
+        if (sscanf(p, "%u,%u,%u%n", &L, &E, &K, &consumed) != 3) {
+            fprintf(stderr, "ds4_load_organ_skip_env: parse error at offset %ld: '%.40s'\n",
+                    (long)(p - src), p);
+            return -1;
+        }
+        if (organ_skip_apply(L, E, K, 1) != 0) {
+            fprintf(stderr, "ds4_load_organ_skip_env: out-of-range (L=%u, E=%u, K=%u)\n",
+                    L, E, K);
+            return -1;
+        }
+        loaded++;
+        p += consumed;
+    }
+    return loaded;
+}
+
+void ds4_organ_skip_print(void) {
+    if (!g_organ_skip_initialized) {
+        printf("organ_skip: not initialized\n");
+        return;
+    }
+    uint32_t per_organ[DS4_N_ORGAN] = {0, 0, 0};
+    for (uint32_t L = 0; L < DS4_N_LAYER; L++) {
+        for (uint32_t E = 0; E < DS4_N_EXPERT; E++) {
+            for (uint32_t K = 0; K < DS4_N_ORGAN; K++) {
+                if (g_organ_skip[((size_t)L * DS4_N_EXPERT + E) * DS4_N_ORGAN + K]) {
+                    per_organ[K]++;
+                }
+            }
+        }
+    }
+    printf("organ_skip: total=%u (gate=%u, up=%u, down=%u)\n",
+           g_organ_skip_count, per_organ[0], per_organ[1], per_organ[2]);
 }
 
 /* Stub populator: validates budget, returns -1 because actual IQ2_XXS → FP16

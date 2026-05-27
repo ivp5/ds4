@@ -15,6 +15,7 @@
 #define DS4_EXPERT_TABLE_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifndef DS4_EXPERT_TABLE_USES_EXTERNAL_DIMS
 #ifndef DS4_N_LAYER
@@ -241,6 +242,62 @@ int ds4_hot_dispatch_layer_cpu(const ds4_hot_expert_store *store, uint32_t layer
                                uint32_t n_selected,
                                const float *input_fp32, float *output_fp32,
                                uint32_t n_embd);
+
+/* ============================================================================
+ * ORGAN-SKIP — per-(layer, expert) per-organ ablation flag (task #649).
+ *
+ * Phase A of the per-organ signed source-top-K harm scorer (see
+ * tmp/20260527_harm_scorer/DESIGN.md). Sets a byte per (L, E, K) where
+ * K = 0 (gate) / 1 (up) / 2 (down). When set, the dispatch path must
+ * zero that organ's contribution to the routed-FFN output for the
+ * given expert at the given layer.
+ *
+ * Loaded from CSV ("L,E,K" rows) via ds4_load_organ_skip_csv() or
+ * directly from env DS4_ORGAN_SKIP via ds4_load_organ_skip_env() ("L,E,K;L,E,K;...").
+ *
+ * The dispatch path is NOT YET WIRED — this commit lands the data
+ * structure and loader. The hook into ds4.c/ds4_metal.m routed-FFN
+ * dispatch is a separate change. Until wired, ds4_organ_should_skip
+ * returns the correct flag but dispatch ignores it. That's intentional
+ * separation of concerns; Phase A.1 ships the hook.
+ * ============================================================================ */
+
+#define DS4_ORGAN_GATE 0u
+#define DS4_ORGAN_UP   1u
+#define DS4_ORGAN_DOWN 2u
+#define DS4_N_ORGAN    3u
+
+extern uint8_t g_organ_skip[DS4_N_LAYER * DS4_N_EXPERT * DS4_N_ORGAN];
+extern int     g_organ_skip_initialized;
+extern uint32_t g_organ_skip_count;
+
+/* Load from CSV file (one "L,E,K" per line, # comments OK).
+ * Returns count of cells loaded, or -1 on error. Replaces prior contents. */
+int ds4_load_organ_skip_csv(const char *csv_path);
+
+/* Load from DS4_ORGAN_SKIP env ("L,E,K;L,E,K;..."). NULL ⇒ read getenv.
+ * Returns count loaded, -1 on parse error, 0 if env unset or empty. */
+int ds4_load_organ_skip_env(const char *override);
+
+/* Programmatic setter for harness use. kind ∈ {0,1,2}. Returns 0/-1. */
+int ds4_organ_skip_set(uint32_t layer, uint32_t expert, uint32_t kind, int on);
+
+/* O(1) query during dispatch. Header inline so it compiles to a single
+ * load+test on the hot path. Returns 0 when not initialized so production
+ * binaries that never set the env var pay zero cost beyond a bool branch. */
+static inline int ds4_organ_should_skip(uint32_t layer, uint32_t expert, uint32_t kind) {
+    extern uint8_t g_organ_skip[DS4_N_LAYER * DS4_N_EXPERT * DS4_N_ORGAN];
+    extern int g_organ_skip_initialized;
+    if (!g_organ_skip_initialized) return 0;
+    if (layer >= DS4_N_LAYER || expert >= DS4_N_EXPERT || kind >= DS4_N_ORGAN) return 0;
+    return g_organ_skip[((size_t)layer * DS4_N_EXPERT + expert) * DS4_N_ORGAN + kind];
+}
+
+/* Clear all flags (used between scoring cells in the harm-scorer driver). */
+void ds4_organ_skip_reset(void);
+
+/* Print summary to stdout: count + per-organ histogram. */
+void ds4_organ_skip_print(void);
 
 /* ============================================================================
  * Diagnostic counters. Increment during routing dispatch via the inline
