@@ -1405,3 +1405,9 @@ int ds4_gpu_mtl4_rms_norm_mul_f32_4_canary(uint32_t n_rows, uint32_t row_width, 
 /* silv 2026-05-27 task #710 — rms_norm_f32_4 MTL4.
  * F=1 variant: norm only, no weight multiply. Diagnostic variant. */
 int ds4_gpu_mtl4_rms_norm_f32_4_canary(uint32_t n_rows, uint32_t row_width, float eps);
+
+/* silv 2026-05-27 tasks #711/#712 — get_rows_f16 + get_rows_i32 MTL4.
+ * Type-variant clones of #691 get_rows_f32. f16 widens to f32 on load;
+ * i32 preserves type for embedding-table hash lookups. */
+int ds4_gpu_mtl4_get_rows_f16_canary(uint32_t n_table_rows, uint32_t row_width, uint32_t n_ids);
+int ds4_gpu_mtl4_get_rows_i32_canary(uint32_t n_table_rows, uint32_t row_width, uint32_t n_ids);

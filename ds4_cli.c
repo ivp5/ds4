@@ -2028,6 +2028,20 @@ int main(int argc, char **argv) {
         const float ep = (argc >= 5) ? (float)atof(argv[4]) : 1.0e-5f;
         return ds4_gpu_mtl4_rms_norm_f32_4_canary(nr, rw, ep) ? 0 : 1;
     }
+    /* --get-rows-f16-canary [n_table [row_width [n_ids]]] : task #711 f16 embedding lookup */
+    if (argc >= 2 && !strcmp(argv[1], "--get-rows-f16-canary")) {
+        const uint32_t nt = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 32;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 128;
+        const uint32_t ni = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
+        return ds4_gpu_mtl4_get_rows_f16_canary(nt, rw, ni) ? 0 : 1;
+    }
+    /* --get-rows-i32-canary [n_table [row_width [n_ids]]] : task #712 i32 lookup */
+    if (argc >= 2 && !strcmp(argv[1], "--get-rows-i32-canary")) {
+        const uint32_t nt = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 32;
+        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 128;
+        const uint32_t ni = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
+        return ds4_gpu_mtl4_get_rows_i32_canary(nt, rw, ni) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);
