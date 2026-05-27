@@ -34882,6 +34882,223 @@ cleanup:
     return (rc && mismatch_total == 0) ? 1 : 0;
 }
 
+/* ============================================================ */
+/* Selected-expert VQB2 decoder — H2125 routed-MoE primitive    */
+/* ============================================================ */
+/* The base vqb2_decode_fp16_mtl4 kernel decodes a contiguous code range.
+ * For routed MoE dispatch (H2125 layer-window pattern), each packet
+ * carries 256 experts but only 6 are selected per token. This kernel
+ * decodes ONLY the selected subset directly from the packet's codes
+ * stream, producing a dense (n_selected × n_rows × n_pairs) fp16 output.
+ *
+ * Layout inside the packet: expert e starts at linear_index = e × n_rows ×
+ * n_pairs. Codes are little-bit-endian packed (bit_width ∈ {2,4,6,8}).
+ *
+ * Output is packed by selection order (not expert ID), so caller's downstream
+ * matmul indexes [k=0..n_selected-1] directly. */
+
+static id<MTLComputePipelineState> g_vqb2_decode_fp16_selected_mtl4_pipeline;
+static int g_vqb2_decode_fp16_selected_mtl4_init_attempted;
+static int g_vqb2_decode_fp16_selected_mtl4_init_ok;
+
+static int ds4_vqb2_decode_fp16_selected_mtl4_pipeline_init(void) {
+    if (g_vqb2_decode_fp16_selected_mtl4_init_attempted) return g_vqb2_decode_fp16_selected_mtl4_init_ok;
+    g_vqb2_decode_fp16_selected_mtl4_init_attempted = 1;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct args_t {\n"
+         "  uint bit_width;\n"
+         "  uint code_mask;\n"
+         "  uint n_rows;\n"
+         "  uint n_pairs;\n"
+         "  uint n_selected;\n"
+         "  uint pad;\n"
+         "};\n"
+         "kernel void vqb2_decode_fp16_selected_mtl4(\n"
+         "    device const args_t *args         [[buffer(0)]],\n"
+         "    device const float  *codebook     [[buffer(1)]],\n"
+         "    device const uchar  *codes        [[buffer(2)]],\n"
+         "    device const uint   *selected     [[buffer(3)]],\n"
+         "    device       half2  *out_fp16     [[buffer(4)]],\n"
+         "    uint2 gid [[thread_position_in_grid]]) {\n"
+         "  /* gid.x = code index within one expert (0..n_rows*n_pairs-1)\n"
+         "   * gid.y = selection slot (0..n_selected-1) */\n"
+         "  const uint codes_per_expert = args->n_rows * args->n_pairs;\n"
+         "  if (gid.x >= codes_per_expert) return;\n"
+         "  if (gid.y >= args->n_selected) return;\n"
+         "  const uint expert = selected[gid.y];\n"
+         "  const uint linear = expert * codes_per_expert + gid.x;\n"
+         "  const uint bit_off = linear * args->bit_width;\n"
+         "  const uint byte_off = bit_off >> 3;\n"
+         "  const uint shift = bit_off & 7u;\n"
+         "  const uint lo = (uint)codes[byte_off];\n"
+         "  const uint hi = (args->bit_width + shift > 8u) ? (uint)codes[byte_off + 1u] : 0u;\n"
+         "  const uint window = lo | (hi << 8);\n"
+         "  const uint code = (window >> shift) & args->code_mask;\n"
+         "  const float re = codebook[code * 2u + 0u];\n"
+         "  const float im = codebook[code * 2u + 1u];\n"
+         "  const uint out_idx = gid.y * codes_per_expert + gid.x;\n"
+         "  out_fp16[out_idx] = half2((half)re, (half)im);\n"
+         "}\n";
+    g_vqb2_decode_fp16_selected_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_vqb2_decode_fp16_selected_mtl4",
+        @"vqb2_decode_fp16_selected_mtl4", 64, NULL, 0);
+    g_vqb2_decode_fp16_selected_mtl4_init_ok =
+        (g_vqb2_decode_fp16_selected_mtl4_pipeline != nil) ? 1 : 0;
+    return g_vqb2_decode_fp16_selected_mtl4_init_ok;
+}
+
+/* Canary: synthetic packet with 256 experts, select arbitrary k experts,
+ * decode them, cross-check against the equivalent base-kernel decode of the
+ * same expert IDs. K∈{4,16,64,256}. */
+int ds4_gpu_mtl4_vqb2_decode_fp16_selected_canary(uint32_t n_selected,
+                                                  uint32_t n_experts_total,
+                                                  uint32_t n_rows,
+                                                  uint32_t n_pairs,
+                                                  uint32_t k_val) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_vqb2_decode_fp16_selected_mtl4_pipeline_init()) return 0;
+    if (n_selected == 0 || n_selected > n_experts_total) {
+        fprintf(stderr, "ds4: vqb2_decode_fp16_selected canary needs 1 ≤ n_selected ≤ n_experts_total\n");
+        return 0;
+    }
+    if (n_rows == 0 || n_pairs == 0) return 0;
+    uint32_t bit_width;
+    switch (k_val) {
+        case 4:   bit_width = 2; break;
+        case 16:  bit_width = 4; break;
+        case 64:  bit_width = 6; break;
+        case 256: bit_width = 8; break;
+        default:  return 0;
+    }
+    const uint32_t codes_per_expert = n_rows * n_pairs;
+    const uint64_t total_codes = (uint64_t)n_experts_total * codes_per_expert;
+    const size_t codes_bytes = (size_t)(total_codes * bit_width + 7u) >> 3;
+
+    /* Build codebook in [-1, +1]. */
+    float *host_cb = (float *)calloc((size_t)k_val * 2u, sizeof(float));
+    if (!host_cb) return 0;
+    const float step = 1.0f / (float)k_val;
+    for (uint32_t i = 0; i < k_val; i++) {
+        host_cb[i * 2u + 0u] =  (float)i * step;
+        host_cb[i * 2u + 1u] = -(float)i * step;
+    }
+    /* Pack codes: per (expert, code_idx), code = (expert + code_idx) % k.
+     * Distinct per expert → cross-check rules out cross-expert smearing. */
+    uint8_t *host_codes = (uint8_t *)calloc(codes_bytes + 8u, 1);
+    if (!host_codes) { free(host_cb); return 0; }
+    for (uint32_t e = 0; e < n_experts_total; e++) {
+        for (uint32_t i = 0; i < codes_per_expert; i++) {
+            const uint32_t code = (e + i) % k_val;
+            const uint64_t linear = (uint64_t)e * codes_per_expert + i;
+            const uint64_t bit_off = linear * bit_width;
+            const size_t byte_off = (size_t)(bit_off >> 3);
+            const uint32_t shift = (uint32_t)(bit_off & 7ull);
+            host_codes[byte_off]      |= (uint8_t)((code << shift) & 0xFFu);
+            if (bit_width + shift > 8u) {
+                host_codes[byte_off + 1u] |= (uint8_t)((code >> (8u - shift)) & 0xFFu);
+            }
+        }
+    }
+    /* Build selected list: every Nth expert (spread evenly across range). */
+    uint32_t *host_sel = (uint32_t *)calloc(n_selected, sizeof(uint32_t));
+    if (!host_sel) { free(host_cb); free(host_codes); return 0; }
+    const uint32_t stride_sel = (n_experts_total > n_selected) ? n_experts_total / n_selected : 1;
+    for (uint32_t s = 0; s < n_selected; s++) {
+        host_sel[s] = (s * stride_sel) % n_experts_total;
+    }
+
+    _Float16 *host_out = (_Float16 *)calloc((size_t)n_selected * codes_per_expert * 2u, sizeof(_Float16));
+    if (!host_out) { free(host_cb); free(host_codes); free(host_sel); return 0; }
+
+    int rc = 0;
+    @autoreleasepool {
+        struct { uint32_t bit_width, code_mask, n_rows, n_pairs, n_selected, pad; }
+            args = { bit_width, (1u << bit_width) - 1u, n_rows, n_pairs, n_selected, 0 };
+        id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cbBuf   = [g_device newBufferWithBytes:host_cb length:(NSUInteger)k_val * 2u * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> codesBuf= [g_device newBufferWithBytes:host_codes length:codes_bytes + 8u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf  = [g_device newBufferWithBytes:host_sel length:(NSUInteger)n_selected * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf  = [g_device newBufferWithLength:(NSUInteger)n_selected * codes_per_expert * 2u * sizeof(_Float16) options:MTLResourceStorageModeShared];
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        NSError *err = nil;
+        id<MTLResidencySet> rs = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (rs) {
+            id<MTLAllocation> allocs[5] = {(id)argsBuf, (id)cbBuf, (id)codesBuf, (id)selBuf, (id)outBuf};
+            [rs addAllocations:allocs count:5];
+            [rs commit];
+            [rs requestResidency];
+            id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+            if (at) {
+                [at setAddress:argsBuf.gpuAddress atIndex:0];
+                [at setAddress:cbBuf.gpuAddress atIndex:1];
+                [at setAddress:codesBuf.gpuAddress atIndex:2];
+                [at setAddress:selBuf.gpuAddress atIndex:3];
+                [at setAddress:outBuf.gpuAddress atIndex:4];
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:rs];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_vqb2_decode_fp16_selected_mtl4_pipeline];
+                [enc setArgumentTable:at];
+                /* 2D grid: (codes_per_expert, n_selected). Threadgroup 64×1. */
+                const NSUInteger tg_x = (codes_per_expert + 63u) / 64u;
+                [enc dispatchThreadgroups:MTLSizeMake(tg_x, n_selected, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+                [g_polar_queue addResidencySet:rs];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long w = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+                [rs endResidency];
+                if (w == 0) {
+                    memcpy(host_out, outBuf.contents, (size_t)n_selected * codes_per_expert * 2u * sizeof(_Float16));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(at, 8);
+            }
+        }
+    }
+    /* Cross-check: for each selected expert, compute expected (re, im) per
+     * code index and compare to host_out. */
+    int mismatch = 0;
+    double max_err = 0.0;
+    if (rc) {
+        for (uint32_t s = 0; s < n_selected; s++) {
+            const uint32_t e = host_sel[s];
+            for (uint32_t i = 0; i < codes_per_expert; i++) {
+                const uint32_t code = (e + i) % k_val;
+                const float exp_re = (float)code * step;
+                const float exp_im = -(float)code * step;
+                const uint32_t out_idx = (s * codes_per_expert + i) * 2u;
+                const float got_re = (float)host_out[out_idx + 0u];
+                const float got_im = (float)host_out[out_idx + 1u];
+                const double e_re = fabs((double)(got_re - exp_re));
+                const double e_im = fabs((double)(got_im - exp_im));
+                if (e_re > max_err) max_err = e_re;
+                if (e_im > max_err) max_err = e_im;
+                if (e_re > 1e-3 || e_im > 1e-3) mismatch++;
+            }
+        }
+    }
+    fprintf(stderr,
+        "ds4: vqb2_decode_fp16_selected MTL4 canary n_sel=%u n_total=%u rows=%u pairs=%u K=%u bw=%u "
+        "mismatch=%d max_err=%.4e rc=%d sel[0]=%u sel[%u]=%u out[s0,0]=(%+.4f,%+.4f)\n",
+        n_selected, n_experts_total, n_rows, n_pairs, k_val, bit_width,
+        mismatch, max_err, rc,
+        host_sel[0], n_selected - 1, host_sel[n_selected - 1],
+        (double)host_out[0], (double)host_out[1]);
+    free(host_cb); free(host_codes); free(host_sel); free(host_out);
+    return (rc && mismatch == 0) ? 1 : 0;
+}
+
 /* Standalone canary: provide a synthetic packet (codebook + codes), dispatch
  * decode, compare against ground-truth pair values. Returns 1 on success.
  *
