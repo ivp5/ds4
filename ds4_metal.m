@@ -13398,6 +13398,46 @@ static int ds4_gpu_encode_mul_mm_id_fp16_pair_swiglu(
  const NSUInteger pairs = (NSUInteger)args->nei0 * (NSUInteger)args->nei1;
  const NSUInteger tg_bytes = 1024;  /* threadgroup mem: 3×64 halves + 2×64 floats + slack */
 
+ /* silv 2026-05-27 — ICB Phase 7 attempt. Opt-in via DS4_MOE_ICB=1.
+  * Records the dispatch once into a classic-MTL ICB; per-call replay
+  * skips encoder rebuild (~45µs/call). Per-token at 6 experts × 43
+  * layers = 258 calls, target ~12ms/token savings. Falls through to
+  * direct encoding when env not set or signature changes. */
+ {
+  static id<MTLBuffer> s_icb_args_buf = nil;
+  static id<MTLBuffer> s_icb_act_buf = nil;
+  static int s_icb_env_checked = 0;
+  static int s_icb_env_active = 0;
+  if (!s_icb_env_checked) {
+   s_icb_env_active = getenv("DS4_MOE_ICB") != NULL ? 1 : 0;
+   s_icb_env_checked = 1;
+  }
+  if (s_icb_env_active) {
+   if (!s_icb_args_buf) {
+    s_icb_args_buf = [g_device newBufferWithLength:sizeof(*args)
+                                           options:MTLResourceStorageModeShared];
+    s_icb_act_buf = [g_device newBufferWithLength:sizeof(*act)
+                                          options:MTLResourceStorageModeShared];
+   }
+   if (s_icb_args_buf && s_icb_act_buf) {
+    memcpy([s_icb_args_buf contents], args, sizeof(*args));
+    memcpy([s_icb_act_buf contents], act, sizeof(*act));
+    if (ds4_gpu_moe_matmul_icb_dispatch(cb, pipeline,
+                                         s_icb_args_buf, 0,
+                                         s_icb_act_buf, 0,
+                                         src0_hot, gate_base_off,
+                                         src0_hot, up_base_off,
+                                         src1, src1_off,
+                                         dst_mid, dst_mid_off,
+                                         ids, ids_off,
+                                         weights, weights_off,
+                                         n_ffn_tiles, n_token_tiles, pairs)) {
+     return 1;
+    }
+   }
+  }
+ }
+
  id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
  [enc setComputePipelineState:pipeline];
  [enc setBytes:args length:sizeof(*args) atIndex:0];
@@ -19507,28 +19547,31 @@ int ds4_gpu_moe_matmul_icb_dispatch(
         slot->n_out_tiles == n_out_tiles && slot->n_tok_tiles == n_tok_tiles;
 
     if (!sig_match) {
-        /* Record all DS4_MOE_ICB_SLOTS commands. The dispatch shape uses
-         * batch_id = idx in tgpig.z; the ICB encodes 6 commands each with
-         * z-extent = 1 at z = expert_idx. */
-        for (NSUInteger idx = 0; idx < DS4_MOE_ICB_SLOTS; idx++) {
-            id<MTLIndirectComputeCommand> cmd =
-                [g_moe_matmul_icb indirectComputeCommandAtIndex:idx];
-            [cmd setComputePipelineState:pipeline];
-            [cmd setKernelBuffer:argsbuf  offset:args_off    atIndex:0];
-            [cmd setKernelBuffer:actbuf   offset:act_off     atIndex:1];
-            [cmd setKernelBuffer:gatebuf  offset:gate_off    atIndex:2];
-            [cmd setKernelBuffer:upbuf    offset:up_off      atIndex:3];
-            [cmd setKernelBuffer:xbuf     offset:x_off       atIndex:4];
-            [cmd setKernelBuffer:midbuf   offset:mid_off     atIndex:5];
-            [cmd setKernelBuffer:idsbuf   offset:ids_off     atIndex:6];
-            [cmd setKernelBuffer:weightsbuf offset:weights_off atIndex:7];
-            [cmd setThreadgroupMemoryLength:1024 atIndex:0];
-            /* Per-slot dispatch: 1 expert (z-extent=1) at z=idx via
-             * tgpig.z offset baked into command. Use concurrent dispatch
-             * since experts are independent. */
-            [cmd concurrentDispatchThreadgroups:MTLSizeMake(n_out_tiles, n_tok_tiles, 1)
-                          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        }
+        /* CORRECTION: original 6-slot design was wrong. Each command's
+         * tgpig.z extent is 1 → all commands would see idx=0 in
+         *   const int idx = (int)(tgpig.z % args.nei0);
+         * Fix: record ONE command with full dispatch shape (n_out_tiles,
+         * n_tok_tiles, n_experts). The kernel sees tgpig.z=0..n_experts-1
+         * naturally via dispatchThreadgroups extent.
+         *
+         * ICB amortization comes from skipping setComputePipelineState +
+         * 8× setBuffer + setThreadgroupMemoryLength + dispatchThreadgroups
+         * encoding (~45µs/call). Same target savings as the 6-slot design;
+         * cleaner implementation. */
+        id<MTLIndirectComputeCommand> cmd =
+            [g_moe_matmul_icb indirectComputeCommandAtIndex:0];
+        [cmd setComputePipelineState:pipeline];
+        [cmd setKernelBuffer:argsbuf  offset:args_off    atIndex:0];
+        [cmd setKernelBuffer:actbuf   offset:act_off     atIndex:1];
+        [cmd setKernelBuffer:gatebuf  offset:gate_off    atIndex:2];
+        [cmd setKernelBuffer:upbuf    offset:up_off      atIndex:3];
+        [cmd setKernelBuffer:xbuf     offset:x_off       atIndex:4];
+        [cmd setKernelBuffer:midbuf   offset:mid_off     atIndex:5];
+        [cmd setKernelBuffer:idsbuf   offset:ids_off     atIndex:6];
+        [cmd setKernelBuffer:weightsbuf offset:weights_off atIndex:7];
+        [cmd setThreadgroupMemoryLength:1024 atIndex:0];
+        [cmd concurrentDispatchThreadgroups:MTLSizeMake(n_out_tiles, n_tok_tiles, n_experts)
+                      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         slot->gate_ptr = (__bridge void *)gatebuf; slot->gate_off = (uint64_t)gate_off;
         slot->up_ptr   = (__bridge void *)upbuf;   slot->up_off   = (uint64_t)up_off;
         slot->x_ptr    = (__bridge void *)xbuf;    slot->x_off    = (uint64_t)x_off;
@@ -19551,8 +19594,11 @@ int ds4_gpu_moe_matmul_icb_dispatch(
     [enc useResource:midbuf     usage:MTLResourceUsageRead | MTLResourceUsageWrite];
     [enc useResource:idsbuf     usage:MTLResourceUsageRead];
     [enc useResource:weightsbuf usage:MTLResourceUsageRead];
+    /* Single command at index 0; n_experts is encoded in the dispatch
+     * extent recorded into the command, not in the replay range. */
+    (void)n_experts;
     [enc executeCommandsInBuffer:g_moe_matmul_icb
-                       withRange:NSMakeRange(0, n_experts)];
+                       withRange:NSMakeRange(0, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
 }
