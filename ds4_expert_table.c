@@ -278,7 +278,14 @@ uint64_t ds4_hot_store_get_calibration_domain(const ds4_hot_expert_store *store)
  * lines so the harness fails loud when its manifest is wrong.
  * ============================================================================ */
 
-uint8_t g_organ_skip[DS4_N_LAYER * DS4_N_EXPERT * DS4_N_ORGAN];
+/* silv 2026-05-27 — explicit 64-byte alignment kills the linker warning
+ *   ld: reducing alignment of section __DATA,__common from 0x8000 to 0x4000
+ * which fired because tentative-storage common for a 33 KB array gets a
+ * size-class alignment of 32 KB by default, exceeding the segment cap.
+ * 64 B (cache line) is the minimum useful alignment for a byte hot-path
+ * array and is well under the 0x4000 segment max. */
+uint8_t g_organ_skip[DS4_N_LAYER * DS4_N_EXPERT * DS4_N_ORGAN]
+        __attribute__((aligned(64)));
 int     g_organ_skip_initialized = 0;
 uint32_t g_organ_skip_count = 0;
 

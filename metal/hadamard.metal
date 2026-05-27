@@ -83,3 +83,70 @@ kernel void kernel_hadamard16_fp16_batched(
     // Orthogonal normalization: scale by 1/sqrt(16) = 0.25.
     block_ptr[tid] = (half)((float)scratch[tid] * kHadamard16InvSqrt16);
 }
+
+// ============================================================================
+// MTL4 widened variant: each threadgroup processes BLOCKS_PER_TG blocks.
+// 256 threads = 16 blocks × 16 elements. Reduces dispatch count 16×.
+//
+// silv 2026-05-27 — "optimize with MTL4, crash into the wall". Companion
+// to the MTL4-dispatched path in ds4_metal.m (ds4_gpu_mtl4_hadamard16_canary).
+// The math is identical to the single-block variant; the per-block butterfly
+// runs independently in disjoint regions of threadgroup scratch.
+//
+// Threadgroup layout:
+//   total_threads = 256 = 16 (BLOCKS_PER_TG) × 16 (elements per block)
+//   tid / 16 → block_in_tg ∈ [0, 16)
+//   tid % 16 → elem_in_block ∈ [0, 16)
+//   scratch[block_in_tg * 16 + elem_in_block] is the per-thread slot
+//
+// Dispatch grid: (n_rows, ceil(blocks_per_row / 16), 1)
+// Partial-tail group: out-of-range blocks early-return per-block.
+// ============================================================================
+
+constant uint kHadamard16BlocksPerTg = 16u;
+
+kernel void kernel_hadamard16_fp16_batched_wide(
+        constant ds4_metal_args_hadamard16_batched & args,
+        device half * x,
+        threadgroup half * scratch [[threadgroup(0)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    const uint row = tgpig.x;
+    const uint tg_block = tgpig.y;
+    const ushort block_in_tg = tid / 16;
+    const ushort elem = tid % 16;
+    const uint global_block = tg_block * kHadamard16BlocksPerTg + (uint)block_in_tg;
+
+    if (row >= args.n_rows) return;
+    // Per-block early-out: tail group may have global_block past the end.
+    const bool active = (global_block < args.blocks_per_row);
+
+    device half * row_ptr = (device half *)((device char *)x +
+                                            (uint64_t)row * args.row_stride_bytes);
+    device half * block_ptr = row_ptr + (uint64_t)global_block * 16u;
+
+    threadgroup half * sub_scratch = scratch + (uint)block_in_tg * 16u;
+
+    if (active) {
+        sub_scratch[elem] = block_ptr[elem];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Butterfly: each block's 16-element segment is independent. All 16 sub-
+    // groups iterate the same stride pattern; barriers are threadgroup-wide so
+    // every block's stage-k is consistent before stage-(k+1) starts.
+    for (uint stride = 1u; stride < 16u; stride <<= 1u) {
+        if (active && ((elem & stride) == 0u)) {
+            const ushort base = (elem & ~(2u * stride - 1u)) + (elem & (stride - 1u));
+            const float a = (float)sub_scratch[base];
+            const float b = (float)sub_scratch[base + stride];
+            sub_scratch[base]          = (half)(a + b);
+            sub_scratch[base + stride] = (half)(a - b);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (active) {
+        block_ptr[elem] = (half)((float)sub_scratch[elem] * kHadamard16InvSqrt16);
+    }
+}

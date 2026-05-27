@@ -16029,6 +16029,261 @@ int ds4_gpu_mtl4_polar_dot_canary(uint32_t packets, uint32_t pairs) {
 }
 
 /* ============================================================ */
+/* MTL4 Hadamard-16 widened kernel — task #653                  */
+/* ============================================================ */
+/* silv 2026-05-27 "crash velocity ship": MTL4 dispatch + widened
+ * kernel (16 blocks per threadgroup, 256 threads) for the Hadamard-16
+ * codec primitive. Reuses polar's compiler/queue/allocator.
+ *
+ * Speedup geometry:
+ *   - MTL4 dispatch overhead < MTL dispatch overhead per CB
+ *   - Widened kernel: 256 threads × 16-block parallelism in scratch =
+ *     16× fewer threadgroups per tensor
+ *
+ * Self-inverse falsifier: applying H twice to a buffer should recover
+ * the original within FP16 precision. Synthetic canary fills with
+ * deterministic random FP16, dispatches twice, checks max|err| < FP16
+ * floor.
+ *
+ * Note: the MTL4 widened kernel source is inlined here (a copy of
+ * kernel_hadamard16_fp16_batched_wide from metal/hadamard.metal). This
+ * keeps the MTL4 path self-contained against the polar-style
+ * MTL4Compiler/Library. The regular MTL path keeps using the source
+ * concatenated into ds4_gpu_full_source.
+ */
+
+static id<MTLComputePipelineState> g_hadamard_mtl4_pipeline;
+static int g_hadamard_mtl4_init_attempted;
+static int g_hadamard_mtl4_init_ok;
+
+static int ds4_hadamard_mtl4_pipeline_init(void) {
+    if (g_hadamard_mtl4_init_attempted) return g_hadamard_mtl4_init_ok;
+    g_hadamard_mtl4_init_attempted = 1;
+
+    if (!ds4_polar_pipeline_init()) return 0; /* reuse compiler/queue/allocator */
+
+    /* MTL4 ArgumentTable binds via gpuAddress + setAddress, which requires
+     * `device const` storage on the kernel side. Using `constant &` (like the
+     * regular MTL path's setBytes-bound args) reads zero/garbage through the
+     * MTL4 binding — first crash this session, caught by mtl4_canary at
+     * rel_L2=1.57 on a 1×16 minimum-scale test. */
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct ds4_metal_args_hadamard16_batched {\n"
+         "  uint32_t n_rows;\n"
+         "  uint32_t blocks_per_row;\n"
+         "  uint64_t row_stride_bytes;\n"
+         "};\n"
+         "kernel void hadamard16_wide(\n"
+         "    device const ds4_metal_args_hadamard16_batched * args_ptr [[buffer(0)]],\n"
+         "    device half * x [[buffer(1)]],\n"
+         "    threadgroup half * scratch [[threadgroup(0)]],\n"
+         "    uint2 tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort tid [[thread_index_in_threadgroup]]) {\n"
+         "  const uint n_rows = args_ptr[0].n_rows;\n"
+         "  const uint blocks_per_row = args_ptr[0].blocks_per_row;\n"
+         "  const uint64_t row_stride_bytes = args_ptr[0].row_stride_bytes;\n"
+         "  const uint row = tgpig.x;\n"
+         "  const uint tg_block = tgpig.y;\n"
+         "  const ushort block_in_tg = tid / 16;\n"
+         "  const ushort elem = tid % 16;\n"
+         "  const uint global_block = tg_block * 16u + (uint)block_in_tg;\n"
+         "  if (row >= n_rows) return;\n"
+         "  const bool active = (global_block < blocks_per_row);\n"
+         "  device half * row_ptr = (device half *)((device char *)x + (uint64_t)row * row_stride_bytes);\n"
+         "  device half * block_ptr = row_ptr + (uint64_t)global_block * 16u;\n"
+         "  threadgroup half * sub = scratch + (uint)block_in_tg * 16u;\n"
+         "  if (active) sub[elem] = block_ptr[elem];\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (uint stride = 1u; stride < 16u; stride <<= 1u) {\n"
+         "    if (active && ((elem & stride) == 0u)) {\n"
+         "      const ushort base = (elem & ~(2u * stride - 1u)) + (elem & (stride - 1u));\n"
+         "      const float a = (float)sub[base];\n"
+         "      const float b = (float)sub[base + stride];\n"
+         "      sub[base] = (half)(a + b);\n"
+         "      sub[base + stride] = (half)(a - b);\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  if (active) block_ptr[elem] = (half)((float)sub[elem] * 0.25f);\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_hadamard16_wide";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: hadamard MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"hadamard16_wide";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_hadamard_mtl4_pipeline = [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                                                   compilerTaskOptions:nil
+                                                                                 error:&err];
+    if (!g_hadamard_mtl4_pipeline) {
+        fprintf(stderr, "ds4: hadamard MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: hadamard MTL4 pipeline initialized "
+                    "(threadExecutionWidth=%lu maxThreadsPerTg=%lu)\n",
+            (unsigned long)g_hadamard_mtl4_pipeline.threadExecutionWidth,
+            (unsigned long)g_hadamard_mtl4_pipeline.maxTotalThreadsPerThreadgroup);
+    g_hadamard_mtl4_init_ok = 1;
+    return 1;
+}
+
+/* MTL4 Hadamard canary: fill an n_rows×n_in FP16 buffer with deterministic
+ * random values, dispatch H twice (H*H=I), check max|err| against FP16
+ * precision floor. n_in must be divisible by 16. Reports per-tensor GPU
+ * elapsed via MTL4CommitFeedback. Returns 1 on success, 0 on failure. */
+int ds4_gpu_mtl4_hadamard16_canary(uint32_t n_rows, uint32_t n_in) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_hadamard_mtl4_pipeline_init()) return 0;
+    if (n_rows == 0u || n_in == 0u || (n_in % 16u) != 0u) {
+        fprintf(stderr, "ds4: hadamard MTL4 canary: n_in=%u must be n_rows>0 and n_in%%16==0\n", n_in);
+        return 0;
+    }
+    const uint32_t blocks_per_row = n_in / 16u;
+    const NSUInteger n_halves = (NSUInteger)n_rows * (NSUInteger)n_in;
+    const NSUInteger byte_count = n_halves * sizeof(uint16_t);
+
+    @autoreleasepool {
+        NSError *err = nil;
+
+        id<MTLBuffer> tensor = [g_device newBufferWithLength:byte_count
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:sizeof(ds4_gpu_hadamard16_batched_args)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> orig = [g_device newBufferWithLength:byte_count
+                                                  options:MTLResourceStorageModeShared];
+        if (!tensor || !argsBuf || !orig) return 0;
+
+        /* Fill with deterministic FP16 in [-0.5, 0.5]. _Float16 cast via uint16
+         * bit pattern would be opaque; use float conversion for clarity. */
+        _Float16 *src = (_Float16 *)tensor.contents;
+        _Float16 *ref = (_Float16 *)orig.contents;
+        uint32_t s = 0xC0FFEE0Du;
+        for (NSUInteger i = 0; i < n_halves; i++) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            const float v = ((float)(int32_t)s / (float)0x80000000u) * 0.5f;
+            src[i] = (_Float16)v;
+            ref[i] = (_Float16)v;
+        }
+
+        ds4_gpu_hadamard16_batched_args *args = (ds4_gpu_hadamard16_batched_args *)argsBuf.contents;
+        args->n_rows = n_rows;
+        args->blocks_per_row = blocks_per_row;
+        args->row_stride_bytes = (uint64_t)n_in * sizeof(uint16_t);
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (!residency) {
+            fprintf(stderr, "ds4: hadamard residency: %s\n",
+                    err ? err.localizedDescription.UTF8String : "(no error)");
+            return 0;
+        }
+        id<MTLAllocation> allocs[2] = { (id<MTLAllocation>)tensor, (id<MTLAllocation>)argsBuf };
+        [residency addAllocations:allocs count:2];
+        [residency commit];
+        [residency requestResidency];
+
+        MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+        atDesc.maxBufferBindCount = 2;
+        atDesc.initializeBindings = YES;
+        id<MTL4ArgumentTable> argTable = [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+        if (!argTable) {
+            fprintf(stderr, "ds4: hadamard arg table: %s\n",
+                    err ? err.localizedDescription.UTF8String : "(no error)");
+            return 0;
+        }
+        [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+        [argTable setAddress:tensor.gpuAddress atIndex:1];
+
+        /* Grid: (n_rows, ceil(blocks_per_row / 16), 1). Threadgroup: 256 = 16×16. */
+        const uint32_t tg_y = (blocks_per_row + 15u) / 16u;
+
+        id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+        [cb beginCommandBufferWithAllocator:g_polar_allocator];
+        [cb useResidencySet:residency];
+        id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) return 0;
+        [enc setComputePipelineState:g_hadamard_mtl4_pipeline];
+        [enc setArgumentTable:argTable];
+        /* 16 blocks × 16 halves × 2 bytes = 512 B of threadgroup scratch. */
+        [enc setThreadgroupMemoryLength:(NSUInteger)(16 * 16 * sizeof(uint16_t)) atIndex:0];
+
+        /* Apply H twice: H × H = I orthogonally, so the buffer round-trips. */
+        [enc dispatchThreadgroups:MTLSizeMake(n_rows, tg_y, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc dispatchThreadgroups:MTLSizeMake(n_rows, tg_y, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        [enc endEncoding];
+        [cb endCommandBuffer];
+
+        [g_polar_queue addResidencySet:residency];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block CFTimeInterval gpuStart = 0.0;
+        __block CFTimeInterval gpuEnd = 0.0;
+        __block NSError *fbErr = nil;
+        MTL4CommitOptions *opts = [MTL4CommitOptions new];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            fbErr = feedback.error;
+            gpuStart = feedback.GPUStartTime;
+            gpuEnd = feedback.GPUEndTime;
+            dispatch_semaphore_signal(sem);
+        }];
+        id<MTL4CommandBuffer> bufs[1] = { cb };
+        [g_polar_queue commit:bufs count:1 options:opts];
+        long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+        [residency endResidency];
+        if (waitRes != 0) { fprintf(stderr, "ds4: hadamard canary timeout\n"); return 0; }
+        if (fbErr) {
+            fprintf(stderr, "ds4: hadamard canary feedback err: %s\n",
+                    fbErr.localizedDescription.UTF8String);
+            return 0;
+        }
+
+        /* Compare H(H(x)) vs original. FP16 round-trip floor ~5e-3. */
+        float maxAbsErr = 0.0f;
+        double sum_sq_diff = 0.0;
+        double sum_sq_ref  = 0.0;
+        for (NSUInteger i = 0; i < n_halves; i++) {
+            const float a = (float)src[i];
+            const float b = (float)ref[i];
+            const float d = fabsf(a - b);
+            if (d > maxAbsErr) maxAbsErr = d;
+            sum_sq_diff += (double)d * (double)d;
+            sum_sq_ref  += (double)b * (double)b;
+        }
+        const double rel_l2 = sqrt(sum_sq_diff / (sum_sq_ref + 1e-12));
+        const double gpuMs = (gpuEnd - gpuStart) * 1000.0;
+        const double n_dispatches_naive = (double)n_rows * (double)blocks_per_row;
+        const double n_dispatches_wide  = (double)n_rows * (double)tg_y;
+        fprintf(stderr,
+                "ds4: hadamard MTL4 canary n_rows=%u n_in=%u (blocks/row=%u, tg_y=%u): "
+                "max_abs_err=%.4e rel_L2=%.4e gpu_elapsed=%.4f ms (2× H dispatches), "
+                "naive_dispatches=%.0f wide_dispatches=%.0f reduction=%.1f×\n",
+                n_rows, n_in, blocks_per_row, tg_y,
+                (double)maxAbsErr, rel_l2, gpuMs,
+                n_dispatches_naive, n_dispatches_wide,
+                n_dispatches_naive / n_dispatches_wide);
+        return rel_l2 < 1.0e-2 ? 1 : 0;
+    }
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +

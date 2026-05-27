@@ -923,6 +923,20 @@ int ds4_gpu_mtl4_polar_dot_canary(uint32_t packets, uint32_t pairs);
 int ds4_gpu_mtl4_polar_tile_canary(uint32_t tiles, uint32_t rows,
                                     uint32_t batches, uint32_t pairs);
 
+/* silv 2026-05-27 task #653 — MTL4 Hadamard-16 widened-dispatch canary.
+ * Allocates an n_rows × n_in FP16 buffer, fills with deterministic random
+ * values, applies the widened Hadamard kernel twice (H×H=I), checks
+ * recovery within FP16 precision. n_in must be divisible by 16.
+ *
+ * The "widened" kernel processes 16 blocks of 16 halves per threadgroup
+ * (256 threads) — 16× fewer threadgroups than the per-block variant. Plus
+ * MTL4 dispatch overhead. Reports max|err|, rel_L2, and dispatch reduction
+ * ratio vs the per-block grid.
+ *
+ * Returns 1 if rel_L2 < 1e-2 (FP16 precision floor for round-trip), 0
+ * otherwise. */
+int ds4_gpu_mtl4_hadamard16_canary(uint32_t n_rows, uint32_t n_in);
+
 /* Real-data variant: load mag/phase/levels/hidden/cos_lut/sin_lut from
  * <prefix>.{mag,phase,levels,hidden,cos_lut,sin_lut}.bin files emitted by
  * analyzers/polar_encode_safetensors.py, then dispatch the H1729 tile×row×batch
