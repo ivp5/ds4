@@ -1023,6 +1023,19 @@ static int ds4_gpu_mpp_available(void) {
  return g_metal4_tensor_api_enabled && !g_quality_mode;
 }
 
+static uint32_t ds4_gpu_env_u32(const char *name, uint32_t default_val) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) {
+        return default_val;
+    }
+    char *end = NULL;
+    const long v = strtol(env, &end, 10);
+    if (end == env || v <= 0) {
+        return default_val;
+    }
+    return (uint32_t)v;
+}
+
 /*
  * Retained Metal4 defaults live here instead of behind user-visible options.
  * The public runtime has one automatic accelerated path plus the global
@@ -2777,15 +2790,16 @@ static int ds4_gpu_encode_mul_mm_id_mapped(
  id<MTLBuffer> dst,
  NSUInteger dst_off);
 static int ds4_gpu_encode_mul_mm_id_mapped_tile(
- id<MTLCommandBuffer> cb,
- id<MTLComputePipelineState> mm_pipeline,
- const ds4_gpu_mul_mm_id_args *mm_args,
- id<MTLBuffer> src0,
- NSUInteger src0_off,
- id<MTLBuffer> src1,
- NSUInteger src1_off,
- id<MTLBuffer> dst,
- NSUInteger dst_off);
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> mm_pipeline,
+        const ds4_gpu_mul_mm_id_args *mm_args,
+        id<MTLBuffer>               src0,
+        NSUInteger                  src0_off,
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst,
+        NSUInteger                  dst_off,
+        uint32_t                    token_tile_n);
 
 typedef struct {
  int32_t ne11;
@@ -13142,30 +13156,98 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mv_pipeline(uint32_t type) {
  }
 }
 
+static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline_for_tile(uint32_t type,
+                                                                         uint32_t tile_n) {
+    switch (type) {
+    case DS4_METAL_TENSOR_IQ2_XXS:
+        if (tile_n == 128u) {
+            return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32_n128", false);
+        }
+        if (tile_n == 64u) {
+            return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32_n64", false);
+        }
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32", false);
+    case DS4_METAL_TENSOR_Q2_K:
+        if (tile_n == 128u) {
+            return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32_n128", false);
+        }
+        if (tile_n == 64u) {
+            return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32_n64", false);
+        }
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
+    case DS4_METAL_TENSOR_Q4_K:
+        if (tile_n == 128u) {
+            return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32_n128", false);
+        }
+        if (tile_n == 64u) {
+            return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32_n64", false);
+        }
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
+    default:
+        return nil;
+    }
+}
+
+static uint32_t ds4_gpu_moe_mm_tile_n(uint32_t gate_type, uint32_t n_tokens) {
+    const uint32_t tile_max = ds4_gpu_env_u32("DS4_METAL_MOE_TILE_MAX", 128u);
+    if (tile_max <= 32u) {
+        return 32u;
+    }
+    if (gate_type == DS4_METAL_TENSOR_Q4_K ||
+        gate_type == DS4_METAL_TENSOR_Q2_K ||
+        gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
+        if (tile_max >= 128u && n_tokens >= 128u && (n_tokens % 128u) == 0) {
+            return 128u;
+        }
+        if (tile_max >= 64u && n_tokens >= 64u && (n_tokens % 64u) == 0) {
+            return 64u;
+        }
+    }
+    return 32u;
+}
+
+static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline_for_tile(uint32_t type,
+                                                                                uint32_t tile_n) {
+    switch (type) {
+    case DS4_METAL_TENSOR_IQ2_XXS:
+        if (tile_n == 128u) {
+            return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f16_n128", false);
+        }
+        if (tile_n == 64u) {
+            return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f16_n64", false);
+        }
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f16", false);
+    case DS4_METAL_TENSOR_Q2_K:
+        if (tile_n == 128u) {
+            return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16_n128", false);
+        }
+        if (tile_n == 64u) {
+            return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16_n64", false);
+        }
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
+    case DS4_METAL_TENSOR_Q4_K:
+        if (tile_n == 128u) {
+            return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16_n128", false);
+        }
+        if (tile_n == 64u) {
+            return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16_n64", false);
+        }
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
+    default:
+        return nil;
+    }
+}
+
+/* silv merge 2026-05-27: backward-compat wrappers for the pre-wide-tile
+ * call sites in ds4_gpu_encode_routed_batch_moe. The wide-tile dispatcher
+ * (_for_tile) is the new primary; legacy callers default to the 32-token
+ * tile, matching antirez's pre-merge semantics. */
 static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
- switch (type) {
- case DS4_METAL_TENSOR_IQ2_XXS:
- return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32", false);
- case DS4_METAL_TENSOR_Q2_K:
- return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
- case DS4_METAL_TENSOR_Q4_K:
- return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
- default:
- return nil;
- }
+    return ds4_gpu_routed_mm_pipeline_for_tile(type, 32u);
 }
 
 static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t type) {
- switch (type) {
- case DS4_METAL_TENSOR_IQ2_XXS:
- return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f16", false);
- case DS4_METAL_TENSOR_Q2_K:
- return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
- case DS4_METAL_TENSOR_Q4_K:
- return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
- default:
- return nil;
- }
+    return ds4_gpu_routed_mm_f16_rhs_pipeline_for_tile(type, 32u);
 }
 
 static int ds4_gpu_encode_mul_mv_id(
@@ -13765,27 +13847,29 @@ static int ds4_gpu_encode_mul_mm_id_map(
 }
 
 static int ds4_gpu_encode_mul_mm_id_mapped_tile(
- id<MTLCommandBuffer> cb,
- id<MTLComputePipelineState> mm_pipeline,
- const ds4_gpu_mul_mm_id_args *mm_args,
- id<MTLBuffer> src0,
- NSUInteger src0_off,
- id<MTLBuffer> src1,
- NSUInteger src1_off,
- id<MTLBuffer> dst,
- NSUInteger dst_off) {
- if (!cb || !mm_pipeline || !mm_args || !src0 || !src1 || !dst ||
- !g_moe_id_map_buffer ||
- mm_args->ne00 <= 0 || mm_args->ne0 <= 0 ||
- mm_args->ne20 <= 0 || mm_args->ne21 <= 0 || mm_args->ne02 <= 0) {
- return 0;
- }
- /*
- * The routed MoE grouped matmul uses the legacy 32-token expert-major tile.
- * The removed TensorOps variant was not semantically stable on evals, so keep
- * this encoder tied to the tested simdgroup kernel shape.
- */
- const NSUInteger tile_n = 32u;
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> mm_pipeline,
+        const ds4_gpu_mul_mm_id_args *mm_args,
+        id<MTLBuffer>               src0,
+        NSUInteger                  src0_off,
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst,
+        NSUInteger                  dst_off,
+        uint32_t                    token_tile_n) {
+    if (!cb || !mm_pipeline || !mm_args || !src0 || !src1 || !dst ||
+        !g_moe_id_map_buffer ||
+        mm_args->ne00 <= 0 || mm_args->ne0 <= 0 ||
+        mm_args->ne20 <= 0 || mm_args->ne21 <= 0 || mm_args->ne02 <= 0) {
+        return 0;
+    }
+    /*
+     * token_tile_n is a contract with the selected kernel. Legacy callers use
+     * the unsuffixed kernels, which are NR1=32, so a zero/default tile must
+     * remain 32. Wide MoE paths pass 64/128 only after selecting the matching
+     * _n64/_n128 pipeline.
+     */
+    const NSUInteger tile_n = token_tile_n != 0u ? (NSUInteger)token_tile_n : 32u;
 
  const NSUInteger tpe_bytes = (NSUInteger)mm_args->ne02 * sizeof(int32_t);
  const NSUInteger hids_bytes = (NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne21 * sizeof(int32_t);
@@ -13812,24 +13896,25 @@ static int ds4_gpu_encode_mul_mm_id_mapped_tile(
 }
 
 static int ds4_gpu_encode_mul_mm_id_mapped(
- id<MTLCommandBuffer> cb,
- id<MTLComputePipelineState> mm_pipeline,
- const ds4_gpu_mul_mm_id_args *mm_args,
- id<MTLBuffer> src0,
- NSUInteger src0_off,
- id<MTLBuffer> src1,
- NSUInteger src1_off,
- id<MTLBuffer> dst,
- NSUInteger dst_off) {
- return ds4_gpu_encode_mul_mm_id_mapped_tile(cb,
- mm_pipeline,
- mm_args,
- src0,
- src0_off,
- src1,
- src1_off,
- dst,
- dst_off);
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> mm_pipeline,
+        const ds4_gpu_mul_mm_id_args *mm_args,
+        id<MTLBuffer>               src0,
+        NSUInteger                  src0_off,
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst,
+        NSUInteger                  dst_off) {
+    return ds4_gpu_encode_mul_mm_id_mapped_tile(cb,
+                                                  mm_pipeline,
+                                                  mm_args,
+                                                  src0,
+                                                  src0_off,
+                                                  src1,
+                                                  src1_off,
+                                                  dst,
+                                                  dst_off,
+                                                  0u);
 }
 
 static int ds4_gpu_encode_attn_out_low_q8_mpp(
@@ -15671,7 +15756,8 @@ int ds4_gpu_routed_moe_batch_tensor(
  xbuf,
  ds4_gpu_tensor_offset(x),
  gatebuf,
- ds4_gpu_tensor_offset(gate));
+ ds4_gpu_tensor_offset(gate),
+ 32u);
  DS4_METAL_PROFILE_MOE_STAGE("gate");
  }
  if (ok) {
@@ -15683,7 +15769,8 @@ int ds4_gpu_routed_moe_batch_tensor(
  xbuf,
  ds4_gpu_tensor_offset(x),
  upbuf,
- ds4_gpu_tensor_offset(up));
+ ds4_gpu_tensor_offset(up),
+ 32u);
  DS4_METAL_PROFILE_MOE_STAGE("up");
  }
  } else if (!fp16_simdgroup_used && use_tiny_pair_mv) {
@@ -15864,7 +15951,8 @@ int ds4_gpu_routed_moe_batch_tensor(
  midbuf,
  ds4_gpu_tensor_offset(mid),
  down_dst,
- down_dst_off);
+ down_dst_off,
+ 32u);
  } else {
  ok = ds4_gpu_encode_mul_mv_id(cb,
  down_mv_pipeline,
