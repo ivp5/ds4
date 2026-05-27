@@ -1870,6 +1870,17 @@ int main(int argc, char **argv) {
         const uint32_t n_rot = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
         return ds4_gpu_mtl4_fp8_kv_quantize_canary(n_rows, n_full, n_rot) ? 0 : 1;
     }
+    /* --indexer-hadamard-fp4-canary [n_rows] : task #685b Walsh-Hadamard + FP4 */
+    if (argc >= 2 && !strcmp(argv[1], "--indexer-hadamard-fp4-canary")) {
+        const uint32_t n_rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
+        return ds4_gpu_mtl4_indexer_hadamard_fp4_canary(n_rows) ? 0 : 1;
+    }
+    /* --kv-fp8-store-canary [head_dim [n_rot]] : task #686 KV finalizer + FP16 mirror */
+    if (argc >= 2 && !strcmp(argv[1], "--kv-fp8-store-canary")) {
+        const uint32_t head_dim = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 192;
+        const uint32_t n_rot = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 64;
+        return ds4_gpu_mtl4_kv_fp8_store_canary(head_dim, n_rot) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

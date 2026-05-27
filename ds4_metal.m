@@ -21554,6 +21554,497 @@ int ds4_gpu_mtl4_fp8_kv_quantize_canary(uint32_t n_rows, uint32_t n_full, uint32
 }
 
 /* ============================================================ */
+/* dsv4_indexer_hadamard_fp4_f32 MTL4 port (silv 2026-05-27 task #685b) */
+/* ============================================================ */
+/* MTL4 port of kernel_dsv4_indexer_hadamard_fp4_f32 from
+ * metal/dsv4_kv.metal. Decode-side indexer QAT: per row, apply a
+ * 128-wide Walsh-Hadamard transform in-place, then FP4 E2M1FN
+ * round-trip with per-32-block scaling.
+ *
+ * Exercises NEW patterns:
+ *   - Walsh-Hadamard butterfly: 7 stride-doubling stages (1,2,4,...,64)
+ *     with threadgroup_barrier between each. In-place pair sum/diff.
+ *   - Hadamard normalization factor 1/sqrt(128) = 0.0883883...
+ *   - Per-32-block amax reduction (different from prior 64-block fp8)
+ *   - FP4 E2M1FN LUT (8 values: 0, 0.5, 1, 1.5, 2, 3, 4, 6) + linear-scan dequant
+ *
+ * Hardcoded head_dim=128. Per-row dispatch (128 threads/row). */
+
+static id<MTLComputePipelineState> g_indexer_hadamard_fp4_mtl4_pipeline;
+static int g_indexer_hadamard_fp4_mtl4_init_attempted;
+static int g_indexer_hadamard_fp4_mtl4_init_ok;
+
+static int ds4_indexer_hadamard_fp4_mtl4_pipeline_init(void) {
+    if (g_indexer_hadamard_fp4_mtl4_init_attempted) return g_indexer_hadamard_fp4_mtl4_init_ok;
+    g_indexer_hadamard_fp4_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "constant float dsv4_e2m1fn_values[8] = {\n"
+         "  0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f\n"
+         "};\n"
+         "static inline float dsv4_e2m1fn_dequant(float x) {\n"
+         "  const float sign = x < 0.0f ? -1.0f : 1.0f;\n"
+         "  const float ax = min(abs(x), 6.0f);\n"
+         "  int best = 0;\n"
+         "  float bd = abs(ax - dsv4_e2m1fn_values[0]);\n"
+         "  for (int i = 1; i < 8; i++) {\n"
+         "    const float d = abs(ax - dsv4_e2m1fn_values[i]);\n"
+         "    if (d < bd || (d == bd && ((i & 1) == 0) && ((best & 1) != 0))) {\n"
+         "      best = i; bd = d;\n"
+         "    }\n"
+         "  }\n"
+         "  return sign * dsv4_e2m1fn_values[best];\n"
+         "}\n"
+         "struct had_args { uint32_t n_rows; uint32_t head_dim; uint64_t row_stride; };\n"
+         "kernel void indexer_hadamard_fp4_mtl4(\n"
+         "    device const had_args *args [[buffer(0)]],\n"
+         "    device       char     *x [[buffer(1)]],\n"
+         "    threadgroup  float    *scratch [[threadgroup(0)]],\n"
+         "    uint   row [[threadgroup_position_in_grid]],\n"
+         "    uint   tid [[thread_position_in_threadgroup]]) {\n"
+         "  if (row >= args->n_rows || args->head_dim != 128u || tid >= 128u) return;\n"
+         "  threadgroup float *vals  = scratch;\n"
+         "  threadgroup float *absbuf = scratch + 128u;\n"
+         "  device float *xr = (device float *)(x + (uint64_t)row * args->row_stride);\n"
+         "  vals[tid] = xr[tid];\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  /* 7-stage Walsh-Hadamard butterfly (log2(128) = 7) */\n"
+         "  for (uint stride = 1u; stride < 128u; stride <<= 1u) {\n"
+         "    if ((tid & stride) == 0u) {\n"
+         "      const uint base = (tid & ~(2u * stride - 1u)) + (tid & (stride - 1u));\n"
+         "      const float a = vals[base];\n"
+         "      const float b = vals[base + stride];\n"
+         "      vals[base] = a + b;\n"
+         "      vals[base + stride] = a - b;\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  /* Hadamard normalization × per-32-block amax */\n"
+         "  float v = vals[tid] * 0.08838834764831845f;  /* 1/sqrt(128) */\n"
+         "  const uint block = tid >> 5u;       /* 0..3, four 32-blocks */\n"
+         "  const uint lane = tid & 31u;\n"
+         "  const uint base = block * 32u;\n"
+         "  absbuf[tid] = abs(v);\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  /* Per-block halving max-reduction (32 → 16 → 8 → 4 → 2 → 1) */\n"
+         "  for (uint stride = 16u; stride > 0u; stride >>= 1u) {\n"
+         "    if (lane < stride) {\n"
+         "      absbuf[base + lane] = max(absbuf[base + lane], absbuf[base + lane + stride]);\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  const float amax = max(absbuf[base], 7.052966104933725e-38f);\n"
+         "  const float scale = exp2(ceil(log2(amax / 6.0f)));\n"
+         "  xr[tid] = dsv4_e2m1fn_dequant(clamp(v / scale, -6.0f, 6.0f)) * scale;\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_indexer_hadamard_fp4_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: indexer_hadamard_fp4 MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"indexer_hadamard_fp4_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 128;
+    g_indexer_hadamard_fp4_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_indexer_hadamard_fp4_mtl4_pipeline) {
+        fprintf(stderr, "ds4: indexer_hadamard_fp4 MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: indexer_hadamard_fp4 MTL4 pipeline initialized\n");
+    g_indexer_hadamard_fp4_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_indexer_hadamard_fp4_canary(uint32_t n_rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_indexer_hadamard_fp4_mtl4_pipeline_init()) return 0;
+    if (n_rows == 0) {
+        fprintf(stderr, "ds4: indexer_hadamard_fp4 canary requires n_rows > 0\n");
+        return 0;
+    }
+
+    /* Canary: each row is a unit impulse — x[0]=1, rest=0.
+     * After Walsh-Hadamard of unit impulse: all 128 outputs = +1
+     *   (H_128 row-0 has all +1 coefficients in this normalization).
+     * Then × 1/sqrt(128) ≈ 0.0884: all elements = 0.0884.
+     * amax per block = 0.0884; scale = exp2(ceil(log2(0.0884/6))) = 2^-6 = 0.015625
+     *   v/scale = 0.0884/0.015625 = 5.658; clamped/in-range.
+     * E2M1FN dequant(5.658) → nearest of {0,0.5,1,1.5,2,3,4,6} = 6 (5.658→6 by tie-break) OR 4 (4 is closer to 5.658)
+     *   abs(5.658-4) = 1.658; abs(5.658-6) = 0.342; 6 wins
+     * Result = 6 × 0.015625 = 0.09375 per element.
+     *
+     * Verify: every output is 0.09375 ± tiny rounding. */
+    const uint32_t head_dim = 128;
+    const uint64_t total = (uint64_t)n_rows * head_dim;
+    const float ref = 0.09375f; /* 6 × 0.015625 */
+    float *host_x = (float *)calloc(total, sizeof(float));
+    if (!host_x) return 0;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        host_x[(uint64_t)r * head_dim + 0] = 1.0f; /* impulse */
+        /* rest are 0 */
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:24
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> xBuf = [g_device newBufferWithBytes:host_x
+                                                   length:total * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+
+        struct { uint32_t n_rows_, head_dim_; uint64_t row_stride_; } args = {
+            .n_rows_ = n_rows, .head_dim_ = head_dim,
+            .row_stride_ = (uint64_t)head_dim * sizeof(float),
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[2] = {
+                (id<MTLAllocation>)argsBuf,
+                (id<MTLAllocation>)xBuf,
+            };
+            [residency addAllocations:allocs count:2];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(4);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:xBuf.gpuAddress atIndex:1];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_indexer_hadamard_fp4_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                /* shmem: vals[128] + absbuf[128] = 256 floats = 1024 bytes */
+                [enc setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_x, xBuf.contents, total * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 4);
+            }
+        }
+    }
+    if (!rc) { free(host_x); return 0; }
+
+    /* Validate: every output ≈ 0.09375, scanning sign — since the
+     * Walsh-Hadamard of (1,0,0,...,0) is all +1 (every H row has
+     * +1 in column 0), all outputs share sign + magnitude. */
+    double max_abs_dev = 0.0;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        for (uint32_t i = 0; i < head_dim; i++) {
+            const float v = host_x[(uint64_t)r * head_dim + i];
+            const double dev = fabs((double)v - (double)ref);
+            if (dev > max_abs_dev) max_abs_dev = dev;
+        }
+    }
+    fprintf(stderr,
+        "ds4: indexer_hadamard_fp4 MTL4 canary n_rows=%u "
+        "x[0]=%.6f (ref=%.6f) x[127]=%.6f max_abs_dev=%.4e\n",
+        n_rows,
+        (double)host_x[0], (double)ref,
+        (double)host_x[head_dim - 1],
+        max_abs_dev);
+    free(host_x);
+    /* E2M1FN has coarse granularity; accept ≤ 0.001 absolute deviation
+     * (rounding inside the dequant + fp arithmetic). */
+    return (max_abs_dev < 1.0e-3) ? 1 : 0;
+}
+
+/* ============================================================ */
+/* dsv4_kv_fp8_store_f32 MTL4 port (silv 2026-05-27 task #686)   */
+/* ============================================================ */
+/* MTL4 port of kernel_dsv4_kv_fp8_store_f32 from metal/dsv4_kv.metal.
+ * Decode-side KV finalizer: identical FP8 round-trip as
+ * fp8_kv_quantize (#684) on the non-RoPE region, but ALSO writes a
+ * FP16-rounded mirror into raw_cache used by FlashAttention.
+ *
+ * The single-token finalizer is dispatched once per token at decode.
+ * Pairs with fp8_kv_quantize_f32 (#684) which is the prefill batched
+ * variant. */
+
+static id<MTLComputePipelineState> g_kv_fp8_store_mtl4_pipeline;
+static int g_kv_fp8_store_mtl4_init_attempted;
+static int g_kv_fp8_store_mtl4_init_ok;
+
+static int ds4_kv_fp8_store_mtl4_pipeline_init(void) {
+    if (g_kv_fp8_store_mtl4_init_attempted) return g_kv_fp8_store_mtl4_init_ok;
+    g_kv_fp8_store_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "constant float dsv4_e4m3fn_exp_scale[16] = {\n"
+         "  0.0f, 0.015625f, 0.03125f, 0.0625f,\n"
+         "  0.125f, 0.25f, 0.5f, 1.0f,\n"
+         "  2.0f, 4.0f, 8.0f, 16.0f,\n"
+         "  32.0f, 64.0f, 128.0f, 256.0f,\n"
+         "};\n"
+         "static inline float dsv4_e4m3fn_value(int i) {\n"
+         "  const int exp_ = (i >> 3) & 0x0f;\n"
+         "  const int mant = i & 0x07;\n"
+         "  return exp_ == 0\n"
+         "    ? float(mant) * 0.001953125f\n"
+         "    : (1.0f + float(mant) * 0.125f) * dsv4_e4m3fn_exp_scale[exp_];\n"
+         "}\n"
+         "static inline float dsv4_e4m3fn_dequant(float x) {\n"
+         "  const float sign = x < 0.0f ? -1.0f : 1.0f;\n"
+         "  const float ax = min(abs(x), 448.0f);\n"
+         "  int lo = 0;\n"
+         "  int hi = 126;\n"
+         "  while (lo < hi) {\n"
+         "    const int mid = (lo + hi + 1) >> 1;\n"
+         "    if (dsv4_e4m3fn_value(mid) <= ax) lo = mid; else hi = mid - 1;\n"
+         "  }\n"
+         "  int best = lo;\n"
+         "  if (best < 126) {\n"
+         "    const float bd = abs(ax - dsv4_e4m3fn_value(best));\n"
+         "    const float nd = abs(ax - dsv4_e4m3fn_value(best + 1));\n"
+         "    if (nd < bd || (nd == bd && ((best + 1) & 1) == 0 && (best & 1) != 0))\n"
+         "      best = best + 1;\n"
+         "  }\n"
+         "  return sign * dsv4_e4m3fn_value(best);\n"
+         "}\n"
+         "struct kv_store_args { int32_t head_dim; int32_t n_rot; int32_t raw_row; };\n"
+         "kernel void kv_fp8_store_mtl4(\n"
+         "    device const kv_store_args *args [[buffer(0)]],\n"
+         "    device       float         *kv   [[buffer(1)]],\n"
+         "    device       float         *raw_cache [[buffer(2)]],\n"
+         "    threadgroup  float         *scratch [[threadgroup(0)]],\n"
+         "    uint tid [[thread_position_in_threadgroup]]) {\n"
+         "  const int head_dim = args->head_dim;\n"
+         "  const int n_rot = args->n_rot;\n"
+         "  const int n_nope = head_dim - n_rot;\n"
+         "  if (head_dim <= 0 || n_rot < 0 || n_nope < 0 || tid >= 64u) return;\n"
+         "  device float *raw = raw_cache + (int64_t)args->raw_row * head_dim;\n"
+         "  /* FP8 round-trip + FP16-mirror on the non-RoPE region in 64-blocks */\n"
+         "  for (int off = 0; off < n_nope; off += 64) {\n"
+         "    float v = 0.0f;\n"
+         "    if (off + (int)tid < n_nope) {\n"
+         "      v = kv[off + tid];\n"
+         "      scratch[tid] = abs(v);\n"
+         "    } else {\n"
+         "      scratch[tid] = 0.0f;\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    for (uint stride = 32u; stride > 0u; stride >>= 1) {\n"
+         "      if (tid < stride) scratch[tid] = max(scratch[tid], scratch[tid + stride]);\n"
+         "      threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    }\n"
+         "    const float amax = max(scratch[0], 1.0e-4f);\n"
+         "    const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));\n"
+         "    if (off + (int)tid < n_nope) {\n"
+         "      const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;\n"
+         "      kv[off + tid] = q;\n"
+         "      raw[off + tid] = (float)((half)q);  /* FP16 round-trip mirror */\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  /* RoPE tail: copy-through with FP16 round-trip mirror to raw */\n"
+         "  for (int i = n_nope + (int)tid; i < head_dim; i += 64) {\n"
+         "    raw[i] = (float)((half)kv[i]);\n"
+         "  }\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_kv_fp8_store_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: kv_fp8_store MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"kv_fp8_store_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 64;
+    g_kv_fp8_store_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_kv_fp8_store_mtl4_pipeline) {
+        fprintf(stderr, "ds4: kv_fp8_store MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: kv_fp8_store MTL4 pipeline initialized\n");
+    g_kv_fp8_store_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_kv_fp8_store_canary(uint32_t head_dim, uint32_t n_rot) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_kv_fp8_store_mtl4_pipeline_init()) return 0;
+    if (head_dim == 0 || n_rot >= head_dim) {
+        fprintf(stderr, "ds4: kv_fp8_store canary requires head_dim > 0, n_rot < head_dim\n");
+        return 0;
+    }
+
+    /* Canary: single-token KV row of head_dim floats.
+     *   non-RoPE region (first head_dim - n_rot): all 1.0
+     *   RoPE tail (last n_rot): all 7.5
+     *   raw_row = 0 (single token)
+     *
+     * Expected (same as fp8_kv_quantize on the FP8 region):
+     *   kv FP8 region: lands on exactly 1.0 (E4M3FN+scale identity at all-ones)
+     *   kv RoPE tail: unchanged at 7.5
+     *   raw FP8 region: FP16 round-trip of 1.0 = 1.0 (FP16 exact)
+     *   raw RoPE tail: FP16 round-trip of 7.5 = 7.5 (FP16 exact for half-integers in [-65k, 65k]) */
+    const int32_t n_nope = (int32_t)(head_dim - n_rot);
+    const uint32_t raw_capacity = head_dim;  /* one row */
+    float *host_kv = (float *)calloc(head_dim, sizeof(float));
+    float *host_raw = (float *)calloc(raw_capacity, sizeof(float));
+    if (!host_kv || !host_raw) { free(host_kv); free(host_raw); return 0; }
+    for (uint32_t i = 0; i < head_dim; i++) {
+        host_kv[i] = (int32_t)i < n_nope ? 1.0f : 7.5f;
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:16
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kvBuf = [g_device newBufferWithBytes:host_kv
+                                                    length:head_dim * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> rawBuf = [g_device newBufferWithLength:raw_capacity * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+
+        struct { int32_t head_dim_, n_rot_, raw_row_, pad_; } args = {
+            .head_dim_ = (int32_t)head_dim,
+            .n_rot_ = (int32_t)n_rot,
+            .raw_row_ = 0,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[3] = {
+                (id<MTLAllocation>)argsBuf,
+                (id<MTLAllocation>)kvBuf,
+                (id<MTLAllocation>)rawBuf,
+            };
+            [residency addAllocations:allocs count:3];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(4);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:kvBuf.gpuAddress atIndex:1];
+                [argTable setAddress:rawBuf.gpuAddress atIndex:2];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_kv_fp8_store_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc setThreadgroupMemoryLength:64 * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_kv, kvBuf.contents, head_dim * sizeof(float));
+                    memcpy(host_raw, rawBuf.contents, raw_capacity * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 4);
+            }
+        }
+    }
+    if (!rc) { free(host_kv); free(host_raw); return 0; }
+
+    /* Validate kv (FP8 region close to 1.0, tail bit-identical 7.5)
+     * and raw (FP16-rounded mirror = same values since 1.0 + 7.5 exact in FP16) */
+    double kv_fp8_dev = 0.0, kv_tail_dev = 0.0;
+    double raw_fp8_dev = 0.0, raw_tail_dev = 0.0;
+    for (uint32_t i = 0; i < head_dim; i++) {
+        if ((int32_t)i < n_nope) {
+            double k = fabs((double)host_kv[i] - 1.0);
+            double r = fabs((double)host_raw[i] - 1.0);
+            if (k > kv_fp8_dev) kv_fp8_dev = k;
+            if (r > raw_fp8_dev) raw_fp8_dev = r;
+        } else {
+            double k = fabs((double)host_kv[i] - 7.5);
+            double r = fabs((double)host_raw[i] - 7.5);
+            if (k > kv_tail_dev) kv_tail_dev = k;
+            if (r > raw_tail_dev) raw_tail_dev = r;
+        }
+    }
+    fprintf(stderr,
+        "ds4: kv_fp8_store MTL4 canary head_dim=%u n_rot=%u "
+        "kv[0]=%.6f raw[0]=%.6f kv[%d]=%.6f raw[%d]=%.6f "
+        "kv_fp8_dev=%.4e raw_fp8_dev=%.4e kv_tail_dev=%.4e raw_tail_dev=%.4e\n",
+        head_dim, n_rot,
+        (double)host_kv[0], (double)host_raw[0],
+        n_nope, (double)host_kv[n_nope], n_nope, (double)host_raw[n_nope],
+        kv_fp8_dev, raw_fp8_dev, kv_tail_dev, raw_tail_dev);
+    free(host_kv); free(host_raw);
+    return (kv_fp8_dev < 0.2 && raw_fp8_dev < 0.2 &&
+            kv_tail_dev < 1.0e-6 && raw_tail_dev < 1.0e-6) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +

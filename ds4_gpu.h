@@ -1272,3 +1272,15 @@ int ds4_gpu_mtl4_soft_max_canary(uint32_t n);
  * RoPE tail unchanged. Exercises kernel-source-embedded LUT tables,
  * binary-search FP8 dequant, halving-reduction amax. */
 int ds4_gpu_mtl4_fp8_kv_quantize_canary(uint32_t n_rows, uint32_t n_full, uint32_t n_rot);
+
+/* silv 2026-05-27 task #685b — dsv4_indexer_hadamard_fp4_f32 MTL4.
+ * 128-wide Walsh-Hadamard butterfly (7-stage stride-doubling) + FP4
+ * E2M1FN inplace quant on indexer Q/KV rows. Per-32-block scaling.
+ * Per-row dispatch (128 threads/row). Hardcoded head_dim=128. */
+int ds4_gpu_mtl4_indexer_hadamard_fp4_canary(uint32_t n_rows);
+
+/* silv 2026-05-27 task #686 — dsv4_kv_fp8_store_f32 MTL4. Decode-time
+ * KV finalizer: same FP8 E4M3FN round-trip as fp8_kv_quantize on the
+ * non-RoPE region, plus FP16-rounded raw_cache mirror used by
+ * FlashAttention. Per-token dispatch (64 threads). */
+int ds4_gpu_mtl4_kv_fp8_store_canary(uint32_t head_dim, uint32_t n_rot);
