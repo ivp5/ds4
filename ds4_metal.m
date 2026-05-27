@@ -17891,6 +17891,220 @@ int ds4_gpu_mtl4_sort_i32_rows_canary(uint32_t top_k, uint32_t n_rows) {
 }
 
 /* ============================================================ */
+/* MTL4 port: kernel_dsv4_router_weights_with_remap (task #677) */
+/* metal/dsv4_misc.metal:210. Companion to router_weights_one    */
+/* but with expert inverse-remap indirection. Already ICB-       */
+/* captured Phase 2 (#555). Completes 4/4 router-cycle MTL4.    */
+/*                                                               */
+/* Args is a `constant uint *args` array (3 uints), not a struct.*/
+/* MTL4 path keeps the array shape via `device const uint *`.    */
+/* selected_ids + weights are both READ-WRITE (in/out).          */
+/* ============================================================ */
+static id<MTLComputePipelineState> g_router_remap_mtl4_pipeline;
+static int g_router_remap_mtl4_init_attempted;
+static int g_router_remap_mtl4_init_ok;
+
+static int ds4_router_remap_mtl4_pipeline_init(void) {
+    if (g_router_remap_mtl4_init_attempted) return g_router_remap_mtl4_init_ok;
+    g_router_remap_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "kernel void router_weights_with_remap_mtl4(\n"
+         "    device const int *inverse_remap_table [[buffer(0)]],\n"
+         "    device int *selected_ids [[buffer(1)]],\n"
+         "    device float *weights [[buffer(2)]],\n"
+         "    device const uint *args [[buffer(3)]],\n"
+         "    threadgroup float *scratch [[threadgroup(0)]],\n"
+         "    uint2 tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort tid [[thread_index_in_threadgroup]]) {\n"
+         "  const uint layer_index = args[0];\n"
+         "  const uint n_expert = args[1];\n"
+         "  const uint n_tokens = args[2];\n"
+         "  const uint token = tgpig.x;\n"
+         "  if (token >= n_tokens) return;\n"
+         "  if (tid >= n_expert) return;\n"
+         "  const uint slot = token * n_expert + tid;\n"
+         "  const int logical = selected_ids[slot];\n"
+         "  int file_pos = -1;\n"
+         "  if (logical >= 0 && logical < 256) {\n"
+         "    file_pos = inverse_remap_table[layer_index * 256u + (uint)logical];\n"
+         "  }\n"
+         "  float w = weights[slot];\n"
+         "  if (file_pos < 0) { w = 0.0f; file_pos = 0; }\n"
+         "  scratch[tid] = w;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  float sum = 0.0f;\n"
+         "  for (uint k = 0; k < n_expert; k++) sum += scratch[k];\n"
+         "  if (sum > 6.103515625e-5f) w *= (1.5f / sum);\n"
+         "  selected_ids[slot] = file_pos;\n"
+         "  weights[slot] = w;\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_router_remap_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: router_remap MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"router_weights_with_remap_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 32;
+    g_router_remap_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_router_remap_mtl4_pipeline) {
+        fprintf(stderr, "ds4: router_remap MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: router_remap MTL4 pipeline initialized\n");
+    g_router_remap_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_router_remap_canary(uint32_t n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_router_remap_mtl4_pipeline_init()) return 0;
+
+    /* Synthetic: identity remap (file_pos = logical for all kept experts).
+     * Selected_ids per token = {0, 50, 100, 150, 200, 250}.
+     * Weights uniform 0.5 → sum = 3.0 → renormalize to 0.5 * (1.5 / 3.0) = 0.25 each. */
+    const uint32_t n_expert = 6;
+    const uint32_t layer = 9;
+    const uint64_t selected_n = (uint64_t)n_tokens * n_expert;
+    const uint64_t remap_n = 43 * 256;
+
+    int32_t *host_remap = (int32_t *)calloc(remap_n, sizeof(int32_t));
+    int32_t *host_selected = (int32_t *)calloc(selected_n, sizeof(int32_t));
+    int32_t *host_selected_ref = (int32_t *)calloc(selected_n, sizeof(int32_t));
+    float *host_weights = (float *)calloc(selected_n, sizeof(float));
+    float *host_weights_ref = (float *)calloc(selected_n, sizeof(float));
+    if (!host_remap || !host_selected || !host_selected_ref || !host_weights || !host_weights_ref) {
+        free(host_remap); free(host_selected); free(host_selected_ref);
+        free(host_weights); free(host_weights_ref);
+        return 0;
+    }
+    /* Identity remap */
+    for (uint64_t i = 0; i < remap_n; i++) host_remap[i] = (int32_t)(i % 256);
+    /* Each token has top-6 = {0, 50, 100, 150, 200, 250}, weights 0.5 each */
+    const int32_t seed_ids[6] = {0, 50, 100, 150, 200, 250};
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t k = 0; k < n_expert; k++) {
+            host_selected[t * n_expert + k] = seed_ids[k];
+            host_selected_ref[t * n_expert + k] = seed_ids[k];  /* identity remap keeps it */
+            host_weights[t * n_expert + k] = 0.5f;
+            host_weights_ref[t * n_expert + k] = 0.5f * (1.5f / 3.0f);  /* = 0.25 */
+        }
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> remapBuf = [g_device newBufferWithBytes:host_remap
+                                                       length:remap_n * sizeof(int32_t)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf = [g_device newBufferWithBytes:host_selected
+                                                     length:selected_n * sizeof(int32_t)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> wBuf = [g_device newBufferWithBytes:host_weights
+                                                   length:selected_n * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:16
+                                                      options:MTLResourceStorageModeShared];
+        const uint32_t args_u32[3] = { layer, n_expert, n_tokens };
+        memcpy(argsBuf.contents, args_u32, sizeof(args_u32));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[4] = {
+                (id<MTLAllocation>)remapBuf, (id<MTLAllocation>)selBuf,
+                (id<MTLAllocation>)wBuf, (id<MTLAllocation>)argsBuf,
+            };
+            [residency addAllocations:allocs count:4];
+            [residency commit];
+            [residency requestResidency];
+
+            MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
+            atDesc.maxBufferBindCount = 4;
+            atDesc.initializeBindings = YES;
+            id<MTL4ArgumentTable> argTable =
+                [g_device newArgumentTableWithDescriptor:atDesc error:&err];
+            if (argTable) {
+                [argTable setAddress:remapBuf.gpuAddress atIndex:0];
+                [argTable setAddress:selBuf.gpuAddress atIndex:1];
+                [argTable setAddress:wBuf.gpuAddress atIndex:2];
+                [argTable setAddress:argsBuf.gpuAddress atIndex:3];
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_router_remap_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc setThreadgroupMemoryLength:n_expert * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(8, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_selected, selBuf.contents, selected_n * sizeof(int32_t));
+                    memcpy(host_weights, wBuf.contents, selected_n * sizeof(float));
+                    rc = 1;
+                }
+            }
+        }
+    }
+    if (!rc) {
+        free(host_remap); free(host_selected); free(host_selected_ref);
+        free(host_weights); free(host_weights_ref);
+        return 0;
+    }
+
+    /* Verify selected_ids unchanged (identity remap), weights renormalized to 0.25 */
+    double max_abs_w = 0.0;
+    uint64_t n_id_correct = 0;
+    for (uint64_t i = 0; i < selected_n; i++) {
+        double d = fabs((double)(host_weights[i] - host_weights_ref[i]));
+        if (d > max_abs_w) max_abs_w = d;
+        if (host_selected[i] == host_selected_ref[i]) n_id_correct++;
+    }
+    fprintf(stderr,
+        "ds4: router_remap MTL4 canary n_tokens=%u n_expert=%u "
+        "weights[0]_gpu=%.4f weights[0]_ref=%.4f max_abs_w=%.4e ids_correct=%llu/%llu\n",
+        n_tokens, n_expert,
+        (double)host_weights[0], (double)host_weights_ref[0], max_abs_w,
+        (unsigned long long)n_id_correct, (unsigned long long)selected_n);
+    free(host_remap); free(host_selected); free(host_selected_ref);
+    free(host_weights); free(host_weights_ref);
+    return (max_abs_w < 1.0e-5 && n_id_correct == selected_n) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +

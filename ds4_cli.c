@@ -1782,6 +1782,13 @@ int main(int argc, char **argv) {
         const uint32_t n_rows = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
         return ds4_gpu_mtl4_sort_i32_rows_canary(top_k, n_rows) ? 0 : 1;
     }
+    /* --router-remap-canary [n_tokens] : task #677 MTL4 port of
+     * kernel_dsv4_router_weights_with_remap (dsv4_misc.metal:210). Identity
+     * remap; verifies weights renormalize to 0.25 per slot. */
+    if (argc >= 2 && !strcmp(argv[1], "--router-remap-canary")) {
+        const uint32_t n_tokens = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4;
+        return ds4_gpu_mtl4_router_remap_canary(n_tokens) ? 0 : 1;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
