@@ -2406,6 +2406,18 @@ int main(int argc, char **argv) {
         const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 20;
         return ds4_gpu_mtl4_vqb2_decode_vectorized_bench(np, nsel, ntot, rows, pairs, k, r) ? 0 : 1;
     }
+    /* --vqb2-noop-write-bench [N_PKTS [N_SEL [ROWS [PAIRS [ROUNDS]]]]] :
+     * silv 2026-05-28 — diagnostic baseline. Writes a constant half2, no
+     * codes load, no codebook lookup. Same dispatch shape as decoders. If
+     * this matches ~2.2 GB/s, the wall is write throughput, not decode. */
+    if (argc >= 2 && !strcmp(argv[1], "--vqb2-noop-write-bench")) {
+        const uint32_t np    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
+        const uint32_t rows  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128;
+        const uint32_t pairs = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 1024;
+        const uint32_t r     = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20;
+        return ds4_gpu_mtl4_vqb2_noop_write_bench(np, nsel, rows, pairs, r) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

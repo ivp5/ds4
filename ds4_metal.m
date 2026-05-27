@@ -34761,6 +34761,135 @@ static int ds4_vqb2_decode_fp16_k256_x4_mtl4_pipeline_init(void) {
     return g_vqb2_decode_fp16_k256_x4_mtl4_init_ok;
 }
 
+/* Diagnostic baseline kernels — silv 2026-05-28.
+ *
+ * Localize the 2.2 GB/s wall the vectorization couldn't break. Two variants
+ * stripped down to isolate each candidate bottleneck:
+ *
+ *   NOOP_WRITE: writes a CONSTANT half2 — no codes load, no codebook lookup.
+ *               If this also hits 2.2 GB/s, the wall is in pure GPU write
+ *               throughput at this dispatch shape (cache-line scatter,
+ *               threadgroup launch overhead, or similar).
+ *
+ *   NOOP_FULL: empty kernel body, just early-exit on first thread.
+ *              Measures launch + sync overhead only. If this is ~87 ms
+ *              for the same dispatch shape, the launch is the wall.
+ *
+ * Same args struct + dispatch grid as the decoder kernels for apples-to-apples. */
+static NSString * const k_vqb2_noop_write_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct args_t {\n"
+     "  uint n_rows;\n"
+     "  uint n_pairs;\n"
+     "  uint n_selected;\n"
+     "  uint n_packets;\n"
+     "  uint codes_stride;\n"
+     "  uint out_stride;\n"
+     "  uint pad0; uint pad1;\n"
+     "};\n"
+     "kernel void vqb2_noop_write(\n"
+     "    device const args_t *args         [[buffer(0)]],\n"
+     "    device const float  *codebook     [[buffer(1)]],\n"
+     "    device const uchar  *codes_base   [[buffer(2)]],\n"
+     "    device const uint   *selected     [[buffer(3)]],\n"
+     "    device       half2  *out_base     [[buffer(4)]],\n"
+     "    uint3 gid [[thread_position_in_grid]]) {\n"
+     "  const uint codes_per_expert = args->n_rows * args->n_pairs;\n"
+     "  if (gid.x >= codes_per_expert) return;\n"
+     "  if (gid.y >= args->n_selected) return;\n"
+     "  if (gid.z >= args->n_packets) return;\n"
+     "  device half2 *out = out_base + gid.z * args->out_stride;\n"
+     "  const uint out_idx = gid.y * codes_per_expert + gid.x;\n"
+     "  out[out_idx] = half2(half(1.0), half(-1.0));\n"
+     "}\n";
+
+static id<MTLComputePipelineState> g_vqb2_noop_write_mtl4_pipeline;
+static int g_vqb2_noop_write_mtl4_init_attempted;
+static int g_vqb2_noop_write_mtl4_init_ok;
+
+static int ds4_vqb2_noop_write_mtl4_pipeline_init(void) {
+    if (g_vqb2_noop_write_mtl4_init_attempted) return g_vqb2_noop_write_mtl4_init_ok;
+    g_vqb2_noop_write_mtl4_init_attempted = 1;
+    g_vqb2_noop_write_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_vqb2_noop_write_msl, @"ds4_vqb2_noop_write_mtl4",
+        @"vqb2_noop_write", 64, NULL, 0);
+    g_vqb2_noop_write_mtl4_init_ok =
+        (g_vqb2_noop_write_mtl4_pipeline != nil) ? 1 : 0;
+    return g_vqb2_noop_write_mtl4_init_ok;
+}
+
+int ds4_gpu_mtl4_vqb2_noop_write_bench(uint32_t n_packets, uint32_t n_selected,
+                                       uint32_t n_rows, uint32_t n_pairs,
+                                       uint32_t rounds) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_vqb2_noop_write_mtl4_pipeline_init()) return 0;
+    if (n_packets == 0 || n_selected == 0 || n_rows == 0 || n_pairs == 0 || rounds == 0) return 0;
+
+    const uint32_t codes_per_expert = n_rows * n_pairs;
+    const size_t sel_out_per_packet = (size_t)n_selected * codes_per_expert * 2u * sizeof(_Float16);
+    double t_ms = 0;
+    int rc = 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> outBuf = [g_device newBufferWithLength:(NSUInteger)n_packets * sel_out_per_packet
+                                                    options:MTLResourceStorageModeShared];
+        struct args_t {
+            uint32_t n_rows, n_pairs, n_selected, n_packets,
+                     codes_stride, out_stride, pad0, pad1;
+        } args = {
+            n_rows, n_pairs, n_selected, n_packets,
+            0,
+            (uint32_t)(sel_out_per_packet / sizeof(_Float16) / 2u),
+            0, 0,
+        };
+        id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args)
+                                                     options:MTLResourceStorageModeShared];
+        if (!outBuf || !argsBuf) return 0;
+
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        const uint64_t t0 = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+            [cb beginCommandBufferWithAllocator:g_polar_allocator];
+            id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+            if (!at) return 0;
+            [at setAddress:argsBuf.gpuAddress atIndex:0];
+            [at setAddress:0 atIndex:1];  /* codebook unused */
+            [at setAddress:0 atIndex:2];  /* codes_base unused */
+            [at setAddress:0 atIndex:3];  /* selected unused */
+            [at setAddress:outBuf.gpuAddress atIndex:4];
+            [enc setComputePipelineState:g_vqb2_noop_write_mtl4_pipeline];
+            [enc setArgumentTable:at];
+            [enc dispatchThreadgroups:MTLSizeMake((codes_per_expert + 63u) / 64u, n_selected, n_packets)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+            [cb endCommandBuffer];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            MTL4CommitOptions *opts = [MTL4CommitOptions new];
+            [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+            id<MTL4CommandBuffer> bufs[1] = {cb};
+            [g_polar_queue commit:bufs count:1 options:opts];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+            ds4_mtl4_pool_release(at, 8);
+        }
+        const uint64_t t1 = mach_absolute_time();
+        t_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        rc = 1;
+    }
+    const uint64_t bytes_per_round =
+        (uint64_t)n_packets * n_selected * codes_per_expert * 2u * sizeof(_Float16);
+    const double gbs = ((double)bytes_per_round * rounds / 1e9) / (t_ms / 1000.0);
+    fprintf(stderr,
+        "ds4: vqb2_noop_write_bench n_packets=%u n_sel=%u rows=%u pairs=%u rounds=%u\n"
+        "  noop write only: %.3f ms (%.3f ms/round)  %.1f GB/s output  (vs decoder ~2.2 GB/s)\n"
+        "  rc=%d\n",
+        n_packets, n_selected, n_rows, n_pairs, rounds,
+        t_ms, t_ms / (double)rounds, gbs, rc);
+    return rc;
+}
+
 /* Vectorized canary + bench: cross-checks vectorized output against the
  * baseline scalar batched decoder for bit-exactness, then measures throughput.
  * K=4 / K=16 / K=256 all supported; selects the appropriate specialization. */

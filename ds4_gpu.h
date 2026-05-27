@@ -1602,6 +1602,13 @@ int ds4_gpu_mtl4_vqb2_decode_stacked_speedup_bench(uint32_t n_packets,
                                                    uint32_t k_val,
                                                    uint32_t rounds);
 
+/* silv 2026-05-28 — no-op write diagnostic. Localizes whether the 2.2 GB/s
+ * wall is from decoder-specific work or pure write throughput at this
+ * dispatch shape. Same args + grid as decoders; writes a constant half2. */
+int ds4_gpu_mtl4_vqb2_noop_write_bench(uint32_t n_packets, uint32_t n_selected,
+                                       uint32_t n_rows, uint32_t n_pairs,
+                                       uint32_t rounds);
+
 /* silv 2026-05-28 — vectorized VQB2 decoder bench. Compares scalar
  * (1 code/thread) against K-specialized vector kernels:
  *   K=4   → 16 codes/thread (32-bit packed nibble pairs)

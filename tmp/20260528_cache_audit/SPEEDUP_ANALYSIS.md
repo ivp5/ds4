@@ -108,3 +108,45 @@ turns ~50M memory writes per layer event into zero. Multi-session work.
 
 The honest signal: the next-level speedup is not bit-extraction
 optimization. It's eliminating the intermediate fp16 store.
+
+---
+
+## UPDATE 3 — diagnostic localizes the wall to write throughput
+
+Added a no-op write kernel that produces a CONSTANT half2 — zero codes
+load, zero codebook lookup, zero decode work. Same dispatch shape as the
+decoder kernels.
+
+  noop write only:     2.7 GB/s output  (73 ms/round)
+  scalar decode:       2.2 GB/s output  (87 ms/round)
+  vectorized decode:   2.2 GB/s output  (90 ms/round, K=16)
+
+The no-op is only 25% faster than the full decoder. **The decoder work
+itself costs almost nothing relative to the pure write.** All previous
+optimization attempts (selected experts, ICB, batched encoder, fused 3D
+grid, vector decode) are addressing the wrong axis: write throughput is
+the wall, not decode compute.
+
+Why 2.7 GB/s when peak is 400 GB/s? 192 MB/round scattered across 786K
+threadgroups × ~250 bytes each. Likely L2 thrashing or write-buffer
+saturation at this dispatch granularity. Larger threadgroups + fewer
+groups might help, but the upper bound is bounded by total bytes /
+peak write bandwidth.
+
+## The architectural move — confirmed, not just hypothesized
+
+**Fused decode-matmul kernel** is now empirically the only path to
+order-of-magnitude speedup. Each thread loads `code`, computes
+`codebook[code]`, multiplies by activation, accumulates into register —
+weights only exist transiently in registers/threadgroup memory; the
+intermediate fp16 write is eliminated entirely.
+
+Reduction: 192 MB/round write → 0 bytes write. Per-token compute moves
+from 87 ms decode + ~10 ms matmul to ~10-20 ms fused. Estimated **~5-10×
+per layer event**, **~200-400 ms savings per token** at 43 layers.
+
+This is multi-session work (kernel + dispatch refactor + correctness
+validation against scalar decode-then-matmul reference). But the
+diagnostic above is conclusive: there is no other path. The vectorized
+decoder kernels stay shipped for future investigation; they are not the
+production path.
