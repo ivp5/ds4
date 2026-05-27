@@ -1838,6 +1838,11 @@ int main(int argc, char **argv) {
         const uint32_t kv_n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 512;
         return ds4_gpu_mtl4_qkv_rms_norm_canary(q_n, kv_n) ? 0 : 1;
     }
+    /* --soft-max-4-canary [n] : task #678 row-softmax float4 vectorized */
+    if (argc >= 2 && !strcmp(argv[1], "--soft-max-4-canary")) {
+        const uint32_t n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 512;
+        return ds4_gpu_mtl4_soft_max_4_canary(n) ? 0 : 1;
+    }
     /* --hc-weighted-sum-canary [n_embd [n_hc [n_tokens]]] : task #683 */
     if (argc >= 2 && !strcmp(argv[1], "--hc-weighted-sum-canary")) {
         const uint32_t n_embd = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;

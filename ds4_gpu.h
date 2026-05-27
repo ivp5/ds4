@@ -1240,3 +1240,9 @@ int ds4_gpu_mtl4_router_finalize_one_canary(int has_bias_flag);
 /* silv 2026-05-27 task #685 — qkv_rms_norm_f32_4 MTL4. Per-layer fused
  * Q+KV RMSNorm. Fires 43× per token. High call-density target. */
 int ds4_gpu_mtl4_qkv_rms_norm_canary(uint32_t q_n, uint32_t kv_n);
+
+/* silv 2026-05-27 task #678 — soft_max_f32_4 MTL4. Row-softmax over
+ * float4 vectorized rows, used in compressor/indexer attention paths.
+ * Per-attention dispatch density. Tests simd reductions + threadgroup
+ * scratch over vectorized inputs. */
+int ds4_gpu_mtl4_soft_max_4_canary(uint32_t n);

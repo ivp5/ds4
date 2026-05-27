@@ -137,3 +137,44 @@ Per INTEGRATION_MAP.md priority:
 - `ds4_cli.c` — 4 new CLI entries
 
 Plus the H2086 IQ2 dequant fix (2 lines) and the comment block above it.
+
+## Update 2026-05-27 turn N+1 — soft_max_f32_4 MTL4 (#678)
+
+16th MTL4 port this session. Coverage **22/81 (27.2%)** ↑ from 21/81.
+
+The 5/5 router-cycle MTL4 set was already complete (#677 prior turn).
+This port begins the **attention pipeline** MTL4 set:
+
+| port | scope | dispatch density |
+|------|-------|------------------|
+| qkv_rms_norm_f32_4 (#685) | Q+KV RMS norm fused | 43×/token |
+| **soft_max_f32_4 (#678)** | row-softmax float4 | per-attention call |
+| kernel_dsv4_indexer_score_one_direct | indexer scoring | per-attention |
+| kernel_dsv4_hc_expand | HC expansion | per-layer |
+
+Canary results at n ∈ {128, 512, 1024, 2048, 4096}:
+
+```
+n=128:  dst[0]=0.020955 (ref=0.020955) sum=1.000000 max_abs=4.66e-10
+n=512:  dst[0]=0.005291 (ref=0.005291) sum=1.000000 max_abs=4.66e-10
+n=1024: dst[0]=0.002650 (ref=0.002650) sum=1.000000 max_abs=2.33e-10
+n=2048: dst[0]=0.001326 (ref=0.001326) sum=1.000000 max_abs=1.16e-10
+n=4096: dst[0]=0.000663 (ref=0.000663) sum=1.000000 max_abs=5.82e-11
+```
+
+Notice max_abs scales as 1/n — absolute error proportional to value
+magnitude (which itself scales as 1/n on uniform-spike input).
+Normalization is float-exact at every n.
+
+Bugs caught this port: zero (template is fully mechanical now).
+
+The kernel uses spike-pattern synthetic input (src[0]=1, rest=0) which
+exercises:
+- simd_max across simdgroups (cross-simd via threadgroup scratch)
+- simd_sum across simdgroups (same path)
+- exp() in float4 vectorized loop
+- inv_sum normalization
+
+That covers everything in the production kernel except mask + sink +
+ALiBi slope, which can be added as a wider canary in a follow-up if a
+real soft_max wire is needed before VQB2 transfer arrives.

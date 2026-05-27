@@ -20291,6 +20291,249 @@ int ds4_gpu_mtl4_qkv_rms_norm_canary(uint32_t q_n, uint32_t kv_n) {
 }
 
 /* ============================================================ */
+/* soft_max_f32_4 MTL4 port (silv 2026-05-27 task #678)         */
+/* ============================================================ */
+/* MTL4-side port of kernel_soft_max_4<float4> from metal/softmax.metal.
+ * Row softmax with optional mask + sink + ALiBi slope (canary uses the
+ * simplified path: scale=1, no mask, no sink, no ALiBi — that exercises
+ * the load-reduce-renormalize pattern over a float4 row).
+ *
+ * Dispatch shape: (rows, planes, 1) threadgroups × (nth, 1, 1) threads.
+ * Threadgroup scratch: 32 floats (one per simdgroup, max 8 simdgroups @
+ * 256 threads on M1).
+ *
+ * The full production-path version would inline mask + sink + ALiBi;
+ * this port validates the core compute kernel + MTL4 argument-table
+ * binding shape. Production wire deferred until A/B path is open per
+ * the deep-ops design memo. */
+
+static id<MTLComputePipelineState> g_soft_max_4_mtl4_pipeline;
+static int g_soft_max_4_mtl4_init_attempted;
+static int g_soft_max_4_mtl4_init_ok;
+
+static int ds4_soft_max_4_mtl4_pipeline_init(void) {
+    if (g_soft_max_4_mtl4_init_attempted) return g_soft_max_4_mtl4_init_ok;
+    g_soft_max_4_mtl4_init_attempted = 1;
+    if (!ds4_polar_pipeline_init()) return 0;
+
+    NSError *err = nil;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct sm_args {\n"
+         "  int32_t n;       /* row length in float elements */\n"
+         "  int32_t n4;      /* row length / 4 */\n"
+         "  float   scale;\n"
+         "};\n"
+         "kernel void soft_max_4_mtl4(\n"
+         "    device const sm_args *args [[buffer(0)]],\n"
+         "    device const float4  *src [[buffer(1)]],\n"
+         "    device       float4  *dst [[buffer(2)]],\n"
+         "    threadgroup  float   *shmem [[threadgroup(0)]],\n"
+         "    uint3  tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort3 tpitg [[thread_position_in_threadgroup]],\n"
+         "    ushort  sgitg [[simdgroup_index_in_threadgroup]],\n"
+         "    ushort  tiisg [[thread_index_in_simdgroup]],\n"
+         "    ushort3 ntg [[threads_per_threadgroup]]) {\n"
+         "  const uint row = tgpig.x;\n"
+         "  const int  n4  = args->n4;\n"
+         "  const float scale = args->scale;\n"
+         "  device const float4 *psrc = src + row * (uint)n4;\n"
+         "  device       float4 *pdst = dst + row * (uint)n4;\n"
+         "  /* pass 1: max */\n"
+         "  float4 lmax4 = (float4)(-INFINITY);\n"
+         "  for (int i = tpitg.x; i < n4; i += ntg.x) {\n"
+         "    lmax4 = fmax(lmax4, psrc[i] * scale);\n"
+         "  }\n"
+         "  float lmax = fmax(fmax(lmax4.x, lmax4.y), fmax(lmax4.z, lmax4.w));\n"
+         "  lmax = simd_max(lmax);\n"
+         "  if (ntg.x > 32) {\n"
+         "    if (sgitg == 0) shmem[tiisg] = -INFINITY;\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    if (tiisg == 0)  shmem[sgitg] = lmax;\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    lmax = shmem[tiisg];\n"
+         "    lmax = simd_max(lmax);\n"
+         "  }\n"
+         "  /* pass 2: exp + sum + write */\n"
+         "  float4 lsum4 = (float4)(0.0f);\n"
+         "  for (int i = tpitg.x; i < n4; i += ntg.x) {\n"
+         "    const float4 e = exp(psrc[i] * scale - lmax);\n"
+         "    lsum4 += e;\n"
+         "    pdst[i] = e;\n"
+         "  }\n"
+         "  float lsum = lsum4.x + lsum4.y + lsum4.z + lsum4.w;\n"
+         "  threadgroup_barrier(mem_flags::mem_none);\n"
+         "  lsum = simd_sum(lsum);\n"
+         "  if (ntg.x > 32) {\n"
+         "    if (sgitg == 0) shmem[tiisg] = 0.0f;\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    if (tiisg == 0)  shmem[sgitg] = lsum;\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    lsum = shmem[tiisg];\n"
+         "    lsum = simd_sum(lsum);\n"
+         "  }\n"
+         "  const float inv_sum = 1.0f / lsum;\n"
+         "  /* pass 3: normalize */\n"
+         "  for (int i = tpitg.x; i < n4; i += ntg.x) {\n"
+         "    pdst[i] *= inv_sum;\n"
+         "  }\n"
+         "}\n";
+
+    MTL4LibraryDescriptor *libDesc = [MTL4LibraryDescriptor new];
+    libDesc.source = source;
+    libDesc.name = @"ds4_soft_max_4_mtl4";
+    id<MTLLibrary> lib = [g_polar_compiler newLibraryWithDescriptor:libDesc error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: soft_max_4 MTL4 library compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    MTL4LibraryFunctionDescriptor *fnDesc = [MTL4LibraryFunctionDescriptor new];
+    fnDesc.library = lib;
+    fnDesc.name = @"soft_max_4_mtl4";
+    MTL4ComputePipelineDescriptor *pipeDesc = [MTL4ComputePipelineDescriptor new];
+    pipeDesc.computeFunctionDescriptor = fnDesc;
+    pipeDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+    pipeDesc.maxTotalThreadsPerThreadgroup = 256;
+    g_soft_max_4_mtl4_pipeline =
+        [g_polar_compiler newComputePipelineStateWithDescriptor:pipeDesc
+                                           compilerTaskOptions:nil error:&err];
+    if (!g_soft_max_4_mtl4_pipeline) {
+        fprintf(stderr, "ds4: soft_max_4 MTL4 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    fprintf(stderr, "ds4: soft_max_4 MTL4 pipeline initialized\n");
+    g_soft_max_4_mtl4_init_ok = 1;
+    return 1;
+}
+
+int ds4_gpu_mtl4_soft_max_4_canary(uint32_t n) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_soft_max_4_mtl4_pipeline_init()) return 0;
+    if (n == 0 || (n % 4) != 0) {
+        fprintf(stderr, "ds4: soft_max_4 canary requires n>0 and n %% 4 == 0\n");
+        return 0;
+    }
+
+    /* Reference setup: all-zero input → softmax → uniform 1/n.
+     * Also test a non-trivial pattern: src[i] = (i==0)?1:0 with scale=1.
+     * Expected: exp(1)/(exp(1) + (n-1)*exp(0)) at index 0; exp(0)/Z elsewhere. */
+    const uint32_t n4 = n / 4;
+    float *host_src = (float *)calloc(n, sizeof(float));
+    float *host_dst = (float *)calloc(n, sizeof(float));
+    if (!host_src || !host_dst) { free(host_src); free(host_dst); return 0; }
+    /* Use the spike pattern for stronger validation than uniform-0. */
+    host_src[0] = 1.0f;
+
+    /* Reference. */
+    const float scale = 1.0f;
+    const float max_v = 1.0f;
+    double Z = expf(1.0f - max_v) + (double)(n - 1) * expf(0.0f - max_v);
+    const float ref0 = (float)(expf(1.0f - max_v) / Z);
+    const float ref_else = (float)(expf(0.0f - max_v) / Z);
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:16
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> srcBuf = [g_device newBufferWithBytes:host_src
+                                                     length:n * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:n * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+
+        struct { int32_t n_, n4_; float scale_; uint32_t pad; } args = {
+            .n_ = (int32_t)n, .n4_ = (int32_t)n4, .scale_ = scale,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 4;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[3] = {
+                (id<MTLAllocation>)argsBuf,
+                (id<MTLAllocation>)srcBuf,
+                (id<MTLAllocation>)dstBuf,
+            };
+            [residency addAllocations:allocs count:3];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(4);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:srcBuf.gpuAddress atIndex:1];
+                [argTable setAddress:dstBuf.gpuAddress atIndex:2];
+
+                /* Pick a thread count: clamp to 256 (M1 max), ≤ n4 */
+                NSUInteger nth = 32u;
+                while (nth < n4 && nth < 256u) nth *= 2u;
+                if (nth > g_soft_max_4_mtl4_pipeline.maxTotalThreadsPerThreadgroup)
+                    nth = g_soft_max_4_mtl4_pipeline.maxTotalThreadsPerThreadgroup;
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_soft_max_4_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                /* 32 simdgroups × 4 bytes = 128 bytes scratch (one slot per
+                 * simdgroup, indexed by sgitg ∈ [0, ntg.x/32)) */
+                [enc setThreadgroupMemoryLength:128 atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                    (void)fb; dispatch_semaphore_signal(sem);
+                }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem,
+                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_dst, dstBuf.contents, n * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 4);
+            }
+        }
+    }
+    if (!rc) { free(host_src); free(host_dst); return 0; }
+
+    /* Validate */
+    double max_abs = 0.0;
+    double sum = 0.0;
+    double d0 = fabs((double)(host_dst[0] - ref0));
+    if (d0 > max_abs) max_abs = d0;
+    sum += (double)host_dst[0];
+    for (uint32_t i = 1; i < n; i++) {
+        double d = fabs((double)(host_dst[i] - ref_else));
+        if (d > max_abs) max_abs = d;
+        sum += (double)host_dst[i];
+    }
+    fprintf(stderr,
+        "ds4: soft_max_4 MTL4 canary n=%u dst[0]=%.6f (ref=%.6f) "
+        "dst[1]=%.6f (ref=%.6f) sum=%.6f max_abs=%.4e\n",
+        n,
+        (double)host_dst[0], (double)ref0,
+        (double)host_dst[1], (double)ref_else,
+        sum, max_abs);
+    free(host_src); free(host_dst);
+    /* Looser tol: float exp accumulation across N=512+ has ~1e-6 drift */
+    return (max_abs < 5.0e-6 && fabs(sum - 1.0) < 5.0e-5) ? 1 : 0;
+}
+
+/* ============================================================ */
 /* H1729 tile×row×batch polar dot kernel                        */
 /* ============================================================ */
 /* Per codex H1729: real MoE execution unit = "resident expert-code tile +
