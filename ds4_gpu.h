@@ -1591,6 +1591,17 @@ int ds4_gpu_mtl4_vqb2_decode_fp16_selected_canary(uint32_t n_selected,
                                                   uint32_t n_pairs,
                                                   uint32_t k_val);
 
+/* silv 2026-05-28 stacked-speedup bench — isolates compute-reduction axis
+ * (full → selected decode) from encoder-amortization axis (per-packet →
+ * batched). Reports A, B, C times and per-axis multipliers. */
+int ds4_gpu_mtl4_vqb2_decode_stacked_speedup_bench(uint32_t n_packets,
+                                                   uint32_t n_selected,
+                                                   uint32_t n_experts_total,
+                                                   uint32_t n_rows,
+                                                   uint32_t n_pairs,
+                                                   uint32_t k_val,
+                                                   uint32_t rounds);
+
 /* silv 2026-05-28 task #742 — wide-tile audit canary.
  * Routes R tokens to a single expert (htpe[0]=R, hids[0..R-1]={0..R-1}),
  * runs each of n32/n64/n128 pipelines, reports per-token mismatch

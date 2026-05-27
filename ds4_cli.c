@@ -2379,6 +2379,20 @@ int main(int argc, char **argv) {
         const uint32_t k     = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 16;
         return ds4_gpu_mtl4_vqb2_decode_fp16_selected_canary(nsel, ntot, rows, pairs, k) ? 0 : 1;
     }
+    /* --vqb2-stacked-bench [N_PKTS [N_SEL [N_TOTAL [ROWS [PAIRS [K [ROUNDS]]]]]]] :
+     * silv 2026-05-28 — isolates compute-reduction vs encoder-amortization
+     * axes for the routed-MoE primitive. Defaults match one DS4 V4 layer event:
+     * 64 packets × 6/256 experts × 128 rows × 1024 pairs × K=16 × 20 rounds. */
+    if (argc >= 2 && !strcmp(argv[1], "--vqb2-stacked-bench")) {
+        const uint32_t np    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
+        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
+        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128;
+        const uint32_t pairs = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1024;
+        const uint32_t k     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 16;
+        const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 20;
+        return ds4_gpu_mtl4_vqb2_decode_stacked_speedup_bench(np, nsel, ntot, rows, pairs, k, r) ? 0 : 1;
+    }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {
         extern int ds4_prefix_cache_phase1_self_test(void);

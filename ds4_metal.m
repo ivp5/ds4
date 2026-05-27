@@ -34492,91 +34492,140 @@ static id<MTLComputePipelineState> g_vqb2_decode_fp16_mtl4_pipeline;
 static int g_vqb2_decode_fp16_mtl4_init_attempted;
 static int g_vqb2_decode_fp16_mtl4_init_ok;
 
+/* silv 2026-05-28 lazy-module-import fix: the base VQB2 decoder MSL is
+ * shared by the MTL4-path pipeline init (this function) AND the classic-MTL
+ * pipeline init (used for ICB Phase 8). Previously each function held its
+ * own copy of the 35-line MSL source — a real drift risk if the decoder
+ * formula changes. Single source, both paths import it. The kernel name
+ * is shared (`vqb2_decode_fp16`); the MTL4-suffixed init produces a
+ * separately-compiled MTL4 pipeline while the classic init produces a
+ * classic-MTL pipeline with supportIndirectCommandBuffers=YES.
+ *
+ * NOT THREAD-SAFE: assumes single-threaded engine init. All sibling
+ * `_init_attempted = 1` patterns share this assumption; concurrent init
+ * would race on the first-call compile path. */
+/* silv 2026-05-28 OOM-speedup batched variant: one dispatch, 3D grid covers
+ * (codes_per_expert × n_selected × n_packets). All packets share codebook +
+ * selection list; codes_base + out_base are big buffers indexed by packet via
+ * stride args. Eliminates per-packet dispatch overhead which the stacked
+ * bench revealed dominates at typical layer-event granularity (~1.4 ms per
+ * dispatch vs ~12 μs of actual memory-bandwidth work). Layer event = one
+ * commit instead of 64 dispatches. */
+static NSString * const k_vqb2_decode_fp16_batched_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct args_t {\n"
+     "  uint bit_width;\n"
+     "  uint code_mask;\n"
+     "  uint n_rows;\n"
+     "  uint n_pairs;\n"
+     "  uint n_selected;\n"
+     "  uint n_packets;\n"
+     "  uint codes_stride;\n"
+     "  uint out_stride;\n"
+     "};\n"
+     "kernel void vqb2_decode_fp16_batched(\n"
+     "    device const args_t *args         [[buffer(0)]],\n"
+     "    device const float  *codebook     [[buffer(1)]],\n"
+     "    device const uchar  *codes_base   [[buffer(2)]],\n"
+     "    device const uint   *selected     [[buffer(3)]],\n"
+     "    device       half2  *out_base     [[buffer(4)]],\n"
+     "    uint3 gid [[thread_position_in_grid]]) {\n"
+     "  const uint codes_per_expert = args->n_rows * args->n_pairs;\n"
+     "  if (gid.x >= codes_per_expert) return;\n"
+     "  if (gid.y >= args->n_selected) return;\n"
+     "  if (gid.z >= args->n_packets) return;\n"
+     "  const device uchar *codes = codes_base + gid.z * args->codes_stride;\n"
+     "  device       half2 *out   = out_base   + gid.z * args->out_stride;\n"
+     "  const uint expert = selected[gid.y];\n"
+     "  const uint linear = expert * codes_per_expert + gid.x;\n"
+     "  const uint bit_off = linear * args->bit_width;\n"
+     "  const uint byte_off = bit_off >> 3;\n"
+     "  const uint shift = bit_off & 7u;\n"
+     "  const uint lo = (uint)codes[byte_off];\n"
+     "  const uint hi = (args->bit_width + shift > 8u) ? (uint)codes[byte_off + 1u] : 0u;\n"
+     "  const uint window = lo | (hi << 8);\n"
+     "  const uint code = (window >> shift) & args->code_mask;\n"
+     "  const float re = codebook[code * 2u + 0u];\n"
+     "  const float im = codebook[code * 2u + 1u];\n"
+     "  out[gid.y * codes_per_expert + gid.x] = half2((half)re, (half)im);\n"
+     "}\n";
+
+static id<MTLComputePipelineState> g_vqb2_decode_fp16_batched_mtl4_pipeline;
+static int g_vqb2_decode_fp16_batched_mtl4_init_attempted;
+static int g_vqb2_decode_fp16_batched_mtl4_init_ok;
+
+static int ds4_vqb2_decode_fp16_batched_mtl4_pipeline_init(void) {
+    if (g_vqb2_decode_fp16_batched_mtl4_init_attempted) return g_vqb2_decode_fp16_batched_mtl4_init_ok;
+    g_vqb2_decode_fp16_batched_mtl4_init_attempted = 1;
+    g_vqb2_decode_fp16_batched_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_vqb2_decode_fp16_batched_msl, @"ds4_vqb2_decode_fp16_batched_mtl4",
+        @"vqb2_decode_fp16_batched", 64, NULL, 0);
+    g_vqb2_decode_fp16_batched_mtl4_init_ok =
+        (g_vqb2_decode_fp16_batched_mtl4_pipeline != nil) ? 1 : 0;
+    return g_vqb2_decode_fp16_batched_mtl4_init_ok;
+}
+
+static NSString * const k_vqb2_decode_fp16_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct args_t {\n"
+     "  uint bit_width;\n"
+     "  uint code_mask;\n"
+     "  uint n_codes;\n"
+     "  uint start_linear;\n"
+     "};\n"
+     "kernel void vqb2_decode_fp16(\n"
+     "    device const args_t *args [[buffer(0)]],\n"
+     "    device const float  *codebook [[buffer(1)]],\n"
+     "    device const uchar  *codes [[buffer(2)]],\n"
+     "    device       half2  *out_fp16 [[buffer(3)]],\n"
+     "    uint gid [[thread_position_in_grid]]) {\n"
+     "  if (gid >= args->n_codes) return;\n"
+     "  const uint linear = args->start_linear + gid;\n"
+     "  const uint bit_off = linear * args->bit_width;\n"
+     "  const uint byte_off = bit_off >> 3;\n"
+     "  const uint shift = bit_off & 7u;\n"
+     "  const uint lo = (uint)codes[byte_off];\n"
+     "  const uint hi = (args->bit_width + shift > 8u) ? (uint)codes[byte_off + 1u] : 0u;\n"
+     "  const uint window = lo | (hi << 8);\n"
+     "  const uint code = (window >> shift) & args->code_mask;\n"
+     "  const float re = codebook[code * 2u + 0u];\n"
+     "  const float im = codebook[code * 2u + 1u];\n"
+     "  out_fp16[gid] = half2((half)re, (half)im);\n"
+     "}\n";
+
 static int ds4_vqb2_decode_fp16_mtl4_pipeline_init(void) {
     if (g_vqb2_decode_fp16_mtl4_init_attempted) return g_vqb2_decode_fp16_mtl4_init_ok;
     g_vqb2_decode_fp16_mtl4_init_attempted = 1;
-    NSString *source =
-        @"#include <metal_stdlib>\n"
-         "using namespace metal;\n"
-         "struct args_t {\n"
-         "  uint bit_width;\n"
-         "  uint code_mask;\n"
-         "  uint n_codes;\n"
-         "  uint start_linear;\n"
-         "};\n"
-         "kernel void vqb2_decode_fp16_mtl4(\n"
-         "    device const args_t *args [[buffer(0)]],\n"
-         "    device const float  *codebook [[buffer(1)]],\n"
-         "    device const uchar  *codes [[buffer(2)]],\n"
-         "    device       half2  *out_fp16 [[buffer(3)]],\n"
-         "    uint gid [[thread_position_in_grid]]) {\n"
-         "  if (gid >= args->n_codes) return;\n"
-         "  const uint linear = args->start_linear + gid;\n"
-         "  const uint bit_off = linear * args->bit_width;\n"
-         "  const uint byte_off = bit_off >> 3;\n"
-         "  const uint shift = bit_off & 7u;\n"
-         "  const uint lo = (uint)codes[byte_off];\n"
-         "  const uint hi = (args->bit_width + shift > 8u) ? (uint)codes[byte_off + 1u] : 0u;\n"
-         "  const uint window = lo | (hi << 8);\n"
-         "  const uint code = (window >> shift) & args->code_mask;\n"
-         "  const float re = codebook[code * 2u + 0u];\n"
-         "  const float im = codebook[code * 2u + 1u];\n"
-         "  out_fp16[gid] = half2((half)re, (half)im);\n"
-         "}\n";
     g_vqb2_decode_fp16_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
-        source, @"ds4_vqb2_decode_fp16_mtl4", @"vqb2_decode_fp16_mtl4", 64, NULL, 0);
+        k_vqb2_decode_fp16_msl, @"ds4_vqb2_decode_fp16_mtl4",
+        @"vqb2_decode_fp16", 64, NULL, 0);
     g_vqb2_decode_fp16_mtl4_init_ok =
         (g_vqb2_decode_fp16_mtl4_pipeline != nil) ? 1 : 0;
     return g_vqb2_decode_fp16_mtl4_init_ok;
 }
 
-/* silv 2026-05-28 ICB Phase 8: classic-MTL VQB2 decoder pipeline. Same MSL
- * source as the MTL4 variant; compiled via newLibraryWithSource so that
- * supportIndirectCommandBuffers=YES can be set on the pipeline descriptor.
- *
- * Required for classic-MTL ICB recording. The MTL4 path (#751) uses the
- * MTL4 compiler and is not ICB-encodable in classic mode. */
+/* silv 2026-05-28 ICB Phase 8: classic-MTL VQB2 decoder pipeline. Imports
+ * the shared k_vqb2_decode_fp16_msl module-source (see above) — same MSL
+ * compiled via newLibraryWithSource (classic path) instead of MTL4Compiler.
+ * supportIndirectCommandBuffers=YES is set on the pipeline descriptor so
+ * classic ICB recording works (the MTL4 path is not ICB-encodable in
+ * classic mode). */
 static int ds4_vqb2_decode_fp16_classic_pipeline_init(void) {
     if (g_vqb2_decode_fp16_classic_init_attempted) return g_vqb2_decode_fp16_classic_init_ok;
     g_vqb2_decode_fp16_classic_init_attempted = 1;
     NSError *err = nil;
-    NSString *source =
-        @"#include <metal_stdlib>\n"
-         "using namespace metal;\n"
-         "struct args_t {\n"
-         "  uint bit_width;\n"
-         "  uint code_mask;\n"
-         "  uint n_codes;\n"
-         "  uint start_linear;\n"
-         "};\n"
-         "kernel void vqb2_decode_fp16_classic(\n"
-         "    device const args_t *args [[buffer(0)]],\n"
-         "    device const float  *codebook [[buffer(1)]],\n"
-         "    device const uchar  *codes [[buffer(2)]],\n"
-         "    device       half2  *out_fp16 [[buffer(3)]],\n"
-         "    uint gid [[thread_position_in_grid]]) {\n"
-         "  if (gid >= args->n_codes) return;\n"
-         "  const uint linear = args->start_linear + gid;\n"
-         "  const uint bit_off = linear * args->bit_width;\n"
-         "  const uint byte_off = bit_off >> 3;\n"
-         "  const uint shift = bit_off & 7u;\n"
-         "  const uint lo = (uint)codes[byte_off];\n"
-         "  const uint hi = (args->bit_width + shift > 8u) ? (uint)codes[byte_off + 1u] : 0u;\n"
-         "  const uint window = lo | (hi << 8);\n"
-         "  const uint code = (window >> shift) & args->code_mask;\n"
-         "  const float re = codebook[code * 2u + 0u];\n"
-         "  const float im = codebook[code * 2u + 1u];\n"
-         "  out_fp16[gid] = half2((half)re, (half)im);\n"
-         "}\n";
-    id<MTLLibrary> lib = [g_device newLibraryWithSource:source options:nil error:&err];
+    id<MTLLibrary> lib = [g_device newLibraryWithSource:k_vqb2_decode_fp16_msl
+                                                options:nil error:&err];
     if (!lib) {
         fprintf(stderr, "ds4: vqb2_decode_fp16_classic library compile failed: %s\n",
                 err ? err.localizedDescription.UTF8String : "(no error)");
         return 0;
     }
-    id<MTLFunction> fn = [lib newFunctionWithName:@"vqb2_decode_fp16_classic"];
+    id<MTLFunction> fn = [lib newFunctionWithName:@"vqb2_decode_fp16"];
     if (!fn) {
-        fprintf(stderr, "ds4: vqb2_decode_fp16_classic function not found\n");
+        fprintf(stderr, "ds4: vqb2_decode_fp16 function not found in classic library\n");
         return 0;
     }
     MTLComputePipelineDescriptor *pdesc = [MTLComputePipelineDescriptor new];
@@ -35097,6 +35146,300 @@ int ds4_gpu_mtl4_vqb2_decode_fp16_selected_canary(uint32_t n_selected,
         (double)host_out[0], (double)host_out[1]);
     free(host_cb); free(host_codes); free(host_sel); free(host_out);
     return (rc && mismatch == 0) ? 1 : 0;
+}
+
+/* silv 2026-05-28 — stacked-speedup bench. Quantifies the combined win of
+ * the H2125 routed-MoE primitive: selected-expert decoder × ICB-style
+ * single-encoder batched dispatch, compared to the baseline full-decode +
+ * encoder-per-call path.
+ *
+ * The bench runs `rounds` iterations of: one routed-MoE layer event = 64
+ * packets, each with 6 selected experts of 256, K=16 (gate/up shape) or
+ * K=256 (L22 island).
+ *
+ * Configurations compared:
+ *   A. FULL decode + per-packet encoder (baseline cost: 256 experts × 64
+ *      packets × encoder open/close per call)
+ *   B. SELECTED decode (6/256) + per-packet encoder (compute -42×, but
+ *      encoder overhead still 64 calls)
+ *   C. SELECTED decode + single-encoder batched (encoder overhead 1, the
+ *      pack-direct production target shape)
+ *
+ * The "10× accuracy" of this bench: ICB / direct shape differences are
+ * usually conflated; this bench isolates the compute-reduction win
+ * (FULL → SELECTED) from the encoder-amortization win (per-packet →
+ * batched) so each can be priced separately. Without isolation, codex
+ * H2126 caught a fused-batched regression that was actually irregular
+ * indexing; isolating axes prevents that confusion. */
+int ds4_gpu_mtl4_vqb2_decode_stacked_speedup_bench(uint32_t n_packets,
+                                                   uint32_t n_selected,
+                                                   uint32_t n_experts_total,
+                                                   uint32_t n_rows,
+                                                   uint32_t n_pairs,
+                                                   uint32_t k_val,
+                                                   uint32_t rounds) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_vqb2_decode_fp16_mtl4_pipeline_init()) return 0;
+    if (!ds4_vqb2_decode_fp16_selected_mtl4_pipeline_init()) return 0;
+    if (!ds4_vqb2_decode_fp16_batched_mtl4_pipeline_init()) return 0;
+    if (n_packets == 0 || n_selected == 0 || n_selected > n_experts_total) return 0;
+    if (n_rows == 0 || n_pairs == 0 || rounds == 0) return 0;
+    uint32_t bit_width;
+    switch (k_val) {
+        case 4:   bit_width = 2; break;
+        case 16:  bit_width = 4; break;
+        case 64:  bit_width = 6; break;
+        case 256: bit_width = 8; break;
+        default:  return 0;
+    }
+    const uint32_t codes_per_expert = n_rows * n_pairs;
+    const uint64_t total_codes_per_packet = (uint64_t)n_experts_total * codes_per_expert;
+    const size_t codes_bytes_per_packet = (size_t)(total_codes_per_packet * bit_width + 7u) >> 3;
+    const size_t full_out_per_packet = (size_t)n_experts_total * codes_per_expert * 2u * sizeof(_Float16);
+    const size_t sel_out_per_packet  = (size_t)n_selected * codes_per_expert * 2u * sizeof(_Float16);
+
+    double t_A_ms = 0, t_B_ms = 0, t_C_ms = 0;
+
+    @autoreleasepool {
+        const float step = 1.0f / (float)k_val;
+        /* Codebook + packed codes (n_packets × 256 experts × codes) + selection list. */
+        id<MTLBuffer> cbBuf = [g_device newBufferWithLength:(NSUInteger)k_val * 2u * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> codesBuf = [g_device newBufferWithLength:(NSUInteger)n_packets * codes_bytes_per_packet
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf = [g_device newBufferWithLength:(NSUInteger)n_selected * sizeof(uint32_t)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> fullOutBuf = [g_device newBufferWithLength:(NSUInteger)n_packets * full_out_per_packet
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selOutBuf  = [g_device newBufferWithLength:(NSUInteger)n_packets * sel_out_per_packet
+                                                         options:MTLResourceStorageModeShared];
+        if (!cbBuf || !codesBuf || !selBuf || !fullOutBuf || !selOutBuf) return 0;
+
+        float *cb_data = (float *)cbBuf.contents;
+        for (uint32_t i = 0; i < k_val; i++) {
+            cb_data[i * 2u + 0u] =  (float)i * step;
+            cb_data[i * 2u + 1u] = -(float)i * step;
+        }
+        /* Codes filled deterministically (don't measure init time) */
+        memset(codesBuf.contents, 0xCD, (NSUInteger)n_packets * codes_bytes_per_packet);
+        uint32_t *sel = (uint32_t *)selBuf.contents;
+        for (uint32_t i = 0; i < n_selected; i++) sel[i] = i * (n_experts_total / n_selected);
+
+        struct full_args_t { uint32_t bit_width, code_mask, n_codes, start_linear; }
+            full_args = { bit_width, (1u << bit_width) - 1u, (uint32_t)total_codes_per_packet, 0 };
+        id<MTLBuffer> fullArgsBuf = [g_device newBufferWithBytes:&full_args length:sizeof(full_args)
+                                                         options:MTLResourceStorageModeShared];
+        struct sel_args_t { uint32_t bit_width, code_mask, n_rows, n_pairs, n_selected, pad; }
+            sel_args = { bit_width, (1u << bit_width) - 1u, n_rows, n_pairs, n_selected, 0 };
+        id<MTLBuffer> selArgsBuf = [g_device newBufferWithBytes:&sel_args length:sizeof(sel_args)
+                                                        options:MTLResourceStorageModeShared];
+
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+
+        /* === A. FULL decode + per-packet encoder === */
+        const uint64_t tA0 = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            for (uint32_t p = 0; p < n_packets; p++) {
+                id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                /* Use the classic pipeline for fair comparison vs ICB path */
+                if (!ds4_vqb2_decode_fp16_classic_pipeline_init()) return 0;
+                [enc setComputePipelineState:g_vqb2_decode_fp16_classic_pipeline];
+                [enc setBuffer:fullArgsBuf offset:0 atIndex:0];
+                [enc setBuffer:cbBuf offset:0 atIndex:1];
+                [enc setBuffer:codesBuf offset:(NSUInteger)p * codes_bytes_per_packet atIndex:2];
+                [enc setBuffer:fullOutBuf offset:(NSUInteger)p * full_out_per_packet atIndex:3];
+                const NSUInteger tg = (total_codes_per_packet + 63u) / 64u;
+                [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+            }
+        }
+        const uint64_t tA1 = mach_absolute_time();
+        t_A_ms = (double)(tA1 - tA0) * (double)tb.numer / (double)tb.denom / 1e6;
+
+        /* === B. SELECTED decode + per-packet encoder ===
+         * (uses MTL4 path since classic path doesn't have a selected variant
+         * pipeline. Both paths produce bit-identical output per #751.) */
+        const uint64_t tB0 = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            for (uint32_t p = 0; p < n_packets; p++) {
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+                if (!at) return 0;
+                [at setAddress:selArgsBuf.gpuAddress atIndex:0];
+                [at setAddress:cbBuf.gpuAddress atIndex:1];
+                [at setAddress:codesBuf.gpuAddress + (uint64_t)p * codes_bytes_per_packet atIndex:2];
+                [at setAddress:selBuf.gpuAddress atIndex:3];
+                [at setAddress:selOutBuf.gpuAddress + (uint64_t)p * sel_out_per_packet atIndex:4];
+                [enc setComputePipelineState:g_vqb2_decode_fp16_selected_mtl4_pipeline];
+                [enc setArgumentTable:at];
+                const NSUInteger tg_x = (codes_per_expert + 63u) / 64u;
+                [enc dispatchThreadgroups:MTLSizeMake(tg_x, n_selected, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+                ds4_mtl4_pool_release(at, 8);
+            }
+        }
+        const uint64_t tB1 = mach_absolute_time();
+        t_B_ms = (double)(tB1 - tB0) * (double)tb.numer / (double)tb.denom / 1e6;
+
+        /* === C. SELECTED decode + single-encoder batched (all packets in one encoder) === */
+        const uint64_t tC0 = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+            [cb beginCommandBufferWithAllocator:g_polar_allocator];
+            id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+            if (!at) return 0;
+            [enc setComputePipelineState:g_vqb2_decode_fp16_selected_mtl4_pipeline];
+            for (uint32_t p = 0; p < n_packets; p++) {
+                [at setAddress:selArgsBuf.gpuAddress atIndex:0];
+                [at setAddress:cbBuf.gpuAddress atIndex:1];
+                [at setAddress:codesBuf.gpuAddress + (uint64_t)p * codes_bytes_per_packet atIndex:2];
+                [at setAddress:selBuf.gpuAddress atIndex:3];
+                [at setAddress:selOutBuf.gpuAddress + (uint64_t)p * sel_out_per_packet atIndex:4];
+                [enc setArgumentTable:at];
+                const NSUInteger tg_x = (codes_per_expert + 63u) / 64u;
+                [enc dispatchThreadgroups:MTLSizeMake(tg_x, n_selected, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            }
+            [enc endEncoding];
+            [cb endCommandBuffer];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            MTL4CommitOptions *opts = [MTL4CommitOptions new];
+            [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+            id<MTL4CommandBuffer> bufs[1] = {cb};
+            [g_polar_queue commit:bufs count:1 options:opts];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+            ds4_mtl4_pool_release(at, 8);
+        }
+        const uint64_t tC1 = mach_absolute_time();
+        t_C_ms = (double)(tC1 - tC0) * (double)tb.numer / (double)tb.denom / 1e6;
+
+        /* === D. SELECTED decode + SINGLE 3D-grid dispatch (OOM-speedup target) ===
+         * One kernel invocation covers all n_packets via gid.z. Eliminates the
+         * per-packet dispatch overhead the bench revealed dominates. */
+        struct batched_args_t {
+            uint32_t bit_width, code_mask, n_rows, n_pairs,
+                     n_selected, n_packets, codes_stride, out_stride;
+        } batched_args = {
+            bit_width, (1u << bit_width) - 1u, n_rows, n_pairs,
+            n_selected, n_packets,
+            (uint32_t)codes_bytes_per_packet,
+            (uint32_t)(sel_out_per_packet / sizeof(_Float16) / 2u),
+        };
+        id<MTLBuffer> batchedArgsBuf = [g_device newBufferWithBytes:&batched_args
+                                                             length:sizeof(batched_args)
+                                                            options:MTLResourceStorageModeShared];
+
+        const uint64_t tD0 = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+            [cb beginCommandBufferWithAllocator:g_polar_allocator];
+            id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+            if (!at) return 0;
+            [at setAddress:batchedArgsBuf.gpuAddress atIndex:0];
+            [at setAddress:cbBuf.gpuAddress atIndex:1];
+            [at setAddress:codesBuf.gpuAddress atIndex:2];
+            [at setAddress:selBuf.gpuAddress atIndex:3];
+            [at setAddress:selOutBuf.gpuAddress atIndex:4];
+            [enc setComputePipelineState:g_vqb2_decode_fp16_batched_mtl4_pipeline];
+            [enc setArgumentTable:at];
+            const NSUInteger tg_x = (codes_per_expert + 63u) / 64u;
+            [enc dispatchThreadgroups:MTLSizeMake(tg_x, n_selected, n_packets)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+            [cb endCommandBuffer];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            MTL4CommitOptions *opts = [MTL4CommitOptions new];
+            [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+            id<MTL4CommandBuffer> bufs[1] = {cb};
+            [g_polar_queue commit:bufs count:1 options:opts];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+            ds4_mtl4_pool_release(at, 8);
+        }
+        const uint64_t tD1 = mach_absolute_time();
+        double t_D_ms = (double)(tD1 - tD0) * (double)tb.numer / (double)tb.denom / 1e6;
+
+        /* === E. SINGLE command buffer with ALL rounds packed inside (production-shape)
+         * — many decodes share one commit + one wait. This is the regime real
+         * inference operates in: tokens batch many kernels per command buffer.
+         * Measures kernel throughput minus sync overhead. */
+        const uint64_t tE0 = mach_absolute_time();
+        {
+            id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+            [cb beginCommandBufferWithAllocator:g_polar_allocator];
+            id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+            if (at) {
+                [at setAddress:batchedArgsBuf.gpuAddress atIndex:0];
+                [at setAddress:cbBuf.gpuAddress atIndex:1];
+                [at setAddress:codesBuf.gpuAddress atIndex:2];
+                [at setAddress:selBuf.gpuAddress atIndex:3];
+                [at setAddress:selOutBuf.gpuAddress atIndex:4];
+                [enc setComputePipelineState:g_vqb2_decode_fp16_batched_mtl4_pipeline];
+                [enc setArgumentTable:at];
+                const NSUInteger tg_x = (codes_per_expert + 63u) / 64u;
+                for (uint32_t r = 0; r < rounds; r++) {
+                    [enc dispatchThreadgroups:MTLSizeMake(tg_x, n_selected, n_packets)
+                        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                }
+                [enc endEncoding];
+                [cb endCommandBuffer];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+                ds4_mtl4_pool_release(at, 8);
+            }
+        }
+        const uint64_t tE1 = mach_absolute_time();
+        double t_E_ms = (double)(tE1 - tE0) * (double)tb.numer / (double)tb.denom / 1e6;
+
+        const uint64_t bytes_per_round =
+            (uint64_t)n_packets * n_selected * n_rows * n_pairs * 2u * sizeof(_Float16);
+        const double gbs_E = ((double)bytes_per_round * rounds / 1e9) / (t_E_ms / 1000.0);
+
+        fprintf(stderr,
+            "ds4: stacked_speedup_bench n_packets=%u n_sel=%u/%u rows=%u pairs=%u K=%u rounds=%u\n"
+            "  A. full   + per-pkt encoder: %.3f ms (%.3f ms/round)\n"
+            "  B. select + per-pkt encoder: %.3f ms (%.3f ms/round)  vs A = %.2fx (compute axis)\n"
+            "  C. select + batched encoder: %.3f ms (%.3f ms/round)  vs B = %.2fx (encoder axis)\n"
+            "  D. select + fused 3D grid:   %.3f ms (%.3f ms/round)  vs C = %.2fx (dispatch axis)\n"
+            "  E. all rounds in 1 cmdbuf:   %.3f ms (%.3f ms/round)  vs D = %.2fx (sync axis)\n"
+            "  combined E vs A = %.2fx   E throughput = %.1f GB/s output\n",
+            n_packets, n_selected, n_experts_total, n_rows, n_pairs, k_val, rounds,
+            t_A_ms, t_A_ms / (double)rounds,
+            t_B_ms, t_B_ms / (double)rounds, t_A_ms / t_B_ms,
+            t_C_ms, t_C_ms / (double)rounds, t_B_ms / t_C_ms,
+            t_D_ms, t_D_ms / (double)rounds, t_C_ms / t_D_ms,
+            t_E_ms, t_E_ms / (double)rounds, t_D_ms / t_E_ms,
+            t_A_ms / t_E_ms, gbs_E);
+        return 1;
+    }
+    return 0;
+}
+
+/* Old fprintf path used when @autoreleasepool exited early — wrapped above. */
+static int ds4_gpu_mtl4_vqb2_decode_stacked_speedup_bench_legacy_print(double a, double b, double c) {
+    (void)a; (void)b; (void)c;
+    return 0;
 }
 
 /* Standalone canary: provide a synthetic packet (codebook + codes), dispatch
