@@ -1533,3 +1533,10 @@ int ds4_gpu_mtl4_mul_mm_id_q8_0_f32_canary(uint32_t M, uint32_t N, uint32_t K, u
  * embedded inline in MSL). Canary uses all-zero qs blocks (every
  * dequant val = d) for analytic reference. */
 int ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
+
+/* silv 2026-05-28 task #736 — mul_mm_id_q4_K_f32 MTL4.
+ * Routed MoE Q4_K prefill matmul. 144-byte 256-element blocks with
+ * 6-bit packed scales+mins (get_scale_min_k4_just2) and 4-bit qs.
+ * Canary uses scales=[1,1,1,1,0,0,0,0,1,1,1,1] + qs=0x11 + d=16,dmin=0
+ * → every dequant val = 16 (analytic reference). */
+int ds4_gpu_mtl4_mul_mm_id_q4_K_f32_canary(uint32_t M, uint32_t N, uint32_t K, uint32_t n_experts);
