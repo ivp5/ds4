@@ -644,7 +644,13 @@ static void ds4_gpu_print_device_summary(void) {
  }
 }
 
-#define DS4_METAL_MAX_MODEL_VIEWS 16
+/* silv 2026-05-28 #771 B+D — cap raised from 16 → 4096 to accommodate
+ * pack-direct synthetic views (one per storage-populated tensor). The
+ * legacy mmap-paging path uses <16 views; the headroom is for B+D, not
+ * a behavior change for the legacy path. Lookup is linear scan; with
+ * O(1500) entries and a few wrap_model_range calls per layer this is
+ * sub-microsecond — measure first, optimize (hash) if it shows up. */
+#define DS4_METAL_MAX_MODEL_VIEWS 4096
 #define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
 
 typedef struct {
@@ -657,6 +663,15 @@ typedef struct {
 
 static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
 static uint32_t g_model_view_count;
+
+/* silv 2026-05-28 #771 B+D — forward declared so the early callers in
+ * ds4_gpu_map_model_views can call this before the definition lower down.
+ * Walks g_model_views[] when range is past model_size for synthetic views. */
+static int ds4_gpu_range_resolvable(
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t offset,
+ uint64_t bytes);
 
 @interface DS4MetalTensor : NSObject
 @property(nonatomic, strong) id<MTLBuffer> buffer;
@@ -935,7 +950,7 @@ static int ds4_gpu_map_model_views(
  fprintf(stderr, "ds4: Metal model mmap base is not page aligned\n");
  return 0;
  }
- if (map_offset > model_size || map_size > model_size - map_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, map_offset, map_size)) {
  fprintf(stderr, "ds4: Metal model mapped range is outside the GGUF mapping\n");
  return 0;
  }
@@ -5328,7 +5343,7 @@ int ds4_gpu_embed_token_hc_tensor(
  }
 
  const uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
- if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, weight_offset, weight_bytes)) {
  fprintf(stderr, "ds4: Metal graph embedding range is outside the mapped model\n");
  return 0;
  }
@@ -5426,7 +5441,7 @@ int ds4_gpu_embed_tokens_hc_tensor(
  }
 
  const uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
- if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, weight_offset, weight_bytes)) {
  fprintf(stderr, "ds4: Metal graph batched embedding range is outside the mapped model\n");
  return 0;
  }
@@ -5521,31 +5536,98 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
  uint64_t offset,
  uint64_t len,
  uint64_t *inner_offset) {
- (void)model_map;
- if (model_size == 0 || offset > model_size || len > model_size - offset) {
- fprintf(stderr, "ds4: Metal model range is outside the mapped model\n");
- return nil;
- }
-
+ /* silv 2026-05-28 #771 B+D — walk views FIRST, then bounds-check on miss.
+  * Pack-direct mode registers synthetic views per storage-populated tensor
+  * (ds4_gpu_register_tensor_view) whose abs_offset is past the metadata-
+  * GGUF size; the legacy "bounds-check first" would reject them before the
+  * view lookup. Reordering preserves legacy behavior for real model views
+  * (same list, same match logic) AND lets synthetic views resolve. */
  const uint64_t end = offset + len;
  for (uint32_t i = 0; i < g_model_view_count; i++) {
- if (g_model_views[i].model_map != model_map ||
- g_model_views[i].model_size != model_size) {
- continue;
- }
- const uint64_t view_start = g_model_views[i].model_offset;
- const uint64_t view_end = view_start + g_model_views[i].bytes;
- if (offset >= view_start && end <= view_end) {
- *inner_offset = offset - view_start;
- return g_model_views[i].buffer;
- }
+  if (g_model_views[i].model_map != model_map ||
+      g_model_views[i].model_size != model_size) {
+   continue;
+  }
+  const uint64_t view_start = g_model_views[i].model_offset;
+  const uint64_t view_end = view_start + g_model_views[i].bytes;
+  if (offset >= view_start && end <= view_end) {
+   *inner_offset = offset - view_start;
+   return g_model_views[i].buffer;
+  }
  }
 
+ /* No view matched. Bounds-check against the mmap'd model size — fails
+  * gracefully for pack-direct calls that didn't get a synthetic view. */
+ if (model_size == 0 || offset > model_size || len > model_size - offset) {
+  fprintf(stderr, "ds4: Metal model range is outside the mapped model\n");
+  return nil;
+ }
  fprintf(stderr,
- "ds4: Metal model range %.2f..%.2f GiB is not covered by mapped model views\n",
- ds4_gpu_gib(offset),
- ds4_gpu_gib(end));
+  "ds4: Metal model range %.2f..%.2f GiB is not covered by mapped model views\n",
+  ds4_gpu_gib(offset),
+  ds4_gpu_gib(end));
  return nil;
+}
+
+/* silv 2026-05-28 #771 B+D — register a per-tensor synthetic view.
+ *
+ * Called from engine_open after override-fill, once per storage-populated
+ * tensor in pack-direct mode. The view binds the tensor's storage MTLBuffer
+ * to its (model_map, model_size, abs_offset) tuple so wrap_model_range
+ * finds it via the same path as real model views. abs_offset may exceed
+ * model_size (metadata-only GGUF) — wrap_model_range walks views before
+ * bounds-checking, so the synthetic offset resolves cleanly.
+ *
+ * Returns 1 on success, 0 if the table is full or args invalid. */
+int ds4_gpu_register_tensor_view(
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t abs_offset,
+ uint64_t bytes,
+ void *metal_buffer_handle) {
+ if (!metal_buffer_handle || bytes == 0) return 0;
+ if (g_model_view_count >= DS4_METAL_MAX_MODEL_VIEWS) {
+  fprintf(stderr,
+   "ds4: Metal model view table full (%u entries); cannot register "
+   "synthetic tensor view at offset %llu\n",
+   g_model_view_count, (unsigned long long)abs_offset);
+  return 0;
+ }
+ id<MTLBuffer> buf = (__bridge id<MTLBuffer>)metal_buffer_handle;
+ g_model_views[g_model_view_count].buffer = buf;
+ g_model_views[g_model_view_count].model_map = model_map;
+ g_model_views[g_model_view_count].model_size = model_size;
+ g_model_views[g_model_view_count].model_offset = abs_offset;
+ g_model_views[g_model_view_count].bytes = bytes;
+ g_model_view_count++;
+ return 1;
+}
+
+/* silv 2026-05-28 #771 B+D — pack-direct-aware bounds check.
+ *
+ * Returns 1 iff the (offset, bytes) range is resolvable either as
+ *   (a) a direct mmap range inside [0, model_size), or
+ *   (b) a registered synthetic model view (storage-backed tensor).
+ *
+ * Used by every "ds4: ... range is outside the mapped model" pre-check
+ * site so the same kernel call works for both GGUF-mmap tensors and
+ * pack-direct synthetic-view tensors. Without this, pack-direct fails
+ * at the pre-check because abs_offset > metadata-GGUF size. */
+static int ds4_gpu_range_resolvable(
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t offset,
+ uint64_t bytes) {
+ if (offset <= model_size && bytes <= model_size - offset) return 1;
+ const uint64_t end = offset + bytes;
+ for (uint32_t i = 0; i < g_model_view_count; i++) {
+  if (g_model_views[i].model_map != model_map) continue;
+  if (g_model_views[i].model_size != model_size) continue;
+  const uint64_t view_start = g_model_views[i].model_offset;
+  const uint64_t view_end = view_start + g_model_views[i].bytes;
+  if (offset >= view_start && end <= view_end) return 1;
+ }
+ return 0;
 }
 
 int ds4_gpu_indexer_score_one_tensor(
@@ -6315,7 +6397,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
  const uint64_t blocks = in_dim / 32;
  const uint64_t row_bytes = blocks * 34;
  const uint64_t weight_bytes = out_dim * row_bytes;
- if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, weight_offset, weight_bytes)) {
  fprintf(stderr, "ds4: Metal Q8_0 tensor matmul range is outside the mapped model\n");
  return 0;
  }
@@ -6491,8 +6573,9 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
  const uint64_t blocks = in_dim / 32;
  const uint64_t row_bytes = blocks * 34;
  const uint64_t weight_bytes = out_dim * row_bytes;
- if (gate_offset > model_size || weight_bytes > model_size - gate_offset ||
- up_offset > model_size || weight_bytes > model_size - up_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, gate_offset, weight_bytes) ||
+
+     !ds4_gpu_range_resolvable(model_map, model_size, up_offset, weight_bytes)) {
  fprintf(stderr, "ds4: Metal shared expert fused gate/up range is outside the mapped model\n");
  return 0;
  }
@@ -6738,7 +6821,7 @@ int ds4_gpu_matmul_f16_tensor(
 
  const uint64_t row_bytes = in_dim * sizeof(uint16_t);
  const uint64_t weight_bytes = row_bytes * out_dim;
- if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, weight_offset, weight_bytes)) {
  fprintf(stderr, "ds4: Metal F16 tensor matmul range is outside the mapped model\n");
  return 0;
  }
@@ -6779,7 +6862,7 @@ int ds4_gpu_matmul_f16_tensor_legacy_inline(
 
  const uint64_t row_bytes = in_dim * sizeof(uint16_t);
  const uint64_t weight_bytes = row_bytes * out_dim;
- if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, weight_offset, weight_bytes)) {
  fprintf(stderr, "ds4: Metal F16 tensor matmul range is outside the mapped model\n");
  return 0;
  }
@@ -7118,8 +7201,9 @@ int ds4_gpu_matmul_f16_pair_tensor(
 
  const uint64_t row_bytes = in_dim * sizeof(uint16_t);
  const uint64_t weight_bytes = row_bytes * out_dim;
- if (weight_a_offset > model_size || weight_bytes > model_size - weight_a_offset ||
- weight_b_offset > model_size || weight_bytes > model_size - weight_b_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, weight_a_offset, weight_bytes) ||
+
+     !ds4_gpu_range_resolvable(model_map, model_size, weight_b_offset, weight_bytes)) {
  fprintf(stderr, "ds4: Metal F16 paired matvec range is outside the mapped model\n");
  return 0;
  }
@@ -7199,7 +7283,7 @@ int ds4_gpu_matmul_f32_tensor(
 
  const uint64_t row_bytes = in_dim * sizeof(float);
  const uint64_t weight_bytes = row_bytes * out_dim;
- if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, weight_offset, weight_bytes)) {
  fprintf(stderr, "ds4: Metal F32 tensor matmul range is outside the mapped model\n");
  return 0;
  }
@@ -7364,7 +7448,7 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
  fprintf(stderr, "ds4: Metal weighted RMS norm received undersized activation buffers\n");
  return 0;
  }
- if (weight_offset > model_size || row_bytes > model_size - weight_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, weight_offset, row_bytes)) {
  fprintf(stderr, "ds4: Metal weighted RMS norm range is outside the mapped model\n");
  return 0;
  }
@@ -7431,8 +7515,9 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
  fprintf(stderr, "ds4: Metal fused q/kv RMS norm received undersized activation buffers\n");
  return 0;
  }
- if (q_weight_offset > model_size || q_row_bytes > model_size - q_weight_offset ||
- kv_weight_offset > model_size || kv_row_bytes > model_size - kv_weight_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, q_weight_offset, q_row_bytes) ||
+
+     !ds4_gpu_range_resolvable(model_map, model_size, kv_weight_offset, kv_row_bytes)) {
  fprintf(stderr, "ds4: Metal fused q/kv RMS norm weight range is outside the mapped model\n");
  return 0;
  }
@@ -8186,7 +8271,7 @@ static int ds4_gpu_compressor_store_one_tensor(
  const uint64_t row_bytes = (uint64_t)width * sizeof(float);
  const uint64_t state_bytes = (uint64_t)state_rows * row_bytes;
  const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
- if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+ if (!ds4_gpu_range_resolvable(model_map, model_size, ape_offset, ape_bytes) ||
  ds4_gpu_tensor_bytes(kv) < row_bytes ||
  ds4_gpu_tensor_bytes(sc) < row_bytes ||
  ds4_gpu_tensor_bytes(state_kv) < state_bytes ||
@@ -8260,7 +8345,7 @@ int ds4_gpu_compressor_store_batch_tensor(
  const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
  const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
 
- if (ape_offset > model_size || ape_bytes > model_size - ape_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, ape_offset, ape_bytes)) {
  fprintf(stderr, "ds4: Metal compressor batch APE range is outside the mapped model\n");
  return 0;
  }
@@ -8909,8 +8994,10 @@ int ds4_gpu_compressor_prefill_tensor(
  const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
  const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
 
- if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
- norm_offset > model_size || norm_bytes > model_size - norm_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, ape_offset, ape_bytes) ||
+
+
+     !ds4_gpu_range_resolvable(model_map, model_size, norm_offset, norm_bytes)) {
  fprintf(stderr, "ds4: Metal compressor prefill tensor range is outside the mapped model\n");
  return 0;
  }
@@ -9262,8 +9349,10 @@ int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
  const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
  const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
 
- if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
- norm_offset > model_size || norm_bytes > model_size - norm_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, ape_offset, ape_bytes) ||
+
+
+     !ds4_gpu_range_resolvable(model_map, model_size, norm_offset, norm_bytes)) {
  fprintf(stderr, "ds4: Metal compressor replay tensor range is outside the mapped model\n");
  return 0;
  }
@@ -9552,7 +9641,7 @@ int ds4_gpu_compressor_prefill_state_ratio4_tensor(
  const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
  const uint64_t ape_bytes = (uint64_t)ratio * width * elem_ape;
 
- if (ape_offset > model_size || ape_bytes > model_size - ape_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, ape_offset, ape_bytes)) {
  fprintf(stderr, "ds4: Metal compressor prefill-state APE range is outside the mapped model\n");
  return 0;
  }
@@ -9670,8 +9759,10 @@ int ds4_gpu_compressor_update_tensor(
  const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
  const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
 
- if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
- norm_offset > model_size || norm_bytes > model_size - norm_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, ape_offset, ape_bytes) ||
+
+
+     !ds4_gpu_range_resolvable(model_map, model_size, norm_offset, norm_bytes)) {
  fprintf(stderr, "ds4: Metal compressor tensor range is outside the mapped model\n");
  return 0;
  }
@@ -9843,8 +9934,9 @@ int ds4_gpu_attention_output_q8_batch_tensor(
  const uint64_t row_b_bytes = (low_dim / 32u) * 34u;
  const uint64_t out_a_bytes = (uint64_t)n_groups * rank * row_a_bytes;
  const uint64_t out_b_bytes = out_dim * row_b_bytes;
- if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset ||
- out_b_offset > model_size || out_b_bytes > model_size - out_b_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, out_a_offset, out_a_bytes) ||
+
+     !ds4_gpu_range_resolvable(model_map, model_size, out_b_offset, out_b_bytes)) {
  fprintf(stderr, "ds4: Metal attention output batch weights are outside the mapped model\n");
  return 0;
  }
@@ -10176,7 +10268,7 @@ int ds4_gpu_attention_output_low_q8_tensor(
 
  const uint64_t row_a_bytes = (group_dim / 32u) * 34u;
  const uint64_t out_a_bytes = (uint64_t)n_groups * rank * row_a_bytes;
- if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, out_a_offset, out_a_bytes)) {
  fprintf(stderr, "ds4: Metal attention output low weights are outside the mapped model\n");
  return 0;
  }
@@ -12711,7 +12803,7 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(
  if (!heads || !q || !raw_kv || !model_map || n_tokens == 0) return 0;
 
  @autoreleasepool {
- if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, sinks_offset, (uint64_t)n_head * sizeof(float))) {
  fprintf(stderr, "ds4: Metal attention sinks range is outside the mapped model\n");
  return 0;
  }
@@ -12768,7 +12860,7 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
  }
 
  @autoreleasepool {
- if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, sinks_offset, (uint64_t)n_head * sizeof(float))) {
  fprintf(stderr, "ds4: Metal attention sinks range is outside the mapped model\n");
  return 0;
  }
@@ -12837,7 +12929,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
  }
 
  @autoreleasepool {
- if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, sinks_offset, (uint64_t)n_head * sizeof(float))) {
  fprintf(stderr, "ds4: Metal attention sinks range is outside the mapped model\n");
  return 0;
  }
@@ -12912,7 +13004,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
  }
 
  @autoreleasepool {
- if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, sinks_offset, (uint64_t)n_head * sizeof(float))) {
  fprintf(stderr, "ds4: Metal indexed attention sinks range is outside the mapped model\n");
  return 0;
  }
@@ -13070,7 +13162,7 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
  }
 
  @autoreleasepool {
- if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, sinks_offset, (uint64_t)n_head * sizeof(float))) {
  fprintf(stderr, "ds4: Metal attention sinks range is outside the mapped model\n");
  return 0;
  }
@@ -13134,7 +13226,7 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
  }
 
  @autoreleasepool {
- if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, sinks_offset, (uint64_t)n_head * sizeof(float))) {
  fprintf(stderr, "ds4: Metal attention sinks range is outside the mapped model\n");
  return 0;
  }
@@ -13208,7 +13300,7 @@ int ds4_gpu_attention_decode_heads_tensor(
  const uint64_t comp_bytes = (uint64_t)n_comp * head_dim *
  (comp_kv_f16 ? sizeof(uint16_t) : sizeof(float));
  const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
- if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, sinks_offset, sink_bytes)) {
  fprintf(stderr, "ds4: Metal graph attention heads sink range is outside the mapped model\n");
  return 0;
  }
@@ -42386,8 +42478,9 @@ int ds4_gpu_hc_split_sinkhorn_tensor(
  fprintf(stderr, "ds4: Metal HC split received undersized activation buffers\n");
  return 0;
  }
- if (scale_offset > model_size || scale_bytes > model_size - scale_offset ||
- base_offset > model_size || mix_bytes > model_size - base_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, scale_offset, scale_bytes) ||
+
+     !ds4_gpu_range_resolvable(model_map, model_size, base_offset, mix_bytes)) {
  fprintf(stderr, "ds4: Metal HC split parameter range is outside the mapped model\n");
  return 0;
  }
@@ -42620,8 +42713,10 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
  return 0;
  }
 
- if (scale_offset > model_size || scale_bytes > model_size - scale_offset ||
- base_offset > model_size || mix_bytes > model_size - base_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, scale_offset, scale_bytes) ||
+
+
+     !ds4_gpu_range_resolvable(model_map, model_size, base_offset, mix_bytes)) {
  fprintf(stderr, "ds4: Metal fused HC split/sum parameter range is outside the mapped model\n");
  return 0;
  }
@@ -42741,9 +42836,13 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
  return 0;
  }
 
- if (scale_offset > model_size || scale_bytes > model_size - scale_offset ||
- base_offset > model_size || mix_bytes > model_size - base_offset ||
- norm_weight_offset > model_size || out_row_bytes > model_size - norm_weight_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, scale_offset, scale_bytes) ||
+
+
+     !ds4_gpu_range_resolvable(model_map, model_size, base_offset, mix_bytes) ||
+
+
+     !ds4_gpu_range_resolvable(model_map, model_size, norm_weight_offset, out_row_bytes)) {
  fprintf(stderr, "ds4: Metal fused HC split/sum/norm parameter range is outside the mapped model\n");
  return 0;
  }
@@ -43308,7 +43407,7 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
  const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
  const uint64_t split_bytes = mix_hc * sizeof(float);
 
- if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, weight_offset, weight_bytes)) {
  fprintf(stderr, "ds4: Metal shared-down HC fusion weight range is outside the mapped model\n");
  return 0;
  }
@@ -43425,7 +43524,7 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
  const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
  const uint64_t split_bytes = mix_hc * sizeof(float);
 
- if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+ if (!ds4_gpu_range_resolvable(model_map, model_size, weight_offset, weight_bytes)) {
  fprintf(stderr, "ds4: Metal Q8 HC fusion weight range is outside the mapped model\n");
  return 0;
  }

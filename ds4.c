@@ -908,6 +908,12 @@ static const gguf_type_info gguf_types[] = {
  [28] = {"f64", 1, 8},
  [29] = {"iq1_m", 256, 56},
  [30] = {"bf16", 1, 2},
+ /* ds4-local FP8 codes (above GGUF spec range) — used when the metadata
+  * GGUF declares the upstream-source dtype directly (silv #771).
+  * tensor_nbytes returns elements×1 for both, matching the safetensors
+  * footprint. Decoder lives in storage path, dispatched by source_exact. */
+ [64] = {"fp8_e4m3", 1, 1},
+ [65] = {"fp8_e8m0", 1, 1},
 };
 
 enum {
@@ -989,11 +995,22 @@ typedef struct {
   * Type-erased to void* because ds4.c is C; the actual id<MTLBuffer> only
   * exists across the Objective-C boundary. ds4_gpu_wrap_heap_bytes/
   * ds4_gpu_release_heap_buffer (ds4_gpu.h) bridge the boundary.
-  *
-  * NULL when bytes is NULL or when the wrap failed (non-fatal: dispatch
-  * falls back to mmap path or skips the tensor). Lifetime tied to storage:
-  * released in model_free_overrides when ownership == DS4_STORAGE_HEAP. */
+	 *
+	 * NULL when bytes is NULL or when the wrap failed (non-fatal: dispatch
+	 * falls back to mmap path or skips the tensor). Lifetime tied to storage:
+	 * released in model_free_overrides when ownership == DS4_STORAGE_HEAP. */
  void *metal_buffer;
+ /* Source-exact FP8_E4M3 tensors have a paired FP8_E8M0 scale grid in the
+  * nonrouted pack. Keep the scale beside the weight at the same abstraction
+  * level so every downstream kernel receives a complete storage object instead
+  * of rediscovering names or touching the pack reader. Scale grids are tiny
+  * (~368 KB total), so override-fill heap-copies them into page-aligned memory
+  * to guarantee Metal wrapping instead of depending on pack mmap alignment. */
+ void *scale_bytes;
+ uint64_t scale_length;
+ uint32_t scale_dtype;
+ uint8_t scale_ownership;
+ void *scale_metal_buffer;
 } ds4_tensor_storage;
 
 typedef struct {
@@ -1020,6 +1037,14 @@ typedef struct {
  uint64_t n_tensors;
  uint64_t alignment;
  uint64_t tensor_data_pos;
+
+ /* Set by parse_tensors when the GGUF's tensor data section is absent
+  * (file ends at or before tensor_data_pos). In that mode every tensor
+  * MUST be supplied via storage by pack override-fill; the validation
+  * runs after override-fill completes. silv 2026-05-28 #771 — metadata-
+  * only GGUF (ds4_metadata_full.gguf) drops the 9 GB dead F16/Q8_0
+  * fallback body that override-fill already replaces from packs. */
+ bool no_tensor_data;
 
  ds4_kv *kv;
  ds4_tensor *tensors;
@@ -1277,12 +1302,27 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
 
  m->tensor_data_pos = align_up(c->pos, m->alignment);
 
+ /* Metadata-only GGUF detection (silv 2026-05-28 #771): if the file ends
+  * at or before the tensor data section start, the body of the GGUF has
+  * been stripped — every tensor MUST be supplied via storage by pack
+  * override-fill. Skip the per-tensor bounds check in that mode; the
+  * post-override-fill validator catches missing storage. */
+ if (m->n_tensors > 0 && m->tensor_data_pos >= m->size) {
+ m->no_tensor_data = true;
+ }
+
  for (uint64_t i = 0; i < m->n_tensors; i++) {
  ds4_tensor *t = &m->tensors[i];
  if (t->rel_offset > UINT64_MAX - m->tensor_data_pos) {
  ds4_die("tensor offset overflow");
  }
  t->abs_offset = m->tensor_data_pos + t->rel_offset;
+ if (m->no_tensor_data) {
+ /* abs_offset points past EOF — kernels must never read mmap for
+  * this tensor. Engine_open's storage-coverage validator (run after
+  * override-fill) enforces every tensor has storage set. */
+ continue;
+ }
  if (t->bytes != 0 &&
  (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset))
  {
@@ -1615,7 +1655,41 @@ static uint32_t tensor_effective_type(const ds4_tensor *t) {
  *
  * Until then: return 0. */
 static int tensor_dtype_can_substitute(const ds4_tensor *t, uint32_t expected) {
- (void)t; (void)expected;
+ if (!t) return 0;
+ /* silv 2026-05-28 #771 — pack-direct lift: when the manifest declares the
+  * UPSTREAM source dtype (BF16 / FP8_E4M3 / F32) but the engine's
+  * tensor_expect_layout codifies its internal compression target (F16 /
+  * Q8_0 / IQ2_XXS), allow substitution. The kernel side dispatches on
+  * tensor_effective_type which reads storage.dtype, so BF16/FP8-storage
+  * paths fire (post-#796 Increment 5). Kernels that DON'T yet read
+  * effective type will crash loud — exactly the signal #793 needs.
+  *
+  * Accepted source-for-target substitutions (silv-upstream → engine-compressed):
+  *   F16  ← BF16          (16-bit IEEE for 16-bit Google brain)
+  *   F16  ← F32           (uncompressed)
+  *   Q8_0 ← BF16          (uncompressed)
+  *   Q8_0 ← FP8_E4M3      (1-byte upstream weight)
+  *   Q8_0 ← F32           (uncompressed)
+  *   IQ2_XXS ← FP8_E4M3   (routed FFN, source-exact)
+  *   IQ2_XXS ← BF16       (routed FFN, source-exact)
+  */
+ if (t->type == expected) return 1;
+ if (expected == DS4_TENSOR_F32 &&
+     (t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F16)) return 1;
+ if (expected == DS4_TENSOR_F16 &&
+     (t->type == DS4_TENSOR_BF16 ||
+      t->type == DS4_TENSOR_F32 ||
+      t->type == DS4_TENSOR_FP8_E4M3)) return 1;
+ if (expected == DS4_TENSOR_Q8_0 &&
+     (t->type == DS4_TENSOR_BF16 ||
+      t->type == DS4_TENSOR_FP8_E4M3 ||
+      t->type == DS4_TENSOR_F32)) return 1;
+ /* IQ2_XXS substitution intentionally NOT added (silv 2026-05-28): the
+  * upstream-source path is FP8_E4M3 declared directly; minimal-GGUF's
+  * IQ2_XXS was an engine-internal compression target the pack-direct
+  * path bypasses entirely. */
+ if (expected == DS4_TENSOR_I32 &&
+     t->type == DS4_TENSOR_I64) return 1;
  return 0;
 }
 
@@ -1628,23 +1702,35 @@ static int tensor_dtype_can_substitute(const ds4_tensor *t, uint32_t expected) {
  * MTLBuffer (if any) BEFORE freeing the underlying bytes. The MTLBuffer
  * holds a pointer into `bytes`; freeing bytes first would dangle. */
 static void model_free_overrides(ds4_model *m) {
- if (!m || !m->tensors) return;
- for (uint64_t i = 0; i < m->n_tensors; i++) {
-  ds4_tensor *t = &m->tensors[i];
-  if (t->storage.metal_buffer) {
-   ds4_gpu_release_heap_buffer(t->storage.metal_buffer);
-   t->storage.metal_buffer = NULL;
-  }
-  if (t->storage.bytes && t->storage.ownership == DS4_STORAGE_HEAP) {
-   free(t->storage.bytes);
-  }
-  /* Reset regardless of ownership (defensive). */
-  t->storage.bytes = NULL;
-  t->storage.length = 0;
-  t->storage.dtype = 0;
-  t->storage.ownership = DS4_STORAGE_NONE;
- }
-}
+	 if (!m || !m->tensors) return;
+	 for (uint64_t i = 0; i < m->n_tensors; i++) {
+	  ds4_tensor *t = &m->tensors[i];
+	  if (t->storage.scale_metal_buffer) {
+	   ds4_gpu_release_heap_buffer(t->storage.scale_metal_buffer);
+	   t->storage.scale_metal_buffer = NULL;
+	  }
+	  if (t->storage.metal_buffer) {
+	   ds4_gpu_release_heap_buffer(t->storage.metal_buffer);
+	   t->storage.metal_buffer = NULL;
+	  }
+	  if (t->storage.scale_bytes && t->storage.scale_ownership == DS4_STORAGE_HEAP) {
+	   free(t->storage.scale_bytes);
+	  }
+	  if (t->storage.bytes && t->storage.ownership == DS4_STORAGE_HEAP) {
+	   free(t->storage.bytes);
+	  }
+	  /* Reset regardless of ownership (defensive). */
+	  t->storage.bytes = NULL;
+	  t->storage.length = 0;
+	  t->storage.dtype = 0;
+	  t->storage.ownership = DS4_STORAGE_NONE;
+	  t->storage.scale_bytes = NULL;
+	  t->storage.scale_length = 0;
+	  t->storage.scale_dtype = 0;
+	  t->storage.scale_ownership = DS4_STORAGE_NONE;
+	  t->storage.scale_metal_buffer = NULL;
+	 }
+	}
 
 /* silv 2026-05-28 task #771 Phase 1 — translate a GGUF tensor name to the
  * non-routed pack convention. Reverse of pack_to_gguf.py.
@@ -2875,9 +2961,18 @@ static void tensor_expect_plain_layout(
 }
 
 static bool tensor_is_routed_expert_type(uint32_t type) {
- return type == DS4_TENSOR_IQ2_XXS ||
- type == DS4_TENSOR_Q2_K ||
- type == DS4_TENSOR_Q4_K;
+ /* silv 2026-05-28 #771: IQ2_XXS/Q2_K/Q4_K are the legacy minimal-GGUF
+  * compression schemes (pre-VQB2). DS4 V4 Flash's upstream routed FFN
+  * is FP8_E4M3 (config.json quantization_config). BF16 is the canonical
+  * floating-point source (some pre-VQB2 packs ship without the FP8
+  * scale-pair). The VQB2/MTL4/ICB dispatch path consumes pack-coded
+  * data at runtime; engine validation just needs to accept the upstream
+  * declared dtypes. */
+ return type == DS4_TENSOR_IQ2_XXS ||  /* legacy minimal-GGUF, kept for back-compat */
+ type == DS4_TENSOR_Q2_K ||             /* legacy */
+ type == DS4_TENSOR_Q4_K ||             /* legacy */
+ type == DS4_TENSOR_FP8_E4M3 ||         /* upstream DS4 V4 Flash */
+ type == DS4_TENSOR_BF16;               /* upstream pre-quant */
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -2885,14 +2980,34 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
  case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
  case DS4_TENSOR_Q2_K: return sizeof(block_q2_K);
  case DS4_TENSOR_Q4_K: return sizeof(block_q4_K);
+ /* silv 2026-05-28 #771 B+D — upstream DS4 V4 Flash uses FP8_E4M3 for
+  * routed experts; BF16 is the canonical floating-point source. These
+  * are not block-quantized — block "size" == element size. The legacy
+  * IQ2/Q2_K/Q4_K paths used QK_K-block layouts; FP8/BF16/F16/F32 paths
+  * dispatch via VQB2/MTL4 from the pack and never need the legacy
+  * row-bytes helper, but a non-zero return prevents the die() trap. */
+ case DS4_TENSOR_FP8_E4M3: return 1;  /* 1 byte/element, no block */
+ case DS4_TENSOR_FP8_E8M0: return 1;  /* 1 byte/element, scale-paired */
+ case DS4_TENSOR_BF16:     return 2;
+ case DS4_TENSOR_F16:      return 2;
+ case DS4_TENSOR_F32:      return 4;
  default: ds4_die("unsupported routed expert tensor type");
  }
  return 0;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
- if ((t->dim[0] % QK_K) != 0) ds4_die("routed expert row is not QK_K aligned");
- return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
+ /* silv 2026-05-28 #771 B+D — non-block dtypes (FP8/BF16/F16/F32) use a
+  * flat row-bytes calculation; only legacy IQ2/Q2_K/Q4_K need QK_K alignment. */
+ const int is_block_quant = (t->type == DS4_TENSOR_IQ2_XXS ||
+                              t->type == DS4_TENSOR_Q2_K ||
+                              t->type == DS4_TENSOR_Q4_K);
+ if (is_block_quant) {
+  if ((t->dim[0] % QK_K) != 0) ds4_die("routed expert row is not QK_K aligned");
+  return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
+ }
+ /* Non-block dtype: row_bytes = elem_count_per_row * elem_size. */
+ return t->dim[0] * routed_expert_block_bytes(t->type);
 }
 
 static void tensor_expect_routed_expert(
@@ -6907,38 +7022,37 @@ static void swiglu(float *out, const float *gate, const float *up, uint64_t n) {
 }
 
 /* The shared expert is a normal Q8_0 SwiGLU MLP that runs for every token. */
+/* silv 2026-05-28 spaghetti-with-statics: hoist scratch buffers to file
+ * statics so per-token calls don't churn the heap. Single-threaded engine
+ * has no contention concern; aligns with silv's standing "no premature
+ * defenses" directive. Saves ~5 malloc/free pairs × 43 layers/token =
+ * 215 alloc/free ops per token. Cost: ~30 KB BSS. */
+static float   g_sffn_gate  [DS4_N_FF_EXP];
+static float   g_sffn_up    [DS4_N_FF_EXP];
+static float   g_sffn_mid   [DS4_N_FF_EXP];
+static int8_t  g_sffn_xq    [((DS4_N_EMBD + 31) / 32) * 32];
+static float   g_sffn_xscale[(DS4_N_EMBD + 31) / 32];
+
 static void layer_shared_ffn_one(
  float * out,
  const ds4_model * model,
  const ds4_layer_weights * layer,
  const float * x) {
- float *gate = xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0]));
- float *up = xmalloc((size_t)DS4_N_FF_EXP * sizeof(up[0]));
- float *mid = xmalloc((size_t)DS4_N_FF_EXP * sizeof(mid[0]));
  const uint64_t in_dim = layer->ffn_gate_shexp->dim[0];
  const uint64_t blocks = (in_dim + 31) / 32;
- int8_t *xq = xmalloc((size_t)blocks * 32);
- float *xscale = xmalloc((size_t)blocks * sizeof(xscale[0]));
-
  if (layer->ffn_up_shexp->type != 8 ||
- layer->ffn_gate_shexp->type != 8 ||
- layer->ffn_up_shexp->dim[0] != in_dim) {
- ds4_die("shared expert gate/up tensors do not share a Q8_0 input layout");
+     layer->ffn_gate_shexp->type != 8 ||
+     layer->ffn_up_shexp->dim[0] != in_dim ||
+     in_dim > DS4_N_EMBD) {
+  ds4_die("shared expert gate/up tensors do not share a Q8_0 input layout");
  }
-
- quantize_q8_0_activation(x, xq, xscale, in_dim);
- matvec_q8_0_pair_prequant(gate, up, model,
- layer->ffn_gate_shexp,
- layer->ffn_up_shexp,
- xq, xscale);
- swiglu(mid, gate, up, DS4_N_FF_EXP);
- matvec_q8_0(out, model, layer->ffn_down_shexp, mid);
-
- free(xscale);
- free(xq);
- free(mid);
- free(up);
- free(gate);
+ (void)blocks;  /* size implicit in DS4_N_EMBD static bound */
+ quantize_q8_0_activation(x, g_sffn_xq, g_sffn_xscale, in_dim);
+ matvec_q8_0_pair_prequant(g_sffn_gate, g_sffn_up, model,
+                            layer->ffn_gate_shexp, layer->ffn_up_shexp,
+                            g_sffn_xq, g_sffn_xscale);
+ swiglu(g_sffn_mid, g_sffn_gate, g_sffn_up, DS4_N_FF_EXP);
+ matvec_q8_0(out, model, layer->ffn_down_shexp, g_sffn_mid);
 }
 
 static void layer_shared_ffn_one_decode_scratch(
@@ -12051,10 +12165,45 @@ static int ds4_matmul_q8_0_via_tensor(ds4_gpu_tensor *dst,
                                        uint64_t out_dim,
                                        const ds4_gpu_tensor *src,
                                        uint64_t n_tok) {
+ /* silv 2026-05-28 #771 B+D wall #2 — storage-dtype guard.
+  *
+  * The Q8_0 storage kernel assumes the buffer carries Q8_0 block-quantized
+  * bytes (out_dim * (in_dim/32) * 34). When pack-direct override-fill lands
+  * FP8_E4M3 / FP8_E8M0 / I8 bytes for a GGUF-declared-Q8_0 tensor, the
+  * buffer is byte-undersized and the kernel rejects with "weight buffer
+  * too small".  The substitute is permitted by tensor_dtype_can_substitute
+  * (ds4.c line 1672) but no FP8-aware Q8_0-shaped kernel exists yet; the
+  * Cycle 9 path mints matmul_fp8_e4m3_storage. Until then, refuse the
+  * mismatch here so the failure surfaces with a named cause rather than
+  * a generic buffer-size message. */
  if (t != NULL && t->storage.metal_buffer != NULL) {
-  s_n_storage_dispatch_q8_0++;
-  return ds4_gpu_matmul_q8_0_storage(dst, t->storage.metal_buffer,
-                                      in_dim, out_dim, src, n_tok);
+	  if (t->storage.dtype != DS4_TENSOR_Q8_0) {
+	   static int once = 0;
+	   if (!once) {
+	    once = 1;
+	    if (t->storage.dtype == DS4_TENSOR_FP8_E4M3) {
+	     fprintf(stderr,
+	      "ds4: Q8_0 dispatcher — storage.dtype=FP8_E4M3 with scale=%s "
+	      "(%llu B); paired source-exact storage is loaded but the FP8/E8M0 "
+	      "matmul kernel is not wired yet.\n",
+	      t->storage.scale_metal_buffer ? "mtlbuf" : "missing",
+	      (unsigned long long)t->storage.scale_length);
+	    } else {
+	     fprintf(stderr,
+	      "ds4: Q8_0 dispatcher — storage.dtype=%u (not Q8_0=8); pack-direct "
+	      "fill used a source-exact substitute that lacks a Q8_0-layout "
+	      "kernel.\n",
+	      (unsigned)t->storage.dtype);
+	    }
+	   }
+	   /* Do not fall through to mmap: metadata-only pack-direct would read
+	    * outside the mapped GGUF and hide the real missing kernel. */
+	   return 0;
+	  } else {
+   s_n_storage_dispatch_q8_0++;
+   return ds4_gpu_matmul_q8_0_storage(dst, t->storage.metal_buffer,
+                                       in_dim, out_dim, src, n_tok);
+  }
  }
  return ds4_gpu_matmul_q8_0_tensor(dst, model->map, model->size,
                                     t->abs_offset, in_dim, out_dim,
@@ -12100,7 +12249,23 @@ static int ds4_matmul_f16_via_tensor(ds4_gpu_tensor *dst,
    return ds4_gpu_matmul_f16_storage(dst, t->storage.metal_buffer,
                                       in_dim, out_dim, src, n_tok);
   }
-  /* storage.dtype not handled by this dispatcher → fall through to mmap. */
+  /* storage.dtype not handled by this dispatcher → fall through to mmap.
+   * silv 2026-05-28 #771 B+D: print named diagnostic so the next kernel
+   * gap is identified, not just "metal failed". */
+  if (model->no_tensor_data) {
+   fprintf(stderr,
+     "ds4: pack-direct F16-matmul fallthrough — tensor=%.*s storage.dtype=%u "
+     "(eff_type=%u, n_tok=%llu) — no F16/BF16 storage kernel matched. "
+     "Next migration: add dispatch for this dtype/n_tok pair.\n",
+     (int)t->name.len, t->name.ptr, eff, eff,
+     (unsigned long long)n_tok);
+  }
+ } else if (t != NULL && model->no_tensor_data) {
+  fprintf(stderr,
+    "ds4: pack-direct F16-matmul fallthrough — tensor=%.*s has no storage "
+    "(metal_buffer=NULL); pack-direct mode but override-fill skipped it. "
+    "(n_tok=%llu)\n",
+    (int)t->name.len, t->name.ptr, (unsigned long long)n_tok);
  }
  return ds4_gpu_matmul_f16_tensor(dst, model->map, model->size,
                                    t->abs_offset, in_dim, out_dim,
@@ -13354,8 +13519,12 @@ static bool metal_graph_encode_decode_layer(
  if (ok) {
  metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
  }
+ const bool shared_gate_up_q8_native =
+ tensor_effective_type(layer->ffn_gate_shexp) == DS4_TENSOR_Q8_0 &&
+ tensor_effective_type(layer->ffn_up_shexp) == DS4_TENSOR_Q8_0;
  const bool fuse_shared_gate_up =
  !g->quality &&
+ shared_gate_up_q8_native &&
  getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
  if (ok && fuse_shared_gate_up) {
  ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
@@ -13382,8 +13551,10 @@ static bool metal_graph_encode_decode_layer(
  }
  DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
  const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
+ const bool shared_down_q8_native =
+ tensor_effective_type(layer->ffn_down_shexp) == DS4_TENSOR_Q8_0;
  const bool fuse_shared_down_hc =
- !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
+ !keep_ffn_out && shared_down_q8_native && !metal_graph_use_reference_shared_down_hc();
  if (ok && fuse_shared_down_hc) {
  ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
  g->shared_out,
@@ -22121,7 +22292,16 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  ds4_gpu_set_quality(e->quality);
  (void)ds4_gpu_set_model_fd(e->model.fd);
  bool mapped_ok = false;
- if (e->cpu_moe) {
+ if (e->model.no_tensor_data) {
+ /* Metadata-only GGUF (silv 2026-05-28 #771): no tensor data section to
+  * Metal-map. Storage for every tensor comes from packs via override-
+  * fill; the Metal backend wraps pack mmaps directly, not the (absent)
+  * GGUF data section. Treat the map step as a no-op success. */
+ fprintf(stderr,
+ "ds4: pack-direct mode — skipping GGUF tensor-data Metal map "
+ "(no_tensor_data=true; storage supplied by packs)\n");
+ mapped_ok = true;
+ } else if (e->cpu_moe) {
  mapped_ok = engine_map_metal_views_with_routed_holes(e);
  } else {
  mapped_ok = (ds4_gpu_set_model_map_range(e->model.map,
@@ -22458,8 +22638,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     uint64_t n_zerocopy = 0;
     /* silv 2026-05-28 — source-exact skip histogram. Bucket the 768 remaining
      * skips by (source_exact_type, t->type) to size the next kernel work. */
-    uint64_t skip_hist_pack_dtype[8] = {0};  /* keyed by ds4_nrpk_dtype enum (0..7) */
-    uint64_t skip_hist_gguf_dtype[80] = {0}; /* keyed by t->type (F16=1, Q8=8, BF16=30, FP8=64) */
+	    uint64_t skip_hist_pack_dtype[8] = {0};  /* keyed by ds4_nrpk_dtype enum (0..7) */
+	    uint64_t skip_hist_gguf_dtype[80] = {0}; /* keyed by t->type (F16=1, Q8=8, BF16=30, FP8=64) */
+	    uint64_t n_fp8_scale_paired = 0;
+	    uint64_t n_fp8_scale_missing = 0;
+	    uint64_t n_fp8_scale_bad_shape = 0;
+	    uint64_t n_fp8_scale_wrap_ok = 0;
+	    uint64_t n_fp8_scale_wrap_fail = 0;
     /* silv 2026-05-28 high-resolution probe — per-tensor F16-mmap vs
      * BF16-storage L2 error.  When BF16-for-F16 source-exact substitute
      * is enabled (Increment 5), this records how much each weight
@@ -22599,7 +22784,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
      if (has_source_exact) {
       const int wired_bf16_f16 = (source_exact_type == DS4_TENSOR_BF16 &&
                                    t->type == DS4_TENSOR_F16);
-      if (!wired_bf16_f16) {
+      /* silv 2026-05-28 #771 B+D — pack-direct mode lifts the Cycle 5
+       * source-exact skip. With no_tensor_data=true, there is NO mmap
+       * fallback to corrupt; the kernel either reads storage.dtype via
+       * tensor_effective_type() (correct), or crashes when it tries to
+       * read m->map (a diagnostic naming the next kernel to migrate).
+       * Both outcomes are strictly better than the legacy "tensor has
+       * GGUF type X with garbage data because we skipped the load." */
+      const int pack_direct = e->model.no_tensor_data;
+      if (!wired_bf16_f16 && !pack_direct) {
        n_skip_source_exact_kernel_gap++;
        /* Histogram by source dtype (pack) AND target dtype (GGUF t->type)
         * to surface the highest-leverage next-kernel targets. */
@@ -22613,14 +22806,24 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
        }
        continue;
       }
-      /* Wired case: fall through to populate heap storage. The
-       * dispatcher will detect storage.dtype==BF16 at call time and
-       * route to the BF16 kernel. */
+      /* Wired case OR pack-direct mode: fall through to populate heap
+       * storage. The dispatcher will detect storage.dtype==(BF16/FP8/F32)
+       * at call time and route appropriately, or crash with a kernel-
+       * not-wired diagnostic that names the next migration target. */
      }
      /* Bytes check: identity fill requires exact match. Source-exact
       * substitute has its own pack-determined size — we accept whatever
-      * the pack manifest declares and trust the kernel to read it. */
-     if (identity_fill && pe->data_bytes != t->bytes) {
+      * the pack manifest declares and trust the kernel to read it.
+      *
+      * silv 2026-05-28 #771 B+D: in pack-direct mode with BF16/F32 source
+      * for F16 target, the conversion below produces an F16 buffer; we
+      * pre-detect that case to skip this pack-vs-gguf byte mismatch. */
+     const int will_convert_to_f16 =
+         (e->model.no_tensor_data && has_source_exact &&
+          t->type == DS4_TENSOR_F16 &&
+          (source_exact_type == DS4_TENSOR_BF16 ||
+           source_exact_type == DS4_TENSOR_F32));
+     if (identity_fill && !will_convert_to_f16 && pe->data_bytes != t->bytes) {
       n_skip_bytes_mismatch++;
       if (n_skip_examples < 6) {
        snprintf(first_skip_examples[n_skip_examples++], 256,
@@ -22631,10 +22834,135 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
       }
       continue;
      }
-     const void *src = ds4_nrpk_get_data(nrpk, pe);
-     if (!src) {
-      n_skip_alloc_fail++;
-      continue;
+	     const void *src = ds4_nrpk_get_data(nrpk, pe);
+	     if (!src) {
+	      n_skip_alloc_fail++;
+	      continue;
+	     }
+	     void *fp8_scale_dst = NULL;
+	     size_t fp8_scale_padded = 0;
+	     uint64_t fp8_scale_length = 0;
+	     if (has_source_exact && source_exact_type == DS4_TENSOR_FP8_E4M3) {
+	      char scale_name[192];
+	      const size_t pack_len = strlen(pack_name2);
+	      if (pack_len > 7 && strcmp(pack_name2 + pack_len - 7, ".weight") == 0) {
+	       const size_t prefix_len = pack_len - 7;
+	       if (prefix_len + 7 >= sizeof(scale_name)) {
+	        n_fp8_scale_missing++;
+	        continue;
+	       }
+	       memcpy(scale_name, pack_name2, prefix_len);
+	       memcpy(scale_name + prefix_len, ".scale", 7);
+	      } else {
+	       if (snprintf(scale_name, sizeof(scale_name), "%s.scale", pack_name2) >= (int)sizeof(scale_name)) {
+	        n_fp8_scale_missing++;
+	        continue;
+	       }
+	      }
+	      const ds4_nrpk_entry *se = ds4_nrpk_lookup(nrpk, scale_name);
+	      if (!se) {
+	       n_fp8_scale_missing++;
+	       if (n_skip_examples < 6) {
+	        snprintf(first_skip_examples[n_skip_examples++], 256,
+	                 "%s: pack=F8_E4M3 missing paired scale %s",
+	                 gguf_name, scale_name);
+	       }
+	       continue;
+	      }
+	      const uint32_t want_s0 = pe->n_dims >= 1 ? (pe->dims[0] + 127u) / 128u : 0u;
+	      const uint32_t want_s1 = pe->n_dims >= 2 ? (pe->dims[1] + 127u) / 128u : 0u;
+	      if (se->dtype != DS4_NRPK_DTYPE_F8_E8M0 ||
+	          se->n_dims != 2 ||
+	          se->dims[0] != want_s0 ||
+	          se->dims[1] != want_s1) {
+	       n_fp8_scale_bad_shape++;
+	       if (n_skip_examples < 6) {
+	        snprintf(first_skip_examples[n_skip_examples++], 256,
+	                 "%s: F8 scale shape/dtype mismatch got dtype=%s dims=%ux%u want=%ux%u",
+	                 gguf_name, ds4_nrpk_dtype_name(se->dtype),
+	                 se->n_dims > 0 ? se->dims[0] : 0u,
+	                 se->n_dims > 1 ? se->dims[1] : 0u,
+	                 want_s0, want_s1);
+	       }
+	       continue;
+	      }
+	      const void *scale_src = ds4_nrpk_get_data(nrpk, se);
+	      if (!scale_src) {
+	       n_skip_alloc_fail++;
+	       continue;
+	      }
+	      fp8_scale_length = se->data_bytes;
+	      const size_t scale_page = (size_t)sysconf(_SC_PAGESIZE);
+	      fp8_scale_padded = ((size_t)fp8_scale_length + scale_page - 1) & ~(scale_page - 1);
+	      if (posix_memalign(&fp8_scale_dst, scale_page, fp8_scale_padded) != 0 || !fp8_scale_dst) {
+	       n_skip_alloc_fail++;
+	       continue;
+	      }
+	      memcpy(fp8_scale_dst, scale_src, (size_t)fp8_scale_length);
+	     }
+	     /* silv 2026-05-28 #771 B+D — pack-direct BF16→F16 conversion.
+      *
+      * For multi-tok prefill the existing dispatcher (ds4_matmul_f16_via_
+      * tensor line 12158-12176) handles BF16 storage only at n_tok=1.
+      * Multi-tok BF16 falls back to mmap, which doesn't exist in pack-
+      * direct mode → crash.
+      *
+      * Increment 5's audit found BF16 source-exact vs F16 down-sample
+      * differs by 1e-10 RMS (FP32 floor) for this corpus — numerically
+      * equivalent. Convert BF16 → F16 inline at fill time so the F16
+      * storage path takes over for ALL n_tok values.
+      *
+      * Loss: source-exact BF16 precision (already shown below noise
+      * floor by Increment 5's high-resolution audit).
+      * Gain: pack-direct boot reaches first gen token without needing
+      * a multi-tok BF16 kernel.
+      *
+      * Next session: write the proper multi-tok BF16 matmul kernel and
+      * drop this conversion — it's a temporary scaffold for B+D ship. */
+     /* converted_bf16_to_f16: re-used for both BF16→F16 and F32→F16 in
+      * pack-direct mode. (Name kept for diff readability; semantically it's
+      * "lossy conversion to F16 because the dispatcher only has F16 storage
+      * path for these tensor types.") */
+     uint8_t *converted_bf16_to_f16 = NULL;
+     if (e->model.no_tensor_data &&
+         has_source_exact &&
+         t->type == DS4_TENSOR_F16 &&
+         (source_exact_type == DS4_TENSOR_BF16 ||
+          source_exact_type == DS4_TENSOR_F32)) {
+      const int from_f32 = (source_exact_type == DS4_TENSOR_F32);
+      const uint64_t elem_bytes = from_f32 ? 4 : 2;
+      const uint64_t n_elems = pe->data_bytes / elem_bytes;
+      const uint64_t f16_bytes = n_elems * 2;
+      const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+      const size_t padded = ((size_t)f16_bytes + page - 1) & ~(page - 1);
+      void *buf = NULL;
+      if (posix_memalign(&buf, page, padded) != 0 || !buf) {
+       n_skip_alloc_fail++;
+       continue;
+      }
+      uint16_t *f16_dst = (uint16_t *)buf;
+      if (from_f32) {
+       const float *f32_src = (const float *)src;
+       for (uint64_t k = 0; k < n_elems; k++) {
+        _Float16 hf16 = (_Float16)f32_src[k];
+        memcpy(&f16_dst[k], &hf16, sizeof(hf16));
+       }
+      } else {
+       /* BF16 → F32 (lossless shift-left 16) → F16 (lossy IEEE round) */
+       const uint16_t *bf16_src = (const uint16_t *)src;
+       for (uint64_t k = 0; k < n_elems; k++) {
+        const uint32_t f32_bits = (uint32_t)bf16_src[k] << 16;
+        float f32_val;
+        memcpy(&f32_val, &f32_bits, sizeof(f32_val));
+        _Float16 hf16 = (_Float16)f32_val;
+        memcpy(&f16_dst[k], &hf16, sizeof(hf16));
+       }
+      }
+      converted_bf16_to_f16 = (uint8_t *)buf;
+      /* Reframe as identity-fill so the rest of the loop treats it as
+       * F16 storage matching t->type. */
+      has_source_exact = 0;
+      identity_fill = 1;
      }
      /* silv 2026-05-28 high-resolution speedup — zero-copy fast path.
       *
@@ -22649,27 +22977,65 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
       * bytes alone (the pack mmap unmaps them when the pack closes).
       * model_free_overrides already respects this ownership flag. */
      const size_t page = (size_t)sysconf(_SC_PAGESIZE);
-     const size_t padded = ((size_t)pe->data_bytes + page - 1) & ~(page - 1);
+     /* silv 2026-05-28 #771 B+D bugfix — `pe->data_bytes / 2` is correct
+      * only when source is F32 (4 bytes/elem → 2 bytes/elem). For BF16
+      * source (2 bytes/elem → F16 2 bytes/elem) the byte count is the
+      * SAME, not halved. Surfaced when matmul_f16_storage hit
+      *   "weight buffer too small (1048576 < 2097152)"
+      * — a BF16-source F16 tensor whose effective_bytes had been wrongly
+      * halved so the wrap_heap_bytes registered a half-sized MTLBuffer.
+      * Compute n_elems from the source dtype and recover the conversion
+      * result size as n_elems * 2 (the F16 byte count). */
+     uint64_t effective_bytes;
+     if (converted_bf16_to_f16) {
+      /* Mirror the source-elem-size logic in the conversion block above. */
+      const int from_f32_eff =
+          has_source_exact ? 0 :  /* identity_fill was reframed; carry the size */
+          0;  /* fall through to BF16 logic */
+      (void)from_f32_eff;
+      /* converted_bf16_to_f16 path always produced f16_bytes = n_elems*2.
+       * Recover n_elems from pe->data_bytes / src_elem_bytes. The
+       * conversion block fixed src_elem_bytes via source_exact_type, but
+       * by here has_source_exact has been zeroed (line 22861 reframe).
+       * Recover the original src dtype indirectly: the F16 output is
+       * always (pe->data_bytes / src_elem_size) * 2. BF16 src has
+       * src_elem_size=2 → output = pe->data_bytes. F32 src has
+       * src_elem_size=4 → output = pe->data_bytes / 2. */
+      /* The conversion block stored elem_bytes in a local that's now out
+       * of scope. Reconstruct: if pe->dtype was F32 (=DS4_NRPK_DTYPE_F32=1)
+       * the conversion was F32→F16. Otherwise it was BF16→F16. */
+      const int was_f32_src = (pe->dtype == 1 /* DS4_NRPK_DTYPE_F32 */);
+      effective_bytes = was_f32_src ? (pe->data_bytes / 2)
+                                    : pe->data_bytes;
+     } else {
+      effective_bytes = pe->data_bytes;
+     }
+     const size_t padded = ((size_t)effective_bytes + page - 1) & ~(page - 1);
      const int src_page_aligned = (((uintptr_t)src & (page - 1)) == 0);
      /* zero_copy_eligible: src is page-aligned; the wrap covers `padded`
-      * bytes which extend beyond pe->data_bytes if the tail isn't page-
+      * bytes which extend beyond effective_bytes if the tail isn't page-
       * aligned. The pack mmap is much larger than any single tensor so
       * the tail bytes are valid memory (other tensors live there). The
-      * kernel reads only `pe->data_bytes` worth (matrix shape governs);
+      * kernel reads only `effective_bytes` worth (matrix shape governs);
       * the extra padded bytes are never touched. */
      void *dst = NULL;
      uint8_t store_ownership = DS4_STORAGE_HEAP;
-     uint64_t store_length = pe->data_bytes;
-     if (src_page_aligned) {
+     uint64_t store_length = effective_bytes;
+	     if (converted_bf16_to_f16) {
+	      /* Heap-owned F16 buffer from the BF16→F16 conversion above. */
+	      dst = converted_bf16_to_f16;
+	      store_ownership = DS4_STORAGE_HEAP;
+	     } else if (src_page_aligned) {
       /* Zero-copy: storage borrows the pack mmap pointer. */
       dst = (void *)src;
       store_ownership = DS4_STORAGE_PACK;
       n_zerocopy++;
-     } else if (posix_memalign(&dst, page, padded) != 0 || !dst) {
-      n_skip_alloc_fail++;
-      continue;
-     }
-     if (store_ownership == DS4_STORAGE_HEAP) {
+	     } else if (posix_memalign(&dst, page, padded) != 0 || !dst) {
+	      if (fp8_scale_dst) free(fp8_scale_dst);
+	      n_skip_alloc_fail++;
+	      continue;
+	     }
+     if (store_ownership == DS4_STORAGE_HEAP && !converted_bf16_to_f16) {
       memcpy(dst, src, (size_t)pe->data_bytes);
      }
      /* Cycle 5 unified storage: bytes + length + dtype + ownership in one
@@ -22681,16 +23047,28 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
       * Cycle 5 makes the activation implicit in dtype != t->type). */
      t->storage.bytes = dst;
      t->storage.length = store_length;
-     t->storage.dtype = has_source_exact ? source_exact_type : t->type;
-     t->storage.ownership = store_ownership;
+	     t->storage.dtype = has_source_exact ? source_exact_type : t->type;
+	     t->storage.ownership = store_ownership;
+	     if (fp8_scale_dst) {
+	      t->storage.scale_bytes = fp8_scale_dst;
+	      t->storage.scale_length = fp8_scale_length;
+	      t->storage.scale_dtype = DS4_TENSOR_FP8_E8M0;
+	      t->storage.scale_ownership = DS4_STORAGE_HEAP;
+	      n_fp8_scale_paired++;
+	     }
      /* #796 Increment 2 — pre-wrap as MTLBuffer (zero-copy on M1 unified
       * memory). May return NULL if the allocator failed page-alignment;
       * dispatch falls back to mmap in that case. Wrap uses `padded` so
       * the buffer covers the full aligned allocation (kernels read only
       * up to storage.length). */
-     t->storage.metal_buffer = ds4_gpu_wrap_heap_bytes(dst, (uint64_t)padded);
-     if (t->storage.metal_buffer) n_wrap_ok++;
-     else n_wrap_fail++;
+	     t->storage.metal_buffer = ds4_gpu_wrap_heap_bytes(dst, (uint64_t)padded);
+	     if (t->storage.metal_buffer) n_wrap_ok++;
+	     else n_wrap_fail++;
+	     if (fp8_scale_dst) {
+	      t->storage.scale_metal_buffer = ds4_gpu_wrap_heap_bytes(fp8_scale_dst, (uint64_t)fp8_scale_padded);
+	      if (t->storage.scale_metal_buffer) n_fp8_scale_wrap_ok++;
+	      else n_fp8_scale_wrap_fail++;
+	     }
      n_filled++;
      bytes_filled += pe->data_bytes;
      /* silv 2026-05-28 high-resolution probe — for BF16-for-F16 source-
@@ -22763,19 +23141,24 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
      }
     }
     fprintf(stderr,
-            "ds4: --nonrouted-pack: override-fill — filled=%llu (%.2f GB), "
-            "skipped dtype_mismatch=%llu bytes_mismatch=%llu alloc_fail=%llu "
-            "source_exact_kernel_gap=%llu mtlbuf_wrap=%llu/%llu (ok/fail) "
-            "zerocopy=%llu\n",
+	            "ds4: --nonrouted-pack: override-fill — filled=%llu (%.2f GB), "
+	            "skipped dtype_mismatch=%llu bytes_mismatch=%llu alloc_fail=%llu "
+	            "source_exact_kernel_gap=%llu mtlbuf_wrap=%llu/%llu (ok/fail) "
+	            "zerocopy=%llu fp8_scales=%llu miss=%llu bad=%llu wrap=%llu/%llu\n",
             (unsigned long long)n_filled,
             (double)bytes_filled / 1e9,
             (unsigned long long)n_skip_dtype_mismatch,
             (unsigned long long)n_skip_bytes_mismatch,
             (unsigned long long)n_skip_alloc_fail,
             (unsigned long long)n_skip_source_exact_kernel_gap,
-            (unsigned long long)n_wrap_ok,
-            (unsigned long long)n_wrap_fail,
-            (unsigned long long)n_zerocopy);
+	            (unsigned long long)n_wrap_ok,
+	            (unsigned long long)n_wrap_fail,
+	            (unsigned long long)n_zerocopy,
+	            (unsigned long long)n_fp8_scale_paired,
+	            (unsigned long long)n_fp8_scale_missing,
+	            (unsigned long long)n_fp8_scale_bad_shape,
+	            (unsigned long long)n_fp8_scale_wrap_ok,
+	            (unsigned long long)n_fp8_scale_wrap_fail);
     if (n_skip_examples > 0) {
      fprintf(stderr, "ds4: --nonrouted-pack: first override-fill skips (Phase 2b will resolve):\n");
      for (int k = 0; k < n_skip_examples; k++) {
@@ -22819,32 +23202,69 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
            "identity-dtype overrides applied; BF16/FP8 kernel paths are "
            "silv-curated to unblock skipped tensors.\n");
    e->nonrouted_pack = nrpk;
+
+   /* Cycle 7 (B+D) — synthetic-view registration for pack-direct boot.
+    *
+    * Existing Metal kernels call ds4_gpu_wrap_model_range(map, size,
+    * abs_offset) which lookups (map, abs_offset) against g_model_views[].
+    * For storage-backed tensors (override-fill landed bytes into
+    * t->storage with t->storage.metal_buffer set), abs_offset is beyond
+    * the GGUF mmap's EOF, so the bounds-check used to fail. The reorder
+    * (walk views first) makes it possible; this loop registers each
+    * storage tensor as a synthetic view so kernels resolve the storage
+    * MTLBuffer at the (map, abs_offset) key with no per-kernel change. */
+   {
+    uint64_t n_views = 0;
+    for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+     ds4_tensor *t = &e->model.tensors[i];
+     if (!t->storage.metal_buffer) continue;
+     if (t->storage.length == 0) continue;
+     if (ds4_gpu_register_tensor_view(e->model.map,
+                                       e->model.size,
+                                       t->abs_offset,
+                                       t->storage.length,
+                                       t->storage.metal_buffer)) {
+      n_views++;
+     }
+    }
+    fprintf(stderr,
+            "ds4: --nonrouted-pack: registered %llu synthetic model views "
+            "(storage tensors now resolvable via wrap_model_range)\n",
+            (unsigned long long)n_views);
+   }
   }
  }
 
  if (opt->vqb2_pack_path && opt->vqb2_pack_path[0]) {
   setenv("DS4_VQB2_PACK_PATH", opt->vqb2_pack_path, 0);
-  char index_path[1280];
-  snprintf(index_path, sizeof(index_path), "%s.index.csv", opt->vqb2_pack_path);
-  ds4_vqb2_pack *pack = (ds4_vqb2_pack *)calloc(1, sizeof(*pack));
-  if (!pack) {
-   fprintf(stderr, "ds4: --vqb2-pack: calloc(ds4_vqb2_pack) failed\n");
-  } else if (!ds4_vqb2_pack_open(opt->vqb2_pack_path, index_path, pack)) {
-   fprintf(stderr, "ds4: --vqb2-pack: open failed (pack=%s index=%s)\n",
-           opt->vqb2_pack_path, index_path);
-   free(pack);
-   pack = NULL;
+  /* Normal PATH_FUSED execution reads the pack directly from Metal via
+   * DS4_VQB2_PACK_PATH. Do not also mmap/open the 37GB pack on the engine
+   * side unless a legacy hot-store pin explicitly needs the CPU handle. */
+  const char *hot_layers_env = getenv("DS4_VQB2_PACK_HOT_LAYERS");
+  if (!(hot_layers_env && hot_layers_env[0])) {
+   fprintf(stderr, "ds4: --vqb2-pack: exported DS4_VQB2_PACK_PATH=%s\n"
+                   "    CPU pack not opened; PATH_FUSED will lazy-bind the pack directly\n",
+           opt->vqb2_pack_path);
   } else {
-   fprintf(stderr, "ds4: --vqb2-pack: opened %s (%.2f GB, %u entries)\n",
-           opt->vqb2_pack_path, (double)pack->pack_size / 1e9,
-           (unsigned)pack->n_entries);
-   e->vqb2_pack = pack;
+   char index_path[1280];
+   snprintf(index_path, sizeof(index_path), "%s.index.csv", opt->vqb2_pack_path);
+   ds4_vqb2_pack *pack = (ds4_vqb2_pack *)calloc(1, sizeof(*pack));
+   if (!pack) {
+    fprintf(stderr, "ds4: --vqb2-pack: calloc(ds4_vqb2_pack) failed\n");
+   } else if (!ds4_vqb2_pack_open(opt->vqb2_pack_path, index_path, pack)) {
+    fprintf(stderr, "ds4: --vqb2-pack: open failed (pack=%s index=%s)\n",
+            opt->vqb2_pack_path, index_path);
+    free(pack);
+    pack = NULL;
+   } else {
+    fprintf(stderr, "ds4: --vqb2-pack: opened %s (%.2f GB, %u entries)\n",
+            opt->vqb2_pack_path, (double)pack->pack_size / 1e9,
+            (unsigned)pack->n_entries);
+    e->vqb2_pack = pack;
 
-   /* Optional: pin layers into the FP16 hot-store for legacy/icb/mtl4.
-    * Budget per layer (256 experts × 3 kinds × 3 row-blocks × ~17 MB
-    * FP16) ≈ 13 GB. Caller is responsible for not OOMing the system. */
-   const char *hot_layers_env = getenv("DS4_VQB2_PACK_HOT_LAYERS");
-   if (hot_layers_env && hot_layers_env[0]) {
+    /* Optional: pin layers into the FP16 hot-store for legacy/icb/mtl4.
+     * Budget per layer (256 experts × 3 kinds × 3 row-blocks × ~17 MB
+     * FP16) ≈ 13 GB. Caller is responsible for not OOMing the system. */
     int requested[DS4_N_LAYER];
     int n_req = 0;
     char lbuf[256];
@@ -22899,10 +23319,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
               (double)budget / 1e9);
      }
     }
-   } else {
-    fprintf(stderr, "ds4: --vqb2-pack: hot-store not populated "
-                    "(set DS4_VQB2_PACK_HOT_LAYERS=L1,L2,... for legacy/icb/mtl4 paths;\n"
-                    "    PATH_FUSED reads pack directly so works without hot-store)\n");
    }
   }
  }
@@ -22935,8 +23351,13 @@ const char *ds4_mpp_mode_name(ds4_mpp_mode m) {
  }
 }
 
+/* silv 2026-05-28 H2247-audit R1: per-layer dispatch timing dump. */
+extern void ds4_metal_vqb2_fp16_dump_layer_timing(void);
+
 void ds4_engine_close(ds4_engine *e) {
  if (!e) return;
+ /* H2247-audit R1: dump per-layer dispatch timing if instrumented. */
+ ds4_metal_vqb2_fp16_dump_layer_timing();
  /* silv 2026-05-28 #796 Increment 2c: dump storage-dispatch counters so we
   * can see when the heap-storage path actually fires vs. the mmap fallback.
   * Print only when at least one path was exercised — silent when neither

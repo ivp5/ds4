@@ -52,6 +52,22 @@ int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
+
+/* Pack-direct synthetic view: register a (model_map, model_size, abs_offset,
+ * bytes, metal_buffer) tuple into the g_model_views[] table so existing
+ * kernels' wrap_model_range(map, size, abs_offset) calls find the storage-
+ * backed tensor. Allows kernels written for the GGUF-mmap world to operate on
+ * pack-direct tensors with no per-kernel migration. Returns 1 on success.
+ *
+ * abs_offset may legally exceed model_size — wrap_model_range walks views
+ * first and bounds-checks only on miss. */
+int ds4_gpu_register_tensor_view(
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t abs_offset,
+ uint64_t bytes,
+ void *metal_buffer_handle);
+
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);
