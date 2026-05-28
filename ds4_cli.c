@@ -1,6 +1,7 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_polar_reader.h"
+#include "ds4_nonrouted_pack.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -1544,6 +1545,15 @@ static cli_config parse_options(int argc, char **argv) {
              * journal trace. See ds4_metal.m for the H1672 pattern outline. */
             setenv("DS4_MTL4_MOE_ENABLE", "1", 1);
             fprintf(stderr, "ds4: --mtl4-moe enabled (DS4_MTL4_MOE_ENABLE=1)\n");
+        } else if (!strcmp(arg, "--vqb2-pack")) {
+            /* silv 2026-05-28 task #764 — VQB2 pack as active routed-FFN source
+             * (Architecture B). Argument is the .vqb2pack file path; engine_open
+             * opens it + exports DS4_VQB2_PACK_PATH for the lazy fused-path
+             * discovery. When DS4_VQB2_PACK_HOT_LAYERS="L1,L2,..." is also set,
+             * those layers are pinned into the FP16 hot-store so the
+             * legacy/icb/mtl4 paths have data too. */
+            c.engine.vqb2_pack_path = need_arg(&i, argc, argv, arg);
+            fprintf(stderr, "ds4: --vqb2-pack %s\n", c.engine.vqb2_pack_path);
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {
@@ -1618,7 +1628,99 @@ static cli_config parse_options(int argc, char **argv) {
     return c;
 }
 
+/* silv 2026-05-28 task #765 — DS4 exec log.
+ *
+ * Every ds4 invocation appends one START line (argv + ts + pid + cwd) to
+ * the log file at process start, and one END line (pid + ts + exit code +
+ * wall) at process exit via atexit().
+ *
+ * Log path resolution (first hit wins):
+ *   1. $DS4_EXEC_LOG env var
+ *   2. $HOME/.ds4_exec.log
+ *   3. /tmp/ds4_exec.log
+ *
+ * Log format (append-only, newline-delimited; argv may contain spaces so
+ * we use NUL-replaced-with-space inside the quoted argv field):
+ *   2026-05-28T08:30:42Z PID=12345 START CWD="/cwd" ARGV="ds4 -m ... -p ..."
+ *   2026-05-28T08:31:05Z PID=12345 END   EXIT=0 WALL=23.42s
+ *
+ * Disable: set DS4_EXEC_LOG=/dev/null (or any path the user controls). */
+static char       ds4_exec_log_path_buf[1024];
+static const char *ds4_exec_log_path = NULL;
+static pid_t       ds4_exec_log_pid  = 0;
+static double      ds4_exec_log_start_s = 0.0;
+static int         ds4_exec_log_exit_code = 0;
+
+static double ds4_exec_log_now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void ds4_exec_log_format_ts(char *buf, size_t cap) {
+    time_t now = time(NULL);
+    struct tm tm_utc;
+    gmtime_r(&now, &tm_utc);
+    strftime(buf, cap, "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+}
+
+static void ds4_exec_log_resolve_path(void) {
+    const char *env = getenv("DS4_EXEC_LOG");
+    if (env && env[0]) {
+        snprintf(ds4_exec_log_path_buf, sizeof(ds4_exec_log_path_buf), "%s", env);
+        ds4_exec_log_path = ds4_exec_log_path_buf;
+        return;
+    }
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        snprintf(ds4_exec_log_path_buf, sizeof(ds4_exec_log_path_buf), "%s/.ds4_exec.log", home);
+        ds4_exec_log_path = ds4_exec_log_path_buf;
+        return;
+    }
+    ds4_exec_log_path = "/tmp/ds4_exec.log";
+}
+
+static void ds4_exec_log_atexit(void) {
+    if (!ds4_exec_log_path) return;
+    FILE *f = fopen(ds4_exec_log_path, "a");
+    if (!f) return;
+    char ts[32];
+    ds4_exec_log_format_ts(ts, sizeof(ts));
+    double wall_s = ds4_exec_log_now_s() - ds4_exec_log_start_s;
+    fprintf(f, "%s PID=%d END   EXIT=%d WALL=%.2fs\n",
+            ts, (int)ds4_exec_log_pid, ds4_exec_log_exit_code, wall_s);
+    fclose(f);
+}
+
+static void ds4_exec_log_init(int argc, char **argv) {
+    ds4_exec_log_resolve_path();
+    ds4_exec_log_pid = getpid();
+    ds4_exec_log_start_s = ds4_exec_log_now_s();
+    char ts[32];
+    ds4_exec_log_format_ts(ts, sizeof(ts));
+    char cwd[1024];
+    if (!getcwd(cwd, sizeof(cwd))) snprintf(cwd, sizeof(cwd), "?");
+    FILE *f = fopen(ds4_exec_log_path, "a");
+    if (!f) return; /* never abort on log failure */
+    fprintf(f, "%s PID=%d START CWD=\"%s\" ARGV=\"",
+            ts, (int)ds4_exec_log_pid, cwd);
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) fputc(' ', f);
+        /* Escape embedded quotes minimally so the line stays parseable. */
+        for (const char *p = argv[i]; *p; p++) {
+            if (*p == '"') fputs("\\\"", f);
+            else if (*p == '\\') fputs("\\\\", f);
+            else if (*p == '\n') fputs("\\n", f);
+            else fputc(*p, f);
+        }
+    }
+    fputs("\"\n", f);
+    fclose(f);
+    atexit(ds4_exec_log_atexit);
+}
+
 int main(int argc, char **argv) {
+    ds4_exec_log_init(argc, argv);
     /* --polar-canary [packets [pairs]] : dispatch the MTL4 polar_dot kernel
      * on synthetic deterministic inputs and report GPU elapsed + max error.
      * Standalone diagnostic for task #563 (codex H1725 port). Bypasses
@@ -2417,6 +2519,158 @@ int main(int argc, char **argv) {
         const uint32_t pairs = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 1024;
         const uint32_t r     = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20;
         return ds4_gpu_mtl4_vqb2_noop_write_bench(np, nsel, rows, pairs, r) ? 0 : 1;
+    }
+    /* --vqb2-decode-matmul-canary [N_PKTS [N_SEL [N_TOTAL [ROWS [PAIRS [K [ROUNDS]]]]]]] :
+     * silv 2026-05-28 — FUSED decode-matmul kernel. Cross-checks each output
+     * against CPU scalar reference + measures GFLOP/s. The architectural move
+     * that bypasses the 2.7 GB/s store wall. Defaults match one DS4 V4 layer
+     * event: 64 packets × 6/256 × 128 rows × 1024 pairs × K=16 × 20 rounds. */
+    if (argc >= 2 && !strcmp(argv[1], "--vqb2-decode-matmul-canary")) {
+        const uint32_t np    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
+        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
+        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128;
+        const uint32_t pairs = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1024;
+        const uint32_t k     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 16;
+        const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 20;
+        return ds4_gpu_mtl4_vqb2_decode_matmul_fp16_canary(np, nsel, ntot, rows, pairs, k, r) ? 0 : 1;
+    }
+    /* --watersic-canary [N_PKTS [N_SEL [N_TOTAL [ROWS [COLS [R [ROUNDS]]]]]]] :
+     * silv 2026-05-28 task #769 — WaterSIC scalar-quant decode-matmul kernel
+     * (QMM-II arxiv 2605.13768 Algorithm 3). Cross-checks vs CPU scalar reference
+     * + measures GFLOP/s. Defaults match one DS4 V4 layer event:
+     *   64 packets × 6/256 selected × 128 rows × 2048 cols × R=4 × 20 rounds.
+     * R ∈ {2, 4, 8}. n_cols * R must be a multiple of 8. */
+    if (argc >= 2 && !strcmp(argv[1], "--watersic-canary")) {
+        extern int ds4_gpu_mtl4_watersic_decode_matmul_fp16_canary(
+            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+        const uint32_t np    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
+        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
+        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128;
+        const uint32_t cols  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
+        const uint32_t R     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 4;
+        const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 20;
+        return ds4_gpu_mtl4_watersic_decode_matmul_fp16_canary(np, nsel, ntot, rows, cols, R, r) ? 0 : 1;
+    }
+    /* --watersic-gate-up-canary [N_PKTS [N_SEL [N_TOTAL [ROWS [COLS [R [CLAMP [ROUNDS]]]]]]]] :
+     * silv 2026-05-28 task #770 — fused gate+up+SwiGLU CODA-style kernel
+     * (arxiv 2605.19269). Single Metal kernel: 2× MAC (decode gate + decode up)
+     * + 2× α scale (epilogue) + clamp + SiLU + multiply. Replaces 2 matmul
+     * kernels + 1 SwiGLU kernel + 2 HBM round trips. Defaults match DS4 V4
+     * FFN layer: 64 pkts × 6/256 × 128 rows × 2048 cols × R=4 × clamp=10 × 5 rounds. */
+    if (argc >= 2 && !strcmp(argv[1], "--watersic-gate-up-canary")) {
+        extern int ds4_gpu_mtl4_watersic_gate_up_swiglu_canary(
+            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t);
+        const uint32_t np    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
+        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
+        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128;
+        const uint32_t cols  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
+        const uint32_t R     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 4;
+        const float clamp    = (argc >= 9) ? (float)atof(argv[8]) : 10.0f;
+        const uint32_t r     = (argc >=10) ? (uint32_t)atoi(argv[9]) : 5;
+        return ds4_gpu_mtl4_watersic_gate_up_swiglu_canary(np, nsel, ntot, rows, cols, R, clamp, r) ? 0 : 1;
+    }
+    /* --watersic-down-canary [N_PKTS [N_SEL [N_TOTAL [ROWS [COLS [R [ROUNDS]]]]]]] :
+     * silv 2026-05-28 task #770 — down-proj + α-scale + route-weight-scale CODA
+     * kernel. Per (packet, slot, row): matmul + 2× scaling epilogue. Output is
+     * per-slot routed value; caller aggregates across slots separately. Defaults
+     * match DS4 V4 down-proj layer: 64 pkts × 6/256 × 4096 rows × 2048 cols × R=4. */
+    if (argc >= 2 && !strcmp(argv[1], "--watersic-down-canary")) {
+        extern int ds4_gpu_mtl4_watersic_down_routed_canary(
+            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+        const uint32_t np    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
+        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
+        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 4096;
+        const uint32_t cols  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
+        const uint32_t R     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 4;
+        const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 5;
+        return ds4_gpu_mtl4_watersic_down_routed_canary(np, nsel, ntot, rows, cols, R, r) ? 0 : 1;
+    }
+    /* --nonrouted-inspect PATH : silv 2026-05-28 — open + summarize a
+     * .pack file built by /Users/silv/cl/tlp/montyneg/ds4/nonrouted/
+     * pack_nonrouted.py from DS4 V4 bf16 safetensors. */
+    if (argc >= 3 && !strcmp(argv[1], "--nonrouted-inspect")) {
+        ds4_nrpk p;
+        if (!ds4_nrpk_open(argv[2], &p)) {
+            fprintf(stderr, "ds4: --nonrouted-inspect failed to open %s\n", argv[2]);
+            return 1;
+        }
+        ds4_nrpk_print_summary(&p);
+        /* prefix counts for sanity */
+        const char *prefixes[] = {
+            "embed", "head", "norm",
+            "layers.0.", "layers.22.", "layers.42.",
+            "layers.0.attn", "layers.0.ffn", "layers.0.hc_",
+            "mtp.0.",
+        };
+        fprintf(stderr, "\n  prefix counts:\n");
+        for (size_t i = 0; i < sizeof(prefixes)/sizeof(prefixes[0]); i++) {
+            uint32_t c = ds4_nrpk_count_prefix(&p, prefixes[i]);
+            fprintf(stderr, "    %-30s %u\n", prefixes[i], c);
+        }
+        ds4_nrpk_close(&p);
+        return 0;
+    }
+    /* --vqb2-pack-fused-canary [N_ENT [N_SEL [N_TOTAL [ROWS [PAIRS [K [ROUNDS]]]]]]] :
+     * silv 2026-05-28 task #758 — Architecture B pack-driven layer dispatch.
+     * Allocates a synthetic pack with N_ENT entries back-to-back, wraps via
+     * newBufferWithBytesNoCopy, runs the per-layer batched dispatch primitive,
+     * cross-checks. Defaults: 64 entries (= one DS4 V4 layer event's worth
+     * of row_blocks: 16 gate + 16 up + 32 down) × 6/256 × 128×1024 × K=16. */
+    if (argc >= 2 && !strcmp(argv[1], "--vqb2-pack-fused-canary")) {
+        const uint32_t nent  = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
+        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
+        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128;
+        const uint32_t pairs = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1024;
+        const uint32_t k     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 16;
+        const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 20;
+        return ds4_gpu_mtl4_vqb2_pack_fused_canary(nent, nsel, ntot, rows, pairs, k, r) ? 0 : 1;
+    }
+    /* --vqb2-pack-icb-bench [N_ENT [N_SEL [N_TOTAL [ROWS [PAIRS [K [ROUNDS]]]]]]] :
+     * Head-to-head A/B: cached MTL4 dispatch vs classic-MTL ICB record-replay. */
+    if (argc >= 2 && !strcmp(argv[1], "--vqb2-pack-icb-bench")) {
+        const uint32_t nent  = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
+        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
+        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128;
+        const uint32_t pairs = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1024;
+        const uint32_t k     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 16;
+        const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 20;
+        return ds4_gpu_mtl4_vqb2_pack_icb_bench(nent, nsel, ntot, rows, pairs, k, r) ? 0 : 1;
+    }
+    /* --vqb2-fused-microbench PACK CSV [LAYER [KIND [ROUNDS]]] :
+     * Warm pack + time N dispatch_kind calls. Reports per-(layer, kind)
+     * ms + projected per-token ms + t/s ceiling for 43-layer × 3-kind. */
+    if (argc >= 2 && !strcmp(argv[1], "--vqb2-fused-microbench")) {
+        if (argc < 4) {
+            fprintf(stderr, "usage: --vqb2-fused-microbench PACK CSV [LAYER [KIND [ROUNDS]]]\n");
+            return 2;
+        }
+        const char *pack_path = argv[2];
+        const char *csv_path  = argv[3];
+        const uint32_t layer  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 22;
+        const uint32_t kind   = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 0;
+        const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20;
+        return ds4_metal_vqb2_fused_microbench(pack_path, csv_path, layer, kind, rounds) ? 0 : 1;
+    }
+    /* --vqb2-fused-bind-smoke PACK_PATH CSV_PATH [LAYER [KIND]] :
+     * Opens a real VQB2 pack, wraps as MTLBuffer, dispatches the fused
+     * decode-matmul for one (layer, kind), prints output sample. Validates
+     * the bind_pack + dispatcher hookup against the on-disk pack. */
+    if (argc >= 2 && !strcmp(argv[1], "--vqb2-fused-bind-smoke")) {
+        if (argc < 4) {
+            fprintf(stderr, "usage: --vqb2-fused-bind-smoke PACK_PATH CSV_PATH [LAYER [KIND]]\n");
+            return 2;
+        }
+        const char *pack_path = argv[2];
+        const char *csv_path  = argv[3];
+        const uint32_t layer  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 22;
+        const uint32_t kind   = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 0;
+        return ds4_metal_vqb2_fused_bind_smoke(pack_path, csv_path, layer, kind) ? 0 : 1;
     }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {

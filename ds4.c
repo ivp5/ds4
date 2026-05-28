@@ -52,6 +52,7 @@
 #include "ds4_moe_route_log.h"
 #include "ds4_polar_reader.h"
 #include "ds4_prefix_cache.h"
+#include "ds4_vqb2_pack.h"  /* silv 2026-05-28 task #764 — --vqb2-pack engine wiring */
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -12182,10 +12183,39 @@ static bool metal_graph_encode_decode_layer(
  if (hot_metal_enabled) {
  ds4_hot_expert_store *hot = ds4_hot_store_get_active();
  if (hot) {
- /* Quick pinning check via CPU read — needs sync first or we may
-  * see stale data. End the GPU batch so router_selected's write
-  * has landed, then read it back. */
- if (ds4_gpu_end_commands() != 0) {
+ /* silv 2026-05-28 (task #764 sync-skip fix): use the layer-fully-pinned
+  * shortcut to bypass the CPU readback + GPU sync barrier when ALL 256
+  * experts of `il` are pinned in the hot-store. With --vqb2-pack +
+  * DS4_VQB2_PACK_HOT_LAYERS=L, all 256 experts of L are pinned at bind
+  * time, so the per-token sel[] check is guaranteed redundant for L.
+  *
+  * Removes: ds4_gpu_end_commands() per token (barrier sync),
+  *          ds4_gpu_tensor_contents() readback (CPU-coherent stall),
+  *          ds4_gpu_begin_commands() restart (batch rebuild).
+  * The Metal-MoE dispatch rides inside the existing GPU batch.
+  *
+  * Fallback: if NOT fully pinned, take the original sync-then-check
+  * path (some per-token selections may still hit the pinned subset). */
+ const int fully_pinned_layer = ds4_hot_layer_fully_pinned(hot, (uint32_t)il);
+ if (fully_pinned_layer) {
+ extern int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *);
+ extern int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *,
+                                              uint32_t, uint32_t,
+                                              struct ds4_gpu_tensor *,
+                                              struct ds4_gpu_tensor *,
+                                              struct ds4_gpu_tensor *,
+                                              struct ds4_gpu_tensor *);
+ if (ds4_metal_vqb2_fp16_bind_store(hot) == 0) {
+ memset(ds4_gpu_tensor_contents(g->routed_out), 0,
+        (size_t)DS4_N_EMBD * sizeof(float));
+ const int dr = ds4_metal_vqb2_fp16_dispatch_gpu(
+   hot, (uint32_t)il, 1u,
+   g->router_selected, g->router_weights,
+   g->ffn_norm, g->routed_out);
+ if (dr == 0) dispatched_via_metal_hot = 1;
+ }
+ } else if (ds4_gpu_end_commands() != 0) {
+ /* Layer not fully pinned — original sync-then-check fallback. */
  const int32_t *sel_cpu = (const int32_t *)ds4_gpu_tensor_contents(g->router_selected);
  if (sel_cpu && ds4_hot_layer_all_pinned(hot, il, sel_cpu, DS4_N_EXPERT_USED)) {
  extern int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *);
@@ -17124,6 +17154,10 @@ struct ds4_engine {
  * engine_activate_prefill_phase() since N <= DS4_N_LAYER and the
  * split is deterministic. */
  uint32_t prefill_metal_phases;
+ /* silv 2026-05-28 task #764 — VQB2 pack handle (Architecture B).
+  * Owned by engine; opened in engine_open when opt->vqb2_pack_path
+  * is set; closed in engine_close. NULL when --vqb2-pack absent. */
+ struct ds4_vqb2_pack *vqb2_pack;
 };
 
 static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine *e) {
@@ -20778,6 +20812,65 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  *out = NULL;
  return 1;
  }
+
+ /* silv 2026-05-28 — STICKY HAZARD tripwire (post-panic, kernel-class).
+  *
+  * A model file larger than the M1 Max Metal wired-memory cap (~48-60 GB)
+  * cannot be mmapped+resident under the default Metal-only path without
+  * panicking the kernel. Past panics: 2026-05-19, 2026-05-23, 2026-05-28.
+  *
+  * Refuse the launch unless EITHER:
+  *   --cpu-moe                  (routed MoE on CPU, Metal fits without)
+  *   --n-cpu-moe N (N > 0)      (partial CPU MoE)
+  *   --prefill-metal-phases X   (phase-split residency; X = -1 auto or >0)
+  *   --backend cpu              (pure CPU, no Metal residency)
+  *
+  * Threshold is 52 GB — silv's chosen project ceiling (above the wired
+  * cap, below the M1 Max 96 GB RAM ceiling). A safety-flagged launch
+  * with model > 52 GB passes; a flag-free launch fails BEFORE any mmap
+  * call so no kernel pressure builds. Stat is cheap (~ms); the binary
+  * exits with rc=2 and an explicit remediation hint.
+  *
+  * The MTP model is checked separately when it loads (small file, but
+  * the rule applies to any GGUF this binary opens). */
+ if (opt->model_path && opt->model_path[0]) {
+  struct stat _ds4_tripwire_st;
+  if (stat(opt->model_path, &_ds4_tripwire_st) == 0) {
+   const uint64_t _DS4_SAFETY_BYTES = 52ULL * 1024ULL * 1024ULL * 1024ULL;
+   const uint64_t fsz = (uint64_t)_ds4_tripwire_st.st_size;
+   const int safe_flag_set =
+    opt->cpu_moe ||
+    opt->n_cpu_moe_layers > 0 ||
+    opt->prefill_metal_phases != 0 ||
+    opt->backend == DS4_BACKEND_CPU;
+   if (fsz > _DS4_SAFETY_BYTES && !safe_flag_set) {
+    fprintf(stderr,
+     "\nds4: TRIPWIRE — refusing to load %s (%.1f GiB > 52 GiB safety cap)\n"
+     "    Direct Metal residency at this size exceeds M1 Max wired-memory\n"
+     "    cap (~48-60 GB) and panics the kernel. Past panics: 2026-05-19,\n"
+     "    2026-05-23, 2026-05-28.\n\n"
+     "    Add ONE of the following safety flags and retry:\n"
+     "      --prefill-metal-phases auto    (recommended; phase-split residency)\n"
+     "      --cpu-moe                      (routed MoE on CPU)\n"
+     "      --n-cpu-moe N                  (partial CPU MoE, N layers)\n"
+     "      --backend cpu                  (pure CPU, no Metal residency)\n\n"
+     "    To bypass (NOT RECOMMENDED — kernel-panic risk):\n"
+     "      DS4_DISABLE_SIZE_TRIPWIRE=1 ds4 ...\n\n",
+     opt->model_path, (double)fsz / (1024.0 * 1024.0 * 1024.0));
+    if (!getenv("DS4_DISABLE_SIZE_TRIPWIRE")) {
+     /* engine struct not yet allocated; nothing to free. Abort early. */
+     *out = NULL;
+     return 2;
+    }
+    fprintf(stderr,
+     "ds4: DS4_DISABLE_SIZE_TRIPWIRE=1 set — proceeding at silv's own risk.\n");
+   }
+  } else {
+   /* stat failure is non-fatal here; the GGUF loader downstream will
+    * report a clearer "file not found" if that's the cause. */
+  }
+ }
+
  ds4_engine *e = xcalloc(1, sizeof(*e));
  e->model.fd = -1;
  e->mtp_model.fd = -1;
@@ -21221,6 +21314,105 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
   }
  }
 
+ /* silv 2026-05-28 task #764 — VQB2 pack engine wire (Architecture B).
+  *
+  * When --vqb2-pack PATH is set, opt->vqb2_pack_path supplies the pack
+  * file. We:
+  *   (a) export DS4_VQB2_PACK_PATH so the PATH_FUSED dispatcher's lazy
+  *       bind in ds4_metal_vqb2_fp16.m finds the same pack;
+  *   (b) open the pack mmap + parse its index CSV;
+  *   (c) if DS4_VQB2_PACK_HOT_LAYERS="L1,L2,..." is set, allocate the
+  *       FP16 hot-store sized for those layers and pin them — this is
+  *       what the legacy/icb/mtl4 paths need to read from. Without
+  *       hot-store population, only PATH_FUSED is exercised.
+  *
+  * Index path convention: <pack_path>.index.csv next to the pack file.
+  * Pack handle is owned by the engine; closed in ds4_engine_close. */
+ if (opt->vqb2_pack_path && opt->vqb2_pack_path[0]) {
+  setenv("DS4_VQB2_PACK_PATH", opt->vqb2_pack_path, 0);
+  char index_path[1280];
+  snprintf(index_path, sizeof(index_path), "%s.index.csv", opt->vqb2_pack_path);
+  ds4_vqb2_pack *pack = (ds4_vqb2_pack *)calloc(1, sizeof(*pack));
+  if (!pack) {
+   fprintf(stderr, "ds4: --vqb2-pack: calloc(ds4_vqb2_pack) failed\n");
+  } else if (!ds4_vqb2_pack_open(opt->vqb2_pack_path, index_path, pack)) {
+   fprintf(stderr, "ds4: --vqb2-pack: open failed (pack=%s index=%s)\n",
+           opt->vqb2_pack_path, index_path);
+   free(pack);
+   pack = NULL;
+  } else {
+   fprintf(stderr, "ds4: --vqb2-pack: opened %s (%.2f GB, %u entries)\n",
+           opt->vqb2_pack_path, (double)pack->pack_size / 1e9,
+           (unsigned)pack->n_entries);
+   e->vqb2_pack = pack;
+
+   /* Optional: pin layers into the FP16 hot-store for legacy/icb/mtl4.
+    * Budget per layer (256 experts × 3 kinds × 3 row-blocks × ~17 MB
+    * FP16) ≈ 13 GB. Caller is responsible for not OOMing the system. */
+   const char *hot_layers_env = getenv("DS4_VQB2_PACK_HOT_LAYERS");
+   if (hot_layers_env && hot_layers_env[0]) {
+    int requested[DS4_N_LAYER];
+    int n_req = 0;
+    char lbuf[256];
+    strncpy(lbuf, hot_layers_env, sizeof(lbuf) - 1);
+    lbuf[sizeof(lbuf) - 1] = '\0';
+    char *tok = strtok(lbuf, ",");
+    while (tok && n_req < (int)DS4_N_LAYER) {
+     int L = atoi(tok);
+     if (L >= 0 && L < (int)DS4_N_LAYER) requested[n_req++] = L;
+     tok = strtok(NULL, ",");
+    }
+    if (n_req > 0) {
+     /* silv 2026-05-28: pack tiles store bit-packed VQB2 codes, not decoded
+      * FP16. Empirical: L22 with 16384 tiles = 0.72 GB heap. Budget 1.5 GB
+      * per layer leaves 100% safety margin. For all 43 layers: ~65 GB total
+      * (fits Metal cap with non-routed segments). The IQ2_XXS-source pin
+      * path (DS4_HOT_PIN_LAYERS) uses 14 GB/layer because it decodes to FP16. */
+     const uint64_t per_layer_budget = ((uint64_t)3ULL << 29); /* 1.5 GB */
+     const uint64_t budget = (uint64_t)n_req * per_layer_budget + ((uint64_t)1ULL << 30);
+     fprintf(stderr, "ds4: --vqb2-pack: DS4_VQB2_PACK_HOT_LAYERS=%s → budget=%.1f GB\n",
+             hot_layers_env, (double)budget / 1e9);
+     ds4_hot_expert_store *store = ds4_hot_expert_store_alloc(budget);
+     if (store) {
+      int n_pin_calls = 0;
+      int total_pinned = 0;
+      for (int i = 0; i < n_req; i++) {
+       int n = ds4_vqb2_pack_load_to_hot_store(store, pack, requested[i], -1);
+       if (n >= 0) {
+        n_pin_calls++;
+        total_pinned += n;
+        fprintf(stderr, "ds4: --vqb2-pack: L%d pinned %d tiles\n",
+                requested[i], n);
+       } else {
+        fprintf(stderr, "ds4: --vqb2-pack: L%d pack_load_to_hot_store FAILED\n",
+                requested[i]);
+        break;
+       }
+      }
+      if (n_pin_calls > 0) {
+       fprintf(stderr, "ds4: --vqb2-pack: hot-store: %d layers, %d total tiles, %.2f GB heap\n",
+               n_pin_calls, total_pinned, (double)ds4_hot_store_heap_bytes_get(store) / 1e9);
+       ds4_hot_store_set_active(store);
+       extern int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *);
+       if (ds4_metal_vqb2_fp16_bind_store(store) != 0) {
+        fprintf(stderr, "ds4: --vqb2-pack: Metal bind failed (CPU dispatch still ok)\n");
+       }
+      } else {
+       ds4_hot_expert_store_free(store);
+      }
+     } else {
+      fprintf(stderr, "ds4: --vqb2-pack: hot-store alloc failed (budget %.1f GB)\n",
+              (double)budget / 1e9);
+     }
+    }
+   } else {
+    fprintf(stderr, "ds4: --vqb2-pack: hot-store not populated "
+                    "(set DS4_VQB2_PACK_HOT_LAYERS=L1,L2,... for legacy/icb/mtl4 paths;\n"
+                    "    PATH_FUSED reads pack directly so works without hot-store)\n");
+   }
+  }
+ }
+
  *out = e;
  return 0;
 }
@@ -21272,6 +21464,12 @@ void ds4_engine_close(ds4_engine *e) {
  ds4_release_instance_lock();
  free(e->directional_steering_dirs);
  free(e->directional_steering_file);
+ /* silv 2026-05-28 task #764 — release VQB2 pack mmap if engine opened one */
+ if (e->vqb2_pack) {
+  ds4_vqb2_pack_close(e->vqb2_pack);
+  free(e->vqb2_pack);
+  e->vqb2_pack = NULL;
+ }
  free(e);
 }
 

@@ -176,6 +176,7 @@ typedef enum {
     PATH_LEGACY = 0,
     PATH_ICB    = 1,
     PATH_MTL4   = 2,
+    PATH_FUSED  = 3,  /* silv 2026-05-28 task #758 — code-direct fused decode-matmul. */
 } dispatch_path_t;
 static dispatch_path_t             s_active_path         = PATH_LEGACY;
 static bool                        s_path_resolved       = false;
@@ -353,8 +354,14 @@ int ds4_metal_vqb2_fp16_init(void) {
         s_scratch_mid         = [s_device newBufferWithLength:SCRATCH_BYTES options:MTLResourceStorageModeShared];
         s_persistent_input    = [s_device newBufferWithLength:IO_PAGE_BYTES options:MTLResourceStorageModeShared];
         s_persistent_output   = [s_device newBufferWithLength:IO_PAGE_BYTES options:MTLResourceStorageModeShared];
+        /* silv 2026-05-28 — allocate uniforms eagerly. dispatch_mtl4 writes
+         * to s_icb_uniforms.contents (line ~753); if ICB never fired first,
+         * lazy-alloc left this nil → silent zero-bind on MTL4 path (kernel
+         * reads zeros, output corrupted). 88 KB ceiling, allocate up-front. */
+        s_icb_uniforms        = [s_device newBufferWithLength:(NSUInteger)(256u * DS4_N_LAYER * ICB_SLOTS_PER_LAYER)
+                                                     options:MTLResourceStorageModeShared];
         if (!s_command_queue || !s_scratch_gate_out || !s_scratch_up_out || !s_scratch_mid ||
-            !s_persistent_input || !s_persistent_output) {
+            !s_persistent_input || !s_persistent_output || !s_icb_uniforms) {
             fprintf(stderr, "ds4_vqb2_fp16: buffer alloc\n"); return -1;
         }
         s_initialized = true;
@@ -845,9 +852,10 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
     if (!s_path_resolved) {
         const char *e = getenv("DS4_VQB2_FP16_PATH");
         if (e && *e) {
-            if      (strcmp(e, "icb")  == 0) s_active_path = PATH_ICB;
-            else if (strcmp(e, "mtl4") == 0) s_active_path = PATH_MTL4;
-            else                             s_active_path = PATH_LEGACY;
+            if      (strcmp(e, "icb")   == 0) s_active_path = PATH_ICB;
+            else if (strcmp(e, "mtl4")  == 0) s_active_path = PATH_MTL4;
+            else if (strcmp(e, "fused") == 0) s_active_path = PATH_FUSED;
+            else                              s_active_path = PATH_LEGACY;
             fprintf(stderr, "ds4_vqb2_fp16: path = %s\n", e);
         }
         s_path_resolved = true;
@@ -855,6 +863,183 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
     switch (s_active_path) {
         case PATH_ICB:  return ds4_metal_vqb2_fp16_dispatch_icb (store, layer, n_tokens, selected_exps, expert_weights, input_fp32, output_fp32);
         case PATH_MTL4: return ds4_metal_vqb2_fp16_dispatch_mtl4(store, layer, n_tokens, selected_exps, expert_weights, input_fp32, output_fp32);
+        case PATH_FUSED: {
+            /* task #760/#761 — auto-bind + per-layer coverage gating.
+             *
+             * On first PATH_FUSED call: open the VQB2 pack named by
+             * DS4_VQB2_PACK_PATH (defaults to <pack>.index.csv next to it),
+             * cache success/failure for the session.
+             *
+             * Per layer first access: probe coverage (bit 0=gate, 1=up,
+             * 2=down). Cache verdict — chain can only run when bitmask==7
+             * (all three organs bound). The H2125 nonrotated_layer22_k256
+             * pack covers L22 gate+up only (bitmask=3 → no DOWN), so on
+             * the full DS4 V4 corpus every layer's coverage != 7 and
+             * production falls through to MTL4 cleanly.
+             *
+             * NOTE: full FFN chain (gate+up → SwiGLU → down → accumulate)
+             * remains multi-session work. The dispatch_kind primitive
+             * exists but the shape adapter (input fp32 vec → packet-shaped
+             * fp16 X tensor, packet-shaped fp16 output → DS4_N_EMBD fp32
+             * accumulator) is not yet implemented. This block lays the
+             * gating + diagnostics so the rest is mechanical. */
+            /* Item A (2026-05-28): per-layer coverage cache moved INTO
+             * ds4_metal_vqb2_fused_bind (bit-packed uint64 masks, precomputed
+             * once). This block reads the answer in O(1). Removed: per-layer
+             * 0xff-uncached byte cache (43 bytes), per-layer first-touch probe
+             * (96 ops/layer). */
+            extern int  ds4_metal_vqb2_fused_bind(const char *, const char *);
+            extern int  ds4_metal_vqb2_fused_layer_fully_covered(uint32_t);
+            static int      s_fused_bind_attempted = 0;
+            static int      s_fused_bind_ok        = 0;
+            static uint64_t s_full_cov_attempts    = 0;
+            static uint64_t s_partial_cov_attempts = 0;
+            if (!s_fused_bind_attempted) {
+                s_fused_bind_attempted = 1;
+                const char *pack_path = getenv("DS4_VQB2_PACK_PATH");
+                const char *csv_path  = getenv("DS4_VQB2_INDEX_PATH");
+                if (pack_path) {
+                    char csv_buf[2048];
+                    if (!csv_path) {
+                        snprintf(csv_buf, sizeof(csv_buf), "%s.index.csv", pack_path);
+                        csv_path = csv_buf;
+                    }
+                    if (ds4_metal_vqb2_fused_bind(pack_path, csv_path) == 0) {
+                        s_fused_bind_ok = 1;
+                        fprintf(stderr, "ds4_vqb2_fp16: PATH_FUSED bound %s\n", pack_path);
+                    } else {
+                        fprintf(stderr, "ds4_vqb2_fp16: PATH_FUSED bind failed; falling back to MTL4\n");
+                    }
+                } else {
+                    fprintf(stderr, "ds4_vqb2_fp16: PATH_FUSED — set DS4_VQB2_PACK_PATH to enable; falling back to MTL4\n");
+                }
+            }
+            if (s_fused_bind_ok) {
+                if (ds4_metal_vqb2_fused_layer_fully_covered(layer)) {
+                    s_full_cov_attempts++;
+                    /* task #761 — full FFN chain. Gen-only (n_tokens==1) for
+                     * now; prefill falls through to MTL4. Any chain step that
+                     * fails also falls through.
+                     *
+                     * Chain:
+                     *   shape adapter   : input_fp32 [4096] → x_buf fp16 [8192 halves]
+                     *   GATE dispatch   : (layer, kind=0, sel, x_buf, gate_buf)
+                     *   UP   dispatch   : (layer, kind=1, sel, x_buf, up_buf)
+                     *   SwiGLU step     : (gate, up, route_w, mid)
+                     *   DOWN dispatch   : (layer, kind=2, sel, mid, down_buf, x_slot_stride=gate_n_rows)
+                     *   sum6 step       : (down_buf, output_fp32)
+                     *
+                     * The shape adapter, out-slot pool, swiglu/sum helpers, and
+                     * strided dispatch_kind all exist as separate APIs. This
+                     * block stitches them. */
+                    if (n_tokens == 1u) {
+                        extern void *ds4_metal_vqb2_fused_x_adapter_fp32_to_fp16(const float *, uint32_t);
+                        extern void *ds4_metal_vqb2_fused_out_buffer(uint32_t, uint32_t);
+                        extern int   ds4_metal_vqb2_fused_dispatch_kind(uint32_t, uint32_t,
+                                                                        const uint32_t *, uint32_t,
+                                                                        void *, void *,
+                                                                        uint32_t *, uint32_t *, uint32_t *);
+                        extern int   ds4_metal_vqb2_fused_dispatch_kind_strided(uint32_t, uint32_t,
+                                                                                 const uint32_t *, uint32_t,
+                                                                                 void *, void *, uint32_t,
+                                                                                 uint32_t *, uint32_t *, uint32_t *);
+                        extern int   ds4_metal_vqb2_fused_swiglu_step(void *, void *, void *, void *,
+                                                                       uint32_t, uint32_t, float);
+                        extern int   ds4_metal_vqb2_fused_sum_step(void *, void *, uint32_t);
+
+                        /* DS4 active experts = 6; cap for safety. */
+                        const uint32_t n_sel = 6u;
+                        uint32_t sel_u32[16];
+                        for (uint32_t i = 0; i < n_sel; i++) sel_u32[i] = (uint32_t)selected_exps[i];
+
+                        /* Shape adapter — 4096 fp32 → MTLBuffer of fp16 in
+                         * 2048 pairs × 2 = 8192 halves linear layout. */
+                        const uint32_t hidden = 4096u;
+                        const uint32_t intermediate = 2048u;
+                        void *x_buf = ds4_metal_vqb2_fused_x_adapter_fp32_to_fp16((const float *)input_fp32, hidden);
+
+                        /* Output buffer slots: 0=gate, 1=up, 2=mid, 3=down. */
+                        const uint32_t gate_bytes = n_sel * intermediate * 2u;
+                        const uint32_t up_bytes   = gate_bytes;
+                        const uint32_t mid_bytes  = gate_bytes;
+                        const uint32_t down_bytes = n_sel * hidden * 2u;
+                        void *gate_buf = x_buf ? ds4_metal_vqb2_fused_out_buffer(0u, gate_bytes) : NULL;
+                        void *up_buf   = gate_buf ? ds4_metal_vqb2_fused_out_buffer(1u, up_bytes) : NULL;
+                        void *mid_buf  = up_buf   ? ds4_metal_vqb2_fused_out_buffer(2u, mid_bytes) : NULL;
+                        void *down_buf = mid_buf  ? ds4_metal_vqb2_fused_out_buffer(3u, down_bytes) : NULL;
+
+                        /* route_weights buffer wrap (fp32, n_sel elements). */
+                        static id<MTLBuffer> s_rw_buf = nil;
+                        static uint32_t s_rw_cap = 0;
+                        if (s_rw_cap < n_sel) {
+                            extern id<MTLDevice> g_device;
+                            s_rw_buf = [g_device newBufferWithLength:(NSUInteger)n_sel * sizeof(float)
+                                                              options:MTLResourceStorageModeShared];
+                            s_rw_cap = n_sel;
+                        }
+                        if (s_rw_buf) memcpy(s_rw_buf.contents, expert_weights, n_sel * sizeof(float));
+                        void *rw_void = (__bridge void *)s_rw_buf;
+
+                        int chain_ok = 0;
+                        if (x_buf && gate_buf && up_buf && mid_buf && down_buf && rw_void) {
+                            uint32_t g_n_rb = 0, g_n_rows = 0, g_n_pairs = 0;
+                            uint32_t u_n_rb = 0, u_n_rows = 0, u_n_pairs = 0;
+                            uint32_t d_n_rb = 0, d_n_rows = 0, d_n_pairs = 0;
+                            int rcg = ds4_metal_vqb2_fused_dispatch_kind(layer, 0u, sel_u32, n_sel,
+                                                                          x_buf, gate_buf,
+                                                                          &g_n_rb, &g_n_rows, &g_n_pairs);
+                            int rcu = (rcg == 0) ?
+                                ds4_metal_vqb2_fused_dispatch_kind(layer, 1u, sel_u32, n_sel,
+                                                                    x_buf, up_buf,
+                                                                    &u_n_rb, &u_n_rows, &u_n_pairs) : -1;
+                            /* SwiGLU produces n_sel × g_n_rows fp16 mid. */
+                            int rcs = (rcu == 0 && g_n_rows == u_n_rows) ?
+                                ds4_metal_vqb2_fused_swiglu_step(gate_buf, up_buf, rw_void, mid_buf,
+                                                                  g_n_rows, n_sel, 0.0f) : 0;
+                            /* DOWN reads per-slot X with stride=g_n_rows halves. */
+                            int rcd = (rcs == 1) ?
+                                ds4_metal_vqb2_fused_dispatch_kind_strided(layer, 2u, sel_u32, n_sel,
+                                                                            mid_buf, down_buf, g_n_rows,
+                                                                            &d_n_rb, &d_n_rows, &d_n_pairs) : -1;
+                            int rcsum = (rcd == 0) ?
+                                ds4_metal_vqb2_fused_sum_step(down_buf, output_fp32, hidden) : 0;
+                            chain_ok = (rcsum == 1);
+                            if (!chain_ok && (s_full_cov_attempts & 1023) == 1) {
+                                fprintf(stderr,
+                                        "ds4_vqb2_fp16: PATH_FUSED L%u chain failed "
+                                        "(rcg=%d rcu=%d rcs=%d rcd=%d rcsum=%d) — fallback\n",
+                                        layer, rcg, rcu, rcs, rcd, rcsum);
+                            }
+                        }
+                        if (chain_ok) {
+                            if ((s_full_cov_attempts & 1023) == 1) {
+                                fprintf(stderr,
+                                        "ds4_vqb2_fp16: PATH_FUSED L%u chain ok "
+                                        "(attempts=%llu)\n",
+                                        layer, (unsigned long long)s_full_cov_attempts);
+                            }
+                            return 0;
+                        }
+                    }
+                    if ((s_full_cov_attempts & 1023) == 1) {
+                        fprintf(stderr,
+                                "ds4_vqb2_fp16: PATH_FUSED L%u eligible "
+                                "(attempts=%llu, n_tokens=%u) — fallback to MTL4\n",
+                                layer, (unsigned long long)s_full_cov_attempts, n_tokens);
+                    }
+                } else {
+                    s_partial_cov_attempts++;
+                    if ((s_partial_cov_attempts & 8191) == 1) {
+                        fprintf(stderr,
+                                "ds4_vqb2_fp16: PATH_FUSED partial-coverage "
+                                "falls=%llu (most layers expected on H2125 "
+                                "single-layer pack)\n",
+                                (unsigned long long)s_partial_cov_attempts);
+                    }
+                }
+            }
+            return ds4_metal_vqb2_fp16_dispatch_mtl4(store, layer, n_tokens, selected_exps, expert_weights, input_fp32, output_fp32);
+        }
         case PATH_LEGACY:
         default:        return ds4_metal_vqb2_fp16_dispatch_legacy(store, layer, n_tokens, selected_exps, expert_weights, input_fp32, output_fp32);
     }

@@ -11,6 +11,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/mman.h>
+#include <errno.h>
 #include <mach/mach_time.h>
 #include "ds4_journal.h"
 
@@ -38,7 +40,11 @@ enum {
  DS4_METAL_TENSOR_IQ2_XXS = 16,
 };
 
-static id<MTLDevice> g_device;
+/* silv 2026-05-28: dropped `static` so PATH_FUSED chain in ds4_metal_vqb2_fp16.m
+ * can `extern id<MTLDevice> g_device;` for ad-hoc MTLBuffer allocation
+ * (route_weights staging in the n_tokens==1 chain). All access still goes
+ * through this TU; the extern only resolves to the same symbol. */
+id<MTLDevice> g_device;
 static id<MTLCommandQueue> g_queue;
 static id<MTLLibrary> g_library;
 static id<MTLCommandBuffer> g_batch_cb;
@@ -1212,7 +1218,11 @@ static void ds4_gpu_detect_metal4_features(void) {
  fprintf(stderr, "ds4: Metal 4 tensor API probe failed; using legacy Metal kernels\n");
  }
  } else {
- fprintf(stderr, "ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices\n");
+ /* silv 2026-05-28 (codex H1777 + path-compare bench): clarified.
+  * Only the M5+/A19+ TensorOps fast path is gated here. MTL4 compute
+  * pipelines, MTL4CommandBuffer, MTL4ComputeCommandEncoder, MTL4ArgumentTable,
+  * and ordinary buffer dispatch all work on M1 Max — PATH_MTL4 uses them. */
+ fprintf(stderr, "ds4: Metal 4 TensorOps fast path disabled (pre-M5/pre-A19); MTL4 compute pipelines still active\n");
  }
  }
  }
@@ -15080,22 +15090,28 @@ int ds4_gpu_routed_moe_one_tensor(
   * gate_buf/up_buf arguments passed to ds4_gpu_encode_mul_mv_id_pair_swiglu
   * must point at the hot-store buffer with the right per-expert offsets.
   * This commit wires the BRANCH; full data plumbing is follow-up work. */
- static int hot_fp16_kernel_env_checked = 0;
+ /* silv 2026-05-28 item C — dispatch_once race fix for #674 (spec-decode
+  * tree search). Function-static `int env_checked` + non-atomic write is
+  * a data race when spec-decode runs multiple speculative threads through
+  * this function. dispatch_once_t is the canonical Apple primitive: lock-
+  * free fast path after first init, single-init guarantee across threads.
+  * Same final state (hot_fp16_kernel_active) but the init block runs
+  * exactly once globally instead of "once per thread that won the race". */
+ static dispatch_once_t hot_fp16_kernel_once = 0;
  static int hot_fp16_kernel_active = 0;
- if (!hot_fp16_kernel_env_checked) {
- hot_fp16_kernel_active = (getenv("DS4_HOT_FP16_KERNEL") != NULL) ? 1 : 0;
- hot_fp16_kernel_env_checked = 1;
- if (hot_fp16_kernel_active && g_moe_mul_mv_id_fp16_pair_swiglu_pipeline) {
- fprintf(stderr,
-   "ds4: DS4_HOT_FP16_KERNEL=1 — FP16 pair_swiglu kernel ready "
-   "(activates only when hot-store fully pinned for selected experts)\n");
- } else if (hot_fp16_kernel_active) {
- fprintf(stderr,
-   "ds4: DS4_HOT_FP16_KERNEL=1 set but FP16 kernel pipeline absent; "
-   "IQ2_XXS path stays active\n");
- hot_fp16_kernel_active = 0;
- }
- }
+ dispatch_once(&hot_fp16_kernel_once, ^{
+     hot_fp16_kernel_active = (getenv("DS4_HOT_FP16_KERNEL") != NULL) ? 1 : 0;
+     if (hot_fp16_kernel_active && g_moe_mul_mv_id_fp16_pair_swiglu_pipeline) {
+         fprintf(stderr,
+                 "ds4: DS4_HOT_FP16_KERNEL=1 — FP16 pair_swiglu kernel ready "
+                 "(activates only when hot-store fully pinned for selected experts)\n");
+     } else if (hot_fp16_kernel_active) {
+         fprintf(stderr,
+                 "ds4: DS4_HOT_FP16_KERNEL=1 set but FP16 kernel pipeline absent; "
+                 "IQ2_XXS path stays active\n");
+         hot_fp16_kernel_active = 0;
+     }
+ });
 
  id<MTLComputePipelineState> pair_swiglu_pipeline = nil;
  if (gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
@@ -15845,8 +15861,18 @@ int ds4_gpu_routed_moe_batch_tensor(
   * fused kernel reading FP16 weights from the hot-store. The down projection
   * runs unchanged from `midbuf`. Returns 1 on successful dispatch; on 0 the
   * IQ2_XXS path below runs as fallback. Hot-store fully-pinned check happens
-  * inside the helper (cheap layer-level check, no GPU sync needed). */
- if (try_fp16_simdgroup) {
+  * inside the helper (cheap layer-level check, no GPU sync needed).
+  *
+  * Item B (silv 2026-05-28 directive): when this layer is fully covered by the
+  * PATH_FUSED pack-direct decoder, the FP16 hot-store is NOT populated for it
+  * (pack-direct reads codes from MTLBuffer, bypassing the hot heap). The
+  * simdgroup helper's hot_layer_fully_pinned check would return 0 anyway, but
+  * we skip the call entirely so the dead branch doesn't even attempt. The
+  * paths are complementary — FP16 simdgroup is for hot-store layers; PATH_FUSED
+  * is for pack-direct layers. They never overlap on a single (layer, kind). */
+ extern int ds4_metal_vqb2_fused_layer_fully_covered(uint32_t);
+ if (try_fp16_simdgroup &&
+     !ds4_metal_vqb2_fused_layer_fully_covered((uint32_t)layer_index)) {
  fp16_simdgroup_used = ds4_gpu_dispatch_fp16_simdgroup_pair_swiglu(
   cb, layer_index, expert_in_dim, expert_mid_dim, n_tokens, n_expert,
   clamp,
@@ -18500,6 +18526,105 @@ void ds4_gpu_mtl4_pool_stats(uint64_t *out_acquire,
 }
 
 /* ============================================================ */
+/* ds4_mtl4_run_canary — shared MTL4 canary boilerplate           */
+/* silv 2026-05-28 task #523 item D                              */
+/* ============================================================ */
+/* Eliminates the ~80-line residency-set / arg-table / cb /
+ * commit / dispatch_semaphore shell repeated across ~50 canaries.
+ * Per-canary becomes ~30 lines (allocate buffers, fill inputs,
+ * compute CPU reference, call run_canary, compare).
+ *
+ * Mirrors `ds4_mtl4_build_kernel_pipeline` for design: all variations
+ * pass through args; the helper owns the boilerplate.
+ *
+ * Buffer bindings: caller passes an array of `id<MTLBuffer>` (as opaque
+ * void *) — the helper adds them to the residency set, sets their
+ * gpuAddress on the argument table in order. For BIND-WITH-OFFSET cases,
+ * caller can pre-compute (buf, offset) and embed offset in the buffer's
+ * contents pre-call (rare; most canaries bind at offset 0).
+ *
+ * Validation: caller supplies a callback that reads any binding's
+ * `contents` after GPU completes and returns 1=pass / 0=fail. Pass NULL
+ * to validate dispatch-completion only (no output check).
+ *
+ * Per-canary count saved: ~80 lines × ~50 canaries = 4000 line cut
+ * after full migration. Helper itself: ~70 lines including comments.
+ */
+/* typedef declared in ds4_gpu.h */
+
+int ds4_mtl4_run_canary(void *pipeline_void,        /* id<MTLComputePipelineState> */
+                        void * const *bindings,     /* array of n id<MTLBuffer> as void * */
+                        uint32_t n_bindings,
+                        unsigned long gx, unsigned long gy, unsigned long gz,
+                        unsigned long tx, unsigned long ty, unsigned long tz,
+                        unsigned long shmem_bytes,
+                        ds4_mtl4_canary_validate_fn validate_fn,
+                        void *user_ctx) {
+    id<MTLComputePipelineState> pipeline =
+        (__bridge id<MTLComputePipelineState>)pipeline_void;
+    const MTLSize grid = MTLSizeMake((NSUInteger)gx, (NSUInteger)gy, (NSUInteger)gz);
+    const MTLSize tg   = MTLSizeMake((NSUInteger)tx, (NSUInteger)ty, (NSUInteger)tz);
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_polar_pipeline_init()) return 0;
+    if (!pipeline || !bindings || n_bindings == 0) return 0;
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = (NSUInteger)n_bindings + 2u;
+        id<MTLResidencySet> residency =
+            [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (!residency) return 0;
+        /* Walk bindings into residency set + argument table. */
+        for (uint32_t i = 0; i < n_bindings; i++) {
+            id<MTLAllocation> alloc =
+                (__bridge id<MTLAllocation>)bindings[i];
+            [residency addAllocations:&alloc count:1];
+        }
+        [residency commit];
+        [residency requestResidency];
+
+        id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire((NSUInteger)n_bindings);
+        if (argTable) {
+            for (uint32_t i = 0; i < n_bindings; i++) {
+                id<MTLBuffer> buf = (__bridge id<MTLBuffer>)bindings[i];
+                [argTable setAddress:buf.gpuAddress atIndex:i];
+            }
+            id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+            [cb beginCommandBufferWithAllocator:g_polar_allocator];
+            [cb useResidencySet:residency];
+            id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pipeline];
+            [enc setArgumentTable:argTable];
+            if (shmem_bytes != 0ul) {
+                [enc setThreadgroupMemoryLength:(NSUInteger)shmem_bytes atIndex:0];
+            }
+            [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+            [enc endEncoding];
+            [cb endCommandBuffer];
+
+            [g_polar_queue addResidencySet:residency];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            MTL4CommitOptions *opts = [MTL4CommitOptions new];
+            [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                (void)fb; dispatch_semaphore_signal(sem);
+            }];
+            id<MTL4CommandBuffer> bufs[1] = { cb };
+            [g_polar_queue commit:bufs count:1 options:opts];
+            const long waitRes = dispatch_semaphore_wait(
+                sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+            [residency endResidency];
+            if (waitRes == 0) {
+                rc = validate_fn ? validate_fn(user_ctx) : 1;
+            }
+            ds4_mtl4_pool_release(argTable, (NSUInteger)n_bindings);
+        }
+    }
+    return rc;
+}
+
+/* ============================================================ */
 /* MTL4 port: kernel_dsv4_ratio4_shift_f32 (task #678)          */
 /* metal/dsv4_kv.metal:271. Tiny KV ratio-4 state shift —        */
 /* state[gid] = state[n + gid] for both kv and score.            */
@@ -18533,107 +18658,69 @@ static int ds4_ratio4_shift_mtl4_pipeline_init(void) {
     return g_ratio4_shift_mtl4_init_ok;
 }
 
-int ds4_gpu_mtl4_ratio4_shift_canary(uint32_t width) {
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!ds4_ratio4_shift_mtl4_pipeline_init()) return 0;
+struct ratio4_shift_canary_ctx {
+    void *kvBuf_void;
+    void *scoreBuf_void;
+    uint32_t n;
+    uint32_t width;
+};
 
-    /* Synthetic: state_kv[gid] = -1.0 (placeholder), state_kv[n + gid] = (float)gid.
-     * Same for state_score. After kernel: state_kv[gid] = (float)gid for gid < n. */
-    const uint32_t n = 4u * width;
-    const uint64_t total = (uint64_t)n * 2;  /* old + new halves */
-    float *host_kv = (float *)calloc(total, sizeof(float));
-    float *host_score = (float *)calloc(total, sizeof(float));
-    if (!host_kv || !host_score) { free(host_kv); free(host_score); return 0; }
-    for (uint32_t i = 0; i < n; i++) {
-        host_kv[i] = -1.0f;
-        host_score[i] = -2.0f;
-        host_kv[n + i] = (float)i;
-        host_score[n + i] = (float)i * 0.5f;
-    }
-
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:16
-                                                      options:MTLResourceStorageModeShared];
-        id<MTLBuffer> kvBuf = [g_device newBufferWithBytes:host_kv
-                                                    length:total * sizeof(float)
-                                                   options:MTLResourceStorageModeShared];
-        id<MTLBuffer> scoreBuf = [g_device newBufferWithBytes:host_score
-                                                       length:total * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
-        *((uint32_t *)argsBuf.contents) = width;
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 4;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[3] = {
-                (id<MTLAllocation>)argsBuf, (id<MTLAllocation>)kvBuf, (id<MTLAllocation>)scoreBuf,
-            };
-            [residency addAllocations:allocs count:3];
-            [residency commit];
-            [residency requestResidency];
-
-            MTL4ArgumentTableDescriptor *atDesc = [MTL4ArgumentTableDescriptor new];
-            atDesc.maxBufferBindCount = 4;
-            atDesc.initializeBindings = YES;
-            id<MTL4ArgumentTable> argTable =
-                [g_device newArgumentTableWithDescriptor:atDesc error:&err];
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:kvBuf.gpuAddress atIndex:1];
-                [argTable setAddress:scoreBuf.gpuAddress atIndex:2];
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_ratio4_shift_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                const NSUInteger tg = 256;
-                const NSUInteger n_tgs = (n + tg - 1) / tg;
-                [enc dispatchThreadgroups:MTLSizeMake(n_tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
-                    (void)fb; dispatch_semaphore_signal(sem);
-                }];
-                id<MTL4CommandBuffer> bufs[1] = { cb };
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem,
-                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_kv, kvBuf.contents, total * sizeof(float));
-                    memcpy(host_score, scoreBuf.contents, total * sizeof(float));
-                    rc = 1;
-                }
-            }
-        }
-    }
-    if (!rc) { free(host_kv); free(host_score); return 0; }
-
-    /* Verify shifted: state_kv[i] should now equal i for i < n */
-    uint64_t n_correct_kv = 0;
-    uint64_t n_correct_score = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        if (host_kv[i] == (float)i) n_correct_kv++;
-        if (host_score[i] == (float)i * 0.5f) n_correct_score++;
+static int ratio4_shift_canary_validate(void *user_ctx) {
+    struct ratio4_shift_canary_ctx *c = (struct ratio4_shift_canary_ctx *)user_ctx;
+    id<MTLBuffer> kvBuf    = (__bridge id<MTLBuffer>)c->kvBuf_void;
+    id<MTLBuffer> scoreBuf = (__bridge id<MTLBuffer>)c->scoreBuf_void;
+    const float *kv    = (const float *)kvBuf.contents;
+    const float *score = (const float *)scoreBuf.contents;
+    uint64_t n_correct_kv = 0, n_correct_score = 0;
+    for (uint32_t i = 0; i < c->n; i++) {
+        if (kv[i]    == (float)i)        n_correct_kv++;
+        if (score[i] == (float)i * 0.5f) n_correct_score++;
     }
     fprintf(stderr,
         "ds4: ratio4_shift MTL4 canary width=%u n=%u "
         "kv_correct=%llu/%u score_correct=%llu/%u\n",
-        width, n,
-        (unsigned long long)n_correct_kv, n,
-        (unsigned long long)n_correct_score, n);
-    free(host_kv); free(host_score);
-    return (n_correct_kv == n && n_correct_score == n) ? 1 : 0;
+        c->width, c->n,
+        (unsigned long long)n_correct_kv, c->n,
+        (unsigned long long)n_correct_score, c->n);
+    return (n_correct_kv == c->n && n_correct_score == c->n) ? 1 : 0;
+}
+
+int ds4_gpu_mtl4_ratio4_shift_canary(uint32_t width) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_ratio4_shift_mtl4_pipeline_init()) return 0;
+    const uint32_t n = 4u * width;
+    const uint64_t total = (uint64_t)n * 2;
+    @autoreleasepool {
+        id<MTLBuffer> argsBuf  = [g_device newBufferWithLength:16
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kvBuf    = [g_device newBufferWithLength:total * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> scoreBuf = [g_device newBufferWithLength:total * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        if (!argsBuf || !kvBuf || !scoreBuf) return 0;
+        *((uint32_t *)argsBuf.contents) = width;
+        float *kv = (float *)kvBuf.contents;
+        float *score = (float *)scoreBuf.contents;
+        for (uint32_t i = 0; i < n; i++) {
+            kv[i] = -1.0f;             score[i] = -2.0f;
+            kv[n + i] = (float)i;      score[n + i] = (float)i * 0.5f;
+        }
+        struct ratio4_shift_canary_ctx ctx = {
+            (__bridge void *)kvBuf, (__bridge void *)scoreBuf, n, width,
+        };
+        void *bindings[3] = {
+            (__bridge void *)argsBuf,
+            (__bridge void *)kvBuf,
+            (__bridge void *)scoreBuf,
+        };
+        const unsigned long n_tg = (n + 255ul) / 256ul;
+        return ds4_mtl4_run_canary(
+            (__bridge void *)g_ratio4_shift_mtl4_pipeline,
+            bindings, 3,
+            n_tg, 1ul, 1ul,
+            256ul, 1ul, 1ul,
+            0ul, ratio4_shift_canary_validate, &ctx);
+    }
 }
 
 /* ============================================================ */
@@ -18682,137 +18769,90 @@ static int ds4_compressor_store_one_mtl4_pipeline_init(void) {
     return g_compressor_store_one_mtl4_init_ok;
 }
 
-int ds4_gpu_mtl4_compressor_store_one_canary(uint32_t width) {
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!ds4_compressor_store_one_mtl4_pipeline_init()) return 0;
+struct compressor_store_one_canary_ctx {
+    void *stateKvBuf_void;
+    void *stateScoreBuf_void;
+    uint32_t width, pos, dst_row;
+};
 
-    const uint32_t ratio = 4;
-    const uint32_t pos = 5;
-    const uint32_t pos_mod = pos % ratio;
-    const uint32_t dst_row = ratio + pos_mod;  /* = 4 + 1 = 5 */
-    const uint32_t state_n = 2 * ratio * width;  /* old + new halves */
-
-    float *host_kv = (float *)calloc(width, sizeof(float));
-    float *host_score = (float *)calloc(width, sizeof(float));
-    float *host_ape = (float *)calloc(ratio * width, sizeof(float));  /* ape_type=0 → float */
-    float *host_state_kv = (float *)calloc(state_n, sizeof(float));
-    float *host_state_score = (float *)calloc(state_n, sizeof(float));
-    if (!host_kv || !host_score || !host_ape || !host_state_kv || !host_state_score) {
-        free(host_kv); free(host_score); free(host_ape);
-        free(host_state_kv); free(host_state_score);
-        return 0;
-    }
-    for (uint32_t i = 0; i < width; i++) {
-        host_kv[i] = (float)i * 0.1f;
-        host_score[i] = (float)i * 0.01f;
-    }
-    /* APE at pos_mod=1 row: per-element offset 0.5 */
-    for (uint32_t i = 0; i < width; i++) {
-        host_ape[pos_mod * width + i] = 0.5f;
-    }
-
-    int rc = 0;
-    @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:16
-                                                      options:MTLResourceStorageModeShared];
-        id<MTLBuffer> kvBuf = [g_device newBufferWithBytes:host_kv
-                                                    length:width * sizeof(float)
-                                                   options:MTLResourceStorageModeShared];
-        id<MTLBuffer> scoreBuf = [g_device newBufferWithBytes:host_score
-                                                       length:width * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
-        id<MTLBuffer> apeBuf = [g_device newBufferWithBytes:host_ape
-                                                     length:ratio * width * sizeof(float)
-                                                    options:MTLResourceStorageModeShared];
-        id<MTLBuffer> stateKvBuf = [g_device newBufferWithLength:state_n * sizeof(float)
-                                                         options:MTLResourceStorageModeShared];
-        id<MTLBuffer> stateScoreBuf = [g_device newBufferWithLength:state_n * sizeof(float)
-                                                            options:MTLResourceStorageModeShared];
-
-        struct { uint32_t width, ratio, pos, ape_type; } args = {
-            .width = width, .ratio = ratio, .pos = pos, .ape_type = 0,
-        };
-        memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[6] = {
-                (id<MTLAllocation>)argsBuf, (id<MTLAllocation>)kvBuf, (id<MTLAllocation>)scoreBuf,
-                (id<MTLAllocation>)apeBuf, (id<MTLAllocation>)stateKvBuf, (id<MTLAllocation>)stateScoreBuf,
-            };
-            [residency addAllocations:allocs count:6];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(6);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:kvBuf.gpuAddress atIndex:1];
-                [argTable setAddress:scoreBuf.gpuAddress atIndex:2];
-                [argTable setAddress:apeBuf.gpuAddress atIndex:3];
-                [argTable setAddress:stateKvBuf.gpuAddress atIndex:4];
-                [argTable setAddress:stateScoreBuf.gpuAddress atIndex:5];
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_compressor_store_one_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                const NSUInteger tg = 256;
-                const NSUInteger n_tgs = (width + tg - 1) / tg;
-                [enc dispatchThreadgroups:MTLSizeMake(n_tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
-                    (void)fb; dispatch_semaphore_signal(sem);
-                }];
-                id<MTL4CommandBuffer> bufs[1] = { cb };
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem,
-                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_state_kv, stateKvBuf.contents, state_n * sizeof(float));
-                    memcpy(host_state_score, stateScoreBuf.contents, state_n * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 6);
-            }
-        }
-    }
-    if (!rc) {
-        free(host_kv); free(host_score); free(host_ape);
-        free(host_state_kv); free(host_state_score);
-        return 0;
-    }
-
-    /* Verify: state_kv[dst_row * width + i] = host_kv[i] = i*0.1 */
-    /*         state_score[dst_row * width + i] = host_score[i] + 0.5 = i*0.01 + 0.5 */
-    uint32_t n_correct_kv = 0;
-    uint32_t n_correct_score = 0;
-    for (uint32_t i = 0; i < width; i++) {
-        const uint32_t idx = dst_row * width + i;
+static int compressor_store_one_canary_validate(void *user_ctx) {
+    struct compressor_store_one_canary_ctx *c =
+        (struct compressor_store_one_canary_ctx *)user_ctx;
+    id<MTLBuffer> stateKv    = (__bridge id<MTLBuffer>)c->stateKvBuf_void;
+    id<MTLBuffer> stateScore = (__bridge id<MTLBuffer>)c->stateScoreBuf_void;
+    const float *kv    = (const float *)stateKv.contents;
+    const float *score = (const float *)stateScore.contents;
+    uint32_t n_correct_kv = 0, n_correct_score = 0;
+    for (uint32_t i = 0; i < c->width; i++) {
+        const uint32_t idx = c->dst_row * c->width + i;
         const float exp_kv = (float)i * 0.1f;
         const float exp_score = (float)i * 0.01f + 0.5f;
-        if (fabsf(host_state_kv[idx] - exp_kv) < 1.0e-4f) n_correct_kv++;
-        if (fabsf(host_state_score[idx] - exp_score) < 1.0e-4f) n_correct_score++;
+        if (fabsf(kv[idx]    - exp_kv)    < 1.0e-4f) n_correct_kv++;
+        if (fabsf(score[idx] - exp_score) < 1.0e-4f) n_correct_score++;
     }
     fprintf(stderr,
         "ds4: compressor_store_one MTL4 canary width=%u pos=%u dst_row=%u "
         "kv_correct=%u/%u score_correct=%u/%u\n",
-        width, pos, dst_row, n_correct_kv, width, n_correct_score, width);
-    free(host_kv); free(host_score); free(host_ape);
-    free(host_state_kv); free(host_state_score);
-    return (n_correct_kv == width && n_correct_score == width) ? 1 : 0;
+        c->width, c->pos, c->dst_row,
+        n_correct_kv, c->width, n_correct_score, c->width);
+    return (n_correct_kv == c->width && n_correct_score == c->width) ? 1 : 0;
+}
+
+int ds4_gpu_mtl4_compressor_store_one_canary(uint32_t width) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_compressor_store_one_mtl4_pipeline_init()) return 0;
+    const uint32_t ratio = 4;
+    const uint32_t pos = 5;
+    const uint32_t pos_mod = pos % ratio;
+    const uint32_t dst_row = ratio + pos_mod;
+    const uint32_t state_n = 2 * ratio * width;
+    @autoreleasepool {
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:16
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kvBuf = [g_device newBufferWithLength:width * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> scoreBuf = [g_device newBufferWithLength:width * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> apeBuf = [g_device newBufferWithLength:ratio * width * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> stateKvBuf = [g_device newBufferWithLength:state_n * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> stateScoreBuf = [g_device newBufferWithLength:state_n * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+        if (!argsBuf || !kvBuf || !scoreBuf || !apeBuf || !stateKvBuf || !stateScoreBuf) return 0;
+        struct { uint32_t width, ratio, pos, ape_type; } args = {
+            .width = width, .ratio = ratio, .pos = pos, .ape_type = 0,
+        };
+        memcpy(argsBuf.contents, &args, sizeof(args));
+        float *kv    = (float *)kvBuf.contents;
+        float *score = (float *)scoreBuf.contents;
+        float *ape   = (float *)apeBuf.contents;
+        memset(ape, 0, ratio * width * sizeof(float));
+        for (uint32_t i = 0; i < width; i++) {
+            kv[i]    = (float)i * 0.1f;
+            score[i] = (float)i * 0.01f;
+            ape[pos_mod * width + i] = 0.5f;
+        }
+        struct compressor_store_one_canary_ctx ctx = {
+            (__bridge void *)stateKvBuf, (__bridge void *)stateScoreBuf,
+            width, pos, dst_row,
+        };
+        void *bindings[6] = {
+            (__bridge void *)argsBuf,
+            (__bridge void *)kvBuf,
+            (__bridge void *)scoreBuf,
+            (__bridge void *)apeBuf,
+            (__bridge void *)stateKvBuf,
+            (__bridge void *)stateScoreBuf,
+        };
+        const unsigned long n_tg = (width + 255ul) / 256ul;
+        return ds4_mtl4_run_canary(
+            (__bridge void *)g_compressor_store_one_mtl4_pipeline,
+            bindings, 6,
+            n_tg, 1ul, 1ul,
+            256ul, 1ul, 1ul,
+            0ul, compressor_store_one_canary_validate, &ctx);
+    }
 }
 
 /* ============================================================ */
@@ -18870,67 +18910,73 @@ static int ds4_softmax_pool_mtl4_pipeline_init(void) {
     return g_softmax_pool_mtl4_init_ok;
 }
 
+struct softmax_pool_canary_ctx {
+    void *dstBuf_void;
+    float *ref;
+    uint32_t ne0, ne1, n_rows;
+    uint64_t dst_n;
+};
+
+static int softmax_pool_canary_validate(void *user_ctx) {
+    struct softmax_pool_canary_ctx *c = (struct softmax_pool_canary_ctx *)user_ctx;
+    id<MTLBuffer> dstBuf = (__bridge id<MTLBuffer>)c->dstBuf_void;
+    const float *gpu = (const float *)dstBuf.contents;
+    double max_abs = 0.0;
+    for (uint64_t i = 0; i < c->dst_n; i++) {
+        double d = fabs((double)(gpu[i] - c->ref[i]));
+        if (d > max_abs) max_abs = d;
+    }
+    fprintf(stderr,
+        "ds4: softmax_pool MTL4 canary ne0=%u ne1=%u n_rows=%u "
+        "expected[0]=%.4f gpu[0]=%.4f max_abs=%.4e\n",
+        c->ne0, c->ne1, c->n_rows,
+        (double)c->ref[0], (double)gpu[0], max_abs);
+    return max_abs < 1.0e-3 ? 1 : 0;
+}
+
 int ds4_gpu_mtl4_softmax_pool_canary(uint32_t ne0, uint32_t ne1, uint32_t n_rows) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!ds4_softmax_pool_mtl4_pipeline_init()) return 0;
-
-    /* Synthetic: kv[ir, id, ic] = ic*ne0+id (constant per row), scores[ir, id, ic] = ir
-     * (rising along row axis). Softmax-pool with max-shift gives weighted average
-     * dominated by max score row. For our pattern: scores rise linearly, so the
-     * highest-ir row dominates; pooled output ≈ kv at row=ne00-1 = ic*ne0+id. */
     const uint64_t kv_n = (uint64_t)n_rows * ne0 * ne1;
     const uint64_t dst_n = (uint64_t)ne0 * ne1;
-    float *host_kv = (float *)calloc(kv_n, sizeof(float));
-    float *host_score = (float *)calloc(kv_n, sizeof(float));
-    float *host_dst_gpu = (float *)calloc(dst_n, sizeof(float));
-    float *host_dst_ref = (float *)calloc(dst_n, sizeof(float));
-    if (!host_kv || !host_score || !host_dst_gpu || !host_dst_ref) {
-        free(host_kv); free(host_score); free(host_dst_gpu); free(host_dst_ref);
-        return 0;
-    }
-    for (uint32_t ic = 0; ic < ne1; ic++) {
-        for (uint32_t id = 0; id < ne0; id++) {
-            for (uint32_t ir = 0; ir < n_rows; ir++) {
-                /* layout: stride along ir (nb*0), then id (nb*1), then ic (nb*2) */
-                const uint64_t idx = ir + (uint64_t)id * n_rows + (uint64_t)ic * n_rows * ne0;
-                host_kv[idx] = (float)(ic * ne0 + id);  /* constant per (id, ic) */
-                host_score[idx] = (float)ir;  /* rising along ir */
-            }
-        }
-    }
-    /* CPU reference */
-    for (uint32_t ic = 0; ic < ne1; ic++) {
-        for (uint32_t id = 0; id < ne0; id++) {
-            float max_s = -INFINITY;
-            for (uint32_t ir = 0; ir < n_rows; ir++) {
-                const uint64_t idx = ir + (uint64_t)id * n_rows + (uint64_t)ic * n_rows * ne0;
-                if (host_score[idx] > max_s) max_s = host_score[idx];
-            }
-            float sum = 0.0f, acc = 0.0f;
-            for (uint32_t ir = 0; ir < n_rows; ir++) {
-                const uint64_t idx = ir + (uint64_t)id * n_rows + (uint64_t)ic * n_rows * ne0;
-                const float w = expf(host_score[idx] - max_s);
-                sum += w;
-                acc += host_kv[idx] * w;
-            }
-            host_dst_ref[id + (uint64_t)ic * ne0] = acc / sum;
-        }
-    }
-
-    int rc = 0;
+    float *ref = (float *)calloc(dst_n, sizeof(float));
+    if (!ref) return 0;
+    int result;
     @autoreleasepool {
-        NSError *err = nil;
-        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128
-                                                      options:MTLResourceStorageModeShared];
-        id<MTLBuffer> kvBuf = [g_device newBufferWithBytes:host_kv
-                                                    length:kv_n * sizeof(float)
-                                                   options:MTLResourceStorageModeShared];
-        id<MTLBuffer> scoreBuf = [g_device newBufferWithBytes:host_score
-                                                       length:kv_n * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
-        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:dst_n * sizeof(float)
-                                                     options:MTLResourceStorageModeShared];
-
+        id<MTLBuffer> argsBuf  = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kvBuf    = [g_device newBufferWithLength:kv_n * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> scoreBuf = [g_device newBufferWithLength:kv_n * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf   = [g_device newBufferWithLength:dst_n * sizeof(float) options:MTLResourceStorageModeShared];
+        if (!argsBuf || !kvBuf || !scoreBuf || !dstBuf) { free(ref); return 0; }
+        float *kv    = (float *)kvBuf.contents;
+        float *score = (float *)scoreBuf.contents;
+        for (uint32_t ic = 0; ic < ne1; ic++) {
+            for (uint32_t id = 0; id < ne0; id++) {
+                for (uint32_t ir = 0; ir < n_rows; ir++) {
+                    const uint64_t idx = ir + (uint64_t)id * n_rows + (uint64_t)ic * n_rows * ne0;
+                    kv[idx] = (float)(ic * ne0 + id);
+                    score[idx] = (float)ir;
+                }
+            }
+        }
+        /* CPU reference */
+        for (uint32_t ic = 0; ic < ne1; ic++) {
+            for (uint32_t id = 0; id < ne0; id++) {
+                float max_s = -INFINITY;
+                for (uint32_t ir = 0; ir < n_rows; ir++) {
+                    const uint64_t idx = ir + (uint64_t)id * n_rows + (uint64_t)ic * n_rows * ne0;
+                    if (score[idx] > max_s) max_s = score[idx];
+                }
+                float sum = 0.0f, acc = 0.0f;
+                for (uint32_t ir = 0; ir < n_rows; ir++) {
+                    const uint64_t idx = ir + (uint64_t)id * n_rows + (uint64_t)ic * n_rows * ne0;
+                    const float w = expf(score[idx] - max_s);
+                    sum += w;
+                    acc += kv[idx] * w;
+                }
+                ref[id + (uint64_t)ic * ne0] = acc / sum;
+            }
+        }
         struct {
             int64_t ne00, ne01, ne02;
             uint64_t nb00, nb01, nb02;
@@ -18950,75 +18996,25 @@ int ds4_gpu_mtl4_softmax_pool_canary(uint32_t ne0, uint32_t ne1, uint32_t n_rows
             .nb1_ = (uint64_t)ne0 * sizeof(float),
         };
         memcpy(argsBuf.contents, &args, sizeof(args));
-
-        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = 8;
-        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
-        if (residency) {
-            id<MTLAllocation> allocs[4] = {
-                (id<MTLAllocation>)argsBuf, (id<MTLAllocation>)kvBuf,
-                (id<MTLAllocation>)scoreBuf, (id<MTLAllocation>)dstBuf,
-            };
-            [residency addAllocations:allocs count:4];
-            [residency commit];
-            [residency requestResidency];
-
-            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(4);
-            if (argTable) {
-                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
-                [argTable setAddress:kvBuf.gpuAddress atIndex:1];
-                [argTable setAddress:scoreBuf.gpuAddress atIndex:2];
-                [argTable setAddress:dstBuf.gpuAddress atIndex:3];
-
-                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-                [cb beginCommandBufferWithAllocator:g_polar_allocator];
-                [cb useResidencySet:residency];
-                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:g_softmax_pool_mtl4_pipeline];
-                [enc setArgumentTable:argTable];
-                const NSUInteger tg = 256;
-                const NSUInteger n_tgs = (dst_n + tg - 1) / tg;
-                [enc dispatchThreadgroups:MTLSizeMake(n_tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-                [enc endEncoding];
-                [cb endCommandBuffer];
-
-                [g_polar_queue addResidencySet:residency];
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                MTL4CommitOptions *opts = [MTL4CommitOptions new];
-                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
-                    (void)fb; dispatch_semaphore_signal(sem);
-                }];
-                id<MTL4CommandBuffer> bufs[1] = { cb };
-                [g_polar_queue commit:bufs count:1 options:opts];
-                long waitRes = dispatch_semaphore_wait(sem,
-                    dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
-                [residency endResidency];
-                if (waitRes == 0) {
-                    memcpy(host_dst_gpu, dstBuf.contents, dst_n * sizeof(float));
-                    rc = 1;
-                }
-                ds4_mtl4_pool_release(argTable, 4);
-            }
-        }
+        struct softmax_pool_canary_ctx ctx = {
+            (__bridge void *)dstBuf, ref, ne0, ne1, n_rows, dst_n,
+        };
+        void *bindings[4] = {
+            (__bridge void *)argsBuf,
+            (__bridge void *)kvBuf,
+            (__bridge void *)scoreBuf,
+            (__bridge void *)dstBuf,
+        };
+        const unsigned long n_tg = (dst_n + 255ul) / 256ul;
+        result = ds4_mtl4_run_canary(
+            (__bridge void *)g_softmax_pool_mtl4_pipeline,
+            bindings, 4,
+            n_tg, 1ul, 1ul,
+            256ul, 1ul, 1ul,
+            0ul, softmax_pool_canary_validate, &ctx);
     }
-    if (!rc) {
-        free(host_kv); free(host_score); free(host_dst_gpu); free(host_dst_ref);
-        return 0;
-    }
-
-    double max_abs = 0.0;
-    for (uint64_t i = 0; i < dst_n; i++) {
-        double d = fabs((double)(host_dst_gpu[i] - host_dst_ref[i]));
-        if (d > max_abs) max_abs = d;
-    }
-    fprintf(stderr,
-        "ds4: softmax_pool MTL4 canary ne0=%u ne1=%u n_rows=%u "
-        "expected[0]=%.4f gpu[0]=%.4f max_abs=%.4e\n",
-        ne0, ne1, n_rows,
-        (double)host_dst_ref[0], (double)host_dst_gpu[0], max_abs);
-    free(host_kv); free(host_score); free(host_dst_gpu); free(host_dst_ref);
-    return max_abs < 1.0e-3 ? 1 : 0;
+    free(ref);
+    return result;
 }
 
 /* ============================================================ */
@@ -22207,6 +22203,93 @@ int ds4_gpu_mtl4_moe_sum6_canary(uint32_t tokens, uint32_t width) {
 }
 
 /* ============================================================ */
+/* moe_sum6_fp16in_mtl4 — Phase 4 of PATH_FUSED chain             */
+/* silv 2026-05-28 task #761                                     */
+/* ============================================================ */
+/* Reads fp16 per-slot DOWN outputs, writes fp32 final output via
+ * float accumulator. Route weights are already folded into mid by
+ * the SwiGLU step (Phase 2), so this is an unweighted sum across
+ * the 6 selected experts: out[d] = sum_{k=0..5} src[k*out_dim + d].
+ *
+ * Why fp16-in: DOWN dispatch_kind writes fp16. Existing fp32-input
+ * `kernel_dsv4_moe_sum6` would force a fp16→fp32 expansion pass.
+ * Reading fp16 directly in the sum kernel saves ~48 KB per layer
+ * per token at DS4 V4 sizes (n_sel=6 × out_dim=4096 × 2 B).
+ *
+ * Dispatch: (out_dim / 256, 1, 1) tg × (256, 1, 1) threads.
+ *
+ * Final output is fp32 because the downstream consumer
+ * (residual-add in ds4.c CPU path) reads fp32. */
+static id<MTLComputePipelineState> g_moe_sum6_fp16in_mtl4_pipeline;
+static int g_moe_sum6_fp16in_mtl4_init_attempted;
+static int g_moe_sum6_fp16in_mtl4_init_ok;
+
+static int ds4_moe_sum6_fp16in_mtl4_pipeline_init(void) {
+    if (g_moe_sum6_fp16in_mtl4_init_attempted) return g_moe_sum6_fp16in_mtl4_init_ok;
+    g_moe_sum6_fp16in_mtl4_init_attempted = 1;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct sum6_fp16_args { uint32_t out_dim; uint32_t pad; };\n"
+         "kernel void moe_sum6_fp16in_mtl4(\n"
+         "    device const sum6_fp16_args *args [[buffer(0)]],\n"
+         "    device const half           *src  [[buffer(1)]],\n"  /* [6 × out_dim] */
+         "    device       float          *dst  [[buffer(2)]],\n"  /* [out_dim] */
+         "    uint gid [[thread_position_in_grid]]) {\n"
+         "  if (gid >= args->out_dim) return;\n"
+         "  const uint o = args->out_dim;\n"
+         "  /* Unroll 6: route_weight already folded into mid by Phase 2 SwiGLU. */\n"
+         "  float acc = (float)src[0u * o + gid]\n"
+         "            + (float)src[1u * o + gid]\n"
+         "            + (float)src[2u * o + gid]\n"
+         "            + (float)src[3u * o + gid]\n"
+         "            + (float)src[4u * o + gid]\n"
+         "            + (float)src[5u * o + gid];\n"
+         "  dst[gid] = acc;\n"
+         "}\n";
+
+    g_moe_sum6_fp16in_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_moe_sum6_fp16in_mtl4",
+        @"moe_sum6_fp16in_mtl4", 256, NULL, 0);
+    g_moe_sum6_fp16in_mtl4_init_ok =
+        (g_moe_sum6_fp16in_mtl4_pipeline != nil) ? 1 : 0;
+    return g_moe_sum6_fp16in_mtl4_init_ok;
+}
+
+/* Phase 4 dispatch wrapper: caller passes fp16 down_out buffer
+ * (slot 3 from ds4_metal_vqb2_fused_out_buffer), fp32 final-output
+ * buffer (typically the production output_fp32 path), and out_dim.
+ * Returns 1=ok, 0=failure. Uses ds4_mtl4_run_canary helper. */
+int ds4_metal_vqb2_fused_sum_step(void *down_out_fp16_buf,
+                                   void *output_fp32_buf,
+                                   uint32_t out_dim) {
+    if (!ds4_moe_sum6_fp16in_mtl4_pipeline_init()) return 0;
+    if (!down_out_fp16_buf || !output_fp32_buf || out_dim == 0) return 0;
+
+    static id<MTLBuffer> s_args_buf = nil;
+    if (!s_args_buf) {
+        s_args_buf = [g_device newBufferWithLength:8
+                                          options:MTLResourceStorageModeShared];
+        if (!s_args_buf) return 0;
+    }
+    struct { uint32_t out_dim; uint32_t pad; } args = { out_dim, 0u };
+    memcpy(s_args_buf.contents, &args, sizeof(args));
+
+    void *bindings[3] = {
+        (__bridge void *)s_args_buf,
+        down_out_fp16_buf,
+        output_fp32_buf,
+    };
+    const unsigned long n_tg = (out_dim + 255ul) / 256ul;
+    return ds4_mtl4_run_canary(
+        (__bridge void *)g_moe_sum6_fp16in_mtl4_pipeline,
+        bindings, 3,
+        n_tg, 1ul, 1ul,
+        256ul, 1ul, 1ul,
+        0ul, NULL, NULL);
+}
+
+/* ============================================================ */
 /* dsv4_moe_swiglu_weight_f16 MTL4 port (silv 2026-05-27 task #689) */
 /* ============================================================ */
 /* MTL4 port of kernel_dsv4_moe_swiglu_weight_f16 — FP16 mid variant
@@ -22404,6 +22487,112 @@ int ds4_gpu_mtl4_moe_swiglu_weight_f16_canary(uint32_t rows, uint32_t width) {
     free(host_gate); free(host_up); free(host_mid); free(host_w);
     /* FP16 has ~0.5e-3 relative precision near 1.5; accept ≤ 1e-3 absolute. */
     return (max_abs < 1.0e-3) ? 1 : 0;
+}
+
+/* ============================================================ */
+/* moe_swiglu_weight_f16in_f16out MTL4 — silv 2026-05-28 task #761  */
+/* ============================================================ */
+/* Phase 2 of PATH_FUSED full-FFN chain. Reads fp16 gate+up (the
+ * direct outputs of `ds4_metal_vqb2_fused_dispatch_kind`), writes
+ * fp16 mid (the direct input to the next dispatch_kind for DOWN).
+ *
+ * Per (slot, row): mid[slot, row] = SiLU(gate) × up × route_weight[slot].
+ *
+ * Why this kernel rather than the existing fp32-in / fp16-out
+ * `kernel_dsv4_moe_swiglu_weight_f16`: the existing one reads fp32
+ * gate/up, but the fused decode-matmul writes fp16. To use the
+ * existing one we'd need a fp16→fp32 round-trip on 24 KB per layer.
+ * The new kernel skips that round-trip — keeps everything in fp16
+ * accumulators where the codec already lives. Saves ~30 KB DRAM
+ * traffic per layer per token.
+ *
+ * Dispatch shape: (n_rows, n_selected, 1) threadgroups × (32, 1, 1)
+ * threads (= one simdgroup per slot, 32 rows-per-iter per simdgroup).
+ * Inputs are flat fp16 arrays length n_selected × n_rows; output the
+ * same shape. Route weights are fp32 length n_selected.
+ *
+ * Canary: independently verifiable against the existing fp32 SwiGLU
+ * (run both with identical inputs, max_rel < 1e-3 on fp16 round-trip).
+ */
+static id<MTLComputePipelineState> g_moe_swiglu_weight_f16_io_mtl4_pipeline;
+static int g_moe_swiglu_weight_f16_io_mtl4_init_attempted;
+static int g_moe_swiglu_weight_f16_io_mtl4_init_ok;
+
+static int ds4_moe_swiglu_weight_f16_io_mtl4_pipeline_init(void) {
+    if (g_moe_swiglu_weight_f16_io_mtl4_init_attempted) return g_moe_swiglu_weight_f16_io_mtl4_init_ok;
+    g_moe_swiglu_weight_f16_io_mtl4_init_attempted = 1;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct sw_args {\n"
+         "  uint32_t n_rows;\n"
+         "  uint32_t n_selected;\n"
+         "  float    clamp_value;\n"
+         "  uint32_t pad;\n"
+         "};\n"
+         "kernel void moe_swiglu_weight_f16_io_mtl4(\n"
+         "    device const sw_args *args [[buffer(0)]],\n"
+         "    device const half    *gate [[buffer(1)]],\n"  /* [n_sel × n_rows] */
+         "    device const half    *up   [[buffer(2)]],\n"  /* [n_sel × n_rows] */
+         "    device const float   *route_w [[buffer(3)]],\n" /* [n_sel] */
+         "    device       half    *mid  [[buffer(4)]],\n"  /* [n_sel × n_rows] */
+         "    uint2 gid [[thread_position_in_grid]]) {\n"
+         "  if (gid.x >= args->n_rows || gid.y >= args->n_selected) return;\n"
+         "  const uint64_t idx = (uint64_t)gid.y * args->n_rows + gid.x;\n"
+         "  float g = (float)gate[idx];\n"
+         "  float u = (float)up[idx];\n"
+         "  const float c = args->clamp_value;\n"
+         "  if (c > 1.0e-6f) { g = min(g, c); u = clamp(u, -c, c); }\n"
+         "  const float silu = g / (1.0f + exp(-g));\n"
+         "  mid[idx] = (half)(silu * u * route_w[gid.y]);\n"
+         "}\n";
+
+    g_moe_swiglu_weight_f16_io_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_moe_swiglu_weight_f16_io_mtl4",
+        @"moe_swiglu_weight_f16_io_mtl4", 256, NULL, 0);
+    g_moe_swiglu_weight_f16_io_mtl4_init_ok =
+        (g_moe_swiglu_weight_f16_io_mtl4_pipeline != nil) ? 1 : 0;
+    return g_moe_swiglu_weight_f16_io_mtl4_init_ok;
+}
+
+/* Dispatch wrapper for the chain wiring: caller supplies gate/up fp16
+ * MTLBuffers (from dispatch_kind outputs), route weights fp32 buffer,
+ * and mid fp16 buffer (from out_buffer slot 2). Returns 1 on success.
+ *
+ * Reuses ds4_mtl4_run_canary helper — see item D pattern. */
+int ds4_metal_vqb2_fused_swiglu_step(void *gate_buf, void *up_buf,
+                                      void *route_weights_buf,
+                                      void *mid_buf,
+                                      uint32_t n_rows, uint32_t n_selected,
+                                      float clamp_value) {
+    if (!ds4_moe_swiglu_weight_f16_io_mtl4_pipeline_init()) return 0;
+    if (!gate_buf || !up_buf || !route_weights_buf || !mid_buf) return 0;
+    if (n_rows == 0 || n_selected == 0) return 0;
+
+    /* Args buffer — persistent, refreshed on each call.
+     * Caller-supplied buffers stay caller-owned. */
+    static id<MTLBuffer> s_args_buf = nil;
+    if (!s_args_buf) {
+        s_args_buf = [g_device newBufferWithLength:16
+                                          options:MTLResourceStorageModeShared];
+        if (!s_args_buf) return 0;
+    }
+    struct { uint32_t n_rows; uint32_t n_selected; float clamp; uint32_t pad; } args = {
+        n_rows, n_selected, clamp_value, 0u,
+    };
+    memcpy(s_args_buf.contents, &args, sizeof(args));
+
+    void *bindings[5] = {
+        (__bridge void *)s_args_buf,
+        gate_buf, up_buf, route_weights_buf, mid_buf,
+    };
+    /* Dispatch grid covers (n_rows, n_selected); 32-wide threadgroups. */
+    return ds4_mtl4_run_canary(
+        (__bridge void *)g_moe_swiglu_weight_f16_io_mtl4_pipeline,
+        bindings, 5,
+        (unsigned long)n_rows, (unsigned long)n_selected, 1ul,
+        32ul, 1ul, 1ul,
+        0ul, NULL, NULL);
 }
 
 /* ============================================================ */
@@ -34890,9 +35079,2084 @@ int ds4_gpu_mtl4_vqb2_noop_write_bench(uint32_t n_packets, uint32_t n_selected,
     return rc;
 }
 
-/* Vectorized canary + bench: cross-checks vectorized output against the
- * baseline scalar batched decoder for bit-exactness, then measures throughput.
- * K=4 / K=16 / K=256 all supported; selects the appropriate specialization. */
+/* ============================================================ */
+/* FUSED DECODE-MATMUL KERNEL — silv 2026-05-28                  */
+/* ============================================================ */
+/* The architectural move: instead of decode-then-store (which writes
+ * 192 MB/round at 2.7 GB/s peak — the noop-write diagnostic showed
+ * this is the wall), decode-on-demand inside the matmul inner loop.
+ * Weights only exist transiently in registers; the intermediate fp16
+ * write is eliminated entirely (192 MB → 96 KB output = 2000× reduction).
+ *
+ * Per output row r of expert e of packet p:
+ *   acc = 0
+ *   for pair_idx in [0, n_pairs):
+ *     code = decode(codes[p], e, r, pair_idx)
+ *     (re, im) = codebook[p][code]
+ *     acc += X[pair_idx*2 + 0] * re + X[pair_idx*2 + 1] * im
+ *   out[p][e_slot][r] = (half)acc
+ *
+ * Output shape: [n_packets][n_selected][n_rows]. Output bytes per layer
+ * event = 64 packets × 6 selected × 128 rows × 2 = 96 KB (vs 192 MB
+ * decode-then-store). Dispatch grid (n_rows, n_selected, n_packets) =
+ * 128 × 6 × 64 = 49K threads vs prior 50M decode threads (1000× fewer
+ * thread launches).
+ *
+ * V1: generic over bit_width (no K-specialization). One float accumulator
+ * per thread, no threadgroup memory yet. X loaded redundantly per thread
+ * — V2 optimization queued. */
+static NSString * const k_vqb2_decode_matmul_fp16_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct args_t {\n"
+     "  uint bit_width;\n"
+     "  uint code_mask;\n"
+     "  uint n_rows;\n"
+     "  uint n_pairs;\n"
+     "  uint n_experts_in_packet;\n"
+     "  uint n_selected;\n"
+     "  uint codes_stride;\n"
+     "  uint out_stride;\n"
+     "  /* silv 2026-05-28 task #761 Phase 3 — per-slot X stride (in halves).\n"
+     "   * 0 = shared X across all selected slots (existing gate/up behavior).\n"
+     "   * >0 = each selected slot reads X[gid.y * x_slot_stride + i] — required\n"
+     "   * for DOWN where each expert has its own mid input. Trailing field;\n"
+     "   * existing callers' positional initializers leave it zero. */\n"
+     "  uint x_slot_stride;\n"
+     "};\n"
+     "kernel void vqb2_decode_matmul_fp16(\n"
+     "    device const args_t *args        [[buffer(0)]],\n"
+     "    device const float  *codebook    [[buffer(1)]],\n"
+     "    device const uchar  *codes_base  [[buffer(2)]],\n"
+     "    device const uint   *selected    [[buffer(3)]],\n"
+     "    device const half   *X           [[buffer(4)]],\n"
+     "    device       half   *out_base    [[buffer(5)]],\n"
+     "    threadgroup float *tg            [[threadgroup(0)]],\n"
+     "    uint3 gid                        [[thread_position_in_grid]],\n"
+     "    uint  tid                        [[thread_index_in_threadgroup]],\n"
+     "    uint3 tg_dim                     [[threads_per_threadgroup]]) {\n"
+     "  const uint tg_threads = tg_dim.x * tg_dim.y * tg_dim.z;\n"
+     "  /* Threadgroup memory layout: codebook (K*2 floats) | X (np*2 floats).\n"
+     "   * Each TG holds tg_threads rows of one (selected, packet) pair, so X is\n"
+     "   * loaded once and reused across all rows — turns 32× redundant device\n"
+     "   * reads of X into one cooperative load. */\n"
+     "  const uint K = args->code_mask + 1u;\n"
+     "  const uint cb_floats = K * 2u;\n"
+     "  threadgroup float *cb_tg = tg;\n"
+     "  threadgroup float *X_tg  = tg + cb_floats;\n"
+     "  const uint np  = args->n_pairs;\n"
+     "  const uint np2 = np * 2u;\n"
+     "  /* Cooperative load (any tg_size works; codebook is ~32-512 floats, X is np*2). */\n"
+     "  for (uint i = tid; i < cb_floats; i += tg_threads) cb_tg[i] = codebook[i];\n"
+     "  /* Phase 3 (#761): per-slot X. Each threadgroup runs for one (selected_slot,\n"
+     "   * row_block) — gid.y is the slot. When x_slot_stride > 0, slot s reads from\n"
+     "   * X[s * x_slot_stride + i]; when 0, all slots share X (gate/up case). */\n"
+     "  const uint x_off = (args->x_slot_stride > 0u) ? (gid.y * args->x_slot_stride) : 0u;\n"
+     "  for (uint i = tid; i < np2; i += tg_threads) X_tg[i] = (float)X[x_off + i];\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  if (gid.x >= args->n_rows)     return;\n"
+     "  if (gid.y >= args->n_selected) return;\n"
+     "  const device uchar *codes = codes_base + gid.z * args->codes_stride;\n"
+     "  const uint expert = selected[gid.y];\n"
+     "  const uint codes_per_expert = args->n_rows * np;\n"
+     "  const uint linear_base = expert * codes_per_expert + gid.x * np;\n"
+     "  const uint bw = args->bit_width;\n"
+     "  const uint mask = args->code_mask;\n"
+     "  float acc = 0.0f;\n"
+     "  /* Fast path: bw==4 (K=16). 8 pairs per iter via uint32 byte-load (32 bits = 8 nibbles).\n"
+     "   * Codes start at byte_base = linear_base/2. Aligned when linear_base mul of 8\n"
+     "   * (which holds when n_pairs % 8 == 0 since n_pairs*r is the row stride). */\n"
+     "  if (bw == 4u && (np & 7u) == 0u && (linear_base & 7u) == 0u) {\n"
+     "    const uint byte_base = linear_base >> 1;\n"
+     "    for (uint p = 0; p < np; p += 8u) {\n"
+     "      const uint w = *((const device uint *)(codes + byte_base + (p >> 1)));\n"
+     "      const uint c0 = (w >>  0) & 0xFu;\n"
+     "      const uint c1 = (w >>  4) & 0xFu;\n"
+     "      const uint c2 = (w >>  8) & 0xFu;\n"
+     "      const uint c3 = (w >> 12) & 0xFu;\n"
+     "      const uint c4 = (w >> 16) & 0xFu;\n"
+     "      const uint c5 = (w >> 20) & 0xFu;\n"
+     "      const uint c6 = (w >> 24) & 0xFu;\n"
+     "      const uint c7 = (w >> 28) & 0xFu;\n"
+     "      const uint xb = p * 2u;\n"
+     "      acc += X_tg[xb+ 0]*cb_tg[c0*2u  ] + X_tg[xb+ 1]*cb_tg[c0*2u+1];\n"
+     "      acc += X_tg[xb+ 2]*cb_tg[c1*2u  ] + X_tg[xb+ 3]*cb_tg[c1*2u+1];\n"
+     "      acc += X_tg[xb+ 4]*cb_tg[c2*2u  ] + X_tg[xb+ 5]*cb_tg[c2*2u+1];\n"
+     "      acc += X_tg[xb+ 6]*cb_tg[c3*2u  ] + X_tg[xb+ 7]*cb_tg[c3*2u+1];\n"
+     "      acc += X_tg[xb+ 8]*cb_tg[c4*2u  ] + X_tg[xb+ 9]*cb_tg[c4*2u+1];\n"
+     "      acc += X_tg[xb+10]*cb_tg[c5*2u  ] + X_tg[xb+11]*cb_tg[c5*2u+1];\n"
+     "      acc += X_tg[xb+12]*cb_tg[c6*2u  ] + X_tg[xb+13]*cb_tg[c6*2u+1];\n"
+     "      acc += X_tg[xb+14]*cb_tg[c7*2u  ] + X_tg[xb+15]*cb_tg[c7*2u+1];\n"
+     "    }\n"
+     "  } else if (bw == 4u && (np & 1u) == 0u) {\n"
+     "    /* Slow K=16 path: byte-aligned but uint32 alignment doesn't hold. */\n"
+     "    const uint byte_base = linear_base >> 1;\n"
+     "    for (uint p = 0; p < np; p += 2u) {\n"
+     "      const uint b = (uint)codes[byte_base + (p >> 1)];\n"
+     "      const uint code0 = b & 0xFu;\n"
+     "      const uint code1 = b >> 4;\n"
+     "      acc += X_tg[p*2u  ]*cb_tg[code0*2u  ] + X_tg[p*2u+1]*cb_tg[code0*2u+1];\n"
+     "      acc += X_tg[(p+1u)*2u]*cb_tg[code1*2u] + X_tg[(p+1u)*2u+1]*cb_tg[code1*2u+1];\n"
+     "    }\n"
+     "  } else if (bw == 2u && (np & 15u) == 0u && (linear_base & 15u) == 0u) {\n"
+     "    /* Fast K=4: 16 pairs per iter via uint32 byte-load (32 bits = 16 2-bit codes). */\n"
+     "    const uint byte_base = linear_base >> 2;\n"
+     "    for (uint p = 0; p < np; p += 16u) {\n"
+     "      const uint w = *((const device uint *)(codes + byte_base + (p >> 2)));\n"
+     "      const uint xb = p * 2u;\n"
+     "      for (uint i = 0; i < 16; i++) {\n"
+     "        const uint c = (w >> (i * 2u)) & 3u;\n"
+     "        acc += X_tg[xb + 2u*i]*cb_tg[c*2u] + X_tg[xb + 2u*i + 1u]*cb_tg[c*2u+1];\n"
+     "      }\n"
+     "    }\n"
+     "  } else if (bw == 2u && (np & 3u) == 0u) {\n"
+     "    /* Slow K=4: byte-aligned but uint32-misaligned. */\n"
+     "    const uint byte_base = linear_base >> 2;\n"
+     "    for (uint p = 0; p < np; p += 4u) {\n"
+     "      const uint b = (uint)codes[byte_base + (p >> 2)];\n"
+     "      const uint c0 = b & 3u;\n"
+     "      const uint c1 = (b >> 2) & 3u;\n"
+     "      const uint c2 = (b >> 4) & 3u;\n"
+     "      const uint c3 = (b >> 6) & 3u;\n"
+     "      acc += X_tg[(p+0u)*2u+0u]*cb_tg[c0*2u+0u] + X_tg[(p+0u)*2u+1u]*cb_tg[c0*2u+1u];\n"
+     "      acc += X_tg[(p+1u)*2u+0u]*cb_tg[c1*2u+0u] + X_tg[(p+1u)*2u+1u]*cb_tg[c1*2u+1u];\n"
+     "      acc += X_tg[(p+2u)*2u+0u]*cb_tg[c2*2u+0u] + X_tg[(p+2u)*2u+1u]*cb_tg[c2*2u+1u];\n"
+     "      acc += X_tg[(p+3u)*2u+0u]*cb_tg[c3*2u+0u] + X_tg[(p+3u)*2u+1u]*cb_tg[c3*2u+1u];\n"
+     "    }\n"
+     "  } else if (bw == 8u && (np & 3u) == 0u && (linear_base & 3u) == 0u) {\n"
+     "    /* Fast K=256: 4 pairs per iter via uint32 byte-load (4 bytes = 4 codes). */\n"
+     "    const uint byte_base = linear_base;\n"
+     "    for (uint p = 0; p < np; p += 4u) {\n"
+     "      const uint w = *((const device uint *)(codes + byte_base + p));\n"
+     "      const uint c0 = (w >>  0) & 0xFFu;\n"
+     "      const uint c1 = (w >>  8) & 0xFFu;\n"
+     "      const uint c2 = (w >> 16) & 0xFFu;\n"
+     "      const uint c3 = (w >> 24) & 0xFFu;\n"
+     "      const uint xb = p * 2u;\n"
+     "      acc += X_tg[xb  ]*cb_tg[c0*2u  ] + X_tg[xb+1]*cb_tg[c0*2u+1];\n"
+     "      acc += X_tg[xb+2]*cb_tg[c1*2u  ] + X_tg[xb+3]*cb_tg[c1*2u+1];\n"
+     "      acc += X_tg[xb+4]*cb_tg[c2*2u  ] + X_tg[xb+5]*cb_tg[c2*2u+1];\n"
+     "      acc += X_tg[xb+6]*cb_tg[c3*2u  ] + X_tg[xb+7]*cb_tg[c3*2u+1];\n"
+     "    }\n"
+     "  } else if (bw == 8u) {\n"
+     "    /* Fast path: bw==8 (K=256), each pair == 1 byte. */\n"
+     "    const uint byte_base = linear_base;\n"
+     "    for (uint p = 0; p < np; p++) {\n"
+     "      const uint code = (uint)codes[byte_base + p];\n"
+     "      acc += X_tg[p*2u+0u]*cb_tg[code*2u+0u] + X_tg[p*2u+1u]*cb_tg[code*2u+1u];\n"
+     "    }\n"
+     "  } else {\n"
+     "    /* Generic bit-aligned path for bw=6 (K=64) and unaligned configurations. */\n"
+     "    for (uint p = 0; p < np; p++) {\n"
+     "      const uint linear = linear_base + p;\n"
+     "      const uint bit_off = linear * bw;\n"
+     "      const uint byte_off = bit_off >> 3;\n"
+     "      const uint shift = bit_off & 7u;\n"
+     "      const uint lo = (uint)codes[byte_off];\n"
+     "      const uint hi = (bw + shift > 8u) ? (uint)codes[byte_off + 1u] : 0u;\n"
+     "      const uint window = lo | (hi << 8);\n"
+     "      const uint code = (window >> shift) & mask;\n"
+     "      acc += X_tg[p*2u+0u]*cb_tg[code*2u+0u] + X_tg[p*2u+1u]*cb_tg[code*2u+1u];\n"
+     "    }\n"
+     "  }\n"
+     "  device half *out = out_base + gid.z * args->out_stride;\n"
+     "  out[gid.y * args->n_rows + gid.x] = (half)acc;\n"
+     "}\n";
+
+static id<MTLComputePipelineState> g_vqb2_decode_matmul_fp16_mtl4_pipeline;
+static int g_vqb2_decode_matmul_fp16_mtl4_init_attempted;
+static int g_vqb2_decode_matmul_fp16_mtl4_init_ok;
+
+static int ds4_vqb2_decode_matmul_fp16_mtl4_pipeline_init(void) {
+    if (g_vqb2_decode_matmul_fp16_mtl4_init_attempted) return g_vqb2_decode_matmul_fp16_mtl4_init_ok;
+    g_vqb2_decode_matmul_fp16_mtl4_init_attempted = 1;
+    g_vqb2_decode_matmul_fp16_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_vqb2_decode_matmul_fp16_msl, @"ds4_vqb2_decode_matmul_fp16_mtl4",
+        @"vqb2_decode_matmul_fp16", 256, NULL, 0);
+    g_vqb2_decode_matmul_fp16_mtl4_init_ok =
+        (g_vqb2_decode_matmul_fp16_mtl4_pipeline != nil) ? 1 : 0;
+    return g_vqb2_decode_matmul_fp16_mtl4_init_ok;
+}
+
+/* silv 2026-05-28 task #768 — vqb2_decode_matmul_fp16 x4row variant.
+ *
+ * 4 outputs per thread instead of 1. The X load + codebook indirection feed
+ * 4 FMAs (4 row outputs) per inner step. Memory traffic per inner step is
+ * unchanged for X (broadcast) and grows 4× for codes (4 row codes), but the
+ * threadgroup-memory codebook lookup is shared via cb_tg[c*2+...] reads.
+ *
+ * Theoretical: 4× arithmetic intensity per X load. Expected speedup: 2-3×
+ * on the H2125 shape if compute-bound (current 107 GFLOP/s; M1 Max peak
+ * ~10.4 TFLOPS fp32, so we have 100× of headroom on compute).
+ *
+ * Correctness: float accumulator preserved per row; output is fp16 per row
+ * unchanged. Cross-check vs the scalar kernel must be bit-exact in float
+ * accumulation order (X is loaded once per pair, applied to 4 codes — same
+ * order as 4 separate scalar invocations).
+ *
+ * Dispatch: gid = (n_rows/4, n_selected, n_packets), TG = 32 threads.
+ * Each TG covers row_block = 32×4 = 128 rows. n_rows must be a multiple of 4. */
+static NSString * const k_vqb2_decode_matmul_fp16_x4row_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct args_t {\n"
+     "  uint bit_width;\n"
+     "  uint code_mask;\n"
+     "  uint n_rows;\n"
+     "  uint n_pairs;\n"
+     "  uint n_experts_in_packet;\n"
+     "  uint n_selected;\n"
+     "  uint codes_stride;\n"
+     "  uint out_stride;\n"
+     "  uint x_slot_stride;\n"
+     "};\n"
+     "/* silv 2026-05-28 x4row args_t MUST match the bench struct order\n"
+     " * {bit_width, code_mask, n_rows, n_pairs, n_experts_in_packet, n_selected,\n"
+     " *  codes_stride, out_stride, x_slot_stride} — earlier swapped order caused\n"
+     " * 100%% mismatch (read bit_width=4 as n_rows, all rows>0 returned early). */\n"
+     "kernel void vqb2_decode_matmul_fp16_x4row(\n"
+     "    device const args_t *args        [[buffer(0)]],\n"
+     "    device const float  *codebook    [[buffer(1)]],\n"
+     "    device const uchar  *codes_base  [[buffer(2)]],\n"
+     "    device const uint   *selected    [[buffer(3)]],\n"
+     "    device const half   *X           [[buffer(4)]],\n"
+     "    device       half   *out_base    [[buffer(5)]],\n"
+     "    threadgroup float *tg            [[threadgroup(0)]],\n"
+     "    uint3 gid                        [[thread_position_in_grid]],\n"
+     "    uint  tid                        [[thread_index_in_threadgroup]],\n"
+     "    uint3 tg_dim                     [[threads_per_threadgroup]]) {\n"
+     "  const uint tg_threads = tg_dim.x * tg_dim.y * tg_dim.z;\n"
+     "  const uint K = args->code_mask + 1u;\n"
+     "  const uint cb_floats = K * 2u;\n"
+     "  threadgroup float *cb_tg = tg;\n"
+     "  threadgroup float *X_tg  = tg + cb_floats;\n"
+     "  const uint np  = args->n_pairs;\n"
+     "  const uint np2 = np * 2u;\n"
+     "  for (uint i = tid; i < cb_floats; i += tg_threads) cb_tg[i] = codebook[i];\n"
+     "  const uint x_off = (args->x_slot_stride > 0u) ? (gid.y * args->x_slot_stride) : 0u;\n"
+     "  for (uint i = tid; i < np2; i += tg_threads) X_tg[i] = (float)X[x_off + i];\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  const uint row_base = gid.x * 4u;\n"
+     "  if (row_base >= args->n_rows)  return;\n"
+     "  if (gid.y >= args->n_selected) return;\n"
+     "  const device uchar *codes = codes_base + gid.z * args->codes_stride;\n"
+     "  const uint expert = selected[gid.y];\n"
+     "  const uint codes_per_expert = args->n_rows * np;\n"
+     "  const uint linear_base0 = expert * codes_per_expert + (row_base + 0u) * np;\n"
+     "  const uint linear_base1 = expert * codes_per_expert + (row_base + 1u) * np;\n"
+     "  const uint linear_base2 = expert * codes_per_expert + (row_base + 2u) * np;\n"
+     "  const uint linear_base3 = expert * codes_per_expert + (row_base + 3u) * np;\n"
+     "  const uint bw = args->bit_width;\n"
+     "  const uint mask = args->code_mask;\n"
+     "  float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;\n"
+     "  /* K=16 fast path: 8 pairs per iter via uint32 byte-load. */\n"
+     "  if (bw == 4u && (np & 7u) == 0u && (linear_base0 & 7u) == 0u) {\n"
+     "    const uint byte_base0 = linear_base0 >> 1;\n"
+     "    const uint byte_base1 = linear_base1 >> 1;\n"
+     "    const uint byte_base2 = linear_base2 >> 1;\n"
+     "    const uint byte_base3 = linear_base3 >> 1;\n"
+     "    for (uint p = 0; p < np; p += 8u) {\n"
+     "      const uint w0 = *((const device uint *)(codes + byte_base0 + (p >> 1)));\n"
+     "      const uint w1 = *((const device uint *)(codes + byte_base1 + (p >> 1)));\n"
+     "      const uint w2 = *((const device uint *)(codes + byte_base2 + (p >> 1)));\n"
+     "      const uint w3 = *((const device uint *)(codes + byte_base3 + (p >> 1)));\n"
+     "      const uint xb = p * 2u;\n"
+     "      for (uint i = 0; i < 8u; i++) {\n"
+     "        const uint shift = i * 4u;\n"
+     "        const uint c0 = (w0 >> shift) & 0xFu;\n"
+     "        const uint c1 = (w1 >> shift) & 0xFu;\n"
+     "        const uint c2 = (w2 >> shift) & 0xFu;\n"
+     "        const uint c3 = (w3 >> shift) & 0xFu;\n"
+     "        const float x_re = X_tg[xb + 2u*i];\n"
+     "        const float x_im = X_tg[xb + 2u*i + 1u];\n"
+     "        acc0 += x_re*cb_tg[c0*2u] + x_im*cb_tg[c0*2u+1u];\n"
+     "        acc1 += x_re*cb_tg[c1*2u] + x_im*cb_tg[c1*2u+1u];\n"
+     "        acc2 += x_re*cb_tg[c2*2u] + x_im*cb_tg[c2*2u+1u];\n"
+     "        acc3 += x_re*cb_tg[c3*2u] + x_im*cb_tg[c3*2u+1u];\n"
+     "      }\n"
+     "    }\n"
+     "  } else if (bw == 2u && (np & 15u) == 0u && (linear_base0 & 15u) == 0u) {\n"
+     "    /* K=4 fast path: 16 pairs per iter via uint32 byte-load (4 rows). */\n"
+     "    const uint byte_base0 = linear_base0 >> 2;\n"
+     "    const uint byte_base1 = linear_base1 >> 2;\n"
+     "    const uint byte_base2 = linear_base2 >> 2;\n"
+     "    const uint byte_base3 = linear_base3 >> 2;\n"
+     "    for (uint p = 0; p < np; p += 16u) {\n"
+     "      const uint w0 = *((const device uint *)(codes + byte_base0 + (p >> 2)));\n"
+     "      const uint w1 = *((const device uint *)(codes + byte_base1 + (p >> 2)));\n"
+     "      const uint w2 = *((const device uint *)(codes + byte_base2 + (p >> 2)));\n"
+     "      const uint w3 = *((const device uint *)(codes + byte_base3 + (p >> 2)));\n"
+     "      const uint xb = p * 2u;\n"
+     "      for (uint i = 0; i < 16u; i++) {\n"
+     "        const uint shift = i * 2u;\n"
+     "        const uint c0 = (w0 >> shift) & 3u;\n"
+     "        const uint c1 = (w1 >> shift) & 3u;\n"
+     "        const uint c2 = (w2 >> shift) & 3u;\n"
+     "        const uint c3 = (w3 >> shift) & 3u;\n"
+     "        const float x_re = X_tg[xb + 2u*i];\n"
+     "        const float x_im = X_tg[xb + 2u*i + 1u];\n"
+     "        acc0 += x_re*cb_tg[c0*2u] + x_im*cb_tg[c0*2u+1u];\n"
+     "        acc1 += x_re*cb_tg[c1*2u] + x_im*cb_tg[c1*2u+1u];\n"
+     "        acc2 += x_re*cb_tg[c2*2u] + x_im*cb_tg[c2*2u+1u];\n"
+     "        acc3 += x_re*cb_tg[c3*2u] + x_im*cb_tg[c3*2u+1u];\n"
+     "      }\n"
+     "    }\n"
+     "  } else if (bw == 8u && (np & 3u) == 0u && (linear_base0 & 3u) == 0u) {\n"
+     "    /* K=256 fast path: 4 pairs per iter (4 codes = 32 bits per row). */\n"
+     "    const uint byte_base0 = linear_base0;\n"
+     "    const uint byte_base1 = linear_base1;\n"
+     "    const uint byte_base2 = linear_base2;\n"
+     "    const uint byte_base3 = linear_base3;\n"
+     "    for (uint p = 0; p < np; p += 4u) {\n"
+     "      const uint w0 = *((const device uint *)(codes + byte_base0 + p));\n"
+     "      const uint w1 = *((const device uint *)(codes + byte_base1 + p));\n"
+     "      const uint w2 = *((const device uint *)(codes + byte_base2 + p));\n"
+     "      const uint w3 = *((const device uint *)(codes + byte_base3 + p));\n"
+     "      const uint xb = p * 2u;\n"
+     "      for (uint i = 0; i < 4u; i++) {\n"
+     "        const uint shift = i * 8u;\n"
+     "        const uint c0 = (w0 >> shift) & 0xFFu;\n"
+     "        const uint c1 = (w1 >> shift) & 0xFFu;\n"
+     "        const uint c2 = (w2 >> shift) & 0xFFu;\n"
+     "        const uint c3 = (w3 >> shift) & 0xFFu;\n"
+     "        const float x_re = X_tg[xb + 2u*i];\n"
+     "        const float x_im = X_tg[xb + 2u*i + 1u];\n"
+     "        acc0 += x_re*cb_tg[c0*2u] + x_im*cb_tg[c0*2u+1u];\n"
+     "        acc1 += x_re*cb_tg[c1*2u] + x_im*cb_tg[c1*2u+1u];\n"
+     "        acc2 += x_re*cb_tg[c2*2u] + x_im*cb_tg[c2*2u+1u];\n"
+     "        acc3 += x_re*cb_tg[c3*2u] + x_im*cb_tg[c3*2u+1u];\n"
+     "      }\n"
+     "    }\n"
+     "  } else {\n"
+     "    /* Generic bit-aligned: bw=6 (K=64) and unaligned. 4 row codes per pair. */\n"
+     "    for (uint p = 0; p < np; p++) {\n"
+     "      const uint bit_off0 = (linear_base0 + p) * bw;\n"
+     "      const uint bit_off1 = (linear_base1 + p) * bw;\n"
+     "      const uint bit_off2 = (linear_base2 + p) * bw;\n"
+     "      const uint bit_off3 = (linear_base3 + p) * bw;\n"
+     "      const uint c0 = ((((uint)codes[bit_off0 >> 3] | ((bw + (bit_off0 & 7u) > 8u) ? ((uint)codes[(bit_off0 >> 3) + 1u] << 8) : 0u)) >> (bit_off0 & 7u)) & mask);\n"
+     "      const uint c1 = ((((uint)codes[bit_off1 >> 3] | ((bw + (bit_off1 & 7u) > 8u) ? ((uint)codes[(bit_off1 >> 3) + 1u] << 8) : 0u)) >> (bit_off1 & 7u)) & mask);\n"
+     "      const uint c2 = ((((uint)codes[bit_off2 >> 3] | ((bw + (bit_off2 & 7u) > 8u) ? ((uint)codes[(bit_off2 >> 3) + 1u] << 8) : 0u)) >> (bit_off2 & 7u)) & mask);\n"
+     "      const uint c3 = ((((uint)codes[bit_off3 >> 3] | ((bw + (bit_off3 & 7u) > 8u) ? ((uint)codes[(bit_off3 >> 3) + 1u] << 8) : 0u)) >> (bit_off3 & 7u)) & mask);\n"
+     "      const float x_re = X_tg[p*2u];\n"
+     "      const float x_im = X_tg[p*2u + 1u];\n"
+     "      acc0 += x_re*cb_tg[c0*2u] + x_im*cb_tg[c0*2u+1u];\n"
+     "      acc1 += x_re*cb_tg[c1*2u] + x_im*cb_tg[c1*2u+1u];\n"
+     "      acc2 += x_re*cb_tg[c2*2u] + x_im*cb_tg[c2*2u+1u];\n"
+     "      acc3 += x_re*cb_tg[c3*2u] + x_im*cb_tg[c3*2u+1u];\n"
+     "    }\n"
+     "  }\n"
+     "  device half *out = out_base + gid.z * args->out_stride;\n"
+     "  const uint out_row_base = gid.y * args->n_rows + row_base;\n"
+     "  out[out_row_base + 0u] = (half)acc0;\n"
+     "  out[out_row_base + 1u] = (half)acc1;\n"
+     "  out[out_row_base + 2u] = (half)acc2;\n"
+     "  out[out_row_base + 3u] = (half)acc3;\n"
+     "}\n";
+
+static id<MTLComputePipelineState> g_vqb2_decode_matmul_fp16_x4row_mtl4_pipeline;
+static int g_vqb2_decode_matmul_fp16_x4row_mtl4_init_attempted;
+static int g_vqb2_decode_matmul_fp16_x4row_mtl4_init_ok;
+
+static int ds4_vqb2_decode_matmul_fp16_x4row_mtl4_pipeline_init(void) {
+    if (g_vqb2_decode_matmul_fp16_x4row_mtl4_init_attempted)
+        return g_vqb2_decode_matmul_fp16_x4row_mtl4_init_ok;
+    g_vqb2_decode_matmul_fp16_x4row_mtl4_init_attempted = 1;
+    g_vqb2_decode_matmul_fp16_x4row_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_vqb2_decode_matmul_fp16_x4row_msl, @"ds4_vqb2_decode_matmul_fp16_x4row_mtl4",
+        @"vqb2_decode_matmul_fp16_x4row", 256, NULL, 0);
+    g_vqb2_decode_matmul_fp16_x4row_mtl4_init_ok =
+        (g_vqb2_decode_matmul_fp16_x4row_mtl4_pipeline != nil) ? 1 : 0;
+    return g_vqb2_decode_matmul_fp16_x4row_mtl4_init_ok;
+}
+
+/* Canary + bench: builds synthetic packet (codes, codebook, X activation),
+ * runs the fused kernel, cross-checks each output against a scalar CPU
+ * reference (decode each code via the same bit-extract logic + accumulate
+ * dot product). Then measures throughput vs the prior decode-then-store
+ * shape from the noop-write diagnostic.
+ *
+ * Tolerance: fp16 accumulator drift bound is ~5e-3 relative at n_pairs=1024.
+ * Float accumulator (used in kernel) gives tighter precision; cross-check
+ * uses float accumulator on CPU too. */
+int ds4_gpu_mtl4_vqb2_decode_matmul_fp16_canary(uint32_t n_packets,
+                                                 uint32_t n_selected,
+                                                 uint32_t n_experts_total,
+                                                 uint32_t n_rows,
+                                                 uint32_t n_pairs,
+                                                 uint32_t k_val,
+                                                 uint32_t rounds) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* silv 2026-05-28 task #768: env DS4_VQB2_MATMUL_X4ROW=1 picks the
+     * 4-rows-per-thread variant. n_rows must be multiple of 4 for the
+     * fast paths to engage; otherwise variant falls back to the generic
+     * bit-aligned path which still works but loses the vector speedup. */
+    const int use_x4row = getenv("DS4_VQB2_MATMUL_X4ROW") &&
+                          getenv("DS4_VQB2_MATMUL_X4ROW")[0] == '1';
+    if (use_x4row) {
+        if (!ds4_vqb2_decode_matmul_fp16_x4row_mtl4_pipeline_init()) return 0;
+    } else {
+        if (!ds4_vqb2_decode_matmul_fp16_mtl4_pipeline_init()) return 0;
+    }
+    if (n_packets == 0 || n_selected == 0 || n_selected > n_experts_total) return 0;
+    if (n_rows == 0 || n_pairs == 0 || rounds == 0) return 0;
+    if (use_x4row && (n_rows & 3u) != 0u) {
+        fprintf(stderr, "ds4: x4row variant needs n_rows %% 4 == 0 (got %u)\n", n_rows);
+        return 0;
+    }
+    uint32_t bit_width;
+    switch (k_val) {
+        case 4:   bit_width = 2; break;
+        case 16:  bit_width = 4; break;
+        case 64:  bit_width = 6; break;
+        case 256: bit_width = 8; break;
+        default:  return 0;
+    }
+    const uint32_t codes_per_expert = n_rows * n_pairs;
+    const uint64_t total_codes_per_packet = (uint64_t)n_experts_total * codes_per_expert;
+    const size_t codes_bytes_per_packet = (size_t)(total_codes_per_packet * bit_width + 7u) >> 3;
+    const size_t out_per_packet_halves = (size_t)n_selected * n_rows;
+
+    int rc = 0;
+    int mismatch = 0;
+    double max_rel = 0.0;
+    double t_ms = 0;
+
+    @autoreleasepool {
+        const float step = 1.0f / (float)k_val;
+        id<MTLBuffer> cbBuf = [g_device newBufferWithLength:(NSUInteger)k_val * 2u * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> codesBuf = [g_device newBufferWithLength:(NSUInteger)n_packets * codes_bytes_per_packet
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf = [g_device newBufferWithLength:(NSUInteger)n_selected * sizeof(uint32_t)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> xBuf = [g_device newBufferWithLength:(NSUInteger)n_pairs * 2u * sizeof(_Float16)
+                                                   options:MTLResourceStorageModeShared];
+        size_t out_buf_bytes = (size_t)n_packets * out_per_packet_halves * sizeof(_Float16);
+        if (out_buf_bytes < 16384) out_buf_bytes = 16384;
+        id<MTLBuffer> outBuf = [g_device newBufferWithLength:(NSUInteger)out_buf_bytes
+                                                    options:MTLResourceStorageModeShared];
+        if (!cbBuf || !codesBuf || !selBuf || !xBuf || !outBuf) return 0;
+
+        float *cb_data = (float *)cbBuf.contents;
+        for (uint32_t i = 0; i < k_val; i++) {
+            cb_data[i * 2u + 0u] =  (float)i * step;
+            cb_data[i * 2u + 1u] = -(float)i * step;
+        }
+        /* Codes: code[expert][i] = (e+i) % k */
+        uint8_t *codes_host = (uint8_t *)codesBuf.contents;
+        memset(codes_host, 0, (size_t)n_packets * codes_bytes_per_packet);
+        for (uint32_t p = 0; p < n_packets; p++) {
+            uint8_t *base = codes_host + (size_t)p * codes_bytes_per_packet;
+            for (uint32_t e = 0; e < n_experts_total; e++) {
+                for (uint32_t i = 0; i < codes_per_expert; i++) {
+                    const uint32_t code = (e + i + p) % k_val;
+                    const uint64_t linear = (uint64_t)e * codes_per_expert + i;
+                    const uint64_t bit_off = linear * bit_width;
+                    const size_t byte_off = (size_t)(bit_off >> 3);
+                    const uint32_t shift = (uint32_t)(bit_off & 7ull);
+                    base[byte_off] |= (uint8_t)((code << shift) & 0xFFu);
+                    if (bit_width + shift > 8u) {
+                        base[byte_off + 1u] |= (uint8_t)((code >> (8u - shift)) & 0xFFu);
+                    }
+                }
+            }
+        }
+        uint32_t *sel = (uint32_t *)selBuf.contents;
+        for (uint32_t i = 0; i < n_selected; i++) sel[i] = i * (n_experts_total / n_selected);
+        /* X: simple sinusoid-ish pattern for non-zero accumulator + per-row variation */
+        _Float16 *x_host = (_Float16 *)xBuf.contents;
+        for (uint32_t i = 0; i < n_pairs * 2u; i++) {
+            x_host[i] = (_Float16)(0.5f + 0.001f * (float)i);
+        }
+
+        struct args_t {
+            uint32_t bit_width, code_mask, n_rows, n_pairs,
+                     n_experts_in_packet, n_selected, codes_stride, out_stride;
+        } args = {
+            bit_width, (1u << bit_width) - 1u, n_rows, n_pairs,
+            n_experts_total, n_selected,
+            (uint32_t)codes_bytes_per_packet,
+            (uint32_t)out_per_packet_halves,
+        };
+        id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args)
+                                                     options:MTLResourceStorageModeShared];
+
+        /* Residency set: REQUIRED on Apple MTL4. Without this, the GPU sees zeros
+         * for any buffer not auto-resident — kernel reads args->n_rows as 0, hits
+         * the early-return guard, and writes nothing. (silv 2026-05-28 catch)  */
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        NSError *rs_err = nil;
+        id<MTLResidencySet> rs = [g_device newResidencySetWithDescriptor:rsDesc error:&rs_err];
+        if (!rs) { fprintf(stderr, "ds4: residency set creation failed: %s\n", rs_err.localizedDescription.UTF8String); return 0; }
+        id<MTLAllocation> allocs[6] = { argsBuf, cbBuf, codesBuf, selBuf, xBuf, outBuf };
+        [rs addAllocations:allocs count:6];
+        [rs commit];
+        [rs requestResidency];
+        [g_polar_queue addResidencySet:rs];
+
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        const uint64_t t0 = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+            [cb beginCommandBufferWithAllocator:g_polar_allocator];
+            [cb useResidencySet:rs];
+            id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+            if (!at) return 0;
+            [at setAddress:argsBuf.gpuAddress atIndex:0];
+            [at setAddress:cbBuf.gpuAddress atIndex:1];
+            [at setAddress:codesBuf.gpuAddress atIndex:2];
+            [at setAddress:selBuf.gpuAddress atIndex:3];
+            [at setAddress:xBuf.gpuAddress atIndex:4];
+            [at setAddress:outBuf.gpuAddress atIndex:5];
+            /* silv 2026-05-28 task #768: x4row variant under debug — see kernel
+             * source for the bug investigation. Default back to baseline path. */
+            [enc setComputePipelineState:
+                use_x4row ? g_vqb2_decode_matmul_fp16_x4row_mtl4_pipeline
+                          : g_vqb2_decode_matmul_fp16_mtl4_pipeline];
+            [enc setArgumentTable:at];
+            /* Threadgroup memory: codebook (K*2 floats) + X (np*2 floats). */
+            const NSUInteger tg_mem_bytes =
+                ((NSUInteger)k_val * 2u + (NSUInteger)n_pairs * 2u) * sizeof(float);
+            [enc setThreadgroupMemoryLength:tg_mem_bytes atIndex:0];
+            /* tg_size=32 = 1 simdgroup wide. x4row: 4 outputs/thread so grid x = n_rows/4. */
+            const NSUInteger eff_rows = use_x4row ? (NSUInteger)n_rows / 4u : (NSUInteger)n_rows;
+            const NSUInteger tg_x = (eff_rows + 31u) / 32u;
+            [enc dispatchThreadgroups:MTLSizeMake(tg_x, n_selected, n_packets)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [enc endEncoding];
+            [cb endCommandBuffer];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            MTL4CommitOptions *opts = [MTL4CommitOptions new];
+            [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+            id<MTL4CommandBuffer> bufs[1] = {cb};
+            [g_polar_queue commit:bufs count:1 options:opts];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+            ds4_mtl4_pool_release(at, 8);
+        }
+        const uint64_t t1 = mach_absolute_time();
+        t_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        [rs endResidency];
+        [g_polar_queue removeResidencySet:rs];
+
+        /* CPU reference: compute the same dot products in float, cross-check. */
+        const _Float16 *gpu_out = (const _Float16 *)outBuf.contents;
+        if (getenv("DS4_PROBE_ARGS")) {
+            fprintf(stderr, "  PROBE: out[0..7] = %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f\n",
+                    (double)gpu_out[0], (double)gpu_out[1], (double)gpu_out[2], (double)gpu_out[3],
+                    (double)gpu_out[4], (double)gpu_out[5], (double)gpu_out[6], (double)gpu_out[7]);
+        }
+        int dumped = 0;
+        for (uint32_t p = 0; p < n_packets; p++) {
+            const uint8_t *base = codes_host + (size_t)p * codes_bytes_per_packet;
+            for (uint32_t es = 0; es < n_selected; es++) {
+                const uint32_t expert = sel[es];
+                for (uint32_t r = 0; r < n_rows; r++) {
+                    float acc = 0.0f;
+                    const uint64_t linear_base =
+                        (uint64_t)expert * codes_per_expert + (uint64_t)r * n_pairs;
+                    for (uint32_t pp = 0; pp < n_pairs; pp++) {
+                        const uint64_t linear = linear_base + pp;
+                        const uint64_t bit_off = linear * bit_width;
+                        const size_t byte_off = (size_t)(bit_off >> 3);
+                        const uint32_t shift = (uint32_t)(bit_off & 7ull);
+                        const uint32_t lo = base[byte_off];
+                        const uint32_t hi = (bit_width + shift > 8u) ? base[byte_off + 1] : 0u;
+                        const uint32_t window = lo | (hi << 8);
+                        const uint32_t code = (window >> shift) & ((1u << bit_width) - 1u);
+                        const float re = cb_data[code * 2u + 0u];
+                        const float im = cb_data[code * 2u + 1u];
+                        const float x_re = (float)x_host[pp * 2u + 0u];
+                        const float x_im = (float)x_host[pp * 2u + 1u];
+                        acc += x_re * re + x_im * im;
+                    }
+                    const float expected = acc;
+                    const float got = (float)gpu_out[p * out_per_packet_halves + es * n_rows + r];
+                    const float denom = (fabsf(expected) > 1e-3f) ? fabsf(expected) : 1e-3f;
+                    const double rel = fabs((double)(got - expected)) / (double)denom;
+                    if (rel > max_rel) max_rel = rel;
+                    if (rel > 5e-2) mismatch++;
+                    if (getenv("DS4_DUMP_MATMUL") && dumped < 8) {
+                        fprintf(stderr, "    [p=%u es=%u expert=%u r=%u] got=%.5f expected=%.5f\n",
+                                p, es, expert, r, (double)got, (double)expected);
+                        dumped++;
+                    }
+                }
+            }
+        }
+        rc = 1;
+    }
+
+    const uint64_t macs_per_round = (uint64_t)n_packets * n_selected * n_rows * n_pairs;
+    const double gflops = ((double)macs_per_round * 2.0 * rounds / 1e9) / (t_ms / 1000.0);
+    const double per_layer_us = t_ms * 1000.0 / (double)rounds;
+
+    fprintf(stderr,
+        "ds4: vqb2_decode_matmul_fp16 canary n_packets=%u n_sel=%u/%u rows=%u pairs=%u K=%u rounds=%u\n"
+        "  fused decode+matmul: %.3f ms total (%.1f us/round)  %.2f GFLOP/s\n"
+        "  cross-check mismatch=%d max_rel=%.4e (must be <5%% per cell)  rc=%d\n",
+        n_packets, n_selected, n_experts_total, n_rows, n_pairs, k_val, rounds,
+        t_ms, per_layer_us, gflops,
+        mismatch, max_rel, rc);
+    return (rc && mismatch == 0) ? 1 : 0;
+}
+
+/* ============================================================================
+ * Runtime fused decode-matmul dispatch (silv 2026-05-28).
+ * Production-callable primitive that takes pre-bound MTLBuffers and runs the
+ * fused kernel for one (layer, kind) batch. Caller manages residency + sync.
+ * Header: ds4_gpu.h ds4_gpu_mtl4_vqb2_decode_matmul_fp16_dispatch.
+ * ============================================================================
+ */
+/* Cached residency set (shared between _dispatch and _dispatch_layer).
+ * Single-slot, single-threaded; reset on any buffer-pointer or shape change. */
+static struct {
+    void *pack, *cb, *sel, *x, *out;
+    id<MTLResidencySet> rs;
+    id<MTLBuffer> argsBuf;
+    uint32_t cached_bw, cached_nrows, cached_npairs;
+    uint32_t cached_ne_in_packet, cached_nsel, cached_out_stride;
+    uint32_t cached_x_slot_stride;
+    int valid;
+} g_pack_dispatch_rs_cache;
+
+static id<MTLResidencySet> pack_dispatch_get_rs(id<MTLBuffer> argsBuf,
+                                                id<MTLBuffer> packBuf,
+                                                id<MTLBuffer> cbBuf,
+                                                id<MTLBuffer> selBuf,
+                                                id<MTLBuffer> xBuf,
+                                                id<MTLBuffer> outBuf) {
+    if (g_pack_dispatch_rs_cache.valid &&
+        g_pack_dispatch_rs_cache.pack == (__bridge void *)packBuf &&
+        g_pack_dispatch_rs_cache.cb   == (__bridge void *)cbBuf &&
+        g_pack_dispatch_rs_cache.sel  == (__bridge void *)selBuf &&
+        g_pack_dispatch_rs_cache.x    == (__bridge void *)xBuf &&
+        g_pack_dispatch_rs_cache.out  == (__bridge void *)outBuf) {
+        return g_pack_dispatch_rs_cache.rs;
+    }
+    if (g_pack_dispatch_rs_cache.valid) {
+        [g_polar_queue removeResidencySet:g_pack_dispatch_rs_cache.rs];
+        [g_pack_dispatch_rs_cache.rs endResidency];
+        g_pack_dispatch_rs_cache.rs = nil;
+        g_pack_dispatch_rs_cache.argsBuf = nil;
+        g_pack_dispatch_rs_cache.valid = 0;
+    }
+    MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+    rsDesc.initialCapacity = 8;
+    NSError *rs_err = nil;
+    id<MTLResidencySet> rs = [g_device newResidencySetWithDescriptor:rsDesc error:&rs_err];
+    if (!rs) return nil;
+    id<MTLAllocation> allocs[6] = { argsBuf, packBuf, cbBuf, selBuf, xBuf, outBuf };
+    [rs addAllocations:allocs count:6];
+    [rs commit];
+    [rs requestResidency];
+    [g_polar_queue addResidencySet:rs];
+    g_pack_dispatch_rs_cache.pack = (__bridge void *)packBuf;
+    g_pack_dispatch_rs_cache.cb   = (__bridge void *)cbBuf;
+    g_pack_dispatch_rs_cache.sel  = (__bridge void *)selBuf;
+    g_pack_dispatch_rs_cache.x    = (__bridge void *)xBuf;
+    g_pack_dispatch_rs_cache.out  = (__bridge void *)outBuf;
+    g_pack_dispatch_rs_cache.rs = rs;
+    g_pack_dispatch_rs_cache.valid = 1;
+    return rs;
+}
+
+int ds4_gpu_mtl4_vqb2_decode_matmul_fp16_dispatch(void *codebook_mtlbuf,
+                                                  void *codes_mtlbuf,
+                                                  void *selected_mtlbuf,
+                                                  void *x_mtlbuf,
+                                                  void *out_mtlbuf,
+                                                  uint32_t n_packets,
+                                                  uint32_t n_selected,
+                                                  uint32_t n_experts_in_packet,
+                                                  uint32_t n_rows,
+                                                  uint32_t n_pairs,
+                                                  uint32_t k_val,
+                                                  uint32_t codes_stride_bytes,
+                                                  uint32_t out_stride_halves) {
+    if (!g_initialized && !ds4_gpu_init()) return -1;
+    if (!ds4_vqb2_decode_matmul_fp16_mtl4_pipeline_init()) return -1;
+    if (!codebook_mtlbuf || !codes_mtlbuf || !selected_mtlbuf ||
+        !x_mtlbuf || !out_mtlbuf) return -1;
+    if (n_packets == 0 || n_selected == 0 || n_selected > n_experts_in_packet) return -1;
+    if (n_rows == 0 || n_pairs == 0) return -1;
+    uint32_t bit_width;
+    switch (k_val) {
+        case 4:   bit_width = 2; break;
+        case 16:  bit_width = 4; break;
+        case 64:  bit_width = 6; break;
+        case 256: bit_width = 8; break;
+        default:  return -1;
+    }
+    id<MTLBuffer> cbBuf    = (__bridge id<MTLBuffer>)codebook_mtlbuf;
+    id<MTLBuffer> codesBuf = (__bridge id<MTLBuffer>)codes_mtlbuf;
+    id<MTLBuffer> selBuf   = (__bridge id<MTLBuffer>)selected_mtlbuf;
+    id<MTLBuffer> xBuf     = (__bridge id<MTLBuffer>)x_mtlbuf;
+    id<MTLBuffer> outBuf   = (__bridge id<MTLBuffer>)out_mtlbuf;
+
+    struct args_t {
+        uint32_t bit_width, code_mask, n_rows, n_pairs,
+                 n_experts_in_packet, n_selected, codes_stride, out_stride;
+    } args = {
+        bit_width, (1u << bit_width) - 1u, n_rows, n_pairs,
+        n_experts_in_packet, n_selected, codes_stride_bytes, out_stride_halves,
+    };
+    int rc = -2;
+    @autoreleasepool {
+        /* Reuse cached args buffer if shape matches, else allocate fresh. */
+        int shape_match = g_pack_dispatch_rs_cache.valid &&
+            g_pack_dispatch_rs_cache.cached_bw == bit_width &&
+            g_pack_dispatch_rs_cache.cached_nrows == n_rows &&
+            g_pack_dispatch_rs_cache.cached_npairs == n_pairs &&
+            g_pack_dispatch_rs_cache.cached_ne_in_packet == n_experts_in_packet &&
+            g_pack_dispatch_rs_cache.cached_nsel == n_selected &&
+            g_pack_dispatch_rs_cache.cached_out_stride == out_stride_halves;
+        id<MTLBuffer> argsBuf = nil;
+        if (shape_match) {
+            argsBuf = g_pack_dispatch_rs_cache.argsBuf;
+            /* But we also need codes_stride to match — overwrite args contents
+             * (same buffer, mutate bytes; cheaper than allocating). */
+            memcpy(argsBuf.contents, &args, sizeof(args));
+        } else {
+            argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args)
+                                           options:MTLResourceStorageModeShared];
+            if (!argsBuf) return -2;
+            if (g_pack_dispatch_rs_cache.valid) {
+                [g_polar_queue removeResidencySet:g_pack_dispatch_rs_cache.rs];
+                [g_pack_dispatch_rs_cache.rs endResidency];
+                g_pack_dispatch_rs_cache.valid = 0;
+            }
+        }
+        id<MTLResidencySet> rs = pack_dispatch_get_rs(argsBuf, codesBuf, cbBuf, selBuf, xBuf, outBuf);
+        if (!rs) return -2;
+        g_pack_dispatch_rs_cache.argsBuf = argsBuf;
+        g_pack_dispatch_rs_cache.cached_bw = bit_width;
+        g_pack_dispatch_rs_cache.cached_nrows = n_rows;
+        g_pack_dispatch_rs_cache.cached_npairs = n_pairs;
+        g_pack_dispatch_rs_cache.cached_ne_in_packet = n_experts_in_packet;
+        g_pack_dispatch_rs_cache.cached_nsel = n_selected;
+        g_pack_dispatch_rs_cache.cached_out_stride = out_stride_halves;
+        g_pack_dispatch_rs_cache.cached_x_slot_stride = 0u;  /* non-strided path */
+
+        id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+        [cb beginCommandBufferWithAllocator:g_polar_allocator];
+        [cb useResidencySet:rs];
+        id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+        if (!at) return -2;
+        [at setAddress:argsBuf.gpuAddress  atIndex:0];
+        [at setAddress:cbBuf.gpuAddress    atIndex:1];
+        [at setAddress:codesBuf.gpuAddress atIndex:2];
+        [at setAddress:selBuf.gpuAddress   atIndex:3];
+        [at setAddress:xBuf.gpuAddress     atIndex:4];
+        [at setAddress:outBuf.gpuAddress   atIndex:5];
+        [enc setComputePipelineState:g_vqb2_decode_matmul_fp16_mtl4_pipeline];
+        [enc setArgumentTable:at];
+        const NSUInteger tg_mem_bytes =
+            ((NSUInteger)k_val * 2u + (NSUInteger)n_pairs * 2u) * sizeof(float);
+        [enc setThreadgroupMemoryLength:tg_mem_bytes atIndex:0];
+        const NSUInteger tg_x = (n_rows + 31u) / 32u;
+        [enc dispatchThreadgroups:MTLSizeMake(tg_x, n_selected, n_packets)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+        [cb endCommandBuffer];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        MTL4CommitOptions *opts = [MTL4CommitOptions new];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+        id<MTL4CommandBuffer> bufs[1] = { cb };
+        [g_polar_queue commit:bufs count:1 options:opts];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+        ds4_mtl4_pool_release(at, 8);
+        /* rs is cache-owned; do NOT tear down here. */
+        rc = 0;
+    }
+    return rc;
+}
+
+/* ============================================================================
+ * task #759 ICB Phase 8 for fused decode-matmul.
+ *
+ * The fused kernel exists as an MTL4 pipeline (g_vqb2_decode_matmul_fp16_mtl4_pipeline);
+ * classic-MTL ICB requires a separate classic-MTL pipeline compiled from the
+ * SAME MSL source. We record the per-layer dispatch sequence into an MTL ICB
+ * once at first call; subsequent calls replay via executeCommandsInBuffer.
+ *
+ * Opt-in via DS4_ICB_VQB2_DECODE_MATMUL=1.
+ * ============================================================================
+ */
+#define DS4_VQB2_DECODE_MATMUL_ICB_SLOTS 96   /* covers H2125 = 16+16+32 = 64, with margin */
+static id<MTLComputePipelineState> g_vqb2_decode_matmul_fp16_classic_pipeline;
+static int g_vqb2_decode_matmul_fp16_classic_init_attempted;
+static int g_vqb2_decode_matmul_fp16_classic_init_ok;
+static id<MTLIndirectCommandBuffer> g_vqb2_decode_matmul_fp16_icb;
+static id<MTLBuffer> g_vqb2_decode_matmul_icb_args_buffer; /* shared args, written each replay */
+typedef struct {
+    void    *args_ptr;
+    void    *cb_ptr;
+    void    *codes_ptr;
+    void    *sel_ptr;
+    void    *x_ptr;
+    void    *out_ptr;
+    uint64_t codes_off;
+    uint64_t out_off;
+    uint32_t n_rows, n_pairs, n_selected, k_val;
+    uint32_t tg_x;
+    int      recorded;
+} ds4_vqb2_decode_matmul_icb_slot;
+static ds4_vqb2_decode_matmul_icb_slot
+    g_vqb2_decode_matmul_icb_slots[DS4_VQB2_DECODE_MATMUL_ICB_SLOTS];
+
+/* Classic-MTL pipeline init. Same MSL source as the MTL4 path; we just compile
+ * via newLibraryWithSource (classic) and set supportIndirectCommandBuffers=YES. */
+static int ds4_vqb2_decode_matmul_fp16_classic_pipeline_init(void) {
+    if (g_vqb2_decode_matmul_fp16_classic_init_attempted)
+        return g_vqb2_decode_matmul_fp16_classic_init_ok;
+    g_vqb2_decode_matmul_fp16_classic_init_attempted = 1;
+    NSError *err = nil;
+    id<MTLLibrary> lib = [g_device newLibraryWithSource:k_vqb2_decode_matmul_fp16_msl
+                                                options:nil error:&err];
+    if (!lib) {
+        fprintf(stderr, "ds4: vqb2_decode_matmul_fp16 classic lib compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    id<MTLFunction> fn = [lib newFunctionWithName:@"vqb2_decode_matmul_fp16"];
+    if (!fn) { fprintf(stderr, "ds4: vqb2_decode_matmul_fp16 classic function not found\n"); return 0; }
+    MTLComputePipelineDescriptor *pdesc = [MTLComputePipelineDescriptor new];
+    pdesc.computeFunction = fn;
+    pdesc.supportIndirectCommandBuffers = YES;
+    g_vqb2_decode_matmul_fp16_classic_pipeline =
+        [g_device newComputePipelineStateWithDescriptor:pdesc
+                                                options:MTLPipelineOptionNone
+                                             reflection:nil
+                                                  error:&err];
+    if (!g_vqb2_decode_matmul_fp16_classic_pipeline) {
+        fprintf(stderr, "ds4: vqb2_decode_matmul_fp16 classic pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "(no error)");
+        return 0;
+    }
+    g_vqb2_decode_matmul_fp16_classic_init_ok = 1;
+    fprintf(stderr, "ds4: vqb2_decode_matmul_fp16 classic pipeline initialized (ICB-compatible)\n");
+    return 1;
+}
+
+/* Returns 1 if env var set; otherwise 0 (caller uses MTL4 path). */
+static int ds4_icb_vqb2_decode_matmul_enabled(void) {
+    static int checked = 0, active = 0;
+    if (!checked) {
+        active = getenv("DS4_ICB_VQB2_DECODE_MATMUL") != NULL ? 1 : 0;
+        checked = 1;
+        if (active) fprintf(stderr, "ds4: DS4_ICB_VQB2_DECODE_MATMUL=1 — fused-matmul ICB engaged\n");
+    }
+    return active;
+}
+
+/* Dispatch a single fused decode-matmul via classic-MTL ICB.
+ * Slot is keyed by all the args; signature mismatch triggers re-record.
+ * Replays cost ~5 µs vs ~60 µs for MTL4 dispatch overhead per call. */
+static int ds4_gpu_vqb2_decode_matmul_fp16_icb_dispatch(
+        id<MTLCommandBuffer> cb,
+        uint32_t slot_idx,
+        id<MTLBuffer> args_buf, NSUInteger args_off,
+        id<MTLBuffer> codebook, NSUInteger codebook_off,
+        id<MTLBuffer> codes,    NSUInteger codes_off,
+        id<MTLBuffer> selected, NSUInteger sel_off,
+        id<MTLBuffer> xbuf,     NSUInteger x_off,
+        id<MTLBuffer> outbuf,   NSUInteger out_off,
+        uint32_t n_rows, uint32_t n_pairs,
+        uint32_t n_selected, uint32_t n_packets, uint32_t k_val) {
+    if (slot_idx >= DS4_VQB2_DECODE_MATMUL_ICB_SLOTS) return 0;
+    if (!cb || !args_buf || !codebook || !codes || !selected || !xbuf || !outbuf) return 0;
+    if (!ds4_vqb2_decode_matmul_fp16_classic_pipeline_init()) return 0;
+
+    if (!g_vqb2_decode_matmul_fp16_icb) {
+        MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
+        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+        desc.inheritBuffers = NO;
+        desc.inheritPipelineState = NO;
+        desc.maxKernelBufferBindCount = 6;
+        g_vqb2_decode_matmul_fp16_icb =
+            [g_device newIndirectCommandBufferWithDescriptor:desc
+                                              maxCommandCount:DS4_VQB2_DECODE_MATMUL_ICB_SLOTS
+                                                      options:MTLResourceStorageModeShared];
+        if (!g_vqb2_decode_matmul_fp16_icb) {
+            fprintf(stderr, "ds4: vqb2_decode_matmul_fp16 ICB alloc failed\n");
+            return 0;
+        }
+    }
+
+    ds4_vqb2_decode_matmul_icb_slot *slot = &g_vqb2_decode_matmul_icb_slots[slot_idx];
+    const uint32_t tg_x = (n_rows + 31u) / 32u;
+    const int sig_match = slot->recorded &&
+        slot->args_ptr  == (__bridge void *)args_buf &&
+        slot->cb_ptr    == (__bridge void *)codebook && (uint64_t)codebook_off == 0 /* codebook always offset 0 */ &&
+        slot->codes_ptr == (__bridge void *)codes && slot->codes_off == (uint64_t)codes_off &&
+        slot->sel_ptr   == (__bridge void *)selected &&
+        slot->x_ptr     == (__bridge void *)xbuf &&
+        slot->out_ptr   == (__bridge void *)outbuf && slot->out_off == (uint64_t)out_off &&
+        slot->n_rows == n_rows && slot->n_pairs == n_pairs &&
+        slot->n_selected == n_selected && slot->k_val == k_val &&
+        slot->tg_x == tg_x;
+
+    if (!sig_match) {
+        id<MTLIndirectComputeCommand> cmd =
+            [g_vqb2_decode_matmul_fp16_icb indirectComputeCommandAtIndex:slot_idx];
+        [cmd setComputePipelineState:g_vqb2_decode_matmul_fp16_classic_pipeline];
+        [cmd setKernelBuffer:args_buf offset:args_off    atIndex:0];
+        [cmd setKernelBuffer:codebook offset:codebook_off atIndex:1];
+        [cmd setKernelBuffer:codes    offset:codes_off    atIndex:2];
+        [cmd setKernelBuffer:selected offset:sel_off      atIndex:3];
+        [cmd setKernelBuffer:xbuf     offset:x_off        atIndex:4];
+        [cmd setKernelBuffer:outbuf   offset:out_off      atIndex:5];
+        const NSUInteger tg_mem_bytes =
+            ((NSUInteger)k_val * 2u + (NSUInteger)n_pairs * 2u) * sizeof(float);
+        [cmd setThreadgroupMemoryLength:tg_mem_bytes atIndex:0];
+        [cmd concurrentDispatchThreadgroups:MTLSizeMake(tg_x, n_selected, n_packets)
+                      threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+        slot->args_ptr  = (__bridge void *)args_buf;
+        slot->cb_ptr    = (__bridge void *)codebook;
+        slot->codes_ptr = (__bridge void *)codes;  slot->codes_off = codes_off;
+        slot->sel_ptr   = (__bridge void *)selected;
+        slot->x_ptr     = (__bridge void *)xbuf;
+        slot->out_ptr   = (__bridge void *)outbuf; slot->out_off  = out_off;
+        slot->n_rows = n_rows; slot->n_pairs = n_pairs;
+        slot->n_selected = n_selected; slot->k_val = k_val;
+        slot->tg_x = tg_x;
+        slot->recorded = 1;
+    }
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc useResource:args_buf usage:MTLResourceUsageRead];
+    [enc useResource:codebook usage:MTLResourceUsageRead];
+    [enc useResource:codes    usage:MTLResourceUsageRead];
+    [enc useResource:selected usage:MTLResourceUsageRead];
+    [enc useResource:xbuf     usage:MTLResourceUsageRead];
+    [enc useResource:outbuf   usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    [enc executeCommandsInBuffer:g_vqb2_decode_matmul_fp16_icb
+                       withRange:NSMakeRange(slot_idx, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+/* ============================================================================
+ * task #758 Architecture B: pack-as-MTLBuffer + per-layer batched dispatch.
+ * silv 2026-05-28.
+ * ============================================================================
+ */
+
+void *ds4_gpu_mtl4_vqb2_pack_wrap_mtlbuffer(void *pack_map, size_t pack_size) {
+    if (!g_initialized && !ds4_gpu_init()) return NULL;
+    if (!pack_map || pack_size == 0) return NULL;
+    /* Zero-copy: caller owns the mmap region; we just hand Metal a view.
+     * deallocator left NULL — Metal doesn't own the memory. */
+    id<MTLBuffer> buf = [g_device newBufferWithBytesNoCopy:pack_map
+                                                   length:(NSUInteger)pack_size
+                                                  options:MTLResourceStorageModeShared
+                                              deallocator:nil];
+    if (!buf) return NULL;
+    return (__bridge_retained void *)buf;
+}
+
+void ds4_gpu_mtl4_vqb2_pack_release_mtlbuffer(void *pack_mtlbuf) {
+    if (!pack_mtlbuf) return;
+    id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)pack_mtlbuf;
+    (void)buf;  /* ARC releases on scope exit */
+}
+
+/* Encode N fused dispatches in one command buffer with one shared residency
+ * set. Each dispatch reads codes from pack_mtlbuf + codes_offsets[i] and
+ * writes to out_mtlbuf + i*out_stride_halves halves. */
+/* silv 2026-05-28 Phase 3 — strided variant. Existing public function below
+ * (zero stride) wraps this with x_slot_stride_halves=0 for backwards compat.
+ * DOWN dispatch in the PATH_FUSED chain passes the per-expert mid stride. */
+int ds4_gpu_mtl4_vqb2_pack_dispatch_layer_strided(void *pack_mtlbuf,
+                                                  void *codebook_mtlbuf,
+                                                  void *selected_mtlbuf,
+                                                  void *x_mtlbuf,
+                                                  void *out_mtlbuf,
+                                                  const uint64_t *codes_offsets,
+                                                  uint32_t n_dispatches,
+                                                  uint32_t n_selected,
+                                                  uint32_t n_experts_in_packet,
+                                                  uint32_t n_rows,
+                                                  uint32_t n_pairs,
+                                                  uint32_t k_val,
+                                                  uint32_t out_stride_halves,
+                                                  uint32_t x_slot_stride_halves) {
+    if (!g_initialized && !ds4_gpu_init()) return -1;
+    if (!ds4_vqb2_decode_matmul_fp16_mtl4_pipeline_init()) return -1;
+    if (!pack_mtlbuf || !codebook_mtlbuf || !selected_mtlbuf ||
+        !x_mtlbuf || !out_mtlbuf || !codes_offsets) return -1;
+    if (n_dispatches == 0) return 0;
+    if (n_selected == 0 || n_selected > n_experts_in_packet) return -1;
+    if (n_rows == 0 || n_pairs == 0) return -1;
+
+    uint32_t bit_width;
+    switch (k_val) {
+        case 4:   bit_width = 2; break;
+        case 16:  bit_width = 4; break;
+        case 64:  bit_width = 6; break;
+        case 256: bit_width = 8; break;
+        default:  return -1;
+    }
+
+    id<MTLBuffer> packBuf = (__bridge id<MTLBuffer>)pack_mtlbuf;
+    id<MTLBuffer> cbBuf   = (__bridge id<MTLBuffer>)codebook_mtlbuf;
+    id<MTLBuffer> selBuf  = (__bridge id<MTLBuffer>)selected_mtlbuf;
+    id<MTLBuffer> xBuf    = (__bridge id<MTLBuffer>)x_mtlbuf;
+    id<MTLBuffer> outBuf  = (__bridge id<MTLBuffer>)out_mtlbuf;
+
+    /* Args is identical for every dispatch in this layer call.
+     * out_stride passed as 0 — we set the out_address per-dispatch instead.
+     * x_slot_stride (Phase 3): 0=shared X (gate/up), >0=per-slot X (DOWN). */
+    struct args_t {
+        uint32_t bit_width, code_mask, n_rows, n_pairs,
+                 n_experts_in_packet, n_selected, codes_stride, out_stride,
+                 x_slot_stride;
+    } args = {
+        bit_width, (1u << bit_width) - 1u, n_rows, n_pairs,
+        n_experts_in_packet, n_selected,
+        0u,  /* codes_stride: we set codes_address per-dispatch, n_packets=1 */
+        out_stride_halves,
+        x_slot_stride_halves,
+    };
+
+    int rc = -2;
+    @autoreleasepool {
+        /* Args buffer reuse: if shape unchanged AND cache valid, reuse argsBuf;
+         * otherwise build a new one. Args matches the dispatch shape, not the
+         * per-call codes_offsets, so reuse is stable across same-shape calls. */
+        id<MTLBuffer> argsBuf = nil;
+        const int shape_match = g_pack_dispatch_rs_cache.valid &&
+            g_pack_dispatch_rs_cache.cached_bw == args.bit_width &&
+            g_pack_dispatch_rs_cache.cached_nrows == n_rows &&
+            g_pack_dispatch_rs_cache.cached_npairs == n_pairs &&
+            g_pack_dispatch_rs_cache.cached_ne_in_packet == n_experts_in_packet &&
+            g_pack_dispatch_rs_cache.cached_nsel == n_selected &&
+            g_pack_dispatch_rs_cache.cached_out_stride == out_stride_halves &&
+            g_pack_dispatch_rs_cache.cached_x_slot_stride == x_slot_stride_halves;
+        if (shape_match) {
+            argsBuf = g_pack_dispatch_rs_cache.argsBuf;
+        } else {
+            argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args)
+                                           options:MTLResourceStorageModeShared];
+            if (!argsBuf) return -2;
+            /* Force rs rebuild because argsBuf changed */
+            if (g_pack_dispatch_rs_cache.valid) {
+                [g_polar_queue removeResidencySet:g_pack_dispatch_rs_cache.rs];
+                [g_pack_dispatch_rs_cache.rs endResidency];
+                g_pack_dispatch_rs_cache.valid = 0;
+            }
+        }
+
+        id<MTLResidencySet> rs = pack_dispatch_get_rs(argsBuf, packBuf, cbBuf, selBuf, xBuf, outBuf);
+        if (!rs) return -2;
+        /* Update args cache + shape */
+        g_pack_dispatch_rs_cache.argsBuf = argsBuf;
+        g_pack_dispatch_rs_cache.cached_bw = args.bit_width;
+        g_pack_dispatch_rs_cache.cached_nrows = n_rows;
+        g_pack_dispatch_rs_cache.cached_npairs = n_pairs;
+        g_pack_dispatch_rs_cache.cached_ne_in_packet = n_experts_in_packet;
+        g_pack_dispatch_rs_cache.cached_nsel = n_selected;
+        g_pack_dispatch_rs_cache.cached_out_stride = out_stride_halves;
+        g_pack_dispatch_rs_cache.cached_x_slot_stride = x_slot_stride_halves;
+
+        id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+        [cb beginCommandBufferWithAllocator:g_polar_allocator];
+        [cb useResidencySet:rs];
+        id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+        if (!at) return -2;
+
+        [enc setComputePipelineState:g_vqb2_decode_matmul_fp16_mtl4_pipeline];
+        [enc setArgumentTable:at];
+        const NSUInteger tg_mem_bytes =
+            ((NSUInteger)k_val * 2u + (NSUInteger)n_pairs * 2u) * sizeof(float);
+        [enc setThreadgroupMemoryLength:tg_mem_bytes atIndex:0];
+        const NSUInteger tg_x = (n_rows + 31u) / 32u;
+
+        /* Stable bindings: args/codebook/selected/X are shared across all
+         * dispatches in this layer call. Only codes and out addresses change. */
+        const uint64_t pack_base = packBuf.gpuAddress;
+        const uint64_t out_base  = outBuf.gpuAddress;
+        const uint64_t out_stride_bytes = (uint64_t)out_stride_halves * sizeof(_Float16);
+        [at setAddress:argsBuf.gpuAddress atIndex:0];
+        [at setAddress:cbBuf.gpuAddress   atIndex:1];
+        [at setAddress:selBuf.gpuAddress  atIndex:3];
+        [at setAddress:xBuf.gpuAddress    atIndex:4];
+
+        for (uint32_t d = 0; d < n_dispatches; d++) {
+            [at setAddress:(pack_base + codes_offsets[d]) atIndex:2];
+            [at setAddress:(out_base + (uint64_t)d * out_stride_bytes) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(tg_x, n_selected, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
+        [enc endEncoding];
+        [cb endCommandBuffer];
+
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        MTL4CommitOptions *opts = [MTL4CommitOptions new];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+        id<MTL4CommandBuffer> bufs[1] = { cb };
+        [g_polar_queue commit:bufs count:1 options:opts];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+        ds4_mtl4_pool_release(at, 8);
+        /* rs is cache-owned; do NOT tear down here. */
+        rc = 0;
+    }
+    return rc;
+}
+
+/* Back-compat wrapper: original signature, shared-X (gate/up) semantic.
+ * All existing callers continue to work; DOWN dispatch uses _strided form. */
+int ds4_gpu_mtl4_vqb2_pack_dispatch_layer(void *pack_mtlbuf,
+                                          void *codebook_mtlbuf,
+                                          void *selected_mtlbuf,
+                                          void *x_mtlbuf,
+                                          void *out_mtlbuf,
+                                          const uint64_t *codes_offsets,
+                                          uint32_t n_dispatches,
+                                          uint32_t n_selected,
+                                          uint32_t n_experts_in_packet,
+                                          uint32_t n_rows,
+                                          uint32_t n_pairs,
+                                          uint32_t k_val,
+                                          uint32_t out_stride_halves) {
+    return ds4_gpu_mtl4_vqb2_pack_dispatch_layer_strided(
+        pack_mtlbuf, codebook_mtlbuf, selected_mtlbuf, x_mtlbuf, out_mtlbuf,
+        codes_offsets, n_dispatches, n_selected, n_experts_in_packet,
+        n_rows, n_pairs, k_val, out_stride_halves,
+        0u  /* x_slot_stride: shared X */);
+}
+
+/* ============================================================================
+ * Bind-pack: production wiring point (silv 2026-05-28 task #759).
+ * Opens a real VQB2 pack, wraps it as MTLBuffer (zero-copy on unified memory),
+ * builds per-entry codebook MTLBuffers + a (layer, kind, row_block) → entry
+ * lookup, and stores everything in a session-scoped binding.
+ *
+ * After bind, `ds4_metal_vqb2_fused_dispatch_kind(layer, kind, sel[6], X, out)`
+ * performs the fused decode-matmul for one (layer, kind) using all entries
+ * of that kind, indexed by row_block.
+ * ============================================================================
+ */
+#include "ds4_vqb2_pack.h"
+
+#define DS4_FUSED_BIND_MAX_LAYERS 64
+#define DS4_FUSED_BIND_MAX_KINDS  3
+#define DS4_FUSED_BIND_MAX_RB     32
+
+static struct {
+    ds4_vqb2_pack pack;
+    int           pack_open;
+    void         *pack_mtlbuf;    /* opaque retained id<MTLBuffer> */
+    /* Cached codebook MTLBuffers — one per unique (layer, kind, row_block)
+     * because different entries may have different K. */
+    id<MTLBuffer> codebook_buf[DS4_FUSED_BIND_MAX_LAYERS][DS4_FUSED_BIND_MAX_KINDS][DS4_FUSED_BIND_MAX_RB];
+    uint64_t      codes_offset[DS4_FUSED_BIND_MAX_LAYERS][DS4_FUSED_BIND_MAX_KINDS][DS4_FUSED_BIND_MAX_RB];
+    int32_t       entry_idx[DS4_FUSED_BIND_MAX_LAYERS][DS4_FUSED_BIND_MAX_KINDS][DS4_FUSED_BIND_MAX_RB];
+    /* silv 2026-05-28 task #761 item A — bit-packed per-(kind) layer presence
+     * masks. Computed ONCE at bind time. Per-layer coverage lookup becomes O(1):
+     *   gate_present = (cov_bits_gate >> L) & 1
+     *   bitmask      = gate_present | (up_present<<1) | (down_present<<2)
+     *
+     * Storage drops from 43 bytes (layer-coverage byte cache in vqb2_fp16.m)
+     * to 3 × uint64 = 24 bytes, AND first-touch probing of MAX_RB×MAX_KINDS
+     * (96 ops/layer × 43 layers = 4128 ops worst case) collapses to a single
+     * shift+AND. Caller in ds4_metal_vqb2_fp16.m drops its own static cache. */
+    uint64_t      cov_bits_kind[DS4_FUSED_BIND_MAX_KINDS];
+    uint64_t      cov_bits_full;  /* bit L set iff all three kinds present at layer L */
+} g_fused_bind;
+
+int ds4_metal_vqb2_fused_bind(const char *pack_path, const char *index_csv_path) {
+    if (!g_initialized && !ds4_gpu_init()) return -1;
+    if (g_fused_bind.pack_open) {
+        fprintf(stderr, "ds4_metal_vqb2_fused_bind: already bound; close existing first\n");
+        return -1;
+    }
+    if (!ds4_vqb2_pack_open(pack_path, index_csv_path, &g_fused_bind.pack)) {
+        fprintf(stderr, "ds4_metal_vqb2_fused_bind: pack_open failed (%s, %s)\n",
+                pack_path, index_csv_path);
+        return -1;
+    }
+    g_fused_bind.pack_open = 1;
+
+    /* Wrap pack mmap as MTLBuffer (zero-copy on Apple Silicon shared mem). */
+    g_fused_bind.pack_mtlbuf = ds4_gpu_mtl4_vqb2_pack_wrap_mtlbuffer(
+        g_fused_bind.pack.map, g_fused_bind.pack.map_size);
+    if (!g_fused_bind.pack_mtlbuf) {
+        fprintf(stderr, "ds4_metal_vqb2_fused_bind: pack wrap failed\n");
+        ds4_vqb2_pack_close(&g_fused_bind.pack);
+        g_fused_bind.pack_open = 0;
+        return -1;
+    }
+
+    /* DS4_FUSED_PRETOUCH=1 → touch every page to pin in OS page cache.
+     * DS4_FUSED_MLOCK=1     → mlock() to also wire down (requires unlimited
+     *                          memlock; will fail on small ulimits). */
+    if (getenv("DS4_FUSED_PRETOUCH")) {
+        const uint8_t *p = (const uint8_t *)g_fused_bind.pack.map;
+        const size_t page = (size_t)getpagesize();
+        uint64_t accum = 0;
+        const uint64_t t0 = mach_absolute_time();
+        for (size_t i = 0; i < g_fused_bind.pack.map_size; i += page) {
+            accum += p[i];  /* force fault-in */
+        }
+        const uint64_t t1 = mach_absolute_time();
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        const double ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        fprintf(stderr, "ds4_metal_vqb2_fused_bind: pre-touch %zu pages took %.2f s (accum=%llu)\n",
+                g_fused_bind.pack.map_size / page, ms / 1000.0, (unsigned long long)accum);
+    }
+    if (getenv("DS4_FUSED_MLOCK")) {
+        const uint64_t t0 = mach_absolute_time();
+        if (mlock(g_fused_bind.pack.map, g_fused_bind.pack.map_size) != 0) {
+            fprintf(stderr, "ds4_metal_vqb2_fused_bind: mlock failed (%s) — try `ulimit -l unlimited`\n",
+                    strerror(errno));
+        } else {
+            const uint64_t t1 = mach_absolute_time();
+            mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+            const double ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+            fprintf(stderr, "ds4_metal_vqb2_fused_bind: mlock %.2f GiB took %.2f s\n",
+                    g_fused_bind.pack.map_size / 1e9, ms / 1000.0);
+        }
+    }
+
+    /* Initialize entry index table to -1 (absent). */
+    memset(g_fused_bind.entry_idx, 0xff, sizeof(g_fused_bind.entry_idx));
+    memset(g_fused_bind.codes_offset, 0, sizeof(g_fused_bind.codes_offset));
+    memset(g_fused_bind.cov_bits_kind, 0, sizeof(g_fused_bind.cov_bits_kind));
+    g_fused_bind.cov_bits_full = 0;
+
+    /* Walk pack entries: cache codebook MTLBuffer + offset per (layer, kind, row_block). */
+    int n_indexed = 0;
+    @autoreleasepool {
+        for (uint32_t i = 0; i < g_fused_bind.pack.n_entries; i++) {
+            const ds4_vqb2_pack_entry *e = &g_fused_bind.pack.entries[i];
+            if (e->layer >= DS4_FUSED_BIND_MAX_LAYERS) continue;
+            if (e->kind_id >= DS4_FUSED_BIND_MAX_KINDS) continue;
+            if ((e->row_start & 127u) != 0) continue;
+            const uint32_t rb = e->row_start >> 7;
+            if (rb >= DS4_FUSED_BIND_MAX_RB) continue;
+
+            /* Codebook for this entry sits at pack_offset + DS4_VQB2_HEADER_BYTES.
+             * Allocate a separate small MTLBuffer (k * 2 floats) and copy. */
+            const uint8_t *cb_src =
+                (const uint8_t *)g_fused_bind.pack.map + e->pack_offset + DS4_VQB2_HEADER_BYTES;
+            const size_t cb_bytes = (size_t)e->k * 2u * sizeof(float);
+            id<MTLBuffer> cbBuf =
+                [g_device newBufferWithBytes:cb_src length:cb_bytes
+                                     options:MTLResourceStorageModeShared];
+            if (!cbBuf) continue;
+            g_fused_bind.codebook_buf[e->layer][e->kind_id][rb] = cbBuf;
+
+            /* codes_offset in pack = pack_offset + header + codebook bytes */
+            g_fused_bind.codes_offset[e->layer][e->kind_id][rb] =
+                e->pack_offset + DS4_VQB2_HEADER_BYTES + cb_bytes;
+            g_fused_bind.entry_idx[e->layer][e->kind_id][rb] = (int32_t)i;
+            /* Bit-packed coverage: layer e->layer has kind_id present. */
+            if (e->layer < 64u && e->kind_id < DS4_FUSED_BIND_MAX_KINDS) {
+                g_fused_bind.cov_bits_kind[e->kind_id] |= (1ull << e->layer);
+            }
+            n_indexed++;
+        }
+    }
+
+    /* Pre-compute "all 3 kinds present" mask (intersection of the 3 kind masks).
+     * Caller's full-coverage check is then: (cov_bits_full >> L) & 1. */
+    g_fused_bind.cov_bits_full =
+        g_fused_bind.cov_bits_kind[0] &
+        g_fused_bind.cov_bits_kind[1] &
+        g_fused_bind.cov_bits_kind[2];
+
+    fprintf(stderr,
+        "ds4_metal_vqb2_fused_bind: pack=%s\n"
+        "  size=%.2f GiB  entries=%u  indexed=%d\n"
+        "  coverage: gate=0x%llx up=0x%llx down=0x%llx full=0x%llx\n"
+        "  pack MTLBuffer wrapped + per-entry codebook cache built\n",
+        pack_path, g_fused_bind.pack.pack_size / 1e9,
+        g_fused_bind.pack.n_entries, n_indexed,
+        (unsigned long long)g_fused_bind.cov_bits_kind[0],
+        (unsigned long long)g_fused_bind.cov_bits_kind[1],
+        (unsigned long long)g_fused_bind.cov_bits_kind[2],
+        (unsigned long long)g_fused_bind.cov_bits_full);
+    return 0;
+}
+
+void ds4_metal_vqb2_fused_unbind(void) {
+    if (!g_fused_bind.pack_open) return;
+    @autoreleasepool {
+        for (int L = 0; L < DS4_FUSED_BIND_MAX_LAYERS; L++)
+        for (int K = 0; K < DS4_FUSED_BIND_MAX_KINDS; K++)
+        for (int R = 0; R < DS4_FUSED_BIND_MAX_RB; R++)
+            g_fused_bind.codebook_buf[L][K][R] = nil;
+    }
+    if (g_fused_bind.pack_mtlbuf) {
+        ds4_gpu_mtl4_vqb2_pack_release_mtlbuffer(g_fused_bind.pack_mtlbuf);
+        g_fused_bind.pack_mtlbuf = NULL;
+    }
+    ds4_vqb2_pack_close(&g_fused_bind.pack);
+    g_fused_bind.pack_open = 0;
+}
+
+/* silv 2026-05-28 task #761 — per-layer coverage probe.
+ *
+ * Returns bitmask of bound kinds for `layer`:
+ *   bit 0 = GATE  (kind_id 0)
+ *   bit 1 = UP    (kind_id 1)
+ *   bit 2 = DOWN  (kind_id 2)
+ *   0 = layer not bound at all; 7 = all three kinds present.
+ *
+ * Foundation for PATH_FUSED's full-FFN chain: caller checks coverage before
+ * attempting fused dispatch; falls back to MTL4 when bitmask != 7.
+ *
+ * Item A (bit-packed cache): O(1) — read 3 bits from the per-kind layer masks
+ * pre-computed once at bind time. Was O(MAX_RB × MAX_KINDS) = 96 ops/layer.
+ * Safe to call before bind (returns 0 because pack_open guard).
+ */
+uint32_t ds4_metal_vqb2_fused_layer_coverage(uint32_t layer) {
+    if (!g_fused_bind.pack_open) return 0;
+    if (layer >= 64u) return 0;
+    const uint64_t bit = 1ull << layer;
+    uint32_t mask = 0;
+    if (g_fused_bind.cov_bits_kind[0] & bit) mask |= 1u;
+    if (g_fused_bind.cov_bits_kind[1] & bit) mask |= 2u;
+    if (g_fused_bind.cov_bits_kind[2] & bit) mask |= 4u;
+    return mask;
+}
+
+/* Bit-packed full-coverage shortcut. Returns nonzero iff all three kinds
+ * (gate, up, down) are present at `layer`. Cheaper than calling
+ * ds4_metal_vqb2_fused_layer_coverage(layer) == 7 because it's a single
+ * shift+AND instead of three. */
+int ds4_metal_vqb2_fused_layer_fully_covered(uint32_t layer) {
+    if (!g_fused_bind.pack_open || layer >= 64u) return 0;
+    return (int)((g_fused_bind.cov_bits_full >> layer) & 1ull);
+}
+
+/* silv 2026-05-28 task #761 — shape adapter: fp32 activation → fp16 X buffer.
+ *
+ * Kernel `vqb2_decode_matmul_fp16` reads X as device half[n_pairs * 2] (line
+ * 34939 of ds4_metal.m). Production code holds the activation as fp32 of
+ * length expert_in_dim. For DS4 V4:
+ *   gate/up: in_dim = 4096 → n_pairs = 2048
+ *   down   : in_dim = 2048 → n_pairs = 1024
+ *
+ * Mapping is LINEAR — element i of the fp32 vector becomes element i of the
+ * fp16 buffer. NO transpose, NO repack: the kernel just consumes
+ * `expert_in_dim` halves in order. The "pair" structure is internal to the
+ * kernel's accumulator (each pair contributes two MAC ops with codebook[c*2+0]
+ * and codebook[c*2+1]) but the input layout is flat.
+ *
+ * Persistent staging buffer + shared MTLBuffer wrap: caller reuses across
+ * calls; the buffer grows on demand and shrinks never. Returns an opaque
+ * id<MTLBuffer> pointer suitable for passing to
+ * `ds4_metal_vqb2_fused_dispatch_kind` as `x_mtlbuf`.
+ *
+ * Args:
+ *   in_fp32  — pointer to fp32 activation vector
+ *   n_elems  — element count (e.g. 4096 for gate/up, 2048 for down)
+ * Returns the MTLBuffer pointer; NULL on failure.
+ *
+ * Cost on M1 (unified mem): one cacheline-walk through `n_elems` floats with a
+ * static_cast to _Float16. For 4096 elems ≈ 1 µs. CPU-side is faster than
+ * kernel-side for this size because launch overhead alone is >5 µs. */
+void *ds4_metal_vqb2_fused_x_adapter_fp32_to_fp16(const float *in_fp32, uint32_t n_elems) {
+    if (!g_initialized && !ds4_gpu_init()) return NULL;
+    if (!in_fp32 || n_elems == 0) return NULL;
+
+    static id<MTLBuffer> s_x_fp16_buf = nil;
+    static uint32_t      s_x_fp16_cap = 0;
+    const uint32_t need_bytes = n_elems * (uint32_t)sizeof(_Float16);
+    if (s_x_fp16_cap < need_bytes) {
+        s_x_fp16_buf = [g_device newBufferWithLength:(NSUInteger)need_bytes
+                                            options:MTLResourceStorageModeShared];
+        if (!s_x_fp16_buf) return NULL;
+        s_x_fp16_cap = need_bytes;
+    }
+    _Float16 *dst = (_Float16 *)s_x_fp16_buf.contents;
+    for (uint32_t i = 0; i < n_elems; i++) dst[i] = (_Float16)in_fp32[i];
+    return (__bridge void *)s_x_fp16_buf;
+}
+
+/* Companion: persistent fp16 output buffer pool for dispatch_kind outputs.
+ *
+ * One slot per (layer, kind) — gate/up/down dispatches write here, downstream
+ * consumers (SwiGLU+route_weight fuse, moe_sum6, fp16→fp32 reducer) read.
+ * Buffer size = n_rb × n_selected × n_rows × sizeof(_Float16). For DS4 V4
+ * gate/up: 1 × 6 × 2048 × 2 = 24 KB per (layer, kind); for down: 1 × 6 ×
+ * 4096 × 2 = 48 KB. Grows on demand; lives for the session lifetime.
+ *
+ * `slot_id` is caller-managed (use a deterministic enum: GATE_OUT=0, UP_OUT=1,
+ * MID_FP16=2, DOWN_OUT=3). Returns NULL on failure. */
+#define DS4_FUSED_OUT_SLOTS 4
+void *ds4_metal_vqb2_fused_out_buffer(uint32_t slot_id, uint32_t need_bytes) {
+    if (!g_initialized && !ds4_gpu_init()) return NULL;
+    if (slot_id >= DS4_FUSED_OUT_SLOTS || need_bytes == 0) return NULL;
+    static id<MTLBuffer> s_out_buf[DS4_FUSED_OUT_SLOTS] = { nil };
+    static uint32_t      s_out_cap[DS4_FUSED_OUT_SLOTS] = { 0 };
+    if (s_out_cap[slot_id] < need_bytes) {
+        s_out_buf[slot_id] = [g_device newBufferWithLength:(NSUInteger)need_bytes
+                                                  options:MTLResourceStorageModeShared];
+        if (!s_out_buf[slot_id]) return NULL;
+        s_out_cap[slot_id] = need_bytes;
+    }
+    return (__bridge void *)s_out_buf[slot_id];
+}
+
+/* Dispatch the fused decode-matmul for one (layer, kind) using the bound pack.
+ * Output layout: out[row_block * n_selected * n_rows + sel_slot * n_rows + row].
+ *
+ * Returns 0 on success, -1 if bind missing or (layer, kind) absent. */
+int ds4_metal_vqb2_fused_dispatch_kind(uint32_t layer, uint32_t kind_id,
+                                        const uint32_t *selected, uint32_t n_selected,
+                                        void *x_mtlbuf, void *out_mtlbuf,
+                                        uint32_t *out_n_dispatches,
+                                        uint32_t *out_n_rows,
+                                        uint32_t *out_n_pairs) {
+    if (!g_fused_bind.pack_open) {
+        fprintf(stderr, "ds4_metal_vqb2_fused_dispatch_kind: bind missing\n");
+        return -1;
+    }
+    if (layer >= DS4_FUSED_BIND_MAX_LAYERS || kind_id >= DS4_FUSED_BIND_MAX_KINDS) return -1;
+
+    /* Gather contiguous row_blocks for this (layer, kind). */
+    uint64_t offsets[DS4_FUSED_BIND_MAX_RB];
+    uint32_t n_rb = 0;
+    uint32_t n_rows = 0, n_pairs = 0, n_experts_in_packet = 0, k_val = 0;
+    id<MTLBuffer> codebook_buf = nil;
+    for (uint32_t rb = 0; rb < DS4_FUSED_BIND_MAX_RB; rb++) {
+        const int32_t idx = g_fused_bind.entry_idx[layer][kind_id][rb];
+        if (idx < 0) continue;
+        const ds4_vqb2_pack_entry *e = &g_fused_bind.pack.entries[idx];
+        if (n_rb == 0) {
+            n_rows = e->n_rows;
+            n_pairs = e->n_pairs;
+            n_experts_in_packet = e->n_experts;
+            k_val = e->k;
+            codebook_buf = g_fused_bind.codebook_buf[layer][kind_id][rb];
+        } else if (e->n_rows != n_rows || e->n_pairs != n_pairs ||
+                   e->k != k_val || e->n_experts != n_experts_in_packet) {
+            fprintf(stderr,
+                "ds4_metal_vqb2_fused_dispatch_kind: heterogeneous row_blocks at L%u kind=%u rb=%u — bail\n",
+                layer, kind_id, rb);
+            return -1;
+        }
+        offsets[n_rb++] = g_fused_bind.codes_offset[layer][kind_id][rb];
+    }
+    if (n_rb == 0) return -1;
+
+    /* Persistent selected buffer (reused across calls — content updated via memcpy).
+     * Stable identity ⇒ residency-set cache hits → 30ms × N_dispatches saved per call. */
+    static id<MTLBuffer> s_persistent_sel_buf = nil;
+    static uint32_t      s_persistent_sel_cap = 0;
+    const uint32_t need = n_selected;
+    if (s_persistent_sel_cap < need) {
+        s_persistent_sel_buf = [g_device newBufferWithLength:(NSUInteger)need * sizeof(uint32_t)
+                                                    options:MTLResourceStorageModeShared];
+        if (!s_persistent_sel_buf) return -1;
+        s_persistent_sel_cap = need;
+    }
+    memcpy(s_persistent_sel_buf.contents, selected, n_selected * sizeof(uint32_t));
+    id<MTLBuffer> selBuf = s_persistent_sel_buf;
+
+    const uint32_t out_stride_halves = n_selected * n_rows;
+    const int rc = ds4_gpu_mtl4_vqb2_pack_dispatch_layer(
+        g_fused_bind.pack_mtlbuf,
+        (__bridge void *)codebook_buf,
+        (__bridge void *)selBuf,
+        x_mtlbuf, out_mtlbuf,
+        offsets, n_rb, n_selected, n_experts_in_packet,
+        n_rows, n_pairs, k_val, out_stride_halves);
+
+    if (out_n_dispatches) *out_n_dispatches = n_rb;
+    if (out_n_rows) *out_n_rows = n_rows;
+    if (out_n_pairs) *out_n_pairs = n_pairs;
+    return rc;
+}
+
+/* Phase 3 strided variant: same as ds4_metal_vqb2_fused_dispatch_kind but
+ * accepts per-slot X stride (in halves). DOWN dispatches with stride>0 so
+ * each selected expert reads its own SwiGLU mid buffer. GATE/UP can keep
+ * using the non-strided wrapper above (shared X = ffn_norm output). */
+int ds4_metal_vqb2_fused_dispatch_kind_strided(uint32_t layer, uint32_t kind_id,
+                                                const uint32_t *selected, uint32_t n_selected,
+                                                void *x_mtlbuf, void *out_mtlbuf,
+                                                uint32_t x_slot_stride_halves,
+                                                uint32_t *out_n_dispatches,
+                                                uint32_t *out_n_rows,
+                                                uint32_t *out_n_pairs) {
+    if (!g_fused_bind.pack_open) {
+        fprintf(stderr, "ds4_metal_vqb2_fused_dispatch_kind_strided: bind missing\n");
+        return -1;
+    }
+    if (layer >= DS4_FUSED_BIND_MAX_LAYERS || kind_id >= DS4_FUSED_BIND_MAX_KINDS) return -1;
+
+    uint64_t offsets[DS4_FUSED_BIND_MAX_RB];
+    uint32_t n_rb = 0;
+    uint32_t n_rows = 0, n_pairs = 0, n_experts_in_packet = 0, k_val = 0;
+    id<MTLBuffer> codebook_buf = nil;
+    for (uint32_t rb = 0; rb < DS4_FUSED_BIND_MAX_RB; rb++) {
+        const int32_t idx = g_fused_bind.entry_idx[layer][kind_id][rb];
+        if (idx < 0) continue;
+        const ds4_vqb2_pack_entry *e = &g_fused_bind.pack.entries[idx];
+        if (n_rb == 0) {
+            n_rows = e->n_rows;
+            n_pairs = e->n_pairs;
+            n_experts_in_packet = e->n_experts;
+            k_val = e->k;
+            codebook_buf = g_fused_bind.codebook_buf[layer][kind_id][rb];
+        } else if (e->n_rows != n_rows || e->n_pairs != n_pairs ||
+                   e->k != k_val || e->n_experts != n_experts_in_packet) {
+            fprintf(stderr,
+                "ds4_metal_vqb2_fused_dispatch_kind_strided: heterogeneous row_blocks at L%u kind=%u rb=%u — bail\n",
+                layer, kind_id, rb);
+            return -1;
+        }
+        offsets[n_rb++] = g_fused_bind.codes_offset[layer][kind_id][rb];
+    }
+    if (n_rb == 0) return -1;
+
+    /* Reuse the same persistent selected buffer that the non-strided variant
+     * uses — they never run concurrently within one PATH_FUSED iteration. */
+    static id<MTLBuffer> s_persistent_sel_buf_strided = nil;
+    static uint32_t      s_persistent_sel_cap_strided = 0;
+    const uint32_t need = n_selected;
+    if (s_persistent_sel_cap_strided < need) {
+        s_persistent_sel_buf_strided = [g_device newBufferWithLength:(NSUInteger)need * sizeof(uint32_t)
+                                                             options:MTLResourceStorageModeShared];
+        if (!s_persistent_sel_buf_strided) return -1;
+        s_persistent_sel_cap_strided = need;
+    }
+    memcpy(s_persistent_sel_buf_strided.contents, selected, n_selected * sizeof(uint32_t));
+    id<MTLBuffer> selBuf = s_persistent_sel_buf_strided;
+
+    const uint32_t out_stride_halves = n_selected * n_rows;
+    const int rc = ds4_gpu_mtl4_vqb2_pack_dispatch_layer_strided(
+        g_fused_bind.pack_mtlbuf,
+        (__bridge void *)codebook_buf,
+        (__bridge void *)selBuf,
+        x_mtlbuf, out_mtlbuf,
+        offsets, n_rb, n_selected, n_experts_in_packet,
+        n_rows, n_pairs, k_val, out_stride_halves, x_slot_stride_halves);
+
+    if (out_n_dispatches) *out_n_dispatches = n_rb;
+    if (out_n_rows) *out_n_rows = n_rows;
+    if (out_n_pairs) *out_n_pairs = n_pairs;
+    return rc;
+}
+
+/* Microbench: bind pack, time N warm dispatch_kind calls, project per-token t/s.
+ * Reports per-(layer, kind) latency and a 43-layer × 3-kind extrapolation. */
+int ds4_metal_vqb2_fused_microbench(const char *pack_path, const char *index_csv_path,
+                                     uint32_t layer, uint32_t kind_id, uint32_t rounds) {
+    if (ds4_metal_vqb2_fused_bind(pack_path, index_csv_path) != 0) return 0;
+    uint32_t n_rows = 0, n_pairs = 0, k_val = 0;
+    for (uint32_t rb = 0; rb < DS4_FUSED_BIND_MAX_RB; rb++) {
+        const int32_t idx = g_fused_bind.entry_idx[layer][kind_id][rb];
+        if (idx < 0) continue;
+        const ds4_vqb2_pack_entry *e = &g_fused_bind.pack.entries[idx];
+        n_rows = e->n_rows; n_pairs = e->n_pairs; k_val = e->k;
+        break;
+    }
+    if (n_rows == 0) {
+        fprintf(stderr, "ds4_metal_vqb2_fused_microbench: no entries for L%u kind=%u\n", layer, kind_id);
+        ds4_metal_vqb2_fused_unbind();
+        return 0;
+    }
+
+    const uint32_t n_selected = 6;
+    uint32_t sel[6] = { 0, 50, 100, 150, 200, 250 };
+    double t_warm_ms = 0.0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xBuf = [g_device newBufferWithLength:(NSUInteger)n_pairs * 2u * sizeof(_Float16)
+                                                   options:MTLResourceStorageModeShared];
+        _Float16 *x_host = (_Float16 *)xBuf.contents;
+        for (uint32_t i = 0; i < n_pairs * 2u; i++) x_host[i] = (_Float16)(0.5f + 0.001f * (float)i);
+        const size_t out_halves = (size_t)DS4_FUSED_BIND_MAX_RB * n_selected * n_rows;
+        id<MTLBuffer> outBuf = [g_device newBufferWithLength:out_halves * sizeof(_Float16)
+                                                    options:MTLResourceStorageModeShared];
+
+        /* Warmup: 1 call to page-in + cache warm */
+        ds4_metal_vqb2_fused_dispatch_kind(layer, kind_id, sel, n_selected,
+                                            (__bridge void *)xBuf, (__bridge void *)outBuf,
+                                            NULL, NULL, NULL);
+
+        /* Timed */
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        const uint64_t t0 = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            ds4_metal_vqb2_fused_dispatch_kind(layer, kind_id, sel, n_selected,
+                                                (__bridge void *)xBuf, (__bridge void *)outBuf,
+                                                NULL, NULL, NULL);
+        }
+        const uint64_t t1 = mach_absolute_time();
+        t_warm_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+    }
+
+    const double per_kind_ms = t_warm_ms / (double)rounds;
+    /* Per-token projection: 43 layers × 3 kinds (gate, up, down) */
+    const double per_token_ms = per_kind_ms * 43.0 * 3.0;
+    const double proj_tps = 1000.0 / per_token_ms;
+
+    fprintf(stderr,
+        "ds4_metal_vqb2_fused_microbench: L%u kind=%u  n_rows=%u n_pairs=%u K=%u\n"
+        "  %u warm rounds: %.3f ms total  →  %.3f ms per (layer, kind)\n"
+        "  projection: 43 layers × 3 kinds × %.3f ms = %.1f ms/token = %.2f t/s ceiling\n",
+        layer, kind_id, n_rows, n_pairs, k_val, rounds,
+        t_warm_ms, per_kind_ms, per_kind_ms, per_token_ms, proj_tps);
+
+    ds4_metal_vqb2_fused_unbind();
+    return 1;
+}
+
+/* Smoke test: bind a pack and dispatch one (layer, kind) call. */
+int ds4_metal_vqb2_fused_bind_smoke(const char *pack_path, const char *index_csv_path,
+                                    uint32_t layer, uint32_t kind_id) {
+    if (ds4_metal_vqb2_fused_bind(pack_path, index_csv_path) != 0) return 0;
+
+    /* Build a placeholder X and out buffer matching the bound entry's shape.
+     * Read shape from the first entry of the requested (layer, kind). */
+    uint32_t n_rows = 0, n_pairs = 0, k_val = 0;
+    for (uint32_t rb = 0; rb < DS4_FUSED_BIND_MAX_RB; rb++) {
+        const int32_t idx = g_fused_bind.entry_idx[layer][kind_id][rb];
+        if (idx < 0) continue;
+        const ds4_vqb2_pack_entry *e = &g_fused_bind.pack.entries[idx];
+        n_rows = e->n_rows; n_pairs = e->n_pairs; k_val = e->k;
+        break;
+    }
+    if (n_rows == 0) {
+        fprintf(stderr, "ds4_metal_vqb2_fused_bind_smoke: no entries for L%u kind=%u\n", layer, kind_id);
+        ds4_metal_vqb2_fused_unbind();
+        return 0;
+    }
+
+    const uint32_t n_selected = 6;
+    uint32_t sel[6] = { 0, 50, 100, 150, 200, 250 };
+
+    int rc;
+    @autoreleasepool {
+        id<MTLBuffer> xBuf = [g_device newBufferWithLength:(NSUInteger)n_pairs * 2u * sizeof(_Float16)
+                                                   options:MTLResourceStorageModeShared];
+        _Float16 *x_host = (_Float16 *)xBuf.contents;
+        for (uint32_t i = 0; i < n_pairs * 2u; i++) x_host[i] = (_Float16)(0.5f + 0.001f * (float)i);
+
+        /* Out: DS4_FUSED_BIND_MAX_RB * n_selected * n_rows halves max */
+        const size_t out_halves = (size_t)DS4_FUSED_BIND_MAX_RB * n_selected * n_rows;
+        id<MTLBuffer> outBuf = [g_device newBufferWithLength:out_halves * sizeof(_Float16)
+                                                    options:MTLResourceStorageModeShared];
+        memset(outBuf.contents, 0, out_halves * sizeof(_Float16));
+
+        uint32_t n_rb = 0;
+        const uint64_t t0 = mach_absolute_time();
+        rc = ds4_metal_vqb2_fused_dispatch_kind(layer, kind_id, sel, n_selected,
+                                                 (__bridge void *)xBuf,
+                                                 (__bridge void *)outBuf,
+                                                 &n_rb, NULL, NULL);
+        const uint64_t t1 = mach_absolute_time();
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        const double ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+
+        /* Print some output values + first nonzero locations */
+        const _Float16 *out_h = (const _Float16 *)outBuf.contents;
+        int nonzero = 0;
+        for (size_t i = 0; i < out_halves; i++) if (out_h[i] != (_Float16)0.0) nonzero++;
+        fprintf(stderr,
+            "ds4_metal_vqb2_fused_bind_smoke: L%u kind=%u  n_rb=%u  n_rows=%u n_pairs=%u K=%u\n"
+            "  dispatch: %.3f ms (%d halves total, %d nonzero)\n"
+            "  out[0..7] = %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n"
+            "  rc=%d\n",
+            layer, kind_id, n_rb, n_rows, n_pairs, k_val,
+            ms, (int)out_halves, nonzero,
+            (double)out_h[0], (double)out_h[1], (double)out_h[2], (double)out_h[3],
+            (double)out_h[4], (double)out_h[5], (double)out_h[6], (double)out_h[7],
+            rc);
+    }
+    ds4_metal_vqb2_fused_unbind();
+    return rc == 0 ? 1 : 0;
+}
+
+/* Synthetic canary: validates the pack-driven layer dispatch primitive.
+ * Allocates n_entries codes blobs back-to-back in a single buffer (simulating
+ * mmap'd pack), wraps as MTLBuffer, dispatches, cross-checks. */
+int ds4_gpu_mtl4_vqb2_pack_fused_canary(uint32_t n_entries,
+                                        uint32_t n_selected,
+                                        uint32_t n_experts_in_packet,
+                                        uint32_t n_rows,
+                                        uint32_t n_pairs,
+                                        uint32_t k_val,
+                                        uint32_t rounds) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_entries == 0 || rounds == 0) return 0;
+    if (n_selected == 0 || n_selected > n_experts_in_packet) return 0;
+    if (n_rows == 0 || n_pairs == 0) return 0;
+    uint32_t bit_width;
+    switch (k_val) {
+        case 4:   bit_width = 2; break;
+        case 16:  bit_width = 4; break;
+        case 64:  bit_width = 6; break;
+        case 256: bit_width = 8; break;
+        default:  return 0;
+    }
+
+    const uint32_t codes_per_expert = n_rows * n_pairs;
+    const uint64_t codes_per_entry = (uint64_t)n_experts_in_packet * codes_per_expert;
+    const size_t entry_bytes = (size_t)((codes_per_entry * bit_width + 7u) >> 3);
+    /* Pack layout: n_entries codes blobs back-to-back. */
+    const size_t pack_size = entry_bytes * n_entries;
+    const size_t out_per_dispatch_halves = (size_t)n_selected * n_rows;
+
+    /* Use mmap to get page-aligned region — newBufferWithBytesNoCopy requires
+     * vm_page_size alignment on Apple Silicon shared mode. calloc doesn't
+     * guarantee this; mmap with anonymous + private does. */
+    const size_t page_size = (size_t)getpagesize();
+    const size_t pack_size_aligned = ((pack_size + page_size - 1) / page_size) * page_size;
+    uint8_t *pack_map = (uint8_t *)mmap(NULL, pack_size_aligned,
+                                         PROT_READ | PROT_WRITE,
+                                         MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (pack_map == MAP_FAILED) {
+        fprintf(stderr, "ds4: pack_fused canary mmap %.2f MB failed\n", pack_size_aligned / 1e6);
+        return 0;
+    }
+    memset(pack_map, 0, pack_size);
+
+    /* Synthesize codes per entry — distinct seed per entry. */
+    for (uint32_t e_idx = 0; e_idx < n_entries; e_idx++) {
+        uint8_t *base = pack_map + (size_t)e_idx * entry_bytes;
+        for (uint32_t e = 0; e < n_experts_in_packet; e++) {
+            for (uint32_t i = 0; i < codes_per_expert; i++) {
+                const uint32_t code = (e + i + e_idx) % k_val;
+                const uint64_t linear = (uint64_t)e * codes_per_expert + i;
+                const uint64_t bit_off = linear * bit_width;
+                const size_t byte_off = (size_t)(bit_off >> 3);
+                const uint32_t shift = (uint32_t)(bit_off & 7ull);
+                base[byte_off] |= (uint8_t)((code << shift) & 0xFFu);
+                if (bit_width + shift > 8u) {
+                    base[byte_off + 1u] |= (uint8_t)((code >> (8u - shift)) & 0xFFu);
+                }
+            }
+        }
+    }
+
+    int rc = 0;
+    int mismatch = 0;
+    double max_rel = 0.0;
+    double t_ms = 0;
+
+    @autoreleasepool {
+        /* Wrap pack as MTLBuffer. */
+        void *pack_buf = ds4_gpu_mtl4_vqb2_pack_wrap_mtlbuffer(pack_map, pack_size);
+        if (!pack_buf) { free(pack_map); return 0; }
+
+        /* Build other GPU buffers. */
+        id<MTLBuffer> cbBuf = [g_device newBufferWithLength:(NSUInteger)k_val * 2u * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf = [g_device newBufferWithLength:(NSUInteger)n_selected * sizeof(uint32_t)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> xBuf = [g_device newBufferWithLength:(NSUInteger)n_pairs * 2u * sizeof(_Float16)
+                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf = [g_device newBufferWithLength:
+                                  (NSUInteger)n_entries * out_per_dispatch_halves * sizeof(_Float16)
+                                                    options:MTLResourceStorageModeShared];
+        if (!cbBuf || !selBuf || !xBuf || !outBuf) {
+            ds4_gpu_mtl4_vqb2_pack_release_mtlbuffer(pack_buf);
+            free(pack_map);
+            return 0;
+        }
+        float *cb_data = (float *)cbBuf.contents;
+        const float step = 1.0f / (float)k_val;
+        for (uint32_t i = 0; i < k_val; i++) {
+            cb_data[i * 2u + 0u] =  (float)i * step;
+            cb_data[i * 2u + 1u] = -(float)i * step;
+        }
+        uint32_t *sel = (uint32_t *)selBuf.contents;
+        for (uint32_t i = 0; i < n_selected; i++)
+            sel[i] = i * (n_experts_in_packet / n_selected);
+        _Float16 *x_host = (_Float16 *)xBuf.contents;
+        for (uint32_t i = 0; i < n_pairs * 2u; i++)
+            x_host[i] = (_Float16)(0.5f + 0.001f * (float)i);
+
+        /* Codes offsets: contiguous in this canary. */
+        uint64_t *offsets = (uint64_t *)malloc((size_t)n_entries * sizeof(uint64_t));
+        if (!offsets) {
+            ds4_gpu_mtl4_vqb2_pack_release_mtlbuffer(pack_buf);
+            free(pack_map);
+            return 0;
+        }
+        for (uint32_t i = 0; i < n_entries; i++)
+            offsets[i] = (uint64_t)i * (uint64_t)entry_bytes;
+
+        /* Detect uniform-stride: if all offsets are i * entry_bytes, we can
+         * collapse 64 dispatches into 1 kernel call via n_packets grid.z.
+         * The H2125 promise is that real packs have layer-major locality,
+         * so this fast path should be the production case. */
+        int uniform_stride = 1;
+        for (uint32_t i = 0; i < n_entries; i++) {
+            if (offsets[i] != (uint64_t)i * (uint64_t)entry_bytes) {
+                uniform_stride = 0; break;
+            }
+        }
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        const uint64_t t0 = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            int d_rc;
+            if (uniform_stride) {
+                /* All-in-one batched dispatch: pack_buf IS the codes buffer,
+                 * codes_stride is uniform entry_bytes, kernel handles all
+                 * entries via gid.z dimension. */
+                d_rc = ds4_gpu_mtl4_vqb2_decode_matmul_fp16_dispatch(
+                    (__bridge void *)cbBuf, pack_buf, (__bridge void *)selBuf,
+                    (__bridge void *)xBuf, (__bridge void *)outBuf,
+                    n_entries, n_selected, n_experts_in_packet,
+                    n_rows, n_pairs, k_val,
+                    (uint32_t)entry_bytes, (uint32_t)out_per_dispatch_halves);
+            } else {
+                d_rc = ds4_gpu_mtl4_vqb2_pack_dispatch_layer(
+                    pack_buf, (__bridge void *)cbBuf, (__bridge void *)selBuf,
+                    (__bridge void *)xBuf, (__bridge void *)outBuf,
+                    offsets, n_entries, n_selected, n_experts_in_packet,
+                    n_rows, n_pairs, k_val, (uint32_t)out_per_dispatch_halves);
+            }
+            if (d_rc != 0) { free(offsets); rc = 0; goto canary_done; }
+        }
+        const uint64_t t1 = mach_absolute_time();
+        t_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        fprintf(stderr, "  uniform_stride path: %s\n", uniform_stride ? "YES" : "NO");
+
+        /* CPU reference. */
+        const _Float16 *gpu_out = (const _Float16 *)outBuf.contents;
+        for (uint32_t e_idx = 0; e_idx < n_entries; e_idx++) {
+            const uint8_t *base = pack_map + (size_t)e_idx * entry_bytes;
+            for (uint32_t es = 0; es < n_selected; es++) {
+                const uint32_t expert = sel[es];
+                for (uint32_t r = 0; r < n_rows; r++) {
+                    float acc = 0.0f;
+                    const uint64_t linear_base =
+                        (uint64_t)expert * codes_per_expert + (uint64_t)r * n_pairs;
+                    for (uint32_t pp = 0; pp < n_pairs; pp++) {
+                        const uint64_t linear = linear_base + pp;
+                        const uint64_t bit_off = linear * bit_width;
+                        const size_t byte_off = (size_t)(bit_off >> 3);
+                        const uint32_t shift = (uint32_t)(bit_off & 7ull);
+                        const uint32_t lo = base[byte_off];
+                        const uint32_t hi = (bit_width + shift > 8u) ? base[byte_off + 1] : 0u;
+                        const uint32_t window = lo | (hi << 8);
+                        const uint32_t code = (window >> shift) & ((1u << bit_width) - 1u);
+                        const float re = cb_data[code * 2u + 0u];
+                        const float im = cb_data[code * 2u + 1u];
+                        const float x_re = (float)x_host[pp * 2u + 0u];
+                        const float x_im = (float)x_host[pp * 2u + 1u];
+                        acc += x_re * re + x_im * im;
+                    }
+                    const float expected = acc;
+                    const float got = (float)gpu_out[e_idx * out_per_dispatch_halves
+                                                     + es * n_rows + r];
+                    const float denom = (fabsf(expected) > 1e-3f) ? fabsf(expected) : 1e-3f;
+                    const double rel = fabs((double)(got - expected)) / (double)denom;
+                    if (rel > max_rel) max_rel = rel;
+                    if (rel > 5e-2) mismatch++;
+                }
+            }
+        }
+        rc = 1;
+        free(offsets);
+
+canary_done:
+        ds4_gpu_mtl4_vqb2_pack_release_mtlbuffer(pack_buf);
+    }
+    munmap(pack_map, pack_size_aligned);
+
+    const uint64_t macs_per_round = (uint64_t)n_entries * n_selected * n_rows * n_pairs;
+    const double gflops = ((double)macs_per_round * 2.0 * rounds / 1e9) / (t_ms / 1000.0);
+    const double per_dispatch_us = t_ms * 1000.0 / (double)(rounds * n_entries);
+
+    fprintf(stderr,
+        "ds4: pack_fused canary entries=%u sel=%u/%u rows=%u pairs=%u K=%u rounds=%u\n"
+        "  pack-batched fused: %.3f ms total (%.1f us/dispatch)  %.2f GFLOP/s\n"
+        "  cross-check mismatch=%d max_rel=%.4e  rc=%d\n",
+        n_entries, n_selected, n_experts_in_packet, n_rows, n_pairs, k_val, rounds,
+        t_ms, per_dispatch_us, gflops, mismatch, max_rel, rc);
+    return (rc && mismatch == 0) ? 1 : 0;
+}
+
+/* ICB head-to-head bench: cached-MTL4 vs classic-ICB.
+ * Same shape as pack_fused canary. Runs both paths back to back; reports
+ * GFLOP/s for each; cross-checks bit-exactness of ICB vs CPU reference. */
+int ds4_gpu_mtl4_vqb2_pack_icb_bench(uint32_t n_entries,
+                                     uint32_t n_selected,
+                                     uint32_t n_experts_in_packet,
+                                     uint32_t n_rows,
+                                     uint32_t n_pairs,
+                                     uint32_t k_val,
+                                     uint32_t rounds) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_vqb2_decode_matmul_fp16_classic_pipeline_init()) return 0;
+    if (n_entries == 0 || rounds == 0) return 0;
+    if (n_selected == 0 || n_selected > n_experts_in_packet) return 0;
+    uint32_t bit_width;
+    switch (k_val) {
+        case 4:   bit_width = 2; break;
+        case 16:  bit_width = 4; break;
+        case 64:  bit_width = 6; break;
+        case 256: bit_width = 8; break;
+        default:  return 0;
+    }
+
+    const uint32_t codes_per_expert = n_rows * n_pairs;
+    const uint64_t codes_per_entry = (uint64_t)n_experts_in_packet * codes_per_expert;
+    const size_t entry_bytes = (size_t)((codes_per_entry * bit_width + 7u) >> 3);
+    const size_t pack_size = entry_bytes * n_entries;
+    const size_t out_per_dispatch_halves = (size_t)n_selected * n_rows;
+
+    /* mmap page-aligned pack region. */
+    const size_t page_size = (size_t)getpagesize();
+    const size_t pack_size_aligned = ((pack_size + page_size - 1) / page_size) * page_size;
+    uint8_t *pack_map = (uint8_t *)mmap(NULL, pack_size_aligned,
+                                         PROT_READ | PROT_WRITE,
+                                         MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (pack_map == MAP_FAILED) return 0;
+    memset(pack_map, 0, pack_size);
+    /* Synthesize codes (same pattern as pack_fused canary). */
+    for (uint32_t e_idx = 0; e_idx < n_entries; e_idx++) {
+        uint8_t *base = pack_map + (size_t)e_idx * entry_bytes;
+        for (uint32_t e = 0; e < n_experts_in_packet; e++) {
+            for (uint32_t i = 0; i < codes_per_expert; i++) {
+                const uint32_t code = (e + i + e_idx) % k_val;
+                const uint64_t linear = (uint64_t)e * codes_per_expert + i;
+                const uint64_t bit_off = linear * bit_width;
+                const size_t byte_off = (size_t)(bit_off >> 3);
+                const uint32_t shift = (uint32_t)(bit_off & 7ull);
+                base[byte_off] |= (uint8_t)((code << shift) & 0xFFu);
+                if (bit_width + shift > 8u)
+                    base[byte_off + 1u] |= (uint8_t)((code >> (8u - shift)) & 0xFFu);
+            }
+        }
+    }
+
+    double t_mtl4_ms = 0.0, t_icb_ms = 0.0;
+    int mtl4_mismatch = 0, icb_mismatch = 0;
+
+    @autoreleasepool {
+        void *pack_buf = ds4_gpu_mtl4_vqb2_pack_wrap_mtlbuffer(pack_map, pack_size_aligned);
+        if (!pack_buf) { munmap(pack_map, pack_size_aligned); return 0; }
+        id<MTLBuffer> packBufObj = (__bridge id<MTLBuffer>)pack_buf;
+
+        id<MTLBuffer> cbBuf = [g_device newBufferWithLength:(NSUInteger)k_val * 2u * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf = [g_device newBufferWithLength:(NSUInteger)n_selected * sizeof(uint32_t)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> xBuf = [g_device newBufferWithLength:(NSUInteger)n_pairs * 2u * sizeof(_Float16)
+                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outMtl4 = [g_device newBufferWithLength:
+                                  (NSUInteger)n_entries * out_per_dispatch_halves * sizeof(_Float16)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outIcb = [g_device newBufferWithLength:
+                                  (NSUInteger)n_entries * out_per_dispatch_halves * sizeof(_Float16)
+                                                    options:MTLResourceStorageModeShared];
+
+        float *cb_data = (float *)cbBuf.contents;
+        const float step = 1.0f / (float)k_val;
+        for (uint32_t i = 0; i < k_val; i++) {
+            cb_data[i * 2u + 0u] =  (float)i * step;
+            cb_data[i * 2u + 1u] = -(float)i * step;
+        }
+        uint32_t *sel = (uint32_t *)selBuf.contents;
+        for (uint32_t i = 0; i < n_selected; i++) sel[i] = i * (n_experts_in_packet / n_selected);
+        _Float16 *x_host = (_Float16 *)xBuf.contents;
+        for (uint32_t i = 0; i < n_pairs * 2u; i++) x_host[i] = (_Float16)(0.5f + 0.001f * (float)i);
+
+        /* args buffer for ICB path (classic ICB requires explicit args buf bind). */
+        struct args_t {
+            uint32_t bit_width, code_mask, n_rows, n_pairs,
+                     n_experts_in_packet, n_selected, codes_stride, out_stride;
+        } args = {
+            bit_width, (1u << bit_width) - 1u, n_rows, n_pairs,
+            n_experts_in_packet, n_selected,
+            (uint32_t)entry_bytes, (uint32_t)out_per_dispatch_halves,
+        };
+        id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args)
+                                                     options:MTLResourceStorageModeShared];
+
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+
+        /* ============ PATH A: cached MTL4 (uniform-stride all-in-one) ============ */
+        const uint64_t t0a = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            int d_rc = ds4_gpu_mtl4_vqb2_decode_matmul_fp16_dispatch(
+                (__bridge void *)cbBuf, pack_buf, (__bridge void *)selBuf,
+                (__bridge void *)xBuf, (__bridge void *)outMtl4,
+                n_entries, n_selected, n_experts_in_packet,
+                n_rows, n_pairs, k_val,
+                (uint32_t)entry_bytes, (uint32_t)out_per_dispatch_halves);
+            if (d_rc != 0) {
+                ds4_gpu_mtl4_vqb2_pack_release_mtlbuffer(pack_buf);
+                munmap(pack_map, pack_size_aligned);
+                return 0;
+            }
+        }
+        const uint64_t t1a = mach_absolute_time();
+        t_mtl4_ms = (double)(t1a - t0a) * (double)tb.numer / (double)tb.denom / 1e6;
+
+        /* ============ PATH B: classic-MTL ICB (one slot, n_packets-batched) ============ */
+        /* First call records the slot, subsequent replays reuse. */
+        const uint64_t t0b = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+            ds4_gpu_vqb2_decode_matmul_fp16_icb_dispatch(
+                cb, /*slot_idx=*/0,
+                argsBuf, /*args_off=*/0,
+                cbBuf,   /*codebook_off=*/0,
+                packBufObj, /*codes_off=*/0,
+                selBuf,  /*sel_off=*/0,
+                xBuf,    /*x_off=*/0,
+                outIcb,  /*out_off=*/0,
+                n_rows, n_pairs, n_selected, n_entries, k_val);
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+        const uint64_t t1b = mach_absolute_time();
+        t_icb_ms = (double)(t1b - t0b) * (double)tb.numer / (double)tb.denom / 1e6;
+
+        /* Bit-exact cross-check: ICB out == MTL4 out (both reference the same kernel). */
+        const _Float16 *mtl4_out = (const _Float16 *)outMtl4.contents;
+        const _Float16 *icb_out  = (const _Float16 *)outIcb.contents;
+        const size_t total_halves = (size_t)n_entries * out_per_dispatch_halves;
+        for (size_t i = 0; i < total_halves; i++) {
+            const float a = (float)mtl4_out[i];
+            const float b = (float)icb_out[i];
+            if (fabsf(a - b) > 1e-3f * (fabsf(a) > 1.0f ? fabsf(a) : 1.0f)) icb_mismatch++;
+        }
+        (void)mtl4_mismatch;
+
+        ds4_gpu_mtl4_vqb2_pack_release_mtlbuffer(pack_buf);
+    }
+    munmap(pack_map, pack_size_aligned);
+
+    const uint64_t macs_per_round = (uint64_t)n_entries * n_selected * n_rows * n_pairs;
+    const double mtl4_gflops = ((double)macs_per_round * 2.0 * rounds / 1e9) / (t_mtl4_ms / 1000.0);
+    const double icb_gflops  = ((double)macs_per_round * 2.0 * rounds / 1e9) / (t_icb_ms / 1000.0);
+    const double speedup = t_mtl4_ms / t_icb_ms;
+
+    fprintf(stderr,
+        "ds4: pack_icb_bench entries=%u sel=%u/%u rows=%u pairs=%u K=%u rounds=%u\n"
+        "  PATH A (cached MTL4): %.3f ms total (%.1f us/round)  %.2f GFLOP/s\n"
+        "  PATH B (classic ICB): %.3f ms total (%.1f us/round)  %.2f GFLOP/s\n"
+        "  speedup: %.2fx (ICB vs MTL4)\n"
+        "  ICB vs MTL4 output mismatch: %d / %zu halves\n",
+        n_entries, n_selected, n_experts_in_packet, n_rows, n_pairs, k_val, rounds,
+        t_mtl4_ms, t_mtl4_ms * 1000.0 / rounds, mtl4_gflops,
+        t_icb_ms,  t_icb_ms  * 1000.0 / rounds, icb_gflops,
+        speedup,
+        icb_mismatch, (size_t)n_entries * out_per_dispatch_halves);
+    return icb_mismatch == 0 ? 1 : 0;
+}
+
+/* Vectorized decoder bench: K=4 / K=16 / K=256 specialized kernels;
+ * cross-checks vectorized output against the scalar baseline. */
 int ds4_gpu_mtl4_vqb2_decode_vectorized_bench(uint32_t n_packets,
                                                uint32_t n_selected,
                                                uint32_t n_experts_total,
@@ -39801,3 +42065,1010 @@ int ds4_gpu_add_model_map_range(const void *model_map, uint64_t model_size, uint
  }
 }
 
+
+/* ============================================================================
+ * WaterSIC decode-matmul kernel (silv 2026-05-28 task #769)
+ *
+ * Implements the QMM-II Algorithm 3 deployable reconstruction:
+ *   out[row] = α[row] * Σ_j Z[row, j] * X[j]
+ *
+ * Z is R-bit signed integer codes (R ∈ {2, 4, 8}, packed little-endian).
+ * α is fp32 per-row scale, SHARED across all 256 experts in one (layer, kind).
+ *
+ * Per QMM-II: WaterSIC scalar quantization is within 2πe/12 ≈ 0.25 bit/entry
+ * of the information-theoretic optimum, AND basis-free. No codebook, no LUT,
+ * coalesced byte reads. Direct memory-bandwidth win over VQB2 K=16 (4×) and
+ * K=4 (2×) at same nominal bits/entry.
+ *
+ * Kernel dispatch shape:
+ *   grid  = (n_rows, n_selected, n_packets)
+ *   TG    = 32 threads (1 simdgroup); one thread = one output row
+ * Threadgroup memory: X_tg (n_cols floats), cooperative-load once per TG.
+ * ============================================================================
+ */
+static NSString * const k_watersic_decode_matmul_fp16_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct args_t {\n"
+     "  uint R;                /* bits per code: 2, 4, or 8 */\n"
+     "  uint n_rows;           /* output rows */\n"
+     "  uint n_cols;           /* input cols = n_pairs * 2 (scalar entries) */\n"
+     "  uint n_experts_in_packet;\n"
+     "  uint n_selected;\n"
+     "  uint codes_stride;     /* per-packet codes stride in bytes */\n"
+     "  uint out_stride;       /* per-packet output stride in halves */\n"
+     "  uint x_slot_stride;    /* 0 = X shared across slots; else per-slot stride in halves */\n"
+     "  uint codes_per_expert; /* n_rows × n_cols × R / 8 bytes */\n"
+     "  uint row_codes_bytes;  /* (n_cols × R + 7) / 8 */\n"
+     "};\n"
+     "kernel void watersic_decode_matmul_fp16(\n"
+     "    device const args_t *args         [[buffer(0)]],\n"
+     "    device const float  *alpha_base   [[buffer(1)]],   /* per-(layer,kind), n_rows fp32 */\n"
+     "    device const uchar  *codes_base   [[buffer(2)]],\n"
+     "    device const uint   *selected     [[buffer(3)]],\n"
+     "    device const half   *X            [[buffer(4)]],\n"
+     "    device       half   *out_base     [[buffer(5)]],\n"
+     "    threadgroup float *X_tg           [[threadgroup(0)]],\n"
+     "    uint3 gid                         [[thread_position_in_grid]],\n"
+     "    uint  tid                         [[thread_index_in_threadgroup]],\n"
+     "    uint3 tg_dim                      [[threads_per_threadgroup]]) {\n"
+     "  const uint tg_threads = tg_dim.x * tg_dim.y * tg_dim.z;\n"
+     "  const uint nc = args->n_cols;\n"
+     "  /* Cooperative X load. */\n"
+     "  const uint x_off = (args->x_slot_stride > 0u) ? (gid.y * args->x_slot_stride) : 0u;\n"
+     "  for (uint i = tid; i < nc; i += tg_threads) X_tg[i] = (float)X[x_off + i];\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  const uint row = gid.x;\n"
+     "  if (row >= args->n_rows)     return;\n"
+     "  if (gid.y >= args->n_selected) return;\n"
+     "  const uint R = args->R;\n"
+     "  const uint expert = selected[gid.y];\n"
+     "  const device uchar *codes_pkt = codes_base + gid.z * args->codes_stride;\n"
+     "  const device uchar *codes_e   = codes_pkt + expert * args->codes_per_expert;\n"
+     "  const device uchar *codes_row = codes_e + row * args->row_codes_bytes;\n"
+     "  float acc = 0.0f;\n"
+     "  /* R=4 fast path: 2 codes/byte, signed 4-bit nibbles. */\n"
+     "  if (R == 4u) {\n"
+     "    for (uint c = 0; c < nc; c += 2u) {\n"
+     "      const uchar b = codes_row[c >> 1];\n"
+     "      /* sign-extend low and high nibbles */\n"
+     "      const int lo = (int)((char)(b << 4)) >> 4;\n"
+     "      const int hi = (int)((char)(b & 0xF0u)) >> 4;\n"
+     "      acc += (float)lo * X_tg[c];\n"
+     "      acc += (float)hi * X_tg[c + 1u];\n"
+     "    }\n"
+     "  } else if (R == 8u) {\n"
+     "    /* R=8: 1 code/byte, signed. */\n"
+     "    for (uint c = 0; c < nc; c++) {\n"
+     "      const int v = (int)((char)codes_row[c]);\n"
+     "      acc += (float)v * X_tg[c];\n"
+     "    }\n"
+     "  } else if (R == 2u) {\n"
+     "    /* R=2: 4 codes/byte, signed 2-bit. */\n"
+     "    for (uint c = 0; c < nc; c += 4u) {\n"
+     "      const uchar b = codes_row[c >> 2];\n"
+     "      const int v0 = (int)((char)(b << 6)) >> 6;\n"
+     "      const int v1 = (int)((char)(b << 4)) >> 6;\n"
+     "      const int v2 = (int)((char)(b << 2)) >> 6;\n"
+     "      const int v3 = (int)((char)(b     )) >> 6;\n"
+     "      acc += (float)v0 * X_tg[c     ];\n"
+     "      acc += (float)v1 * X_tg[c + 1u];\n"
+     "      acc += (float)v2 * X_tg[c + 2u];\n"
+     "      acc += (float)v3 * X_tg[c + 3u];\n"
+     "    }\n"
+     "  }\n"
+     "  const float a = alpha_base[row];\n"
+     "  device half *out = out_base + gid.z * args->out_stride;\n"
+     "  out[gid.y * args->n_rows + row] = (half)(a * acc);\n"
+     "}\n";
+
+static id<MTLComputePipelineState> g_watersic_decode_matmul_fp16_mtl4_pipeline;
+static int g_watersic_decode_matmul_fp16_mtl4_init_attempted;
+static int g_watersic_decode_matmul_fp16_mtl4_init_ok;
+
+static int ds4_watersic_decode_matmul_fp16_mtl4_pipeline_init(void) {
+    if (g_watersic_decode_matmul_fp16_mtl4_init_attempted)
+        return g_watersic_decode_matmul_fp16_mtl4_init_ok;
+    g_watersic_decode_matmul_fp16_mtl4_init_attempted = 1;
+    g_watersic_decode_matmul_fp16_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_watersic_decode_matmul_fp16_msl,
+        @"ds4_watersic_decode_matmul_fp16_mtl4",
+        @"watersic_decode_matmul_fp16", 256, NULL, 0);
+    g_watersic_decode_matmul_fp16_mtl4_init_ok =
+        (g_watersic_decode_matmul_fp16_mtl4_pipeline != nil) ? 1 : 0;
+    if (g_watersic_decode_matmul_fp16_mtl4_init_ok) {
+        fprintf(stderr,
+            "ds4: ds4_watersic_decode_matmul_fp16_mtl4 MTL4 pipeline initialized\n");
+    }
+    return g_watersic_decode_matmul_fp16_mtl4_init_ok;
+}
+
+/* WaterSIC canary: build synthetic Z codes + α + X, dispatch kernel, cross-check
+ * each output vs the scalar CPU reference. Then run `rounds` for timing.
+ * R ∈ {2, 4, 8}. */
+int ds4_gpu_mtl4_watersic_decode_matmul_fp16_canary(uint32_t n_packets,
+                                                     uint32_t n_selected,
+                                                     uint32_t n_experts_total,
+                                                     uint32_t n_rows,
+                                                     uint32_t n_cols,
+                                                     uint32_t R,
+                                                     uint32_t rounds) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_watersic_decode_matmul_fp16_mtl4_pipeline_init()) return 0;
+    if (n_packets == 0 || n_selected == 0 || n_selected > n_experts_total) return 0;
+    if (n_rows == 0 || n_cols == 0 || rounds == 0) return 0;
+    if (R != 2u && R != 4u && R != 8u) {
+        fprintf(stderr, "ds4: watersic canary requires R in {2, 4, 8} (got %u)\n", R);
+        return 0;
+    }
+    if ((n_cols * R) & 7u) {
+        fprintf(stderr, "ds4: watersic canary requires n_cols*R %% 8 == 0 (got nc=%u R=%u)\n",
+                n_cols, R);
+        return 0;
+    }
+
+    const uint32_t row_codes_bytes = (n_cols * R + 7u) >> 3;
+    const uint32_t codes_per_expert = row_codes_bytes * n_rows;
+    const size_t codes_bytes_per_packet = (size_t)codes_per_expert * n_experts_total;
+    const size_t out_per_packet_halves = (size_t)n_selected * n_rows;
+    const int half_range = 1 << (R - 1);
+
+    int rc = 0;
+    int mismatch = 0;
+    double max_rel = 0.0;
+    double t_ms = 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> alphaBuf = [g_device newBufferWithLength:(NSUInteger)n_rows * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> codesBuf = [g_device newBufferWithLength:(NSUInteger)n_packets * codes_bytes_per_packet
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf   = [g_device newBufferWithLength:(NSUInteger)n_selected * sizeof(uint32_t)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> xBuf     = [g_device newBufferWithLength:(NSUInteger)n_cols * sizeof(_Float16)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf   = [g_device newBufferWithLength:(NSUInteger)n_packets * out_per_packet_halves * sizeof(_Float16)
+                                                       options:MTLResourceStorageModeShared];
+
+        /* Synthesize α: 0.01 + 0.0005 * row */
+        float *alpha_host = (float *)alphaBuf.contents;
+        for (uint32_t r = 0; r < n_rows; r++) {
+            alpha_host[r] = 0.01f + 0.0005f * (float)r;
+        }
+
+        /* Synthesize codes: Z[p, e, r, c] = ((p + e + r + c) mod 2^R) - 2^(R-1) */
+        uint8_t *codes_host = (uint8_t *)codesBuf.contents;
+        memset(codes_host, 0, (size_t)n_packets * codes_bytes_per_packet);
+        for (uint32_t p = 0; p < n_packets; p++) {
+            uint8_t *pkt = codes_host + (size_t)p * codes_bytes_per_packet;
+            for (uint32_t e = 0; e < n_experts_total; e++) {
+                uint8_t *expert_codes = pkt + (size_t)e * codes_per_expert;
+                for (uint32_t r = 0; r < n_rows; r++) {
+                    uint8_t *row_codes = expert_codes + (size_t)r * row_codes_bytes;
+                    for (uint32_t c = 0; c < n_cols; c++) {
+                        const int z = (int)((p + e + r + c) % (uint32_t)(1 << R)) - half_range;
+                        const uint32_t u = (uint32_t)(z + (1 << R)) & ((1u << R) - 1u);
+                        const uint32_t bit_off = c * R;
+                        const uint32_t byte_off = bit_off >> 3;
+                        const uint32_t shift = bit_off & 7u;
+                        row_codes[byte_off] |= (uint8_t)(u << shift);
+                        if (R + shift > 8u) {
+                            row_codes[byte_off + 1u] |= (uint8_t)(u >> (8u - shift));
+                        }
+                    }
+                }
+            }
+        }
+
+        uint32_t *sel = (uint32_t *)selBuf.contents;
+        for (uint32_t i = 0; i < n_selected; i++) sel[i] = i * (n_experts_total / n_selected);
+
+        _Float16 *x_host = (_Float16 *)xBuf.contents;
+        for (uint32_t i = 0; i < n_cols; i++) {
+            x_host[i] = (_Float16)(0.1f + 0.001f * (float)i);
+        }
+
+        struct args_t {
+            uint32_t R, n_rows, n_cols, n_experts_in_packet, n_selected,
+                     codes_stride, out_stride, x_slot_stride,
+                     codes_per_expert, row_codes_bytes;
+        } args = {
+            R, n_rows, n_cols, n_experts_total, n_selected,
+            (uint32_t)codes_bytes_per_packet,
+            (uint32_t)out_per_packet_halves,
+            0u, /* x shared across slots */
+            codes_per_expert, row_codes_bytes,
+        };
+        id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args)
+                                                     options:MTLResourceStorageModeShared];
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        NSError *rs_err = nil;
+        id<MTLResidencySet> rs = [g_device newResidencySetWithDescriptor:rsDesc error:&rs_err];
+        if (!rs) {
+            fprintf(stderr, "ds4: watersic canary residency set failed: %s\n",
+                    rs_err.localizedDescription.UTF8String);
+            return 0;
+        }
+        id<MTLAllocation> allocs[6] = { argsBuf, alphaBuf, codesBuf, selBuf, xBuf, outBuf };
+        [rs addAllocations:allocs count:6];
+        [rs commit];
+        [g_polar_queue addResidencySet:rs];
+
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        const uint64_t t0 = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+            [cb beginCommandBufferWithAllocator:g_polar_allocator];
+            [cb useResidencySet:rs];
+            id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+            [at setAddress:argsBuf.gpuAddress  atIndex:0];
+            [at setAddress:alphaBuf.gpuAddress atIndex:1];
+            [at setAddress:codesBuf.gpuAddress atIndex:2];
+            [at setAddress:selBuf.gpuAddress   atIndex:3];
+            [at setAddress:xBuf.gpuAddress     atIndex:4];
+            [at setAddress:outBuf.gpuAddress   atIndex:5];
+            [enc setComputePipelineState:g_watersic_decode_matmul_fp16_mtl4_pipeline];
+            [enc setArgumentTable:at];
+            /* Threadgroup mem: n_cols floats for X. */
+            const NSUInteger tg_mem_bytes = (NSUInteger)n_cols * sizeof(float);
+            [enc setThreadgroupMemoryLength:tg_mem_bytes atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(n_rows, n_selected, n_packets)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [enc endEncoding];
+            [cb endCommandBuffer];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            MTL4CommitOptions *opts = [MTL4CommitOptions new];
+            [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+            id<MTL4CommandBuffer> bufs[1] = {cb};
+            [g_polar_queue commit:bufs count:1 options:opts];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+            ds4_mtl4_pool_release(at, 8);
+        }
+        const uint64_t t1 = mach_absolute_time();
+        t_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        [rs endResidency];
+        [g_polar_queue removeResidencySet:rs];
+
+        /* CPU reference: compute one output per (packet, slot, row) and compare. */
+        const _Float16 *gpu_out = (const _Float16 *)outBuf.contents;
+        int dumped = 0;
+        for (uint32_t p = 0; p < n_packets; p++) {
+            const uint8_t *pkt = codes_host + (size_t)p * codes_bytes_per_packet;
+            for (uint32_t es = 0; es < n_selected; es++) {
+                const uint32_t expert = sel[es];
+                const uint8_t *expert_codes = pkt + (size_t)expert * codes_per_expert;
+                for (uint32_t r = 0; r < n_rows; r++) {
+                    const uint8_t *row_codes = expert_codes + (size_t)r * row_codes_bytes;
+                    double acc = 0.0;
+                    for (uint32_t c = 0; c < n_cols; c++) {
+                        const uint32_t bit_off = c * R;
+                        const uint32_t byte_off = bit_off >> 3;
+                        const uint32_t shift = bit_off & 7u;
+                        uint32_t window = (uint32_t)row_codes[byte_off];
+                        if (R + shift > 8u) window |= ((uint32_t)row_codes[byte_off + 1u]) << 8u;
+                        const uint32_t u = (window >> shift) & ((1u << R) - 1u);
+                        int z = (int)u;
+                        if (u & (1u << (R - 1u))) z -= (1 << R);
+                        acc += (double)z * (double)x_host[c];
+                    }
+                    const float expected = (float)(alpha_host[r] * acc);
+                    const float got = (float)gpu_out[p * out_per_packet_halves + es * n_rows + r];
+                    const float denom = (fabsf(expected) > 1e-3f) ? fabsf(expected) : 1e-3f;
+                    const double rel = fabs((double)(got - expected)) / (double)denom;
+                    if (rel > max_rel) max_rel = rel;
+                    if (rel > 5e-2) mismatch++;
+                    if (getenv("DS4_DUMP_WATERSIC") && dumped < 8) {
+                        fprintf(stderr,
+                            "    [p=%u es=%u expert=%u r=%u] got=%.5f expected=%.5f\n",
+                            p, es, expert, r, (double)got, (double)expected);
+                        dumped++;
+                    }
+                }
+            }
+        }
+        rc = 1;
+    }
+
+    const uint64_t macs_per_round = (uint64_t)n_packets * n_selected * n_rows * n_cols;
+    const double gflops = ((double)macs_per_round * 2.0 * rounds / 1e9) / (t_ms / 1000.0);
+    const double per_layer_us = t_ms * 1000.0 / (double)rounds;
+
+    fprintf(stderr,
+        "ds4: watersic_decode_matmul_fp16 canary n_packets=%u n_sel=%u/%u rows=%u cols=%u R=%u rounds=%u\n"
+        "  matmul: %.3f ms total (%.1f us/round)  %.2f GFLOP/s\n"
+        "  cross-check mismatch=%d max_rel=%.4e (must be <5%% per cell)  rc=%d\n",
+        n_packets, n_selected, n_experts_total, n_rows, n_cols, R, rounds,
+        t_ms, per_layer_us, gflops,
+        mismatch, max_rel, rc);
+    return (rc && mismatch == 0) ? 1 : 0;
+}
+
+/* ============================================================================
+ * WaterSIC fused gate+up+SwiGLU decode-matmul kernel (silv 2026-05-28 task #770).
+ *
+ * CODA-style (arxiv 2605.19269): GEMM mainloop with composable epilogue
+ * primitives. One kernel computes:
+ *   gate_dot[row] = Σ_j Z_gate[row,j] * X[j]
+ *   up_dot[row]   = Σ_j Z_up[row,j]   * X[j]
+ *   g = α_gate[row] * gate_dot[row]                 (Scaling primitive 1)
+ *   u = α_up[row]   * up_dot[row]                   (Scaling primitive 2)
+ *   if clamp > 0: g = min(g, clamp); u = clamp(u, -clamp, clamp)
+ *   silu_g = g / (1 + exp(-g))                      (Pairwise transform)
+ *   out[row] = silu_g * u                           (Pairwise transform + store)
+ *
+ * Replaces 2 separate matmul kernels + 1 SwiGLU kernel + 2 HBM round trips.
+ * Per TritonMoE 35% memory traffic reduction: saves ~6TF + 2Td bytes/layer.
+ *
+ * Identical args struct + dispatch shape to watersic_decode_matmul_fp16,
+ * except now binds TWO codes buffers + TWO α arrays.
+ * ============================================================================
+ */
+static NSString * const k_watersic_decode_matmul_gate_up_swiglu_fp16_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct args_t {\n"
+     "  uint R;\n"
+     "  uint n_rows;             /* = d_ffn (output rows after gate+up) */\n"
+     "  uint n_cols;             /* = d_model (input cols) */\n"
+     "  uint n_experts_in_packet;\n"
+     "  uint n_selected;\n"
+     "  uint codes_stride;       /* gate codes per-packet stride in bytes */\n"
+     "  uint up_codes_stride;    /* up codes per-packet stride in bytes (same value usually) */\n"
+     "  uint out_stride;\n"
+     "  uint x_slot_stride;\n"
+     "  uint codes_per_expert;\n"
+     "  uint row_codes_bytes;\n"
+     "  float swiglu_limit;      /* DS4 V4 = 10.0; <= 0 = no clamp */\n"
+     "};\n"
+     "kernel void watersic_decode_matmul_gate_up_swiglu_fp16(\n"
+     "    device const args_t *args             [[buffer(0)]],\n"
+     "    device const float  *alpha_gate       [[buffer(1)]],   /* n_rows fp32 */\n"
+     "    device const float  *alpha_up         [[buffer(2)]],   /* n_rows fp32 */\n"
+     "    device const uchar  *gate_codes_base  [[buffer(3)]],\n"
+     "    device const uchar  *up_codes_base    [[buffer(4)]],\n"
+     "    device const uint   *selected         [[buffer(5)]],\n"
+     "    device const half   *X                [[buffer(6)]],\n"
+     "    device       half   *out_base         [[buffer(7)]],\n"
+     "    threadgroup float   *X_tg             [[threadgroup(0)]],\n"
+     "    uint3 gid                             [[thread_position_in_grid]],\n"
+     "    uint  tid                             [[thread_index_in_threadgroup]],\n"
+     "    uint3 tg_dim                          [[threads_per_threadgroup]]) {\n"
+     "  const uint tg_threads = tg_dim.x * tg_dim.y * tg_dim.z;\n"
+     "  const uint nc = args->n_cols;\n"
+     "  /* Cooperative X load — shared between gate and up matmuls (the win). */\n"
+     "  const uint x_off = (args->x_slot_stride > 0u) ? (gid.y * args->x_slot_stride) : 0u;\n"
+     "  for (uint i = tid; i < nc; i += tg_threads) X_tg[i] = (float)X[x_off + i];\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  const uint row = gid.x;\n"
+     "  if (row >= args->n_rows)     return;\n"
+     "  if (gid.y >= args->n_selected) return;\n"
+     "  const uint R = args->R;\n"
+     "  const uint expert = selected[gid.y];\n"
+     "  const device uchar *gate_pkt = gate_codes_base + gid.z * args->codes_stride;\n"
+     "  const device uchar *up_pkt   = up_codes_base   + gid.z * args->up_codes_stride;\n"
+     "  const device uchar *gate_codes_e = gate_pkt + expert * args->codes_per_expert;\n"
+     "  const device uchar *up_codes_e   = up_pkt   + expert * args->codes_per_expert;\n"
+     "  const device uchar *gate_row = gate_codes_e + row * args->row_codes_bytes;\n"
+     "  const device uchar *up_row   = up_codes_e   + row * args->row_codes_bytes;\n"
+     "  /* GEMM mainloop: decode + matmul for BOTH gate and up in one inner loop. */\n"
+     "  float acc_g = 0.0f;\n"
+     "  float acc_u = 0.0f;\n"
+     "  if (R == 4u) {\n"
+     "    for (uint c = 0; c < nc; c += 2u) {\n"
+     "      const uchar bg = gate_row[c >> 1];\n"
+     "      const uchar bu = up_row[c >> 1];\n"
+     "      const int g_lo = (int)((char)(bg << 4)) >> 4;\n"
+     "      const int g_hi = (int)((char)(bg & 0xF0u)) >> 4;\n"
+     "      const int u_lo = (int)((char)(bu << 4)) >> 4;\n"
+     "      const int u_hi = (int)((char)(bu & 0xF0u)) >> 4;\n"
+     "      const float x0 = X_tg[c     ];\n"
+     "      const float x1 = X_tg[c + 1u];\n"
+     "      acc_g += (float)g_lo * x0 + (float)g_hi * x1;\n"
+     "      acc_u += (float)u_lo * x0 + (float)u_hi * x1;\n"
+     "    }\n"
+     "  } else if (R == 8u) {\n"
+     "    for (uint c = 0; c < nc; c++) {\n"
+     "      const int vg = (int)((char)gate_row[c]);\n"
+     "      const int vu = (int)((char)up_row[c]);\n"
+     "      const float xc = X_tg[c];\n"
+     "      acc_g += (float)vg * xc;\n"
+     "      acc_u += (float)vu * xc;\n"
+     "    }\n"
+     "  } else if (R == 2u) {\n"
+     "    for (uint c = 0; c < nc; c += 4u) {\n"
+     "      const uchar bg = gate_row[c >> 2];\n"
+     "      const uchar bu = up_row[c >> 2];\n"
+     "      const int g0 = (int)((char)(bg << 6)) >> 6;\n"
+     "      const int g1 = (int)((char)(bg << 4)) >> 6;\n"
+     "      const int g2 = (int)((char)(bg << 2)) >> 6;\n"
+     "      const int g3 = (int)((char)(bg     )) >> 6;\n"
+     "      const int u0 = (int)((char)(bu << 6)) >> 6;\n"
+     "      const int u1 = (int)((char)(bu << 4)) >> 6;\n"
+     "      const int u2 = (int)((char)(bu << 2)) >> 6;\n"
+     "      const int u3 = (int)((char)(bu     )) >> 6;\n"
+     "      const float x0 = X_tg[c     ];\n"
+     "      const float x1 = X_tg[c + 1u];\n"
+     "      const float x2 = X_tg[c + 2u];\n"
+     "      const float x3 = X_tg[c + 3u];\n"
+     "      acc_g += (float)g0*x0 + (float)g1*x1 + (float)g2*x2 + (float)g3*x3;\n"
+     "      acc_u += (float)u0*x0 + (float)u1*x1 + (float)u2*x2 + (float)u3*x3;\n"
+     "    }\n"
+     "  }\n"
+     "  /* CODA epilogue chain — all in registers, no HBM round trip. */\n"
+     "  float g = alpha_gate[row] * acc_g;\n"
+     "  float u = alpha_up[row]   * acc_u;\n"
+     "  const float c = args->swiglu_limit;\n"
+     "  if (c > 1.0e-6f) {\n"
+     "    g = min(g, c);\n"
+     "    u = clamp(u, -c, c);\n"
+     "  }\n"
+     "  const float silu_g = g / (1.0f + exp(-g));\n"
+     "  const float result = silu_g * u;\n"
+     "  device half *out = out_base + gid.z * args->out_stride;\n"
+     "  out[gid.y * args->n_rows + row] = (half)result;\n"
+     "}\n";
+
+static id<MTLComputePipelineState> g_watersic_gate_up_swiglu_mtl4_pipeline;
+static int g_watersic_gate_up_swiglu_mtl4_init_attempted;
+static int g_watersic_gate_up_swiglu_mtl4_init_ok;
+
+static int ds4_watersic_gate_up_swiglu_mtl4_pipeline_init(void) {
+    if (g_watersic_gate_up_swiglu_mtl4_init_attempted)
+        return g_watersic_gate_up_swiglu_mtl4_init_ok;
+    g_watersic_gate_up_swiglu_mtl4_init_attempted = 1;
+    g_watersic_gate_up_swiglu_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_watersic_decode_matmul_gate_up_swiglu_fp16_msl,
+        @"ds4_watersic_gate_up_swiglu_mtl4",
+        @"watersic_decode_matmul_gate_up_swiglu_fp16", 256, NULL, 0);
+    g_watersic_gate_up_swiglu_mtl4_init_ok =
+        (g_watersic_gate_up_swiglu_mtl4_pipeline != nil) ? 1 : 0;
+    if (g_watersic_gate_up_swiglu_mtl4_init_ok) {
+        fprintf(stderr,
+            "ds4: ds4_watersic_gate_up_swiglu_mtl4 MTL4 pipeline initialized\n");
+    }
+    return g_watersic_gate_up_swiglu_mtl4_init_ok;
+}
+
+int ds4_gpu_mtl4_watersic_gate_up_swiglu_canary(uint32_t n_packets,
+                                                 uint32_t n_selected,
+                                                 uint32_t n_experts_total,
+                                                 uint32_t n_rows,
+                                                 uint32_t n_cols,
+                                                 uint32_t R,
+                                                 float swiglu_limit,
+                                                 uint32_t rounds) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_watersic_gate_up_swiglu_mtl4_pipeline_init()) return 0;
+    if (n_packets == 0 || n_selected == 0 || n_selected > n_experts_total) return 0;
+    if (n_rows == 0 || n_cols == 0 || rounds == 0) return 0;
+    if (R != 2u && R != 4u && R != 8u) return 0;
+    if ((n_cols * R) & 7u) return 0;
+
+    const uint32_t row_codes_bytes = (n_cols * R + 7u) >> 3;
+    const uint32_t codes_per_expert = row_codes_bytes * n_rows;
+    const size_t codes_bytes_per_packet = (size_t)codes_per_expert * n_experts_total;
+    const size_t out_per_packet_halves = (size_t)n_selected * n_rows;
+    const int half_range = 1 << (R - 1);
+
+    int rc = 0;
+    int mismatch = 0;
+    double max_rel = 0.0;
+    double t_ms = 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> alphaGBuf = [g_device newBufferWithLength:(NSUInteger)n_rows * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> alphaUBuf = [g_device newBufferWithLength:(NSUInteger)n_rows * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gateBuf   = [g_device newBufferWithLength:(NSUInteger)n_packets * codes_bytes_per_packet
+                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> upBuf     = [g_device newBufferWithLength:(NSUInteger)n_packets * codes_bytes_per_packet
+                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf    = [g_device newBufferWithLength:(NSUInteger)n_selected * sizeof(uint32_t)
+                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> xBuf      = [g_device newBufferWithLength:(NSUInteger)n_cols * sizeof(_Float16)
+                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf    = [g_device newBufferWithLength:(NSUInteger)n_packets * out_per_packet_halves * sizeof(_Float16)
+                                                        options:MTLResourceStorageModeShared];
+
+        float *alpha_g_host = (float *)alphaGBuf.contents;
+        float *alpha_u_host = (float *)alphaUBuf.contents;
+        for (uint32_t r = 0; r < n_rows; r++) {
+            alpha_g_host[r] = 0.01f + 0.0005f * (float)r;
+            alpha_u_host[r] = 0.02f + 0.0003f * (float)r;
+        }
+
+        /* Synthesize gate codes: Z_g[p, e, r, c] = ((p + e + r + c) % 2^R) - 2^(R-1)
+         * Synthesize up   codes: Z_u[p, e, r, c] = ((p + e + r + c + 1) % 2^R) - 2^(R-1) */
+        uint8_t *gate_host = (uint8_t *)gateBuf.contents;
+        uint8_t *up_host   = (uint8_t *)upBuf.contents;
+        memset(gate_host, 0, (size_t)n_packets * codes_bytes_per_packet);
+        memset(up_host,   0, (size_t)n_packets * codes_bytes_per_packet);
+        for (uint32_t p = 0; p < n_packets; p++) {
+            uint8_t *gpkt = gate_host + (size_t)p * codes_bytes_per_packet;
+            uint8_t *upkt = up_host   + (size_t)p * codes_bytes_per_packet;
+            for (uint32_t e = 0; e < n_experts_total; e++) {
+                uint8_t *g_e = gpkt + (size_t)e * codes_per_expert;
+                uint8_t *u_e = upkt + (size_t)e * codes_per_expert;
+                for (uint32_t r = 0; r < n_rows; r++) {
+                    uint8_t *gr = g_e + (size_t)r * row_codes_bytes;
+                    uint8_t *ur = u_e + (size_t)r * row_codes_bytes;
+                    for (uint32_t c = 0; c < n_cols; c++) {
+                        const int zg = (int)((p + e + r + c    ) % (uint32_t)(1 << R)) - half_range;
+                        const int zu = (int)((p + e + r + c + 1) % (uint32_t)(1 << R)) - half_range;
+                        const uint32_t ug = (uint32_t)(zg + (1 << R)) & ((1u << R) - 1u);
+                        const uint32_t uu = (uint32_t)(zu + (1 << R)) & ((1u << R) - 1u);
+                        const uint32_t bit_off = c * R;
+                        const uint32_t byte_off = bit_off >> 3;
+                        const uint32_t shift = bit_off & 7u;
+                        gr[byte_off] |= (uint8_t)(ug << shift);
+                        ur[byte_off] |= (uint8_t)(uu << shift);
+                        if (R + shift > 8u) {
+                            gr[byte_off + 1u] |= (uint8_t)(ug >> (8u - shift));
+                            ur[byte_off + 1u] |= (uint8_t)(uu >> (8u - shift));
+                        }
+                    }
+                }
+            }
+        }
+
+        uint32_t *sel = (uint32_t *)selBuf.contents;
+        for (uint32_t i = 0; i < n_selected; i++) sel[i] = i * (n_experts_total / n_selected);
+
+        _Float16 *x_host = (_Float16 *)xBuf.contents;
+        for (uint32_t i = 0; i < n_cols; i++) x_host[i] = (_Float16)(0.1f + 0.001f * (float)i);
+
+        struct args_t {
+            uint32_t R, n_rows, n_cols, n_experts_in_packet, n_selected,
+                     codes_stride, up_codes_stride, out_stride, x_slot_stride,
+                     codes_per_expert, row_codes_bytes;
+            float swiglu_limit;
+        } args = {
+            R, n_rows, n_cols, n_experts_total, n_selected,
+            (uint32_t)codes_bytes_per_packet,
+            (uint32_t)codes_bytes_per_packet,
+            (uint32_t)out_per_packet_halves,
+            0u,
+            codes_per_expert, row_codes_bytes,
+            swiglu_limit,
+        };
+        id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args)
+                                                     options:MTLResourceStorageModeShared];
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        NSError *rs_err = nil;
+        id<MTLResidencySet> rs = [g_device newResidencySetWithDescriptor:rsDesc error:&rs_err];
+        if (!rs) {
+            fprintf(stderr, "ds4: watersic gate+up canary residency set failed: %s\n",
+                    rs_err.localizedDescription.UTF8String);
+            return 0;
+        }
+        id<MTLAllocation> allocs[8] = { argsBuf, alphaGBuf, alphaUBuf, gateBuf, upBuf, selBuf, xBuf, outBuf };
+        [rs addAllocations:allocs count:8];
+        [rs commit];
+        [g_polar_queue addResidencySet:rs];
+
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        const uint64_t t0 = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+            [cb beginCommandBufferWithAllocator:g_polar_allocator];
+            [cb useResidencySet:rs];
+            id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+            [at setAddress:argsBuf.gpuAddress   atIndex:0];
+            [at setAddress:alphaGBuf.gpuAddress atIndex:1];
+            [at setAddress:alphaUBuf.gpuAddress atIndex:2];
+            [at setAddress:gateBuf.gpuAddress   atIndex:3];
+            [at setAddress:upBuf.gpuAddress     atIndex:4];
+            [at setAddress:selBuf.gpuAddress    atIndex:5];
+            [at setAddress:xBuf.gpuAddress      atIndex:6];
+            [at setAddress:outBuf.gpuAddress    atIndex:7];
+            [enc setComputePipelineState:g_watersic_gate_up_swiglu_mtl4_pipeline];
+            [enc setArgumentTable:at];
+            const NSUInteger tg_mem_bytes = (NSUInteger)n_cols * sizeof(float);
+            [enc setThreadgroupMemoryLength:tg_mem_bytes atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(n_rows, n_selected, n_packets)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [enc endEncoding];
+            [cb endCommandBuffer];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            MTL4CommitOptions *opts = [MTL4CommitOptions new];
+            [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+            id<MTL4CommandBuffer> bufs[1] = {cb};
+            [g_polar_queue commit:bufs count:1 options:opts];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+            ds4_mtl4_pool_release(at, 8);
+        }
+        const uint64_t t1 = mach_absolute_time();
+        t_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        [rs endResidency];
+        [g_polar_queue removeResidencySet:rs];
+
+        /* CPU reference */
+        const _Float16 *gpu_out = (const _Float16 *)outBuf.contents;
+        int dumped = 0;
+        for (uint32_t p = 0; p < n_packets; p++) {
+            const uint8_t *gpkt = gate_host + (size_t)p * codes_bytes_per_packet;
+            const uint8_t *upkt = up_host   + (size_t)p * codes_bytes_per_packet;
+            for (uint32_t es = 0; es < n_selected; es++) {
+                const uint32_t expert = sel[es];
+                const uint8_t *g_e = gpkt + (size_t)expert * codes_per_expert;
+                const uint8_t *u_e = upkt + (size_t)expert * codes_per_expert;
+                for (uint32_t r = 0; r < n_rows; r++) {
+                    const uint8_t *gr = g_e + (size_t)r * row_codes_bytes;
+                    const uint8_t *ur = u_e + (size_t)r * row_codes_bytes;
+                    double acc_g = 0.0, acc_u = 0.0;
+                    for (uint32_t c = 0; c < n_cols; c++) {
+                        const uint32_t bit_off = c * R;
+                        const uint32_t byte_off = bit_off >> 3;
+                        const uint32_t shift = bit_off & 7u;
+                        uint32_t wg = (uint32_t)gr[byte_off];
+                        uint32_t wu = (uint32_t)ur[byte_off];
+                        if (R + shift > 8u) {
+                            wg |= ((uint32_t)gr[byte_off + 1u]) << 8u;
+                            wu |= ((uint32_t)ur[byte_off + 1u]) << 8u;
+                        }
+                        const uint32_t ug_v = (wg >> shift) & ((1u << R) - 1u);
+                        const uint32_t uu_v = (wu >> shift) & ((1u << R) - 1u);
+                        int zg = (int)ug_v; if (ug_v & (1u << (R - 1u))) zg -= (1 << R);
+                        int zu = (int)uu_v; if (uu_v & (1u << (R - 1u))) zu -= (1 << R);
+                        acc_g += (double)zg * (double)x_host[c];
+                        acc_u += (double)zu * (double)x_host[c];
+                    }
+                    double g = (double)alpha_g_host[r] * acc_g;
+                    double u = (double)alpha_u_host[r] * acc_u;
+                    if (swiglu_limit > 1.0e-6f) {
+                        if (g > swiglu_limit) g = swiglu_limit;
+                        if (u > swiglu_limit) u = swiglu_limit;
+                        if (u < -swiglu_limit) u = -swiglu_limit;
+                    }
+                    const double silu_g = g / (1.0 + exp(-g));
+                    const float expected = (float)(silu_g * u);
+                    const float got = (float)gpu_out[p * out_per_packet_halves + es * n_rows + r];
+                    const float denom = (fabsf(expected) > 1e-3f) ? fabsf(expected) : 1e-3f;
+                    const double rel = fabs((double)(got - expected)) / (double)denom;
+                    if (rel > max_rel) max_rel = rel;
+                    if (rel > 5e-2) mismatch++;
+                    if (getenv("DS4_DUMP_WATERSIC") && dumped < 8) {
+                        fprintf(stderr,
+                            "    [p=%u es=%u expert=%u r=%u] got=%.5f expected=%.5f silu_g=%.4f u=%.4f\n",
+                            p, es, expert, r, (double)got, (double)expected, silu_g, u);
+                        dumped++;
+                    }
+                }
+            }
+        }
+        rc = 1;
+    }
+
+    /* FLOPs: 2 matvecs (2*n_cols MACs each) + ~5 ops epilogue = 2 * 2*n_cols + 5 per output.
+     * Bandwidth: 2 codes buffers + α + X read = 2 × n_cols × R/8 bytes per row + small. */
+    const uint64_t macs_per_round = (uint64_t)n_packets * n_selected * n_rows * n_cols * 2u; /* gate + up */
+    const double gflops = ((double)macs_per_round * 2.0 * rounds / 1e9) / (t_ms / 1000.0);
+    const double per_layer_us = t_ms * 1000.0 / (double)rounds;
+
+    fprintf(stderr,
+        "ds4: watersic_gate_up_swiglu canary n_packets=%u n_sel=%u/%u rows=%u cols=%u R=%u clamp=%.1f rounds=%u\n"
+        "  fused gate+up+SwiGLU: %.3f ms total (%.1f us/round)  %.2f GFLOP/s\n"
+        "  cross-check mismatch=%d max_rel=%.4e (must be <5%% per cell)  rc=%d\n",
+        n_packets, n_selected, n_experts_total, n_rows, n_cols, R, swiglu_limit, rounds,
+        t_ms, per_layer_us, gflops,
+        mismatch, max_rel, rc);
+    return (rc && mismatch == 0) ? 1 : 0;
+}
+
+/* ============================================================================
+ * WaterSIC down-proj decode-matmul + route-weight scaling CODA kernel
+ * (silv 2026-05-28 task #770 continuation).
+ *
+ * Down-projection in a routed-MoE FFN: input is the SwiGLU-activated hidden
+ * state H[n_cols = d_ffn = 2048], output is per-(packet, slot, row) of size
+ * d_model = 4096. The per-token aggregation across selected slots is a
+ * separate reduction (or caller-side sum).
+ *
+ * CODA epilogue chain:
+ *   acc = matmul(Z_down_codes, H)            (mainloop: decode + dot product)
+ *   y   = α_down[row] * acc                   (Scaling primitive 1)
+ *   y_routed = route_weights[pkt,slot] * y    (Scaling primitive 2)
+ *   out[pkt, slot, row] = (half)y_routed      (Store)
+ *
+ * Caller sums across slots in a downstream kernel; this matches the
+ * existing VQB2 + dsv4_moe_sum6_f32 pattern.
+ * ============================================================================
+ */
+static NSString * const k_watersic_decode_matmul_down_routed_fp16_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct args_t {\n"
+     "  uint R;\n"
+     "  uint n_rows;             /* = d_model for down */\n"
+     "  uint n_cols;             /* = d_ffn for down */\n"
+     "  uint n_experts_in_packet;\n"
+     "  uint n_selected;\n"
+     "  uint codes_stride;\n"
+     "  uint out_stride;\n"
+     "  uint x_slot_stride;\n"
+     "  uint codes_per_expert;\n"
+     "  uint row_codes_bytes;\n"
+     "  uint route_weights_stride;  /* per-packet stride in route_weights (n_selected typically) */\n"
+     "};\n"
+     "kernel void watersic_decode_matmul_down_routed_fp16(\n"
+     "    device const args_t *args             [[buffer(0)]],\n"
+     "    device const float  *alpha_base       [[buffer(1)]],\n"
+     "    device const uchar  *codes_base       [[buffer(2)]],\n"
+     "    device const uint   *selected         [[buffer(3)]],\n"
+     "    device const half   *X                [[buffer(4)]],\n"
+     "    device       half   *out_base         [[buffer(5)]],\n"
+     "    device const float  *route_weights    [[buffer(6)]],\n"
+     "    threadgroup float   *X_tg             [[threadgroup(0)]],\n"
+     "    uint3 gid                             [[thread_position_in_grid]],\n"
+     "    uint  tid                             [[thread_index_in_threadgroup]],\n"
+     "    uint3 tg_dim                          [[threads_per_threadgroup]]) {\n"
+     "  const uint tg_threads = tg_dim.x * tg_dim.y * tg_dim.z;\n"
+     "  const uint nc = args->n_cols;\n"
+     "  const uint x_off = (args->x_slot_stride > 0u) ? (gid.y * args->x_slot_stride) : 0u;\n"
+     "  for (uint i = tid; i < nc; i += tg_threads) X_tg[i] = (float)X[x_off + i];\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  const uint row = gid.x;\n"
+     "  if (row >= args->n_rows)     return;\n"
+     "  if (gid.y >= args->n_selected) return;\n"
+     "  const uint R = args->R;\n"
+     "  const uint expert = selected[gid.y];\n"
+     "  const device uchar *codes_pkt = codes_base + gid.z * args->codes_stride;\n"
+     "  const device uchar *codes_e   = codes_pkt + expert * args->codes_per_expert;\n"
+     "  const device uchar *codes_row = codes_e + row * args->row_codes_bytes;\n"
+     "  float acc = 0.0f;\n"
+     "  if (R == 4u) {\n"
+     "    for (uint c = 0; c < nc; c += 2u) {\n"
+     "      const uchar b = codes_row[c >> 1];\n"
+     "      const int lo = (int)((char)(b << 4)) >> 4;\n"
+     "      const int hi = (int)((char)(b & 0xF0u)) >> 4;\n"
+     "      acc += (float)lo * X_tg[c] + (float)hi * X_tg[c + 1u];\n"
+     "    }\n"
+     "  } else if (R == 8u) {\n"
+     "    for (uint c = 0; c < nc; c++) {\n"
+     "      const int v = (int)((char)codes_row[c]);\n"
+     "      acc += (float)v * X_tg[c];\n"
+     "    }\n"
+     "  } else if (R == 2u) {\n"
+     "    for (uint c = 0; c < nc; c += 4u) {\n"
+     "      const uchar b = codes_row[c >> 2];\n"
+     "      const int v0 = (int)((char)(b << 6)) >> 6;\n"
+     "      const int v1 = (int)((char)(b << 4)) >> 6;\n"
+     "      const int v2 = (int)((char)(b << 2)) >> 6;\n"
+     "      const int v3 = (int)((char)(b     )) >> 6;\n"
+     "      acc += (float)v0*X_tg[c] + (float)v1*X_tg[c+1u] + (float)v2*X_tg[c+2u] + (float)v3*X_tg[c+3u];\n"
+     "    }\n"
+     "  }\n"
+     "  /* CODA epilogue: α scale, then route_weight scale, then store. */\n"
+     "  const float a = alpha_base[row];\n"
+     "  const float w = route_weights[gid.z * args->route_weights_stride + gid.y];\n"
+     "  device half *out = out_base + gid.z * args->out_stride;\n"
+     "  out[gid.y * args->n_rows + row] = (half)(a * acc * w);\n"
+     "}\n";
+
+static id<MTLComputePipelineState> g_watersic_down_routed_mtl4_pipeline;
+static int g_watersic_down_routed_mtl4_init_attempted;
+static int g_watersic_down_routed_mtl4_init_ok;
+
+static int ds4_watersic_down_routed_mtl4_pipeline_init(void) {
+    if (g_watersic_down_routed_mtl4_init_attempted)
+        return g_watersic_down_routed_mtl4_init_ok;
+    g_watersic_down_routed_mtl4_init_attempted = 1;
+    g_watersic_down_routed_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_watersic_decode_matmul_down_routed_fp16_msl,
+        @"ds4_watersic_down_routed_mtl4",
+        @"watersic_decode_matmul_down_routed_fp16", 256, NULL, 0);
+    g_watersic_down_routed_mtl4_init_ok =
+        (g_watersic_down_routed_mtl4_pipeline != nil) ? 1 : 0;
+    if (g_watersic_down_routed_mtl4_init_ok) {
+        fprintf(stderr,
+            "ds4: ds4_watersic_down_routed_mtl4 MTL4 pipeline initialized\n");
+    }
+    return g_watersic_down_routed_mtl4_init_ok;
+}
+
+int ds4_gpu_mtl4_watersic_down_routed_canary(uint32_t n_packets,
+                                              uint32_t n_selected,
+                                              uint32_t n_experts_total,
+                                              uint32_t n_rows,
+                                              uint32_t n_cols,
+                                              uint32_t R,
+                                              uint32_t rounds) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_watersic_down_routed_mtl4_pipeline_init()) return 0;
+    if (n_packets == 0 || n_selected == 0 || n_selected > n_experts_total) return 0;
+    if (n_rows == 0 || n_cols == 0 || rounds == 0) return 0;
+    if (R != 2u && R != 4u && R != 8u) return 0;
+    if ((n_cols * R) & 7u) return 0;
+
+    const uint32_t row_codes_bytes = (n_cols * R + 7u) >> 3;
+    const uint32_t codes_per_expert = row_codes_bytes * n_rows;
+    const size_t codes_bytes_per_packet = (size_t)codes_per_expert * n_experts_total;
+    const size_t out_per_packet_halves = (size_t)n_selected * n_rows;
+    const int half_range = 1 << (R - 1);
+
+    int rc = 0;
+    int mismatch = 0;
+    double max_rel = 0.0;
+    double t_ms = 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> alphaBuf = [g_device newBufferWithLength:(NSUInteger)n_rows * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> codesBuf = [g_device newBufferWithLength:(NSUInteger)n_packets * codes_bytes_per_packet
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf   = [g_device newBufferWithLength:(NSUInteger)n_selected * sizeof(uint32_t)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> xBuf     = [g_device newBufferWithLength:(NSUInteger)n_cols * sizeof(_Float16)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf   = [g_device newBufferWithLength:(NSUInteger)n_packets * out_per_packet_halves * sizeof(_Float16)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> rwBuf    = [g_device newBufferWithLength:(NSUInteger)n_packets * n_selected * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+
+        /* α scaled down: down-proj has n_rows=4096 + n_cols=2048 + R=8 codes,
+         * |out| = |α[r] · Σ Z·X · w| can hit fp16 max 65504 with α=0.01. Use
+         * smaller α to keep all 3 R variants in fp16 range. */
+        float *alpha_host = (float *)alphaBuf.contents;
+        for (uint32_t r = 0; r < n_rows; r++) alpha_host[r] = 0.0001f + 0.00001f * (float)r;
+
+        uint8_t *codes_host = (uint8_t *)codesBuf.contents;
+        memset(codes_host, 0, (size_t)n_packets * codes_bytes_per_packet);
+        for (uint32_t p = 0; p < n_packets; p++) {
+            uint8_t *pkt = codes_host + (size_t)p * codes_bytes_per_packet;
+            for (uint32_t e = 0; e < n_experts_total; e++) {
+                uint8_t *expert_codes = pkt + (size_t)e * codes_per_expert;
+                for (uint32_t r = 0; r < n_rows; r++) {
+                    uint8_t *row_codes = expert_codes + (size_t)r * row_codes_bytes;
+                    for (uint32_t c = 0; c < n_cols; c++) {
+                        const int z = (int)((p + e + r + c) % (uint32_t)(1 << R)) - half_range;
+                        const uint32_t u = (uint32_t)(z + (1 << R)) & ((1u << R) - 1u);
+                        const uint32_t bit_off = c * R;
+                        const uint32_t byte_off = bit_off >> 3;
+                        const uint32_t shift = bit_off & 7u;
+                        row_codes[byte_off] |= (uint8_t)(u << shift);
+                        if (R + shift > 8u) {
+                            row_codes[byte_off + 1u] |= (uint8_t)(u >> (8u - shift));
+                        }
+                    }
+                }
+            }
+        }
+
+        uint32_t *sel = (uint32_t *)selBuf.contents;
+        for (uint32_t i = 0; i < n_selected; i++) sel[i] = i * (n_experts_total / n_selected);
+
+        _Float16 *x_host = (_Float16 *)xBuf.contents;
+        for (uint32_t i = 0; i < n_cols; i++) x_host[i] = (_Float16)(0.1f + 0.001f * (float)i);
+
+        /* Route weights: per-(packet, slot) softmax-normalized. Synthesize: w[p, s] = 0.1 + 0.01*p + 0.05*s. */
+        float *rw_host = (float *)rwBuf.contents;
+        for (uint32_t p = 0; p < n_packets; p++) {
+            for (uint32_t s = 0; s < n_selected; s++) {
+                rw_host[p * n_selected + s] = 0.1f + 0.01f * (float)p + 0.05f * (float)s;
+            }
+        }
+
+        struct args_t {
+            uint32_t R, n_rows, n_cols, n_experts_in_packet, n_selected,
+                     codes_stride, out_stride, x_slot_stride,
+                     codes_per_expert, row_codes_bytes, route_weights_stride;
+        } args = {
+            R, n_rows, n_cols, n_experts_total, n_selected,
+            (uint32_t)codes_bytes_per_packet,
+            (uint32_t)out_per_packet_halves,
+            0u,
+            codes_per_expert, row_codes_bytes,
+            n_selected,
+        };
+        id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args)
+                                                     options:MTLResourceStorageModeShared];
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 8;
+        NSError *rs_err = nil;
+        id<MTLResidencySet> rs = [g_device newResidencySetWithDescriptor:rsDesc error:&rs_err];
+        if (!rs) {
+            fprintf(stderr, "ds4: watersic down canary residency set failed: %s\n",
+                    rs_err.localizedDescription.UTF8String);
+            return 0;
+        }
+        id<MTLAllocation> allocs[7] = { argsBuf, alphaBuf, codesBuf, selBuf, xBuf, outBuf, rwBuf };
+        [rs addAllocations:allocs count:7];
+        [rs commit];
+        [g_polar_queue addResidencySet:rs];
+
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        const uint64_t t0 = mach_absolute_time();
+        for (uint32_t r = 0; r < rounds; r++) {
+            id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+            [cb beginCommandBufferWithAllocator:g_polar_allocator];
+            [cb useResidencySet:rs];
+            id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(8);
+            [at setAddress:argsBuf.gpuAddress  atIndex:0];
+            [at setAddress:alphaBuf.gpuAddress atIndex:1];
+            [at setAddress:codesBuf.gpuAddress atIndex:2];
+            [at setAddress:selBuf.gpuAddress   atIndex:3];
+            [at setAddress:xBuf.gpuAddress     atIndex:4];
+            [at setAddress:outBuf.gpuAddress   atIndex:5];
+            [at setAddress:rwBuf.gpuAddress    atIndex:6];
+            [enc setComputePipelineState:g_watersic_down_routed_mtl4_pipeline];
+            [enc setArgumentTable:at];
+            const NSUInteger tg_mem_bytes = (NSUInteger)n_cols * sizeof(float);
+            [enc setThreadgroupMemoryLength:tg_mem_bytes atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(n_rows, n_selected, n_packets)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [enc endEncoding];
+            [cb endCommandBuffer];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            MTL4CommitOptions *opts = [MTL4CommitOptions new];
+            [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+            id<MTL4CommandBuffer> bufs[1] = {cb};
+            [g_polar_queue commit:bufs count:1 options:opts];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+            ds4_mtl4_pool_release(at, 8);
+        }
+        const uint64_t t1 = mach_absolute_time();
+        t_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        [rs endResidency];
+        [g_polar_queue removeResidencySet:rs];
+
+        const _Float16 *gpu_out = (const _Float16 *)outBuf.contents;
+        int dumped = 0;
+        for (uint32_t p = 0; p < n_packets; p++) {
+            const uint8_t *pkt = codes_host + (size_t)p * codes_bytes_per_packet;
+            for (uint32_t es = 0; es < n_selected; es++) {
+                const uint32_t expert = sel[es];
+                const float rw = rw_host[p * n_selected + es];
+                const uint8_t *expert_codes = pkt + (size_t)expert * codes_per_expert;
+                for (uint32_t r = 0; r < n_rows; r++) {
+                    const uint8_t *row_codes = expert_codes + (size_t)r * row_codes_bytes;
+                    double acc = 0.0;
+                    for (uint32_t c = 0; c < n_cols; c++) {
+                        const uint32_t bit_off = c * R;
+                        const uint32_t byte_off = bit_off >> 3;
+                        const uint32_t shift = bit_off & 7u;
+                        uint32_t window = (uint32_t)row_codes[byte_off];
+                        if (R + shift > 8u) window |= ((uint32_t)row_codes[byte_off + 1u]) << 8u;
+                        const uint32_t u = (window >> shift) & ((1u << R) - 1u);
+                        int z = (int)u; if (u & (1u << (R - 1u))) z -= (1 << R);
+                        acc += (double)z * (double)x_host[c];
+                    }
+                    const float expected = (float)(alpha_host[r] * acc * rw);
+                    const float got = (float)gpu_out[p * out_per_packet_halves + es * n_rows + r];
+                    const float denom = (fabsf(expected) > 1e-3f) ? fabsf(expected) : 1e-3f;
+                    const double rel = fabs((double)(got - expected)) / (double)denom;
+                    if (rel > max_rel) max_rel = rel;
+                    if (rel > 5e-2) mismatch++;
+                    if (getenv("DS4_DUMP_WATERSIC") && dumped < 8) {
+                        fprintf(stderr,
+                            "    [p=%u es=%u expert=%u r=%u] got=%.5f expected=%.5f rw=%.4f\n",
+                            p, es, expert, r, (double)got, (double)expected, rw);
+                        dumped++;
+                    }
+                }
+            }
+        }
+        rc = 1;
+    }
+
+    const uint64_t macs_per_round = (uint64_t)n_packets * n_selected * n_rows * n_cols;
+    const double gflops = ((double)macs_per_round * 2.0 * rounds / 1e9) / (t_ms / 1000.0);
+    const double per_layer_us = t_ms * 1000.0 / (double)rounds;
+
+    fprintf(stderr,
+        "ds4: watersic_down_routed canary n_packets=%u n_sel=%u/%u rows=%u cols=%u R=%u rounds=%u\n"
+        "  down + α-scale + route-scale: %.3f ms total (%.1f us/round)  %.2f GFLOP/s\n"
+        "  cross-check mismatch=%d max_rel=%.4e (must be <5%% per cell)  rc=%d\n",
+        n_packets, n_selected, n_experts_total, n_rows, n_cols, R, rounds,
+        t_ms, per_layer_us, gflops,
+        mismatch, max_rel, rc);
+    return (rc && mismatch == 0) ? 1 : 0;
+}

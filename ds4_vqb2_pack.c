@@ -536,38 +536,66 @@ int ds4_cli_vqb2_pack_layer_tour(const char *pack_path, const char *index_csv_pa
 
 /* Cache-audit A1 fix: pack-aware loader. Iterates entries in layer-major
  * order (preserves H2125 locality) and pins each expert × row_block. */
+/* Pin one entry into the hot store. Pulled out so the layer-filter and
+ * full-scan paths share identical semantics. */
+static int load_entry_to_hot_store(struct ds4_hot_expert_store *store,
+                                   const ds4_vqb2_pack *p,
+                                   uint32_t i, int *n_pinned, int *n_errors) {
+    const ds4_vqb2_pack_entry *e = &p->entries[i];
+    if ((e->row_start & 127u) != 0) {
+        fprintf(stderr,
+            "ds4_vqb2_pack_load_to_hot_store: entry %u row_start=%u not multiple of 128\n",
+            i, e->row_start);
+        (*n_errors)++;
+        return -1;
+    }
+    const uint32_t row_block = e->row_start >> 7;
+    ds4_vqb2_file view;
+    if (!ds4_vqb2_pack_view_from_entry(p, i, &view)) {
+        (*n_errors)++;
+        return -1;
+    }
+    for (uint32_t expert = 0; expert < e->n_experts; expert++) {
+        if (ds4_hot_pin_expert_from_vqb2(store, e->layer, e->kind_id,
+                                          row_block, &view, expert) == 0) {
+            (*n_pinned)++;
+        } else {
+            (*n_errors)++;
+        }
+    }
+    /* view shares pack mmap — ds4_vqb2_close is safe no-op */
+    return 0;
+}
+
 int ds4_vqb2_pack_load_to_hot_store(struct ds4_hot_expert_store *store,
                                     const ds4_vqb2_pack *p,
                                     int layer_filter, int kind_filter) {
     if (!store || !p) return -1;
     int n_pinned = 0;
     int n_errors = 0;
-    for (uint32_t i = 0; i < p->n_entries; i++) {
-        const ds4_vqb2_pack_entry *e = &p->entries[i];
-        if (layer_filter >= 0 && (int)e->layer != layer_filter) continue;
-        if (kind_filter >= 0  && (int)e->kind_id != kind_filter) continue;
-        if ((e->row_start % 128u) != 0) {
-            fprintf(stderr,
-                "ds4_vqb2_pack_load_to_hot_store: entry %u row_start=%u not multiple of 128\n",
-                i, e->row_start);
-            n_errors++;
-            continue;
-        }
-        const uint32_t row_block = e->row_start / 128u;
-        ds4_vqb2_file view;
-        if (!ds4_vqb2_pack_view_from_entry(p, i, &view)) {
-            n_errors++;
-            continue;
-        }
-        for (uint32_t expert = 0; expert < e->n_experts; expert++) {
-            if (ds4_hot_pin_expert_from_vqb2(store, e->layer, e->kind_id,
-                                              row_block, &view, expert) == 0) {
-                n_pinned++;
-            } else {
-                n_errors++;
+
+    if (layer_filter >= 0 && (uint32_t)layer_filter < DS4_VQB2_PACK_MAX_LAYER) {
+        /* O(N_per_layer) path via lookup array: ≤96 slots, not p->n_entries. */
+        const uint32_t L = (uint32_t)layer_filter;
+        const uint32_t k_lo = kind_filter >= 0 ? (uint32_t)kind_filter : 0u;
+        const uint32_t k_hi = kind_filter >= 0 ? (uint32_t)kind_filter + 1u
+                                               : DS4_VQB2_PACK_N_KIND;
+        for (uint32_t kind = k_lo; kind < k_hi && kind < DS4_VQB2_PACK_N_KIND; kind++) {
+            for (uint32_t rb = 0; rb < DS4_VQB2_PACK_MAX_ROW_BLOCKS; rb++) {
+                const int32_t slot = lookup_slot(L, kind, rb << 7);
+                if (slot < 0) continue;
+                const int32_t idx = p->lookup[slot];
+                if (idx < 0) continue;
+                load_entry_to_hot_store(store, p, (uint32_t)idx, &n_pinned, &n_errors);
             }
         }
-        /* view shares pack mmap — ds4_vqb2_close is safe no-op */
+    } else {
+        /* Full scan: layer_filter=-1 or out-of-range. */
+        for (uint32_t i = 0; i < p->n_entries; i++) {
+            const ds4_vqb2_pack_entry *e = &p->entries[i];
+            if (kind_filter >= 0 && (int)e->kind_id != kind_filter) continue;
+            load_entry_to_hot_store(store, p, i, &n_pinned, &n_errors);
+        }
     }
     fprintf(stderr,
         "ds4_vqb2_pack_load_to_hot_store: layer_filter=%d kind_filter=%d "

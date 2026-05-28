@@ -103,6 +103,14 @@ typedef struct {
     int  prefill_metal_phases;
     ds4_mpp_mode mpp_mode;  /* silv-local Metal Pre-Prefill mode; default DS4_MPP_AUTO */
     bool inspect_only;
+    /* silv 2026-05-28 — VQB2 pack path (Architecture B). When non-NULL,
+     * engine_open: (a) opens the pack mmap so PATH_FUSED can bind it
+     * directly, (b) exports DS4_VQB2_PACK_PATH for the lazy fused-path
+     * discovery, and (c) optionally pre-pins layers into the FP16
+     * hot-store when DS4_VQB2_PACK_HOT_LAYERS="L1,L2,..." is set.
+     * The pack stays open for the lifetime of the engine.
+     * Index CSV path: <vqb2_pack_path>.index.csv (canonical). */
+    const char *vqb2_pack_path;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);

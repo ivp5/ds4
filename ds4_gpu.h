@@ -1609,6 +1609,215 @@ int ds4_gpu_mtl4_vqb2_noop_write_bench(uint32_t n_packets, uint32_t n_selected,
                                        uint32_t n_rows, uint32_t n_pairs,
                                        uint32_t rounds);
 
+/* silv 2026-05-28 — FUSED decode-matmul. Decodes VQB2 codes inline inside
+ * the matmul inner loop; no intermediate fp16 weight store. The
+ * architectural move that bypasses the 2.7 GB/s store wall identified by
+ * the noop-write diagnostic. Output is [n_packets][n_selected][n_rows] fp16
+ * computed as out[p][s][r] = sum_pair X[pair*2:(pair+1)*2] · decode(p,e,r,pair).
+ * Canary cross-checks each output against a CPU scalar reference. */
+int ds4_gpu_mtl4_vqb2_decode_matmul_fp16_canary(uint32_t n_packets,
+                                                uint32_t n_selected,
+                                                uint32_t n_experts_total,
+                                                uint32_t n_rows,
+                                                uint32_t n_pairs,
+                                                uint32_t k_val,
+                                                uint32_t rounds);
+
+/* silv 2026-05-28 — runtime fused decode-matmul dispatch primitive.
+ *
+ * This is the production wiring point for the H2125 routed-MoE primitive.
+ * Operates on raw VQB2 codes (no fp16 intermediate store) and computes
+ *   out[p][s][r] = sum_{pair} X[p][pair] · decode(codes[p], selected[s], r, pair)
+ *
+ * Buffers are MTLBuffer* (opaque void* to keep this header ObjC-free):
+ *   codebook      — [k_val × 2] float (re, im interleaved); K ∈ {4,16,64,256}
+ *   codes_base    — concatenated raw VQB2 codes for n_packets, each packet of
+ *                   size (n_experts_in_packet × n_rows × n_pairs × bit_width)/8
+ *                   bytes. Stride between packets = codes_stride bytes.
+ *   selected      — [n_selected] uint32 expert IDs (0..n_experts_in_packet-1)
+ *   X             — [n_pairs × 2] fp16 activation pairs (re, im)
+ *   out_base      — [n_packets × n_selected × n_rows] fp16 output
+ *
+ * Returns 0 on success, non-zero on Metal error. Callers must:
+ *   - ensure buffers are GPU-resident (MTL4 residency set semantics)
+ *   - sync after this call returns (function is synchronous)
+ *
+ * Performance: 54 GFLOP/s K=16, 85 GFLOP/s K=4, ~50 GFLOP/s K=256 on M1 Max
+ * (measured 2026-05-28 H2125 shape: 64 packets × 6-of-256 × 128×1024 pairs). */
+int ds4_gpu_mtl4_vqb2_decode_matmul_fp16_dispatch(void *codebook_mtlbuf,
+                                                  void *codes_mtlbuf,
+                                                  void *selected_mtlbuf,
+                                                  void *x_mtlbuf,
+                                                  void *out_mtlbuf,
+                                                  uint32_t n_packets,
+                                                  uint32_t n_selected,
+                                                  uint32_t n_experts_in_packet,
+                                                  uint32_t n_rows,
+                                                  uint32_t n_pairs,
+                                                  uint32_t k_val,
+                                                  uint32_t codes_stride_bytes,
+                                                  uint32_t out_stride_halves);
+
+/* silv 2026-05-28 task #758 — pack-as-MTLBuffer + per-layer fused dispatch.
+ *
+ * Architecture B substrate. Wraps a host-resident pack region (mmap'd) as an
+ * MTLBuffer once, then per-layer dispatches the fused kernel for every
+ * (layer, kind, row_block) entry sharing a single command buffer.
+ *
+ * Lifecycle:
+ *   ds4_gpu_mtl4_vqb2_pack_wrap_mtlbuffer(map, size) → opaque MTLBuffer*
+ *     • Zero-copy wrap via newBufferWithBytesNoCopy. Pack owner retains
+ *       responsibility for unmapping.
+ *     • Returned handle must be released via ds4_gpu_mtl4_vqb2_pack_release_mtlbuffer.
+ *
+ *   ds4_gpu_mtl4_vqb2_pack_dispatch_layer(pack_buf, codebook_buf, selected_buf,
+ *                                          x_buf, out_buf, codes_offsets[N_PACKETS],
+ *                                          ...)
+ *     • Encodes N_PACKETS fused dispatches into one command buffer.
+ *     • All buffers added to a single residency set for the CB's lifetime.
+ *     • Synchronous; waits for completion before returning.
+ *
+ * Returns 0 success, non-zero error. */
+void *ds4_gpu_mtl4_vqb2_pack_wrap_mtlbuffer(void *pack_map, size_t pack_size);
+void  ds4_gpu_mtl4_vqb2_pack_release_mtlbuffer(void *pack_mtlbuf);
+
+int ds4_gpu_mtl4_vqb2_pack_dispatch_layer(void *pack_mtlbuf,
+                                          void *codebook_mtlbuf,
+                                          void *selected_mtlbuf,
+                                          void *x_mtlbuf,
+                                          void *out_mtlbuf,
+                                          const uint64_t *codes_offsets,
+                                          uint32_t n_dispatches,
+                                          uint32_t n_selected,
+                                          uint32_t n_experts_in_packet,
+                                          uint32_t n_rows,
+                                          uint32_t n_pairs,
+                                          uint32_t k_val,
+                                          uint32_t out_stride_halves);
+
+/* Canary: synthetic pack-backed fused dispatch. Allocates pack-shaped data
+ * (1 codes blob with multiple entries spaced by entry_stride bytes), wraps
+ * it as MTLBuffer, runs the layer dispatch primitive, cross-checks each
+ * output against CPU scalar reference. */
+int ds4_gpu_mtl4_vqb2_pack_fused_canary(uint32_t n_entries,
+                                        uint32_t n_selected,
+                                        uint32_t n_experts_in_packet,
+                                        uint32_t n_rows,
+                                        uint32_t n_pairs,
+                                        uint32_t k_val,
+                                        uint32_t rounds);
+
+/* Head-to-head: cached MTL4 vs classic ICB on the same shape. */
+int ds4_gpu_mtl4_vqb2_pack_icb_bench(uint32_t n_entries,
+                                     uint32_t n_selected,
+                                     uint32_t n_experts_in_packet,
+                                     uint32_t n_rows,
+                                     uint32_t n_pairs,
+                                     uint32_t k_val,
+                                     uint32_t rounds);
+
+/* Production bind-pack + dispatcher (silv 2026-05-28 task #759).
+ *
+ * Bind once at engine init; subsequent dispatch_kind calls reuse the wrapped
+ * MTLBuffer + per-(layer, kind, row_block) codebook cache.
+ *
+ * dispatch_kind signature mirrors the existing FP16 routed-FFN entry point
+ * but operates on raw VQB2 codes (no FP16 hot store required). */
+int  ds4_metal_vqb2_fused_bind(const char *pack_path, const char *index_csv_path);
+void ds4_metal_vqb2_fused_unbind(void);
+int  ds4_metal_vqb2_fused_dispatch_kind(uint32_t layer, uint32_t kind_id,
+                                         const uint32_t *selected, uint32_t n_selected,
+                                         void *x_mtlbuf, void *out_mtlbuf,
+                                         uint32_t *out_n_dispatches,
+                                         uint32_t *out_n_rows,
+                                         uint32_t *out_n_pairs);
+/* Phase 3 (DOWN): x_slot_stride_halves > 0 ⇒ per-slot X (DOWN); == 0 ⇒ shared X. */
+int  ds4_metal_vqb2_fused_dispatch_kind_strided(uint32_t layer, uint32_t kind_id,
+                                                 const uint32_t *selected, uint32_t n_selected,
+                                                 void *x_mtlbuf, void *out_mtlbuf,
+                                                 uint32_t x_slot_stride_halves,
+                                                 uint32_t *out_n_dispatches,
+                                                 uint32_t *out_n_rows,
+                                                 uint32_t *out_n_pairs);
+int  ds4_metal_vqb2_fused_bind_smoke(const char *pack_path, const char *index_csv_path,
+                                     uint32_t layer, uint32_t kind_id);
+int  ds4_metal_vqb2_fused_microbench(const char *pack_path, const char *index_csv_path,
+                                     uint32_t layer, uint32_t kind_id, uint32_t rounds);
+
+/* silv 2026-05-28 task #761 — per-layer coverage bitmask.
+ *   bit 0 = GATE bound  (any row_block present for kind_id=0)
+ *   bit 1 = UP   bound  (kind_id=1)
+ *   bit 2 = DOWN bound  (kind_id=2)
+ *
+ * Returns 0 if bind missing or layer out of range. PATH_FUSED inspects this
+ * before attempting the full FFN chain — only proceeds when bitmask == 7
+ * (all three organs bound for this layer). Falls back to MTL4 otherwise.
+ *
+ * Safe to call before bind. Item A (bit-packed cache, 2026-05-28): O(1) lookup
+ * — coverage masks pre-computed once at ds4_metal_vqb2_fused_bind time. */
+uint32_t ds4_metal_vqb2_fused_layer_coverage(uint32_t layer);
+
+/* Bit-packed full-coverage shortcut. Nonzero iff layer has all three kinds
+ * (GATE+UP+DOWN) bound. One shift+AND vs three for layer_coverage(layer)==7. */
+int ds4_metal_vqb2_fused_layer_fully_covered(uint32_t layer);
+
+/* silv 2026-05-28 task #761 — shape adapter + persistent output staging.
+ *
+ * The fused decode-matmul kernel reads X as `device half[n_pairs * 2]`. The
+ * shape adapter converts fp32 activation to fp16 in linear order (no
+ * transpose/repack — kernel cares about the flat length, not "pair" semantics
+ * at the host level). Persistent staging buffer reused across calls; grows
+ * on demand. Returns opaque id<MTLBuffer> pointer for use as `x_mtlbuf` in
+ * ds4_metal_vqb2_fused_dispatch_kind. NULL on failure. CPU-side conversion
+ * — faster than a kernel launch at DS4 sizes (≤ 4096 floats, ≈1 µs). */
+void *ds4_metal_vqb2_fused_x_adapter_fp32_to_fp16(const float *in_fp32, uint32_t n_elems);
+
+/* Persistent fp16 output buffer pool. One slot per (kind, role): caller
+ * passes slot_id ∈ [0,4). Bytes grows on demand. NULL on failure.
+ * Suggested slot use: 0=GATE_OUT, 1=UP_OUT, 2=MID_FP16, 3=DOWN_OUT. */
+void *ds4_metal_vqb2_fused_out_buffer(uint32_t slot_id, uint32_t need_bytes);
+
+/* silv 2026-05-28 task #761 Phase 2 — fp16-in/fp16-out SwiGLU+weight step.
+ *
+ * Reads fp16 gate[n_sel × n_rows] and up[n_sel × n_rows] (typically direct
+ * outputs of ds4_metal_vqb2_fused_dispatch_kind), applies SiLU(gate)×up×
+ * route_weight[slot] in fp32 accumulator, writes fp16 mid[n_sel × n_rows].
+ *
+ * Skips the fp16→fp32 round-trip the existing fp32-in `moe_swiglu_weight_f16`
+ * would force. Saves ~30 KB DRAM traffic per layer per token at DS4 V4
+ * sizes (n_rows=2048, n_sel=6).
+ *
+ * Buffers are opaque id<MTLBuffer> pointers (void* on the C side). Returns
+ * 1=ok, 0=failure (pipeline init / dispatch). Caller-supplied buffers are
+ * not retained beyond the dispatch (they're caller-owned). */
+int ds4_metal_vqb2_fused_swiglu_step(void *gate_buf, void *up_buf,
+                                      void *route_weights_buf,
+                                      void *mid_buf,
+                                      uint32_t n_rows, uint32_t n_selected,
+                                      float clamp_value);
+
+/* silv 2026-05-28 task #523 item D — shared MTL4 canary boilerplate.
+ *
+ * Mirrors `ds4_mtl4_build_kernel_pipeline` design. Per-canary collapses
+ * from ~110 lines to ~30 by lifting residency/argtable/cb/commit shell
+ * into this helper. `bindings` is an array of id<MTLBuffer>-as-void* in
+ * the order they bind to the kernel arg table. `validate_fn` returns
+ * 1=pass / 0=fail; reads outputs via captured user_ctx. NULL validate
+ * means dispatch-completion-only (no output check).
+ *
+ * Returns 1 on success, 0 on any failure (residency / argtable / wait
+ * timeout / validate fail). C-friendly signature: grid/tg as 3 scalars
+ * each (the implementation builds MTLSize internally). */
+typedef int (*ds4_mtl4_canary_validate_fn)(void *user_ctx);
+int ds4_mtl4_run_canary(void *pipeline,             /* id<MTLComputePipelineState> */
+                        void * const *bindings,     /* array of id<MTLBuffer> as void* */
+                        uint32_t n_bindings,
+                        unsigned long gx, unsigned long gy, unsigned long gz,
+                        unsigned long tx, unsigned long ty, unsigned long tz,
+                        unsigned long shmem_bytes,
+                        ds4_mtl4_canary_validate_fn validate_fn,
+                        void *user_ctx);
+
 /* silv 2026-05-28 — vectorized VQB2 decoder bench. Compares scalar
  * (1 code/thread) against K-specialized vector kernels:
  *   K=4   → 16 codes/thread (32-bit packed nibble pairs)
