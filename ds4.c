@@ -13451,6 +13451,22 @@ static bool metal_graph_encode_decode_layer(
  const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
  const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
  const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+ /* silv 2026-05-28 OOM-1 Direction B — router precision instability
+  * documented. Teacher-force diff-test showed GPU router selects
+  * DISJOINT top-6 experts from CPU even with identical cur_hc input
+  * (4096->256 matmul in F16 weight precision flips all 6 top-k
+  * boundaries at ffn_norm diff 0.024). Mid-encode CPU intercept here
+  * is invalid (synchronize during command-buffer encoding fails).
+  * Proper fix lives at one of:
+  *   (a) router fp32 — promote ffn_gate_inp.weight at engine_open to F32
+  *       (2 MB -> 4 MB cost), patch metal_graph_matmul_plain_tensor to
+  *       dispatch f32 kernel when weight is F32.
+  *   (b) margin-gate at router_select_tensor — codex H2251 port: compute
+  *       top-k vs top-(k+1) margin; if < 0.002, fall back to CPU
+  *       routing decision (still GPU MoE compute).
+  *   (c) router as separate two-phase: pre-encode CPU compute writes
+  *       router_logits buffer; encode skips router matmul and goes
+  *       straight to router_select. */
  if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
  DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
  if (ok) ok = ds4_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
