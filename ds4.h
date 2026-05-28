@@ -111,6 +111,13 @@ typedef struct {
      * The pack stays open for the lifetime of the engine.
      * Index CSV path: <vqb2_pack_path>.index.csv (canonical). */
     const char *vqb2_pack_path;
+    /* silv 2026-05-28 task #771 Phase 1 — non-routed pack path. When set,
+     * engine_open opens the DS4NRPK1 pack (attention/embed/output/router/MTP)
+     * and exposes it as a runtime lookup source. Companion to vqb2_pack_path
+     * for routed-FFN. With both set, full inference can run without reading
+     * tensor data from the GGUF (path-direct loader). Phase 1 ships the open
+     * + diagnostic; Phase 2 wires the tensor-load lookup override. */
+    const char *nonrouted_pack_path;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
@@ -134,6 +141,31 @@ typedef struct {
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
+
+/* silv 2026-05-28 #796 Increment 2c/2d — end-to-end dispatcher canary.
+ * Constructs a fake tensor with storage.metal_buffer set, routes through
+ * ds4_matmul_f16_via_tensor, and verifies (a) output matches CPU reference
+ * within 1e-4 max_rel AND (b) the storage-dispatch counter incremented by
+ * exactly 1. Returns 1 on PASS, 0 on FAIL. Requires GPU initialized;
+ * M%%4==0 and N%%32==0.
+ *
+ * The _mt variant takes n_tok > 1 to exercise the multi-token kernel paths
+ * (mul_mv_ext for small batches, NAX/mul_mm for larger). After Increment
+ * 2d's kernel_dispatch unification, all 4 paths route through the same
+ * helper from both the mmap-tensor and heap-storage variants. */
+int ds4_via_tensor_canary(uint32_t M, uint32_t N);
+int ds4_via_tensor_canary_mt(uint32_t M, uint32_t N, uint32_t n_tok);
+/* Q8_0 storage-path canary — Increment 3. Builds Q8_0-packed weight matrix
+ * + wraps via heap_bytes + routes via dispatcher. Tolerance accounts for
+ * Q8_0 quantization error already being in the expected reference. */
+int ds4_via_tensor_q8_0_canary(uint32_t M, uint32_t N, uint32_t n_tok);
+/* BF16 storage-path canary — Increment 4. BF16 dispatcher is storage-only
+ * (no mmap fallback). Matvec only (n_tok=1) — kernel is matvec-only. */
+int ds4_via_tensor_bf16_canary(uint32_t M, uint32_t N);
+/* Source-exact BF16-for-F16 canary — Increment 5a SEVERE TEST. Verifies
+ * the F16 dispatcher routes BF16-storage tensors through the BF16 kernel,
+ * NOT the F16 kernel (silent corruption catch). */
+int ds4_via_tensor_source_exact_bf16_canary(uint32_t M, uint32_t N);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);

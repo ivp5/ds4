@@ -1,0 +1,8 @@
+ds4: --nonrouted-pack /Users/silv/cl/tlp/montyneg/ds4/nonrouted/ds4v4_nonrouted.pack
+ds4: --vqb2-pack /Users/silv/cl/tlp/montyneg/ds4/vqb2/DeepSeek-V4-Flash/nonrotated_layer22_k256_gateup_top4_20260528/pack/ds4_flash_nonrotated_layer22_k256_gateup_top4.vqb2pack
+ds4: --prefill-metal-phases auto: resolved N=3 (total=72.56 GiB, cap=48.00 GiB, headroom=14.00 GiB, per-phase budget=34.00 GiB)
+ds4: cpu-moe: layers 0..42 run their routed MoE on the CPU (first 43 of 43)
+ds4: Metal device Apple M1 Max, 64.00 GiB RAM
+ds4: Metal 4 TensorOps fast path disabled (pre-M5/pre-A19); MTL4 compute pipelines still active
+ds4: Metal source metal/flash_attn.metal not found (set DS4_METAL_FLASH_ATTN_SOURCE to override)
+ds4: metal backend unavailable; aborting startup

@@ -53,6 +53,7 @@
 #include "ds4_polar_reader.h"
 #include "ds4_prefix_cache.h"
 #include "ds4_vqb2_pack.h"  /* silv 2026-05-28 task #764 — --vqb2-pack engine wiring */
+#include "ds4_nonrouted_pack.h"  /* silv 2026-05-28 task #771 Phase 1 — --nonrouted-pack engine wiring */
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -917,6 +918,15 @@ enum {
  DS4_TENSOR_Q4_K = 12,
  DS4_TENSOR_IQ2_XXS = 16,
  DS4_TENSOR_I32 = 26,
+ DS4_TENSOR_I64 = 27,
+ DS4_TENSOR_F64 = 28,
+ DS4_TENSOR_BF16 = 30,
+ /* silv 2026-05-28 task #771 Phase 2b — ds4-local types for FP8 pair.
+  * NOT GGUF-standard. Pack stores FP8_E4M3 mantissa + paired FP8_E8M0
+  * scale exponent. Decoder reads both, multiplies, produces F32 or F16.
+  * Reserved above the GGUF spec range (≥ 64). */
+ DS4_TENSOR_FP8_E4M3 = 64,
+ DS4_TENSOR_FP8_E8M0 = 65,
 };
 
 typedef struct {
@@ -924,6 +934,67 @@ typedef struct {
  uint32_t type;
  uint64_t value_pos;
 } ds4_kv;
+
+/* silv 2026-05-28 Cycle 5 (task #790) — unified tensor storage.
+ *
+ * Replaces the 4 override_* fields (override_data, override_bytes,
+ * override_source_type, override_source_active) with a single embedded
+ * struct. Semantics:
+ *
+ *   bytes == NULL  → tensor is served from m->map + t->abs_offset, and
+ *                    the effective dtype is t->type. (default zero state)
+ *
+ *   bytes != NULL  → tensor is served from `bytes` (size = `length`),
+ *                    and the effective dtype is `dtype`. This is the
+ *                    authoritative source-of-truth.
+ *
+ *   ownership      → controls engine_close cleanup:
+ *                      DS4_STORAGE_NONE (0) — no cleanup (default)
+ *                      DS4_STORAGE_HEAP (1) — free(bytes)
+ *                      DS4_STORAGE_PACK (2) — pack mmap, do not free
+ *
+ * This collapses the dual representation: there was previously NO way
+ * to tell from `override_source_active` alone whether the pack dtype
+ * matched the GGUF type. The new design makes `dtype` always
+ * authoritative when bytes is set (matches t->type for identity-fill,
+ * differs for source-exact). Side effect: fixes a latent bug where
+ * `override_source_active` was declared but never written — so the
+ * source-exact path was dormant before Cycle 5.
+ *
+ * Engineer roster perspectives:
+ *   Knuth/Linus: one struct, one concept, one source of truth
+ *   Carmack: dtype is ALWAYS meaningful when bytes is set; no flag-check needed
+ *   Pearl: removes the "second representation that could disagree" — there
+ *          is no longer a case where override_source_type and t->type can
+ *          drift apart without the system knowing about it. */
+enum {
+ DS4_STORAGE_NONE = 0,
+ DS4_STORAGE_HEAP = 1,
+ DS4_STORAGE_PACK = 2,
+};
+
+typedef struct {
+ void *bytes;       /* NULL → use mmap + t->abs_offset */
+ uint64_t length;
+ uint32_t dtype;    /* effective dtype when bytes != NULL */
+ uint8_t  ownership;
+ /* silv 2026-05-28 #796 Increment 2 (Option C from the architecture memo) —
+  * pre-wrapped MTLBuffer over `bytes`. Set at engine_open when the override-
+  * fill loop wraps the heap-allocated tensor data as an MTLBuffer. The
+  * wrapping is zero-copy on shared-memory devices (M1 Max unified memory):
+  * `newBufferWithBytesNoCopy:length:options:MTLResourceStorageModeShared`
+  * makes the SAME bytes addressable by GPU kernels without a duplicate
+  * allocation.
+  *
+  * Type-erased to void* because ds4.c is C; the actual id<MTLBuffer> only
+  * exists across the Objective-C boundary. ds4_gpu_wrap_heap_bytes/
+  * ds4_gpu_release_heap_buffer (ds4_gpu.h) bridge the boundary.
+  *
+  * NULL when bytes is NULL or when the wrap failed (non-fatal: dispatch
+  * falls back to mmap path or skips the tensor). Lifetime tied to storage:
+  * released in model_free_overrides when ownership == DS4_STORAGE_HEAP. */
+ void *metal_buffer;
+} ds4_tensor_storage;
 
 typedef struct {
  ds4_str name;
@@ -934,6 +1005,9 @@ typedef struct {
  uint64_t abs_offset;
  uint64_t elements;
  uint64_t bytes;
+ /* Unified storage descriptor — see ds4_tensor_storage above. Zero-init
+  * (bytes=NULL) means "served from m->map at abs_offset using t->type". */
+ ds4_tensor_storage storage;
 } ds4_tensor;
 
 typedef struct {
@@ -1098,8 +1172,12 @@ static bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *
  return true;
 }
 
+/* Forward decl — defined alongside tensor_data() further down. */
+static void model_free_overrides(ds4_model *m);
+
 static void model_close(ds4_model *m) {
  if (!m) return;
+ model_free_overrides(m);  /* silv 2026-05-28 task #771 Phase 1 scaffold */
  free(m->kv);
  free(m->tensors);
  if (m->map) munmap((void *)m->map, (size_t)m->size);
@@ -1492,9 +1570,222 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
 #endif
 #endif
 
-/* Return the in-place tensor payload inside the mapped GGUF. */
+/* Return the tensor payload. Prefers storage.bytes (overridden by
+ * nonrouted-pack loader); falls back to GGUF mmap + abs_offset. Single
+ * choke point for ALL tensor reads — Cycle 5 unified storage descriptor
+ * makes overrides transparent to downstream readers. */
 static const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
+ if (t->storage.bytes) return t->storage.bytes;
  return m->map + t->abs_offset;
+}
+
+/* Return the effective dtype of a tensor's data. When storage is set,
+ * storage.dtype is authoritative (may differ from t->type for source-
+ * exact pack data). When storage is unset, t->type. Cycle 5: no flag
+ * lookup — storage.bytes presence determines which path to take. */
+static uint32_t tensor_effective_type(const ds4_tensor *t) {
+ if (t->storage.bytes) return t->storage.dtype;
+ return t->type;
+}
+
+/* tensor_expect_layout substitution policy. Cycle 5 made the unified
+ * storage descriptor track storage.dtype authoritatively, but kernels
+ * downstream still read tensors as `t->type` (they don't yet call
+ * tensor_effective_type). Until kernels are wired to dispatch on
+ * tensor_effective_type, accepting a source-exact substitution at the
+ * layout boundary would let mismatched-dtype bytes reach a kernel that
+ * interprets them as t->type — silent corruption.
+ *
+ * Conservative floor (Cycle 5 ground rule): refuse substitution when
+ * storage.dtype != t->type. This matches the pre-Cycle-5 effective
+ * behavior (the now-fixed override_source_active flag was never
+ * written, so substitute always returned 0). The override-fill loop
+ * also defends in depth: source-exact pack tensors are SKIPPED at the
+ * pack-load site (n_skip_source_exact_kernel_gap counter), so they
+ * never reach this function.
+ *
+ * Lift the floor by:
+ *   (a) wiring routed-FFN and non-routed kernels to call
+ *       tensor_effective_type() and dispatch BF16/FP8 paths
+ *   (b) verifying with a canary that source-exact tensors produce the
+ *       same output as the lossy-converted reference path
+ *   (c) flipping this function to permit substitution when those paths
+ *       exist (look for tensor_effective_type call counts in the
+ *       routed-FFN dispatcher)
+ *
+ * Until then: return 0. */
+static int tensor_dtype_can_substitute(const ds4_tensor *t, uint32_t expected) {
+ (void)t; (void)expected;
+ return 0;
+}
+
+/* Free heap-owned storage across all model tensors. Called from
+ * model_close (engine_close path). Cycle 5: respects ownership flag —
+ * heap-owned storage is freed; pack-mmap storage is left to the pack
+ * lifecycle.
+ *
+ * #796 Increment 2 (silv 2026-05-28): also release the pre-wrapped
+ * MTLBuffer (if any) BEFORE freeing the underlying bytes. The MTLBuffer
+ * holds a pointer into `bytes`; freeing bytes first would dangle. */
+static void model_free_overrides(ds4_model *m) {
+ if (!m || !m->tensors) return;
+ for (uint64_t i = 0; i < m->n_tensors; i++) {
+  ds4_tensor *t = &m->tensors[i];
+  if (t->storage.metal_buffer) {
+   ds4_gpu_release_heap_buffer(t->storage.metal_buffer);
+   t->storage.metal_buffer = NULL;
+  }
+  if (t->storage.bytes && t->storage.ownership == DS4_STORAGE_HEAP) {
+   free(t->storage.bytes);
+  }
+  /* Reset regardless of ownership (defensive). */
+  t->storage.bytes = NULL;
+  t->storage.length = 0;
+  t->storage.dtype = 0;
+  t->storage.ownership = DS4_STORAGE_NONE;
+ }
+}
+
+/* silv 2026-05-28 task #771 Phase 1 — translate a GGUF tensor name to the
+ * non-routed pack convention. Reverse of pack_to_gguf.py.
+ *
+ * Mapping rules (GGUF → pack):
+ *   1) top-level fixed names: token_embd.weight, output.weight, output_norm.weight, output_hc_*.weight
+ *   2) per-layer: blk.N.X → layers.N.Y where Y depends on X (sub-component rewrites)
+ *   3) MTP fixed names: mtp.0.* (most are identical between conventions)
+ *
+ * Returns: 1 if a translation was produced (writes into out_buf), 0 if no
+ * mapping exists (e.g., routed-FFN expert weights which live in VQB2 pack).
+ * out_buf must be at least 192 bytes (longest pack name + format slack). */
+static int ds4_nrpk_translate_gguf_name(const char *gguf, char *out_buf, size_t out_sz) {
+    if (!gguf || !out_buf || out_sz < 192) return 0;
+
+    /* Top-level fixed rewrites. */
+    struct { const char *gguf; const char *pack; } top[] = {
+        {"token_embd.weight",      "embed.weight"},
+        {"output.weight",          "head.weight"},
+        {"output_norm.weight",     "norm.weight"},
+        {"output_hc_base.weight",  "hc_head_base"},
+        {"output_hc_fn.weight",    "hc_head_fn"},
+        {"output_hc_scale.weight", "hc_head_scale"},
+    };
+    for (size_t i = 0; i < sizeof(top) / sizeof(top[0]); i++) {
+        if (strcmp(gguf, top[i].gguf) == 0) {
+            snprintf(out_buf, out_sz, "%s", top[i].pack);
+            return 1;
+        }
+    }
+
+    /* MTP names — most are blk.N.X → mtp.0.Y similar to per-layer but pinned to mtp.0.
+     * Pack keeps mtp.0.* names; GGUF has mtp.0.* with under-scored attention/ffn. */
+    if (strncmp(gguf, "mtp.0.", 6) == 0) {
+        const char *rest = gguf + 6;
+        struct { const char *gguf_suffix; const char *pack_suffix; } mtp_map[] = {
+            {"attn_norm.weight",       "attn_norm.weight"},
+            {"ffn_norm.weight",        "ffn_norm.weight"},
+            {"attn_q_a.weight",        "attn.wq_a.weight"},
+            {"attn_q_a_norm.weight",   "attn.q_norm.weight"},
+            {"attn_q_b.weight",        "attn.wq_b.weight"},
+            {"attn_kv.weight",         "attn.wkv.weight"},
+            {"attn_kv_a_norm.weight",  "attn.kv_norm.weight"},
+            {"attn_sinks.weight",      "attn.attn_sink"},
+            {"attn_output_a.weight",   "attn.wo_a.weight"},
+            {"attn_output_b.weight",   "attn.wo_b.weight"},
+            {"hc_attn_base.weight",    "hc_attn_base"},
+            {"hc_attn_fn.weight",      "hc_attn_fn"},
+            {"hc_attn_scale.weight",   "hc_attn_scale"},
+            {"hc_ffn_base.weight",     "hc_ffn_base"},
+            {"hc_ffn_fn.weight",       "hc_ffn_fn"},
+            {"hc_ffn_scale.weight",    "hc_ffn_scale"},
+            {"hc_head_base.weight",    "hc_head_base"},
+            {"hc_head_fn.weight",      "hc_head_fn"},
+            {"hc_head_scale.weight",   "hc_head_scale"},
+            {"ffn_gate_inp.weight",    "ffn.gate.weight"},
+            {"exp_probs_b.bias",       "ffn.gate.bias"},
+            {"ffn_gate_shexp.weight",  "ffn.shared_experts.w1.weight"},
+            {"ffn_down_shexp.weight",  "ffn.shared_experts.w2.weight"},
+            {"ffn_up_shexp.weight",    "ffn.shared_experts.w3.weight"},
+            {"attn_compressor_kv.weight",   "attn.compressor.wkv.weight"},
+            {"attn_compressor_gate.weight", "attn.compressor.wgate.weight"},
+            {"attn_compressor_norm.weight", "attn.compressor.norm.weight"},
+            {"attn_compressor_ape.weight",  "attn.compressor.ape"},
+            {"indexer.attn_q_b.weight",     "attn.indexer.wq_b.weight"},
+            {"indexer.proj.weight",         "attn.indexer.weights_proj.weight"},
+            {"indexer_compressor_kv.weight",   "attn.indexer.compressor.wkv.weight"},
+            {"indexer_compressor_gate.weight", "attn.indexer.compressor.wgate.weight"},
+            {"indexer_compressor_norm.weight", "attn.indexer.compressor.norm.weight"},
+            {"indexer_compressor_ape.weight",  "attn.indexer.compressor.ape"},
+            {"e_proj.weight",  "e_proj.weight"},
+            {"h_proj.weight",  "h_proj.weight"},
+            {"enorm.weight",   "enorm.weight"},
+            {"hnorm.weight",   "hnorm.weight"},
+            {"norm.weight",    "norm.weight"},
+        };
+        for (size_t i = 0; i < sizeof(mtp_map) / sizeof(mtp_map[0]); i++) {
+            if (strcmp(rest, mtp_map[i].gguf_suffix) == 0) {
+                snprintf(out_buf, out_sz, "mtp.0.%s", mtp_map[i].pack_suffix);
+                return 1;
+            }
+        }
+        return 0; /* unmapped mtp tensor */
+    }
+
+    /* Per-layer: blk.N.X → layers.N.Y */
+    if (strncmp(gguf, "blk.", 4) == 0) {
+        const char *p = gguf + 4;
+        char *dot = strchr(p, '.');
+        if (!dot) return 0;
+        size_t idx_len = (size_t)(dot - p);
+        if (idx_len == 0 || idx_len > 8) return 0;
+        char idx[16];
+        memcpy(idx, p, idx_len);
+        idx[idx_len] = '\0';
+        const char *suffix = dot + 1;
+
+        struct { const char *gguf_suffix; const char *pack_suffix; } layer_map[] = {
+            {"attn_norm.weight",            "attn_norm.weight"},
+            {"ffn_norm.weight",             "ffn_norm.weight"},
+            {"attn_q_a.weight",             "attn.wq_a.weight"},
+            {"attn_q_a_norm.weight",        "attn.q_norm.weight"},
+            {"attn_q_b.weight",             "attn.wq_b.weight"},
+            {"attn_kv.weight",              "attn.wkv.weight"},
+            {"attn_kv_a_norm.weight",       "attn.kv_norm.weight"},
+            {"attn_sinks.weight",           "attn.attn_sink"},
+            {"attn_output_a.weight",        "attn.wo_a.weight"},
+            {"attn_output_b.weight",        "attn.wo_b.weight"},
+            {"hc_attn_base.weight",         "hc_attn_base"},
+            {"hc_attn_fn.weight",           "hc_attn_fn"},
+            {"hc_attn_scale.weight",        "hc_attn_scale"},
+            {"hc_ffn_base.weight",          "hc_ffn_base"},
+            {"hc_ffn_fn.weight",            "hc_ffn_fn"},
+            {"hc_ffn_scale.weight",         "hc_ffn_scale"},
+            {"ffn_gate_inp.weight",         "ffn.gate.weight"},
+            {"exp_probs_b.bias",            "ffn.gate.bias"},
+            {"ffn_gate_tid2eid.weight",     "ffn.gate.tid2eid"},
+            {"ffn_gate_shexp.weight",       "ffn.shared_experts.w1.weight"},
+            {"ffn_down_shexp.weight",       "ffn.shared_experts.w2.weight"},
+            {"ffn_up_shexp.weight",         "ffn.shared_experts.w3.weight"},
+            {"attn_compressor_kv.weight",   "attn.compressor.wkv.weight"},
+            {"attn_compressor_gate.weight", "attn.compressor.wgate.weight"},
+            {"attn_compressor_norm.weight", "attn.compressor.norm.weight"},
+            {"attn_compressor_ape.weight",  "attn.compressor.ape"},
+            {"indexer.attn_q_b.weight",     "attn.indexer.wq_b.weight"},
+            {"indexer.proj.weight",         "attn.indexer.weights_proj.weight"},
+            {"indexer_compressor_kv.weight",   "attn.indexer.compressor.wkv.weight"},
+            {"indexer_compressor_gate.weight", "attn.indexer.compressor.wgate.weight"},
+            {"indexer_compressor_norm.weight", "attn.indexer.compressor.norm.weight"},
+            {"indexer_compressor_ape.weight",  "attn.indexer.compressor.ape"},
+        };
+        for (size_t i = 0; i < sizeof(layer_map) / sizeof(layer_map[0]); i++) {
+            if (strcmp(suffix, layer_map[i].gguf_suffix) == 0) {
+                snprintf(out_buf, out_sz, "layers.%s.%s", idx, layer_map[i].pack_suffix);
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    return 0;
 }
 
 typedef struct {
@@ -2516,6 +2807,12 @@ static void tensor_expect_layout(
  uint64_t d2) {
  if (!t) ds4_die("internal error: missing tensor while validating layout");
  if (t->type != type) {
+ /* silv 2026-05-28 task #771 Phase 2b — accept source-exact substitute
+  * (BF16/FP8 override_data backing an originally lossy-declared slot).
+  * The kernel that reads this tensor must dispatch on tensor_effective_type. */
+ if (tensor_dtype_can_substitute(t, type)) {
+  /* OK — substitution permitted */
+ } else {
  fprintf(stderr,
  "ds4: tensor %.*s has type %s, expected %s\n",
  (int)t->name.len,
@@ -2523,6 +2820,7 @@ static void tensor_expect_layout(
  tensor_type_name(t->type),
  tensor_type_name(type));
  exit(1);
+ }
  }
  if (t->ndim != ndim) {
  fprintf(stderr,
@@ -11436,6 +11734,946 @@ static bool metal_graph_matmul_plain_tensor(
  const ds4_gpu_tensor *x,
  uint64_t n_tok);
 
+/* ======================================================================== *
+ * Routed-MoE dispatch abstraction — engineer roster cycle 1 (2026-05-28)
+ * ======================================================================== *
+ *
+ * Replaces a 165-line nested if/else cascade at the routed-MoE dispatch site
+ * with a single plan/apply pair. The cascade had been the home of:
+ *
+ *   - task #764's "sync-skip" optimization that silently broke correctness
+ *     (the fully_pinned shortcut bypassed end_commands then dispatch_gpu
+ *     read stale CPU pointers of GPU-written tensors)
+ *
+ *   - #761 (1)+(2) caveats documented inline rather than encoded as data
+ *
+ *   - Three independent dispatch backends (CPU-default, CPU-hot-FP16,
+ *     Metal-hot-FP16, Metal-default) interleaved in branchy code
+ *
+ * The abstraction declares the sync invariants in a static table (O(1)
+ * lookup). Each backend's "needs_cpu_sync" flag is checked uniformly in
+ * apply(); the bug surface (an unsynced dispatch) cannot recur because
+ * the sync barrier is data-driven, not branch-driven.
+ *
+ * Engineer roster cycle 1 perspectives baked in:
+ *   - Carmack/Hotz: no special cases, one always-correct path
+ *   - Linus: no premature optimization that silently breaks correctness
+ *   - Pearl: sync invariant declared at the data level, not the call level
+ *   - Knuth: table-driven dispatch over conditional cascade
+ *   - DJB: backend metadata in a const table; no ad-hoc env probes per call
+ *
+ * Multi-cycle plan:
+ *   Cycle 1 (this): introduce plan/apply API + sync-invariant table.
+ *   Cycle 2: replace the nested if/else call site with one apply() call.
+ *   Cycle 3: backends that read GPU buffers (Metal-hot) gain MTLBuffer
+ *            handle dispatch (task #784) so needs_cpu_sync drops to 0.
+ *   Cycle 4: routed_moe_plan extends to multi-token (Tier 1 multi-token
+ *            PATH_FUSED chain).
+ */
+typedef enum {
+ DS4_ROUTED_MOE_CPU_DEFAULT     = 0, /* CPU IQ2_XXS dequant + matmul */
+ DS4_ROUTED_MOE_CPU_HOT_FP16    = 1, /* CPU via predequant FP16 hot-store */
+ DS4_ROUTED_MOE_METAL_HOT_FP16  = 2, /* Metal via VQB2 hot-store dispatch_gpu */
+ DS4_ROUTED_MOE_METAL_DEFAULT   = 3, /* Default Metal routed FFN (vqb2 pack direct) */
+ DS4_ROUTED_MOE_BACKEND_COUNT
+} ds4_routed_moe_backend;
+
+/* Sync-invariant table. Indexed by backend. Each row says how the
+ * dispatcher MUST treat the GPU command buffer around the backend call. */
+typedef struct {
+ uint8_t needs_cpu_sync;        /* end_commands() before + begin_commands() after */
+ uint8_t reads_cpu_input_ptrs;  /* dereferences ds4_gpu_tensor_contents() */
+ const char *name;
+} ds4_routed_moe_backend_props;
+
+static const ds4_routed_moe_backend_props DS4_ROUTED_MOE_PROPS[DS4_ROUTED_MOE_BACKEND_COUNT] = {
+ [DS4_ROUTED_MOE_CPU_DEFAULT]    = { 1, 1, "cpu_default"    },
+ [DS4_ROUTED_MOE_CPU_HOT_FP16]   = { 1, 1, "cpu_hot_fp16"   },
+ [DS4_ROUTED_MOE_METAL_HOT_FP16] = { 1, 1, "metal_hot_fp16" }, /* Until task #784 lands */
+ [DS4_ROUTED_MOE_METAL_DEFAULT]  = { 0, 0, "metal_default"  },
+};
+
+/* The plan is the FULL decision: which backend + which hot-store (NULL
+ * for non-hot backends). Computed once per (layer, token); execution is
+ * a pure dispatch table lookup. */
+typedef struct {
+ ds4_routed_moe_backend backend;
+ ds4_hot_expert_store *hot;  /* non-NULL iff backend is *_HOT_* */
+} ds4_routed_moe_plan;
+
+/* Env-var caches: read once per process, not per dispatch. DJB style. */
+static int  ds4_routed_moe_env_initialized = 0;
+static int  ds4_routed_moe_env_hot_fp16 = 0;
+static int  ds4_routed_moe_env_hot_metal = 0;
+
+static void ds4_routed_moe_env_init(void) {
+ if (ds4_routed_moe_env_initialized) return;
+ ds4_routed_moe_env_hot_fp16 = (getenv("DS4_HOT_FP16") != NULL ||
+                                  getenv("DS4_VQB2_FP16") != NULL) ? 1 : 0;
+ ds4_routed_moe_env_hot_metal = (getenv("DS4_HOT_METAL_MOE") != NULL) ? 1 : 0;
+ ds4_routed_moe_env_initialized = 1;
+ if (ds4_routed_moe_env_hot_fp16) {
+  fprintf(stderr,
+   "ds4: DS4_HOT_FP16=1 — predequant FP16 hot-store dispatch engaged (CPU-MoE site)\n");
+ }
+ if (ds4_routed_moe_env_hot_metal) {
+  fprintf(stderr,
+   "ds4: DS4_HOT_METAL_MOE=1 — Metal-MoE FP16 hot-store hook engaged "
+   "(staging; honors sync invariant via routed_moe abstraction)\n");
+ }
+}
+
+/* Decide the backend for this (layer, token). Pure function — no GPU work,
+ * no sync. Returns the plan. The caller passes it to apply(). */
+static ds4_routed_moe_plan ds4_routed_moe_decide(
+ uint8_t cpu_moe_layer_il,
+ uint8_t force_metal_moe,
+ const int32_t *sel_for_pinning_check, /* may be NULL — only used by hot backends to test all_pinned */
+ uint32_t il) {
+ ds4_routed_moe_env_init();
+ ds4_routed_moe_plan p = { .backend = DS4_ROUTED_MOE_METAL_DEFAULT, .hot = NULL };
+ if (cpu_moe_layer_il && !force_metal_moe) {
+  /* CPU-MoE branch. Optional hot-store fastpath if env + all-pinned. */
+  p.backend = DS4_ROUTED_MOE_CPU_DEFAULT;
+  if (ds4_routed_moe_env_hot_fp16 && sel_for_pinning_check) {
+   ds4_hot_expert_store *hot = ds4_hot_store_get_active();
+   if (hot && ds4_hot_layer_all_pinned(hot, il, sel_for_pinning_check, DS4_N_EXPERT_USED)) {
+    p.backend = DS4_ROUTED_MOE_CPU_HOT_FP16;
+    p.hot = hot;
+   }
+  }
+ } else if (ds4_routed_moe_env_hot_metal && sel_for_pinning_check) {
+  /* Metal-MoE branch with optional hot-store. */
+  ds4_hot_expert_store *hot = ds4_hot_store_get_active();
+  if (hot && ds4_hot_layer_all_pinned(hot, il, sel_for_pinning_check, DS4_N_EXPERT_USED)) {
+   p.backend = DS4_ROUTED_MOE_METAL_HOT_FP16;
+   p.hot = hot;
+  }
+ }
+ return p;
+}
+
+/* Cycle 2 apply: the WHOLE routed-MoE dispatch encapsulated.
+ *
+ * Returns:
+ *   1  = dispatched via a hot/specialized backend; caller skips default path
+ *   0  = no specialized dispatch (caller should run default routed_moe_one_tensor)
+ *  -1  = hard failure; caller propagates by setting ok=false
+ *
+ * Owns the full sync invariant. If a backend needs CPU sync, this function
+ * does end_commands() and begin_commands() around the dispatch. If a backend
+ * fails mid-flight, the batch is still restarted so downstream GPU work
+ * continues from a clean state.
+ *
+ * The 165-line nested if/else in metal_graph_encode_decode_layer becomes
+ * a single call to this function. The bug surface (task #764 sync-skip,
+ * #761 (1)+(2)) cannot recur because every code path through here goes
+ * through the same data-driven sync barrier check.
+ */
+static int ds4_routed_moe_apply_full(
+ ds4_gpu_graph *g,
+ const ds4_model *model,
+ const ds4_layer_weights *layer,
+ uint32_t il,
+ uint8_t force_metal_moe) {
+ (void)model;  /* layer/g carry the needed model context */
+ ds4_routed_moe_env_init();
+
+ const bool is_cpu_moe_layer = (!force_metal_moe && g->cpu_moe_layer[il]);
+
+ /* If neither branch applies, return 0 — caller runs default Metal path. */
+ if (!is_cpu_moe_layer && !ds4_routed_moe_env_hot_metal) {
+  return 0;
+ }
+
+ /* CPU-MoE branch: scratch + sync first. */
+ if (is_cpu_moe_layer) {
+  if (!metal_graph_ensure_cpu_moe_scratch(g, 1)) return -1;
+ }
+
+ /* Sync: commit pending GPU writes so tensor_contents reads see coherent data.
+  * end_commands returns 0 if there is no in-flight batch (rare/error state). */
+ if (ds4_gpu_end_commands() == 0) return -1;
+
+ const float *xs   = (const float *)  ds4_gpu_tensor_contents(g->ffn_norm);
+ const int32_t *sel = (const int32_t *)ds4_gpu_tensor_contents(g->router_selected);
+ const float *w    = (const float *)  ds4_gpu_tensor_contents(g->router_weights);
+ float *out        = (float *)        ds4_gpu_tensor_contents(g->routed_out);
+ const int contents_ok = (xs && sel && w && out) ? 1 : 0;
+ if (!contents_ok) {
+  ds4_gpu_begin_commands();
+  return -1;
+ }
+
+ /* Decide the backend now that we have sel for pinning checks. */
+ ds4_routed_moe_plan plan = ds4_routed_moe_decide(
+  is_cpu_moe_layer ? 1 : 0, force_metal_moe, sel, il);
+
+ int dispatched = 0;
+ switch (plan.backend) {
+ case DS4_ROUTED_MOE_CPU_HOT_FP16: {
+  memset(out, 0, (size_t)DS4_N_EMBD * sizeof(float));
+  const int dr = ds4_hot_dispatch_layer_cpu(
+   plan.hot, il, sel, w,
+   DS4_N_EXPERT_USED, xs, out, DS4_N_EMBD);
+  if (dr == 0) dispatched = 1;
+  break;
+ }
+ case DS4_ROUTED_MOE_CPU_DEFAULT: {
+  cpu_routed_moe_batch_handoff_prealloc(
+   g->cpu_model, layer, il,
+   xs, sel, w, out,
+   1, DS4_SWIGLU_CLAMP_EXP,
+   g->cpu_moe_mid, g->cpu_moe_xq,
+   g->cpu_moe_midq, g->cpu_moe_pair_ids);
+  dispatched = 1;
+  break;
+ }
+ case DS4_ROUTED_MOE_METAL_HOT_FP16: {
+  extern int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *);
+  extern int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *,
+                                               uint32_t, uint32_t,
+                                               struct ds4_gpu_tensor *,
+                                               struct ds4_gpu_tensor *,
+                                               struct ds4_gpu_tensor *,
+                                               struct ds4_gpu_tensor *);
+  if (ds4_metal_vqb2_fp16_bind_store(plan.hot) == 0) {
+   memset(out, 0, (size_t)DS4_N_EMBD * sizeof(float));
+   const int dr = ds4_metal_vqb2_fp16_dispatch_gpu(
+    plan.hot, il, 1u,
+    g->router_selected, g->router_weights,
+    g->ffn_norm, g->routed_out);
+   if (dr == 0) dispatched = 1;
+  }
+  break;
+ }
+ case DS4_ROUTED_MOE_METAL_DEFAULT:
+ default:
+  /* No specialized dispatch — caller runs default path. */
+  break;
+ }
+
+ /* HOT-dispatch counters: count selected experts at this layer for CPU paths. */
+ if (dispatched && (plan.backend == DS4_ROUTED_MOE_CPU_DEFAULT
+                     || plan.backend == DS4_ROUTED_MOE_CPU_HOT_FP16)) {
+  for (uint32_t hot_i = 0; hot_i < DS4_N_EXPERT_USED; hot_i++) {
+   if (sel[hot_i] >= 0) ds4_hot_count_dispatch(il, (uint32_t)sel[hot_i]);
+  }
+ }
+
+ /* Restart batch unconditionally — we synced, the batch needs to resume. */
+ if (ds4_gpu_begin_commands() == 0) return -1;
+
+ /* CPU branches ALWAYS count as "dispatched" (caller skips default path).
+  * Metal-hot may fall through to default if pinning failed mid-flight. */
+ if (is_cpu_moe_layer) return 1;
+ return dispatched;
+}
+
+/* silv 2026-05-28 #796 Increment 2c — production dispatch wrapper for F16
+ * matmul.  Bridges (tensor → GPU matmul) so call sites don't repeat the
+ * heap-vs-mmap storage check.
+ *
+ * When a tensor has been override-filled (Phase 2b) and wrapped as an
+ * MTLBuffer (Increment 2 foundation), dispatch through the heap-storage
+ * path; otherwise fall back to the mmap-offset path.
+ *
+ * Engineer-roster motivation:
+ *   Linus:    one dispatch site for one decision; callers must not repeat
+ *   Carmack:  if I'm typing the same conditional N times, I'm wrong
+ *   Pearl:    single place where the check happens — no drift possible
+ *   DJB:      separate the "where is the data" question from the kernel call
+ *
+ * NOTE: F16 only for this increment.  Other dtypes (Q8_0, BF16, ...) follow
+ * the same pattern; each gets its own dispatch helper as the storage path
+ * is wired for that dtype.  Storage-side n_tok>1 falls back to mmap path
+ * until matmul_f16_storage grows multi-token support (Increment 3). */
+static uint64_t s_n_storage_dispatch_f16 = 0;
+static uint64_t s_n_storage_skip_multi_tok_f16 = 0;
+static uint64_t s_n_storage_dispatch_q8_0 = 0;
+static uint64_t s_n_storage_dispatch_bf16 = 0;
+/* silv 2026-05-28 high-resolution review — counter for BF16 storage path
+ * SUPPRESSED via env var. When DS4_BF16_STORAGE_DISABLE=1 is set, the F16
+ * dispatcher falls through to mmap even when storage.dtype==BF16. This
+ * enables A/B engine output comparison: run with the env var set vs
+ * unset, hash the output, compare. If outputs differ → Increment 5 is
+ * doing real work. If identical → Increment 5 is dormant (kernel-level
+ * canary fires but no observable model-level effect). */
+static uint64_t s_n_storage_dispatch_bf16_suppressed = 0;
+
+/* Read DS4_BF16_STORAGE_DISABLE once and cache. Returns 1 to DISABLE
+ * (force mmap fallback even when BF16 storage is set). Default 0 (use
+ * BF16 storage when available — Increment 5a behavior). */
+static int ds4_bf16_storage_disabled(void) {
+ static int cached = -1;
+ if (cached < 0) {
+  const char *env = getenv("DS4_BF16_STORAGE_DISABLE");
+  cached = (env && env[0] == '1') ? 1 : 0;
+  if (cached) {
+   fprintf(stderr, "ds4: DS4_BF16_STORAGE_DISABLE=1 — BF16 storage path "
+           "FORCED OFF, F16 dispatcher will use mmap for BF16-stored tensors\n");
+  }
+ }
+ return cached;
+}
+
+/* silv 2026-05-28 #796 Increment 4 — BF16 dispatch wrapper.
+ *
+ * Asymmetric vs F16/Q8_0: BF16 has NO mmap-fallback path because the kernel
+ * (mul_mv_bf16_f32) was minted for the FP8 source-exact decode path —
+ * there is no mmap-source BF16 weight in the model today. Returns 0 if
+ * storage is absent. This is the storage-only dtype case.
+ *
+ * Currently no production call site routes here. Increment 5 (lift Cycle
+ * 5 ground rule + populate BF16 storage in override-fill) is the gate. */
+static int ds4_matmul_bf16_via_tensor(ds4_gpu_tensor *dst,
+                                       const ds4_model *model,
+                                       const ds4_tensor *t,
+                                       uint64_t in_dim,
+                                       uint64_t out_dim,
+                                       const ds4_gpu_tensor *src,
+                                       uint64_t n_tok) {
+ (void)model;  /* BF16 has no mmap fallback */
+ if (t == NULL || t->storage.metal_buffer == NULL) return 0;
+ s_n_storage_dispatch_bf16++;
+ return ds4_gpu_matmul_bf16_storage(dst, t->storage.metal_buffer,
+                                     in_dim, out_dim, src, n_tok);
+}
+
+/* silv 2026-05-28 #796 Increment 3 — Q8_0 dispatch wrapper.
+ * Parallel to ds4_matmul_f16_via_tensor for Q8_0 weights. Routes to
+ * ds4_gpu_matmul_q8_0_storage when storage.metal_buffer is populated;
+ * falls back to mmap-offset ds4_gpu_matmul_q8_0_tensor otherwise. */
+static int ds4_matmul_q8_0_via_tensor(ds4_gpu_tensor *dst,
+                                       const ds4_model *model,
+                                       const ds4_tensor *t,
+                                       uint64_t in_dim,
+                                       uint64_t out_dim,
+                                       const ds4_gpu_tensor *src,
+                                       uint64_t n_tok) {
+ if (t != NULL && t->storage.metal_buffer != NULL) {
+  s_n_storage_dispatch_q8_0++;
+  return ds4_gpu_matmul_q8_0_storage(dst, t->storage.metal_buffer,
+                                      in_dim, out_dim, src, n_tok);
+ }
+ return ds4_gpu_matmul_q8_0_tensor(dst, model->map, model->size,
+                                    t->abs_offset, in_dim, out_dim,
+                                    src, n_tok);
+}
+
+static int ds4_matmul_f16_via_tensor(ds4_gpu_tensor *dst,
+                                      const ds4_model *model,
+                                      const ds4_tensor *t,
+                                      uint64_t in_dim,
+                                      uint64_t out_dim,
+                                      const ds4_gpu_tensor *src,
+                                      uint64_t n_tok) {
+ /* Increment 2d (2026-05-28): n_tok=1 restriction LIFTED via unified
+  * kernel_dispatch helper inside matmul_f16_storage. All 4 kernel paths
+  * (matvec / mul_mv_ext / NAX / mul_mm) are available to the storage
+  * path now. The s_n_storage_skip_multi_tok_f16 counter is preserved as
+  * dead-but-instructive — increment only if a future regression
+  * reintroduces a multi-tok-specific skip.
+  *
+  * Increment 5a (2026-05-28): dispatch on tensor_effective_type. When the
+  * pack stored BF16 source-exact bytes for a tensor whose t->type is F16,
+  * route to the BF16 kernel (matvec only — falls back to mmap for n_tok>1
+  * because no multi-tok BF16 kernel exists yet). When storage.dtype
+  * matches t->type (identity-fill case), use the F16 storage kernel as
+  * before. Unrecognized storage.dtype falls through to mmap path — the
+  * mmap region still holds whatever the GGUF declared (F16 bytes), safe
+  * to read with the F16 kernel. */
+ if (t != NULL && t->storage.metal_buffer != NULL) {
+  const uint32_t eff = t->storage.dtype;
+  if (eff == DS4_TENSOR_BF16 && n_tok == 1) {
+   if (ds4_bf16_storage_disabled()) {
+    s_n_storage_dispatch_bf16_suppressed++;
+    /* Fall through to mmap path — same numerics as pre-Increment-5. */
+   } else {
+    /* Source-exact BF16 substitute for F16-typed tensor. */
+    s_n_storage_dispatch_bf16++;
+    return ds4_gpu_matmul_bf16_storage(dst, t->storage.metal_buffer,
+                                        in_dim, out_dim, src, n_tok);
+   }
+  } else if (eff == DS4_TENSOR_F16) {
+   s_n_storage_dispatch_f16++;
+   return ds4_gpu_matmul_f16_storage(dst, t->storage.metal_buffer,
+                                      in_dim, out_dim, src, n_tok);
+  }
+  /* storage.dtype not handled by this dispatcher → fall through to mmap. */
+ }
+ return ds4_gpu_matmul_f16_tensor(dst, model->map, model->size,
+                                   t->abs_offset, in_dim, out_dim,
+                                   src, n_tok);
+}
+
+/* silv 2026-05-28 #796 Increment 2c/2d — dispatcher canary.
+ *
+ * End-to-end verification that ds4_matmul_f16_via_tensor correctly routes a
+ * fake-storage tensor through the heap-storage path AND that the storage
+ * counter increments. Mirrors ds4_gpu_mtl4_matmul_f16_storage_canary but
+ * goes through the dispatcher (one extra hop) so we exercise the conditional.
+ *
+ * n_tok > 1 (Increment 2d): exercises the multi-token kernel paths via the
+ * unified kernel_dispatch helper (mul_mv_ext / NAX / mul_mm). The unified
+ * refactor means n_tok > 1 now works through matmul_f16_storage too.
+ *
+ * Returns 1 on success (output matches expected within 1e-4 max_rel AND
+ * counter incremented by exactly 1), 0 on failure. */
+int ds4_via_tensor_canary(uint32_t M, uint32_t N) {
+ return ds4_via_tensor_canary_mt(M, N, 1);
+}
+
+int ds4_via_tensor_canary_mt(uint32_t M, uint32_t N, uint32_t n_tok) {
+ if (!ds4_gpu_init()) {
+  fprintf(stderr, "ds4: via_tensor canary needs GPU init\n");
+  return 0;
+ }
+ if (M == 0 || N == 0 || (M % 4) != 0 || (N % 32) != 0) {
+  fprintf(stderr, "ds4: via_tensor canary needs M%%4==0 and N%%32==0 (got M=%u N=%u)\n", M, N);
+  return 0;
+ }
+ const size_t page = (size_t)getpagesize();
+ const uint64_t matrix_bytes = (uint64_t)M * N * sizeof(uint16_t);
+ const size_t padded = (size_t)(((uint64_t)matrix_bytes + page - 1) & ~(uint64_t)(page - 1));
+
+ void *host_mat = NULL;
+ if (posix_memalign(&host_mat, page, padded) != 0 || !host_mat) return 0;
+ const uint64_t vec_count = (uint64_t)n_tok * N;
+ const uint64_t out_count = (uint64_t)n_tok * M;
+ float *host_vec = (float *)calloc((size_t)vec_count, sizeof(float));
+ float *host_dst = (float *)calloc((size_t)out_count, sizeof(float));
+ float *expected = (float *)calloc((size_t)out_count, sizeof(float));
+ if (!host_vec || !host_dst || !expected) {
+  free(host_mat); free(host_vec); free(host_dst); free(expected);
+  return 0;
+ }
+
+ uint16_t *mat16 = (uint16_t *)host_mat;
+ for (uint32_t r = 0; r < M; r++) {
+  for (uint32_t c = 0; c < N; c++) {
+   float v = (float)((int)r % 7) * 0.01f + (float)((int)c % 5) * 0.001f;
+   _Float16 h = (_Float16)v;
+   memcpy(&mat16[(uint64_t)r * N + c], &h, sizeof(h));
+  }
+ }
+ /* Fill activation with token-distinct values so different tokens produce
+  * different outputs (otherwise multi-tok degenerates to single-tok). */
+ for (uint32_t t = 0; t < n_tok; t++) {
+  for (uint32_t c = 0; c < N; c++) {
+   host_vec[(uint64_t)t * N + c] = (float)((int)c % 3) * 0.1f + 0.5f + (float)((int)t % 11) * 0.01f;
+  }
+ }
+ for (uint32_t t = 0; t < n_tok; t++) {
+  for (uint32_t r = 0; r < M; r++) {
+   double acc = 0.0;
+   for (uint32_t c = 0; c < N; c++) {
+    _Float16 h;
+    memcpy(&h, &mat16[(uint64_t)r * N + c], sizeof(h));
+    acc += (double)(float)h * (double)host_vec[(uint64_t)t * N + c];
+   }
+   expected[(uint64_t)t * M + r] = (float)acc;
+  }
+ }
+
+ void *weight_buf = ds4_gpu_wrap_heap_bytes(host_mat, (uint64_t)padded);
+ if (!weight_buf) {
+  free(host_mat); free(host_vec); free(host_dst); free(expected);
+  return 0;
+ }
+
+ /* Build the fake tensor with storage.metal_buffer populated. The dispatcher
+  * checks (t->storage.metal_buffer != NULL) and routes to the storage path;
+  * t->abs_offset (used by the fallback) is never dereferenced. */
+ ds4_tensor fake_tensor = {0};
+ fake_tensor.type = 1; /* GGUF F16 */
+ fake_tensor.abs_offset = 0;
+ fake_tensor.storage.bytes = host_mat;
+ fake_tensor.storage.length = matrix_bytes;
+ fake_tensor.storage.dtype = 1;
+ fake_tensor.storage.ownership = DS4_STORAGE_HEAP;
+ fake_tensor.storage.metal_buffer = weight_buf;
+
+ /* The dispatcher's fallback path derefs model->map/model->size — never
+  * reached here because storage path takes precedence, but pass a zero-model
+  * so any future bug that bypasses storage gets a deterministic NULL-deref
+  * crash instead of UB. */
+ ds4_model dummy_model = {0};
+
+ ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(vec_count * sizeof(float));
+ ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+ int rc = 0;
+ uint64_t counter_before = s_n_storage_dispatch_f16;
+ if (x && out && ds4_gpu_tensor_write(x, 0, host_vec, (size_t)vec_count * sizeof(float)) > 0) {
+  if (ds4_matmul_f16_via_tensor(out, &dummy_model, &fake_tensor, N, M, x, n_tok) != 0) {
+   if (ds4_gpu_tensor_read(out, 0, host_dst, (size_t)out_count * sizeof(float)) > 0) {
+    rc = 1;
+   }
+  }
+ }
+ uint64_t counter_after = s_n_storage_dispatch_f16;
+ ds4_gpu_tensor_free(x);
+ ds4_gpu_tensor_free(out);
+ ds4_gpu_release_heap_buffer(weight_buf);
+
+ /* Tolerance per kernel path:
+  *   n_tok==1   matvec uses FP32 accumulators → tight 1e-4
+  *   n_tok<=8   mul_mv_ext also FP32 accumulator → tight 1e-4
+  *   n_tok>=32  NAX direct-RHS / mul_mm use FP16 accumulators for speed →
+  *              looser 5e-4 (matches the kernel's actual precision; observed
+  *              max_rel ~2.3e-4 in n_tok=32 sweep, hits FP16 precision floor).
+  * If a future kernel change tightens FP16 acc to FP32, the canary will
+  * still pass — tolerance is the loose upper bound, not a target. */
+ const double tol = (n_tok >= 16) ? 5e-4 : 1e-4;
+ int mismatch = 0;
+ double max_rel = 0.0;
+ if (rc) {
+  for (uint64_t i = 0; i < out_count; i++) {
+   const double diff = fabs((double)(host_dst[i] - expected[i]));
+   const double rel = diff / (fabs((double)expected[i]) + 1e-7);
+   if (rel > max_rel) max_rel = rel;
+   if (rel > tol) mismatch++;
+  }
+ }
+ const uint64_t counter_delta = counter_after - counter_before;
+ const int counter_ok = (counter_delta == 1);
+ fprintf(stderr,
+  "ds4: via_tensor canary M=%u N=%u n_tok=%u "
+  "dst[0]=%.5f (ref=%.5f) dst[end]=%.5f (ref=%.5f) "
+  "mismatch=%d max_rel=%.4e counter_delta=%llu %s\n",
+  M, N, n_tok,
+  (double)host_dst[0], (double)expected[0],
+  (double)host_dst[out_count - 1], (double)expected[out_count - 1],
+  mismatch, max_rel,
+  (unsigned long long)counter_delta,
+  (rc && mismatch == 0 && counter_ok) ? "PASS" : "FAIL");
+
+ free(host_mat); free(host_vec); free(host_dst); free(expected);
+ return (rc && mismatch == 0 && counter_ok) ? 1 : 0;
+}
+
+/* silv 2026-05-28 #796 Increment 3 — Q8_0 dispatcher canary.
+ *
+ * Parallel to ds4_via_tensor_canary_mt but with Q8_0 quantized weights.
+ * Builds an F32 reference matrix, quantizes it to Q8_0 (32-element blocks
+ * with FP16 scale + INT8[32]), wraps as MTLBuffer, routes through
+ * ds4_matmul_q8_0_via_tensor dispatcher, verifies (a) output matches
+ * dequant-then-multiply reference within tolerance (b) Q8_0 storage
+ * counter incremented by exactly 1.
+ *
+ * Q8_0 quantization error is per-block ~scale/256 — much larger than F16
+ * rounding noise. Tolerance is 5e-2 relative for n_tok=1; multi-token
+ * paths inherit the F16-accumulator floor on top (use 1e-1).
+ *
+ * Returns 1 on PASS, 0 on FAIL. Requires M%%4==0, N%%32==0 (block-size
+ * aligned), GPU initialized. */
+int ds4_via_tensor_q8_0_canary(uint32_t M, uint32_t N, uint32_t n_tok) {
+ if (!ds4_gpu_init()) {
+  fprintf(stderr, "ds4: via_tensor_q8_0 canary needs GPU init\n");
+  return 0;
+ }
+ if (M == 0 || N == 0 || (M % 4) != 0 || (N % 32) != 0 || n_tok == 0) {
+  fprintf(stderr, "ds4: via_tensor_q8_0 canary needs M%%4==0 and N%%32==0 (got M=%u N=%u n_tok=%u)\n",
+          M, N, n_tok);
+  return 0;
+ }
+ const size_t page = (size_t)getpagesize();
+ const uint64_t blocks_per_row = N / 32;
+ const uint64_t row_bytes = blocks_per_row * 34;  /* 2-byte FP16 scale + 32 INT8 */
+ const uint64_t matrix_bytes = (uint64_t)M * row_bytes;
+ const size_t padded = (size_t)(((uint64_t)matrix_bytes + page - 1) & ~(uint64_t)(page - 1));
+
+ void *host_mat = NULL;
+ if (posix_memalign(&host_mat, page, padded) != 0 || !host_mat) return 0;
+ const uint64_t vec_count = (uint64_t)n_tok * N;
+ const uint64_t out_count = (uint64_t)n_tok * M;
+ float *host_ref = (float *)calloc((size_t)M * N, sizeof(float));
+ float *host_vec = (float *)calloc((size_t)vec_count, sizeof(float));
+ float *host_dst = (float *)calloc((size_t)out_count, sizeof(float));
+ float *expected = (float *)calloc((size_t)out_count, sizeof(float));
+ if (!host_ref || !host_vec || !host_dst || !expected) {
+  free(host_mat); free(host_ref); free(host_vec); free(host_dst); free(expected);
+  return 0;
+ }
+
+ /* Build deterministic F32 reference matrix. */
+ for (uint32_t r = 0; r < M; r++) {
+  for (uint32_t c = 0; c < N; c++) {
+   host_ref[(uint64_t)r * N + c] =
+    (float)((int)r % 7) * 0.01f + (float)((int)c % 5) * 0.001f;
+  }
+ }
+ /* Quantize to Q8_0: each 32-element block gets one FP16 scale + 32 INT8. */
+ uint8_t *q8 = (uint8_t *)host_mat;
+ for (uint32_t r = 0; r < M; r++) {
+  for (uint64_t b = 0; b < blocks_per_row; b++) {
+   const float *src_block = &host_ref[(uint64_t)r * N + b * 32];
+   float amax = 0.0f;
+   for (int k = 0; k < 32; k++) {
+    const float v = fabsf(src_block[k]);
+    if (v > amax) amax = v;
+   }
+   const float scale = amax / 127.0f;
+   const float iscale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+   _Float16 hscale = (_Float16)scale;
+   uint8_t *blk = q8 + (uint64_t)r * row_bytes + b * 34;
+   memcpy(blk, &hscale, 2);
+   for (int k = 0; k < 32; k++) {
+    int q = (int)roundf(src_block[k] * iscale);
+    if (q > 127) q = 127;
+    if (q < -128) q = -128;
+    blk[2 + k] = (uint8_t)(int8_t)q;
+   }
+  }
+ }
+
+ /* Build host_vec with token-distinct values, then compute expected
+  * using the DEQUANTIZED weight matrix (to match what the kernel sees). */
+ for (uint32_t t = 0; t < n_tok; t++) {
+  for (uint32_t c = 0; c < N; c++) {
+   host_vec[(uint64_t)t * N + c] =
+    (float)((int)c % 3) * 0.1f + 0.5f + (float)((int)t % 11) * 0.01f;
+  }
+ }
+ for (uint32_t t = 0; t < n_tok; t++) {
+  for (uint32_t r = 0; r < M; r++) {
+   double acc = 0.0;
+   for (uint64_t b = 0; b < blocks_per_row; b++) {
+    uint8_t *blk = q8 + (uint64_t)r * row_bytes + b * 34;
+    _Float16 hscale;
+    memcpy(&hscale, blk, 2);
+    const float scale = (float)hscale;
+    for (int k = 0; k < 32; k++) {
+     const int8_t q = (int8_t)blk[2 + k];
+     const float w = scale * (float)q;
+     acc += (double)w * (double)host_vec[(uint64_t)t * N + b * 32 + k];
+    }
+   }
+   expected[(uint64_t)t * M + r] = (float)acc;
+  }
+ }
+
+ void *weight_buf = ds4_gpu_wrap_heap_bytes(host_mat, (uint64_t)padded);
+ if (!weight_buf) {
+  free(host_mat); free(host_ref); free(host_vec); free(host_dst); free(expected);
+  return 0;
+ }
+
+ ds4_tensor fake_tensor = {0};
+ fake_tensor.type = 8; /* GGUF Q8_0 */
+ fake_tensor.abs_offset = 0;
+ fake_tensor.storage.bytes = host_mat;
+ fake_tensor.storage.length = matrix_bytes;
+ fake_tensor.storage.dtype = 8;
+ fake_tensor.storage.ownership = DS4_STORAGE_HEAP;
+ fake_tensor.storage.metal_buffer = weight_buf;
+
+ ds4_model dummy_model = {0};
+
+ ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(vec_count * sizeof(float));
+ ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+ int rc = 0;
+ uint64_t counter_before = s_n_storage_dispatch_q8_0;
+ if (x && out && ds4_gpu_tensor_write(x, 0, host_vec, (size_t)vec_count * sizeof(float)) > 0) {
+  if (ds4_matmul_q8_0_via_tensor(out, &dummy_model, &fake_tensor, N, M, x, n_tok) != 0) {
+   if (ds4_gpu_tensor_read(out, 0, host_dst, (size_t)out_count * sizeof(float)) > 0) {
+    rc = 1;
+   }
+  }
+ }
+ uint64_t counter_after = s_n_storage_dispatch_q8_0;
+ ds4_gpu_tensor_free(x);
+ ds4_gpu_tensor_free(out);
+ ds4_gpu_release_heap_buffer(weight_buf);
+
+ /* Q8_0 expected-vs-actual: both use dequant-then-multiply, so the
+  * floor should match the kernel's accumulator (FP32 for n_tok=1, FP16
+  * for multi-tok). Q8_0 NAX kernel observed max_rel ~5.06e-4 — slightly
+  * above F16's 2.3e-4 because the Q8_0 dequant adds one more rounding
+  * step in FP16 before the FP16 mac. Use 1e-3 for multi-tok. */
+ const double tol = (n_tok >= 16) ? 1e-3 : 1e-4;
+ int mismatch = 0;
+ double max_rel = 0.0;
+ if (rc) {
+  for (uint64_t i = 0; i < out_count; i++) {
+   const double diff = fabs((double)(host_dst[i] - expected[i]));
+   const double rel = diff / (fabs((double)expected[i]) + 1e-7);
+   if (rel > max_rel) max_rel = rel;
+   if (rel > tol) mismatch++;
+  }
+ }
+ const uint64_t counter_delta = counter_after - counter_before;
+ const int counter_ok = (counter_delta == 1);
+ fprintf(stderr,
+  "ds4: via_tensor_q8_0 canary M=%u N=%u n_tok=%u "
+  "dst[0]=%.5f (ref=%.5f) dst[end]=%.5f (ref=%.5f) "
+  "mismatch=%d max_rel=%.4e counter_delta=%llu %s\n",
+  M, N, n_tok,
+  (double)host_dst[0], (double)expected[0],
+  (double)host_dst[out_count - 1], (double)expected[out_count - 1],
+  mismatch, max_rel,
+  (unsigned long long)counter_delta,
+  (rc && mismatch == 0 && counter_ok) ? "PASS" : "FAIL");
+
+ free(host_mat); free(host_ref); free(host_vec); free(host_dst); free(expected);
+ return (rc && mismatch == 0 && counter_ok) ? 1 : 0;
+}
+
+/* silv 2026-05-28 #796 Increment 4 — BF16 dispatcher canary.
+ *
+ * Parallel to Q8_0 canary but with BF16 truncate-encoded weights (BF16 =
+ * upper 16 bits of FP32 — no round-to-nearest). Matvec only (n_tok=1)
+ * because the BF16 MSL kernel is matvec-only.
+ *
+ * Tolerance is tight (1e-4) because BF16 expected uses the SAME
+ * bf16→f32 widen the kernel does — no rounding mismatch.
+ *
+ * Returns 1 on PASS, 0 on FAIL. Requires M%%4==0, N%%32==0, n_tok=1. */
+int ds4_via_tensor_bf16_canary(uint32_t M, uint32_t N) {
+ if (!ds4_gpu_init()) {
+  fprintf(stderr, "ds4: via_tensor_bf16 canary needs GPU init\n");
+  return 0;
+ }
+ if (M == 0 || N == 0 || (M % 4) != 0 || (N % 32) != 0) {
+  fprintf(stderr, "ds4: via_tensor_bf16 canary needs M%%4==0 and N%%32==0 (got M=%u N=%u)\n",
+          M, N);
+  return 0;
+ }
+ const size_t page = (size_t)getpagesize();
+ const uint64_t matrix_bytes = (uint64_t)M * N * sizeof(uint16_t);
+ const size_t padded = (size_t)(((uint64_t)matrix_bytes + page - 1) & ~(uint64_t)(page - 1));
+
+ void *host_mat = NULL;
+ if (posix_memalign(&host_mat, page, padded) != 0 || !host_mat) return 0;
+ float *host_vec = (float *)calloc(N, sizeof(float));
+ float *host_dst = (float *)calloc(M, sizeof(float));
+ float *expected = (float *)calloc(M, sizeof(float));
+ if (!host_vec || !host_dst || !expected) {
+  free(host_mat); free(host_vec); free(host_dst); free(expected);
+  return 0;
+ }
+
+ /* Encode matrix as BF16 (upper 16 bits of fp32, truncate — no rounding). */
+ uint16_t *mat16 = (uint16_t *)host_mat;
+ for (uint32_t r = 0; r < M; r++) {
+  for (uint32_t c = 0; c < N; c++) {
+   float v = (float)((int)r % 7) * 0.01f + (float)((int)c % 5) * 0.001f;
+   uint32_t bits;
+   memcpy(&bits, &v, sizeof(bits));
+   mat16[(uint64_t)r * N + c] = (uint16_t)(bits >> 16);
+  }
+ }
+ for (uint32_t c = 0; c < N; c++) host_vec[c] = (float)((int)c % 3) * 0.1f + 0.5f;
+ /* Reference accumulates using bf16→f32 widen the kernel does. */
+ for (uint32_t r = 0; r < M; r++) {
+  double acc = 0.0;
+  for (uint32_t c = 0; c < N; c++) {
+   uint32_t f32_bits = (uint32_t)mat16[(uint64_t)r * N + c] << 16;
+   float w;
+   memcpy(&w, &f32_bits, sizeof(w));
+   acc += (double)w * (double)host_vec[c];
+  }
+  expected[r] = (float)acc;
+ }
+
+ void *weight_buf = ds4_gpu_wrap_heap_bytes(host_mat, (uint64_t)padded);
+ if (!weight_buf) {
+  free(host_mat); free(host_vec); free(host_dst); free(expected);
+  return 0;
+ }
+
+ ds4_tensor fake_tensor = {0};
+ fake_tensor.type = 30; /* GGUF BF16 */
+ fake_tensor.abs_offset = 0;
+ fake_tensor.storage.bytes = host_mat;
+ fake_tensor.storage.length = matrix_bytes;
+ fake_tensor.storage.dtype = 30;
+ fake_tensor.storage.ownership = DS4_STORAGE_HEAP;
+ fake_tensor.storage.metal_buffer = weight_buf;
+
+ ds4_model dummy_model = {0};
+
+ ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)N * sizeof(float));
+ ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)M * sizeof(float));
+ int rc = 0;
+ uint64_t counter_before = s_n_storage_dispatch_bf16;
+ if (x && out && ds4_gpu_tensor_write(x, 0, host_vec, (size_t)N * sizeof(float)) > 0) {
+  if (ds4_matmul_bf16_via_tensor(out, &dummy_model, &fake_tensor, N, M, x, 1) != 0) {
+   if (ds4_gpu_tensor_read(out, 0, host_dst, (size_t)M * sizeof(float)) > 0) {
+    rc = 1;
+   }
+  }
+ }
+ uint64_t counter_after = s_n_storage_dispatch_bf16;
+ ds4_gpu_tensor_free(x);
+ ds4_gpu_tensor_free(out);
+ ds4_gpu_release_heap_buffer(weight_buf);
+
+ /* High-resolution tolerance (2026-05-28 review): observed max_rel at
+  * M=64..1024 / N=128..4096 was 1.0e-07. BF16 expected uses the same
+  * bf16→f32 widen the kernel does, so this floor reflects FP32-acc
+  * precision noise. Tighten to 1e-6 (10x headroom over observed) so any
+  * future regression that pushes precision to FP16-floor (~1e-3) or
+  * even a subtler mid-range drop (5e-6) FAILS LOUD. Old 1e-4 hid 3 OOM
+  * of headroom — a slow drift would have passed undetected. */
+ int mismatch = 0;
+ double max_rel = 0.0;
+ if (rc) {
+  for (uint32_t r = 0; r < M; r++) {
+   const double diff = fabs((double)(host_dst[r] - expected[r]));
+   const double rel = diff / (fabs((double)expected[r]) + 1e-7);
+   if (rel > max_rel) max_rel = rel;
+   if (rel > 1e-6) mismatch++;
+  }
+ }
+ const uint64_t counter_delta = counter_after - counter_before;
+ const int counter_ok = (counter_delta == 1);
+ fprintf(stderr,
+  "ds4: via_tensor_bf16 canary M=%u N=%u "
+  "dst[0]=%.5f (ref=%.5f) dst[end]=%.5f (ref=%.5f) "
+  "mismatch=%d max_rel=%.4e counter_delta=%llu %s\n",
+  M, N,
+  (double)host_dst[0], (double)expected[0],
+  (double)host_dst[M - 1], (double)expected[M - 1],
+  mismatch, max_rel,
+  (unsigned long long)counter_delta,
+  (rc && mismatch == 0 && counter_ok) ? "PASS" : "FAIL");
+
+ free(host_mat); free(host_vec); free(host_dst); free(expected);
+ return (rc && mismatch == 0 && counter_ok) ? 1 : 0;
+}
+
+/* silv 2026-05-28 #796 Increment 5a — source-exact dispatcher canary.
+ *
+ * The SEVERE TEST that the F16 dispatcher correctly routes based on
+ * storage.dtype rather than t->type. Builds a tensor with:
+ *   t->type            = DS4_TENSOR_F16  (declared as F16)
+ *   storage.dtype      = DS4_TENSOR_BF16 (actually BF16 bytes)
+ *
+ * Routes through ds4_matmul_f16_via_tensor and verifies:
+ *   (a) output matches the BF16 reference (bf16→f32 widen)
+ *   (b) the BF16 counter incremented (not the F16 counter) — proving the
+ *       dispatcher used the storage dtype to pick the kernel
+ *
+ * Without Increment 5a's dtype-aware dispatch, the F16 dispatcher would
+ * have called matmul_f16_storage which reads BF16 bytes as F16 → silent
+ * corruption. This canary catches that regression class.
+ *
+ * Matvec only (n_tok=1) because the BF16 kernel is matvec-only. */
+int ds4_via_tensor_source_exact_bf16_canary(uint32_t M, uint32_t N) {
+ if (!ds4_gpu_init()) return 0;
+ if (M == 0 || N == 0 || (M % 4) != 0 || (N % 32) != 0) {
+  fprintf(stderr, "ds4: source-exact bf16 canary needs M%%4==0 and N%%32==0 (got M=%u N=%u)\n", M, N);
+  return 0;
+ }
+ const size_t page = (size_t)getpagesize();
+ const uint64_t matrix_bytes = (uint64_t)M * N * sizeof(uint16_t);
+ const size_t padded = (size_t)(((uint64_t)matrix_bytes + page - 1) & ~(uint64_t)(page - 1));
+
+ void *host_mat = NULL;
+ if (posix_memalign(&host_mat, page, padded) != 0 || !host_mat) return 0;
+ float *host_vec = (float *)calloc(N, sizeof(float));
+ float *host_dst = (float *)calloc(M, sizeof(float));
+ float *expected = (float *)calloc(M, sizeof(float));
+ if (!host_vec || !host_dst || !expected) {
+  free(host_mat); free(host_vec); free(host_dst); free(expected);
+  return 0;
+ }
+
+ uint16_t *mat16 = (uint16_t *)host_mat;
+ for (uint32_t r = 0; r < M; r++) {
+  for (uint32_t c = 0; c < N; c++) {
+   float v = (float)((int)r % 7) * 0.01f + (float)((int)c % 5) * 0.001f;
+   uint32_t bits;
+   memcpy(&bits, &v, sizeof(bits));
+   mat16[(uint64_t)r * N + c] = (uint16_t)(bits >> 16); /* BF16 truncate */
+  }
+ }
+ for (uint32_t c = 0; c < N; c++) host_vec[c] = (float)((int)c % 3) * 0.1f + 0.5f;
+ for (uint32_t r = 0; r < M; r++) {
+  double acc = 0.0;
+  for (uint32_t c = 0; c < N; c++) {
+   uint32_t f32_bits = (uint32_t)mat16[(uint64_t)r * N + c] << 16;
+   float w;
+   memcpy(&w, &f32_bits, sizeof(w));
+   acc += (double)w * (double)host_vec[c];
+  }
+  expected[r] = (float)acc;
+ }
+
+ void *weight_buf = ds4_gpu_wrap_heap_bytes(host_mat, (uint64_t)padded);
+ if (!weight_buf) {
+  free(host_mat); free(host_vec); free(host_dst); free(expected);
+  return 0;
+ }
+
+ /* THE CRITICAL DIFFERENCE: t->type = F16, storage.dtype = BF16.
+  * Source-exact substitute: the pack provided BF16 bytes for a tensor
+  * the GGUF declared as F16. Without Increment 5a, the F16 dispatcher
+  * would have read these BF16 bytes as F16 → garbage. */
+ ds4_tensor fake_tensor = {0};
+ fake_tensor.type = DS4_TENSOR_F16;
+ fake_tensor.abs_offset = 0;
+ fake_tensor.storage.bytes = host_mat;
+ fake_tensor.storage.length = matrix_bytes;
+ fake_tensor.storage.dtype = DS4_TENSOR_BF16;
+ fake_tensor.storage.ownership = DS4_STORAGE_HEAP;
+ fake_tensor.storage.metal_buffer = weight_buf;
+
+ ds4_model dummy_model = {0};
+ ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)N * sizeof(float));
+ ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)M * sizeof(float));
+ int rc = 0;
+ uint64_t bf16_before = s_n_storage_dispatch_bf16;
+ uint64_t f16_before = s_n_storage_dispatch_f16;
+ if (x && out && ds4_gpu_tensor_write(x, 0, host_vec, (size_t)N * sizeof(float)) > 0) {
+  /* Route via F16 dispatcher — verifies it switches to BF16 path. */
+  if (ds4_matmul_f16_via_tensor(out, &dummy_model, &fake_tensor, N, M, x, 1) != 0) {
+   if (ds4_gpu_tensor_read(out, 0, host_dst, (size_t)M * sizeof(float)) > 0) {
+    rc = 1;
+   }
+  }
+ }
+ uint64_t bf16_after = s_n_storage_dispatch_bf16;
+ uint64_t f16_after = s_n_storage_dispatch_f16;
+ ds4_gpu_tensor_free(x);
+ ds4_gpu_tensor_free(out);
+ ds4_gpu_release_heap_buffer(weight_buf);
+
+ /* High-resolution tolerance (2026-05-28 review): same 1e-6 floor as the
+  * BF16-only canary. Severe test verifies dispatcher routing, not kernel
+  * precision; the kernel-precision check still wants 1e-6 to catch any
+  * future regression that lets BF16 storage silently degrade to FP16
+  * precision. Combined with bf16_delta==1 && f16_delta==0 it catches
+  * BOTH numerical drift AND routing drift. */
+ int mismatch = 0;
+ double max_rel = 0.0;
+ if (rc) {
+  for (uint32_t r = 0; r < M; r++) {
+   const double diff = fabs((double)(host_dst[r] - expected[r]));
+   const double rel = diff / (fabs((double)expected[r]) + 1e-7);
+   if (rel > max_rel) max_rel = rel;
+   if (rel > 1e-6) mismatch++;
+  }
+ }
+ const uint64_t bf16_delta = bf16_after - bf16_before;
+ const uint64_t f16_delta = f16_after - f16_before;
+ const int routing_ok = (bf16_delta == 1 && f16_delta == 0);
+ fprintf(stderr,
+  "ds4: source-exact bf16 canary M=%u N=%u "
+  "dst[0]=%.5f (ref=%.5f) dst[end]=%.5f (ref=%.5f) "
+  "mismatch=%d max_rel=%.4e bf16_delta=%llu f16_delta=%llu %s\n",
+  M, N,
+  (double)host_dst[0], (double)expected[0],
+  (double)host_dst[M - 1], (double)expected[M - 1],
+  mismatch, max_rel,
+  (unsigned long long)bf16_delta, (unsigned long long)f16_delta,
+  (rc && mismatch == 0 && routing_ok) ? "PASS" : "FAIL");
+
+ free(host_mat); free(host_vec); free(host_dst); free(expected);
+ return (rc && mismatch == 0 && routing_ok) ? 1 : 0;
+}
+
 /* When force_metal_moe == false, the caller must guarantee that model->map
  * and the layer's expert offsets live in the same GGUF as g->cpu_model so the
  * CPU MoE handoff reads the right bytes. Pass true from the MTP draft path,
@@ -11532,18 +12770,18 @@ static bool metal_graph_encode_decode_layer(
  if (ok) {
  metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
  }
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->qr, model->map, model->size,
- layer->attn_q_a->abs_offset,
- DS4_N_EMBD, q_rank,
- g->attn_norm, 1) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->qr, model,
+  layer->attn_q_a,
+  DS4_N_EMBD, q_rank,
+  g->attn_norm, 1) != 0;
  if (ok) {
  metal_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
  }
  if (qkv_rms_fused) {
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
- layer->attn_kv->abs_offset,
- DS4_N_EMBD, DS4_N_HEAD_DIM,
- g->attn_norm, 1) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->kv_raw, model,
+  layer->attn_kv,
+  DS4_N_EMBD, DS4_N_HEAD_DIM,
+  g->attn_norm, 1) != 0;
  if (ok) {
  metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
  }
@@ -11571,10 +12809,10 @@ static bool metal_graph_encode_decode_layer(
  if (qkv_rms_fused && ok) {
  metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
  }
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size,
- layer->attn_q_b->abs_offset,
- q_rank, q_dim,
- g->qr_norm, 1) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->q, model,
+  layer->attn_q_b,
+  q_rank, q_dim,
+  g->qr_norm, 1) != 0;
  if (ok) {
  metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
  }
@@ -11592,10 +12830,10 @@ static bool metal_graph_encode_decode_layer(
  metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
  }
  if (!qkv_rms_fused) {
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
- layer->attn_kv->abs_offset,
- DS4_N_EMBD, DS4_N_HEAD_DIM,
- g->attn_norm, 1) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->kv_raw, model,
+  layer->attn_kv,
+  DS4_N_EMBD, DS4_N_HEAD_DIM,
+  g->attn_norm, 1) != 0;
  if (ok) {
  metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
  }
@@ -11662,12 +12900,12 @@ static bool metal_graph_encode_decode_layer(
  g->attn_norm,
  1) != 0;
  } else {
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_kv_cur, model->map, model->size,
- layer->attn_compressor_kv->abs_offset,
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->comp_kv_cur, model,
+ layer->attn_compressor_kv,
  DS4_N_EMBD, comp_width,
  g->attn_norm, 1) != 0;
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_sc_cur, model->map, model->size,
- layer->attn_compressor_gate->abs_offset,
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->comp_sc_cur, model,
+ layer->attn_compressor_gate,
  DS4_N_EMBD, comp_width,
  g->attn_norm, 1) != 0;
  }
@@ -11743,12 +12981,12 @@ static bool metal_graph_encode_decode_layer(
  g->attn_norm,
  1) != 0;
  } else {
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_kv_cur, model->map, model->size,
- layer->indexer_compressor_kv->abs_offset,
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->comp_kv_cur, model,
+ layer->indexer_compressor_kv,
  DS4_N_EMBD, index_width,
  g->attn_norm, 1) != 0;
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_sc_cur, model->map, model->size,
- layer->indexer_compressor_gate->abs_offset,
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->comp_sc_cur, model,
+ layer->indexer_compressor_gate,
  DS4_N_EMBD, index_width,
  g->attn_norm, 1) != 0;
  }
@@ -11795,8 +13033,8 @@ static bool metal_graph_encode_decode_layer(
  fprintf(stderr, "ds4: Metal graph indexer weight projection expects F16 weights\n");
  ok = false;
  }
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->indexer_q, model->map, model->size,
- layer->indexer_attn_q_b->abs_offset,
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->indexer_q, model,
+ layer->indexer_attn_q_b,
  q_rank, indexer_q_dim,
  g->qr_norm, 1) != 0;
  if (ok) ok = ds4_gpu_rope_tail_tensor(g->indexer_q, 1,
@@ -11812,8 +13050,8 @@ static bool metal_graph_encode_decode_layer(
  attn_factor,
  DS4_ROPE_YARN_BETA_FAST,
  DS4_ROPE_YARN_BETA_SLOW) != 0;
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->indexer_weights, model->map, model->size,
- layer->indexer_proj->abs_offset,
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->indexer_weights, model,
+ layer->indexer_proj,
  DS4_N_EMBD, DS4_N_INDEXER_HEAD,
  g->attn_norm, 1) != 0;
  const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
@@ -12072,192 +13310,30 @@ static bool metal_graph_encode_decode_layer(
  metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
  metal_graph_pe_router_trace_one(g->router_selected, g->router_weights, il, pos);
  }
- if (ok && !force_metal_moe && g->cpu_moe_layer[il]) {
- ok = metal_graph_ensure_cpu_moe_scratch(g, 1) && (ds4_gpu_end_commands() != 0);
+ /* silv 2026-05-28 engineer-roster cycle 2: routed-MoE dispatch collapsed
+  * from a 165-line nested if/else into a single apply_full() call.
+  * apply_full() honors the sync invariant declared in DS4_ROUTED_MOE_PROPS
+  * uniformly across all backends — the task #764 sync-skip kludge cannot
+  * recur because the dispatch decision and the sync barrier are now
+  * data-driven, not branch-driven. */
  if (ok) {
- const float *xs = (const float *) ds4_gpu_tensor_contents(g->ffn_norm);
- const int32_t *sel = (const int32_t *)ds4_gpu_tensor_contents(g->router_selected);
- const float *w = (const float *) ds4_gpu_tensor_contents(g->router_weights);
- float *out = (float *) ds4_gpu_tensor_contents(g->routed_out);
- ok = xs && sel && w && out;
- if (ok) {
- /* silv 2026-05-26 — predequant FP16 hot-store dispatch at CPU-MoE site.
-  *
-  * Env flag: DS4_HOT_FP16=1 (alias: DS4_VQB2_FP16 — legacy name kept for
-  * compatibility with existing shell scripts).
-  *
-  * Active path: when the active hot-store has all 6 selected experts for
-  * the current layer fully pinned (FP16 polar-decoded tiles in heap), skip
-  * the IQ2_XXS dequant+matmul and call ds4_hot_dispatch_layer_cpu — which
-  * is fed pre-dequantized FP16 weights directly.
-  *
-  * The Metal-MoE-side hot-store path (gen-on-GPU) lives in
-  * ds4_gpu_routed_moe_batch_tensor, gated separately by DS4_HOT_METAL_MOE.
-  * This branch fires only when gen is on CPU (--prefill-metal-phases or
-  * --cpu-moe sets cpu_moe_layer[il]=true). */
- static int hot_env_checked = 0;
- static int hot_enabled = 0;
- if (!hot_env_checked) {
- hot_enabled = (getenv("DS4_HOT_FP16") != NULL ||
-                getenv("DS4_VQB2_FP16") != NULL) ? 1 : 0;
- hot_env_checked = 1;
- if (hot_enabled) {
- fprintf(stderr,
-   "ds4: DS4_HOT_FP16=1 — predequant FP16 hot-store dispatch engaged (CPU-MoE site)\n");
- }
- }
- int dispatched_via_hot = 0;
- if (hot_enabled) {
- ds4_hot_expert_store *hot = ds4_hot_store_get_active();
- if (hot && ds4_hot_layer_all_pinned(hot, il, sel, DS4_N_EXPERT_USED)) {
- memset(out, 0, (size_t)DS4_N_EMBD * sizeof(float));
- const int dr = ds4_hot_dispatch_layer_cpu(hot, il, sel, w,
-                                            DS4_N_EXPERT_USED,
-                                            xs, out, DS4_N_EMBD);
- if (dr == 0) dispatched_via_hot = 1;
- }
- }
- if (!dispatched_via_hot) {
- cpu_routed_moe_batch_handoff_prealloc(g->cpu_model, layer, il,
- xs, sel, w, out,
- 1, DS4_SWIGLU_CLAMP_EXP,
- g->cpu_moe_mid,
- g->cpu_moe_xq,
- g->cpu_moe_midq,
- g->cpu_moe_pair_ids);
- }
- /* silv 2026-05-26 HOT-dispatch counters: count selected experts at this
-  * layer. Zero-overhead when expert_table uninitialized; no behavior change. */
- for (uint32_t hot_i = 0; hot_i < DS4_N_EXPERT_USED; hot_i++) {
- if (sel[hot_i] >= 0) {
- ds4_hot_count_dispatch(il, (uint32_t)sel[hot_i]);
- }
- }
- }
- }
- if (ok) ok = (ds4_gpu_begin_commands() != 0);
- } else if (ok) {
- /* silv 2026-05-26 — Metal-MoE predequant FP16 hot-store hook (gen path).
-  *
-  * Env flag: DS4_HOT_METAL_MOE=1
-  *
-  * When the active hot-store has all 6 selected experts for layer `il`
-  * pinned (FP16 tiles in heap), redirect dispatch to
-  * ds4_metal_vqb2_fp16_dispatch (Metal-side complex-pair FP16 kernel
-  * via DS4_VQB2_FP16_PATH=legacy|mtl4|icb).
-  *
-  * TWO CAVEATS (both must resolve before this path produces correct + fast):
-  *
-  * (1) CODEC mismatch: existing FP16 kernel is polar-codec — reads
-  *     weights as [n_rows][n_pairs][2] complex pairs, expects input
-  *     formatted as n_rows complex pairs (re,im). DS4 routed FFN is
-  *     vanilla matvec, NOT complex-pair multiplication.
-  *
-  * (2) GPU↔CPU SYNC: this hook reads tensor_contents() of GPU tensors
-  *     (router_selected, router_weights, ffn_norm) mid-batch. Those
-  *     tensors were written by kernels queued earlier in the SAME
-  *     batch (g_batch_cb still pending). On M1 unified memory the
-  *     CPU sees stale data until the batch commits + waits. The
-  *     CPU-MoE branch (line 11463) calls ds4_gpu_end_commands() FIRST
-  *     to sync; this Metal-MoE branch does not. To make this hook
-  *     produce correct values today, either (a) add ds4_gpu_end_commands()
-  *     before the reads (slow — kills GPU batching benefit), or (b)
-  *     refactor ds4_metal_vqb2_fp16_dispatch to take GPU tensor
-  *     handles and dispatch via the shared batch (proper fix).
-  *
-  * Until (1)+(2) resolve, this path produces numerically wrong output.
-  * Wiring is in place so the next-iteration kernel + dispatcher refactor
-  * have a stable hook site. Default off; opt-in for staging only. */
- static int hot_metal_env_checked = 0;
- static int hot_metal_enabled = 0;
- if (!hot_metal_env_checked) {
- hot_metal_enabled = (getenv("DS4_HOT_METAL_MOE") != NULL) ? 1 : 0;
- hot_metal_env_checked = 1;
- if (hot_metal_enabled) {
- fprintf(stderr,
-   "ds4: DS4_HOT_METAL_MOE=1 — Metal-MoE FP16 hot-store hook engaged "
-   "(WARNING: polar-codec layout mismatch — output may be wrong until codec aligns)\n");
- }
- }
- int dispatched_via_metal_hot = 0;
- if (hot_metal_enabled) {
- ds4_hot_expert_store *hot = ds4_hot_store_get_active();
- if (hot) {
- /* silv 2026-05-28 (task #764 sync-skip fix): use the layer-fully-pinned
-  * shortcut to bypass the CPU readback + GPU sync barrier when ALL 256
-  * experts of `il` are pinned in the hot-store. With --vqb2-pack +
-  * DS4_VQB2_PACK_HOT_LAYERS=L, all 256 experts of L are pinned at bind
-  * time, so the per-token sel[] check is guaranteed redundant for L.
-  *
-  * Removes: ds4_gpu_end_commands() per token (barrier sync),
-  *          ds4_gpu_tensor_contents() readback (CPU-coherent stall),
-  *          ds4_gpu_begin_commands() restart (batch rebuild).
-  * The Metal-MoE dispatch rides inside the existing GPU batch.
-  *
-  * Fallback: if NOT fully pinned, take the original sync-then-check
-  * path (some per-token selections may still hit the pinned subset). */
- const int fully_pinned_layer = ds4_hot_layer_fully_pinned(hot, (uint32_t)il);
- if (fully_pinned_layer) {
- extern int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *);
- extern int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *,
-                                              uint32_t, uint32_t,
-                                              struct ds4_gpu_tensor *,
-                                              struct ds4_gpu_tensor *,
-                                              struct ds4_gpu_tensor *,
-                                              struct ds4_gpu_tensor *);
- if (ds4_metal_vqb2_fp16_bind_store(hot) == 0) {
- memset(ds4_gpu_tensor_contents(g->routed_out), 0,
-        (size_t)DS4_N_EMBD * sizeof(float));
- const int dr = ds4_metal_vqb2_fp16_dispatch_gpu(
-   hot, (uint32_t)il, 1u,
+ const int dispatched = ds4_routed_moe_apply_full(g, model, layer, il, force_metal_moe);
+ if (dispatched < 0) {
+  ok = false;
+ } else if (dispatched == 0) {
+  /* Default Metal routed FFN — only path apply_full doesn't handle. */
+  ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
+   g->routed_gate, g->routed_up, g->routed_mid, g->routed_down,
+   model->map, model->size,
+   layer->ffn_gate_exps->abs_offset,
+   layer->ffn_up_exps->abs_offset,
+   layer->ffn_down_exps->abs_offset,
+   layer->ffn_gate_exps->type, layer->ffn_down_exps->type,
+   gate_expert_bytes, gate_row_bytes,
+   down_expert_bytes, down_row_bytes,
+   (uint32_t)expert_in_dim, (uint32_t)down_in_dim, (uint32_t)routed_out_dim,
    g->router_selected, g->router_weights,
-   g->ffn_norm, g->routed_out);
- if (dr == 0) dispatched_via_metal_hot = 1;
- }
- } else if (ds4_gpu_end_commands() != 0) {
- /* Layer not fully pinned — original sync-then-check fallback. */
- const int32_t *sel_cpu = (const int32_t *)ds4_gpu_tensor_contents(g->router_selected);
- if (sel_cpu && ds4_hot_layer_all_pinned(hot, il, sel_cpu, DS4_N_EXPERT_USED)) {
- extern int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *);
- extern int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *,
-                                              uint32_t, uint32_t,
-                                              struct ds4_gpu_tensor *,
-                                              struct ds4_gpu_tensor *,
-                                              struct ds4_gpu_tensor *,
-                                              struct ds4_gpu_tensor *);
- if (ds4_metal_vqb2_fp16_bind_store(hot) == 0) {
- memset(ds4_gpu_tensor_contents(g->routed_out), 0,
-        (size_t)DS4_N_EMBD * sizeof(float));
- const int dr = ds4_metal_vqb2_fp16_dispatch_gpu(
-   hot, (uint32_t)il, 1u,
-   g->router_selected, g->router_weights,
-   g->ffn_norm, g->routed_out);
- if (dr == 0) dispatched_via_metal_hot = 1;
- }
- }
- if (ok) ok = (ds4_gpu_begin_commands() != 0);  /* restart batch */
- }
- }
- }
- if (!dispatched_via_metal_hot) {
- ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
- g->routed_gate,
- g->routed_up,
- g->routed_mid,
- g->routed_down,
- model->map, model->size,
- layer->ffn_gate_exps->abs_offset,
- layer->ffn_up_exps->abs_offset,
- layer->ffn_down_exps->abs_offset,
- layer->ffn_gate_exps->type,
- layer->ffn_down_exps->type,
- gate_expert_bytes, gate_row_bytes,
- down_expert_bytes, down_row_bytes,
- (uint32_t)expert_in_dim,
- (uint32_t)down_in_dim,
- (uint32_t)routed_out_dim,
- g->router_selected, g->router_weights,
- DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+   DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
  }
  }
  DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
@@ -12294,14 +13370,14 @@ static bool metal_graph_encode_decode_layer(
  g->ffn_norm,
  DS4_SWIGLU_CLAMP_EXP) != 0;
  } else {
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
- layer->ffn_gate_shexp->abs_offset,
- DS4_N_EMBD, shared_dim,
- g->ffn_norm, 1) != 0;
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_up, model->map, model->size,
- layer->ffn_up_shexp->abs_offset,
- DS4_N_EMBD, shared_dim,
- g->ffn_norm, 1) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->shared_gate, model,
+  layer->ffn_gate_shexp,
+  DS4_N_EMBD, shared_dim,
+  g->ffn_norm, 1) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->shared_up, model,
+  layer->ffn_up_shexp,
+  DS4_N_EMBD, shared_dim,
+  g->ffn_norm, 1) != 0;
  if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up, shared_dim, 0.0f, 1.0f) != 0;
  }
  DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
@@ -12323,10 +13399,10 @@ static bool metal_graph_encode_decode_layer(
  DS4_N_EMBD,
  DS4_N_HC) != 0;
  } else if (ok) {
- ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out, model->map, model->size,
- layer->ffn_down_shexp->abs_offset,
- shared_dim, DS4_N_EMBD,
- g->shared_mid, 1) != 0;
+ ok = ds4_matmul_q8_0_via_tensor(g->shared_out, model,
+  layer->ffn_down_shexp,
+  shared_dim, DS4_N_EMBD,
+  g->shared_mid, 1) != 0;
  }
  DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
  if (ok) {
@@ -12375,10 +13451,14 @@ static bool metal_graph_encode_output_head(
  uint64_t vocab_dim) {
  const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
  bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->output_pre,
- model->map,
- model->size,
- weights->output_hc_fn->abs_offset,
+ /* silv 2026-05-28 #796 Increment 2c — first production call site wired
+  * to via_tensor dispatcher. When weights->output_hc_fn has been override-
+  * filled, this routes through ds4_gpu_matmul_f16_storage (heap path);
+  * otherwise falls back to mmap-offset path. Same numeric result; storage
+  * counter (s_n_storage_dispatch_f16) tracks live usage. */
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->output_pre,
+ model,
+ weights->output_hc_fn,
  hc_dim,
  DS4_N_HC,
  g->flat_hc,
@@ -12415,14 +13495,10 @@ static bool metal_graph_encode_output_head(
  if (ok) {
  metal_graph_debug_dump_tensor("result_norm", g->output_norm, DS4_N_EMBD, DS4_N_LAYER, 0);
  }
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
- model->map,
- model->size,
- weights->output->abs_offset,
- DS4_N_EMBD,
- vocab_dim,
- g->output_norm,
- 1) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->logits, model,
+  weights->output,
+  DS4_N_EMBD, vocab_dim,
+  g->output_norm, 1) != 0;
  if (ok) {
  metal_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, DS4_N_LAYER, 0);
  }
@@ -12475,14 +13551,10 @@ static bool metal_graph_encode_output_head_batch(
  (uint32_t)hc_dim,
  n_tokens,
  DS4_RMS_EPS) != 0;
- if (ok) ok = ds4_gpu_matmul_f16_tensor(output_pre,
- model->map,
- model->size,
- weights->output_hc_fn->abs_offset,
- hc_dim,
- DS4_N_HC,
- g->batch_flat_hc,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_f16_via_tensor(output_pre, model,
+  weights->output_hc_fn,
+  hc_dim, DS4_N_HC,
+  g->batch_flat_hc, n_tokens) != 0;
  if (ok) ok = ds4_gpu_output_hc_weights_tensor(output_weights,
  output_pre,
  model->map,
@@ -12504,14 +13576,10 @@ static bool metal_graph_encode_output_head_batch(
  DS4_N_EMBD,
  n_tokens,
  DS4_RMS_EPS) != 0;
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(logits,
- model->map,
- model->size,
- weights->output->abs_offset,
- DS4_N_EMBD,
- vocab_dim,
- output_norm,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(logits, model,
+  weights->output,
+  DS4_N_EMBD, vocab_dim,
+  output_norm, n_tokens) != 0;
 
  ds4_gpu_tensor_free(logits);
  ds4_gpu_tensor_free(output_norm);
@@ -12530,8 +13598,10 @@ static bool metal_graph_matmul_plain_tensor(
  const ds4_gpu_tensor *x,
  uint64_t n_tok) {
  if (w->type == DS4_TENSOR_F16) {
- return ds4_gpu_matmul_f16_tensor(out, model->map, model->size,
- w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
+ return ds4_matmul_f16_via_tensor(out, model,
+  w,
+  in_dim, out_dim,
+  x, n_tok) != 0;
  }
  if (w->type == DS4_TENSOR_F32) {
  return ds4_gpu_matmul_f32_tensor(out, model->map, model->size,
@@ -12572,14 +13642,10 @@ static bool metal_graph_encode_output_head_mtp(
  mtp->norm->abs_offset,
  DS4_N_EMBD,
  DS4_RMS_EPS) != 0;
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
- base_model->map,
- base_model->size,
- base_weights->output->abs_offset,
- DS4_N_EMBD,
- vocab_dim,
- g->output_norm,
- 1) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->logits, base_model,
+  base_weights->output,
+  DS4_N_EMBD, vocab_dim,
+  g->output_norm, 1) != 0;
  return ok;
 }
 
@@ -13389,24 +14455,16 @@ static bool metal_graph_refresh_ratio4_compressor_state(
  4ull * DS4_N_EMBD * sizeof(float));
  bool ok = tail_hc != NULL;
  if (ok) {
- ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
- model->map,
- model->size,
- kv_weight->abs_offset,
- DS4_N_EMBD,
- width,
- tail_hc,
- 4) != 0;
+ ok = ds4_matmul_f16_via_tensor(g->batch_comp_kv, model,
+  kv_weight,
+  DS4_N_EMBD, width,
+  tail_hc, 4) != 0;
  }
  if (ok) {
- ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_sc,
- model->map,
- model->size,
- score_weight->abs_offset,
- DS4_N_EMBD,
- width,
- tail_hc,
- 4) != 0;
+ ok = ds4_matmul_f16_via_tensor(g->batch_comp_sc, model,
+  score_weight,
+  DS4_N_EMBD, width,
+  tail_hc, 4) != 0;
  }
  if (ok) {
  ok = ds4_gpu_compressor_prefill_state_ratio4_tensor(state_kv,
@@ -13517,14 +14575,10 @@ static bool metal_graph_warmup_prefill_kernels(
 
  bool ok = ds4_gpu_begin_commands() != 0;
  if (ok) {
- ok = ds4_gpu_matmul_f16_tensor(g->batch_hc_mix,
- model->map,
- model->size,
- weights->layer[0].hc_attn_fn->abs_offset,
- hc_dim,
- mix_hc,
- g->batch_flat_hc,
- n_tokens) != 0;
+ ok = ds4_matmul_f16_via_tensor(g->batch_hc_mix, model,
+  weights->layer[0].hc_attn_fn,
+  hc_dim, mix_hc,
+  g->batch_flat_hc, n_tokens) != 0;
  }
  if (ok) ok = ds4_gpu_end_commands() != 0;
  if (!ok) {
@@ -13672,14 +14726,10 @@ static bool metal_graph_encode_layer_attention_batch(
  (uint32_t)hc_dim,
  n_tokens,
  DS4_RMS_EPS) != 0;
- if (ok) ok = ds4_gpu_matmul_f16_tensor(hc_mix_view,
- model->map,
- model->size,
- layer->hc_attn_fn->abs_offset,
- hc_dim,
- mix_hc,
- g->batch_flat_hc,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_f16_via_tensor(hc_mix_view, model,
+  layer->hc_attn_fn,
+  hc_dim, mix_hc,
+  g->batch_flat_hc, n_tokens) != 0;
  if (metal_graph_use_reference_hc_decode()) {
  if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
  hc_mix_view,
@@ -13728,28 +14778,20 @@ static bool metal_graph_encode_layer_attention_batch(
  }
  DS4_METAL_PROFILE_ATTN_STAGE("norm");
  DS4_METAL_PROFILE_Q_STAGE("pre_q");
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_qr,
- model->map,
- model->size,
- layer->attn_q_a->abs_offset,
- DS4_N_EMBD,
- q_rank,
- g->batch_attn_norm,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_qr, model,
+  layer->attn_q_a,
+  DS4_N_EMBD, q_rank,
+  g->batch_attn_norm, n_tokens) != 0;
  if (ok) {
  metal_graph_debug_dump_tensor("q_lora", g->batch_qr,
  (uint64_t)n_tokens * q_rank, il, pos0);
  }
  DS4_METAL_PROFILE_Q_STAGE("q_a");
  if (qkv_rms_fused) {
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_kv_raw,
- model->map,
- model->size,
- layer->attn_kv->abs_offset,
- DS4_N_EMBD,
- DS4_N_HEAD_DIM,
- g->batch_attn_norm,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_kv_raw, model,
+  layer->attn_kv,
+  DS4_N_EMBD, DS4_N_HEAD_DIM,
+  g->batch_attn_norm, n_tokens) != 0;
  if (ok) {
  metal_graph_debug_dump_tensor("KVraw", g->batch_kv_raw,
  (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
@@ -13785,14 +14827,10 @@ static bool metal_graph_encode_layer_attention_batch(
  (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
  }
  DS4_METAL_PROFILE_Q_STAGE("q_a_norm");
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_q,
- model->map,
- model->size,
- layer->attn_q_b->abs_offset,
- q_rank,
- q_dim,
- g->batch_qr_norm,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_q, model,
+  layer->attn_q_b,
+  q_rank, q_dim,
+  g->batch_qr_norm, n_tokens) != 0;
  if (ok) {
  metal_graph_debug_dump_tensor("Qraw", g->batch_q,
  (uint64_t)n_tokens * q_dim, il, pos0);
@@ -13829,14 +14867,10 @@ static bool metal_graph_encode_layer_attention_batch(
  DS4_METAL_PROFILE_Q_STAGE("rope");
  DS4_METAL_PROFILE_ATTN_STAGE("q_path");
  if (!qkv_rms_fused) {
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_kv_raw,
- model->map,
- model->size,
- layer->attn_kv->abs_offset,
- DS4_N_EMBD,
- DS4_N_HEAD_DIM,
- g->batch_attn_norm,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_kv_raw, model,
+  layer->attn_kv,
+  DS4_N_EMBD, DS4_N_HEAD_DIM,
+  g->batch_attn_norm, n_tokens) != 0;
  if (ok) {
  metal_graph_debug_dump_tensor("KVraw", g->batch_kv_raw,
  (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
@@ -13963,27 +14997,19 @@ static bool metal_graph_encode_layer_attention_batch(
  fprintf(stderr, "ds4: Metal layer-major prefill needs attention compressor weights\n");
  ok = false;
  }
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
- model->map,
- model->size,
- layer->attn_compressor_kv->abs_offset,
- DS4_N_EMBD,
- comp_width,
- g->batch_attn_norm,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->batch_comp_kv, model,
+  layer->attn_compressor_kv,
+  DS4_N_EMBD, comp_width,
+  g->batch_attn_norm, n_tokens) != 0;
  if (ok) metal_graph_debug_dump_tensor("attn_comp_kv_raw",
  g->batch_comp_kv,
  (uint64_t)comp_width * n_tokens,
  il,
  pos0);
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_sc,
- model->map,
- model->size,
- layer->attn_compressor_gate->abs_offset,
- DS4_N_EMBD,
- comp_width,
- g->batch_attn_norm,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->batch_comp_sc, model,
+  layer->attn_compressor_gate,
+  DS4_N_EMBD, comp_width,
+  g->batch_attn_norm, n_tokens) != 0;
  if (ok) metal_graph_debug_dump_tensor("attn_comp_score_raw",
  g->batch_comp_sc,
  (uint64_t)comp_width * n_tokens,
@@ -14248,40 +15274,28 @@ static bool metal_graph_encode_layer_attention_batch(
  fprintf(stderr, "ds4: Metal layer-major prefill needs indexer weights\n");
  ok = false;
  }
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
- model->map,
- model->size,
- layer->indexer_compressor_kv->abs_offset,
- DS4_N_EMBD,
- index_width,
- g->batch_attn_norm,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->batch_comp_kv, model,
+  layer->indexer_compressor_kv,
+  DS4_N_EMBD, index_width,
+  g->batch_attn_norm, n_tokens) != 0;
  if (ok) metal_graph_debug_dump_tensor("indexer_comp_kv_raw",
  g->batch_comp_kv,
  (uint64_t)index_width * n_tokens,
  il,
  pos0);
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_sc,
- model->map,
- model->size,
- layer->indexer_compressor_gate->abs_offset,
- DS4_N_EMBD,
- index_width,
- g->batch_attn_norm,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->batch_comp_sc, model,
+  layer->indexer_compressor_gate,
+  DS4_N_EMBD, index_width,
+  g->batch_attn_norm, n_tokens) != 0;
  if (ok) metal_graph_debug_dump_tensor("indexer_comp_score_raw",
  g->batch_comp_sc,
  (uint64_t)index_width * n_tokens,
  il,
  pos0);
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_q,
- model->map,
- model->size,
- layer->indexer_attn_q_b->abs_offset,
- q_rank,
- (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
- g->batch_qr_norm,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->batch_indexer_q, model,
+  layer->indexer_attn_q_b,
+  q_rank, (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
+  g->batch_qr_norm, n_tokens) != 0;
  if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_indexer_q,
  n_tokens,
  DS4_N_INDEXER_HEAD,
@@ -14296,14 +15310,10 @@ static bool metal_graph_encode_layer_attention_batch(
  attn_factor,
  DS4_ROPE_YARN_BETA_FAST,
  DS4_ROPE_YARN_BETA_SLOW) != 0;
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_weights,
- model->map,
- model->size,
- layer->indexer_proj->abs_offset,
- DS4_N_EMBD,
- DS4_N_INDEXER_HEAD,
- g->batch_attn_norm,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->batch_indexer_weights, model,
+  layer->indexer_proj,
+  DS4_N_EMBD, DS4_N_INDEXER_HEAD,
+  g->batch_attn_norm, n_tokens) != 0;
  if (zero_prefix) {
  if (ok && n_comp > g->layer_comp_cap[il]) {
  fprintf(stderr, "ds4: Metal layer-major indexer cache capacity exceeded at layer %u\n", il);
@@ -15019,14 +16029,10 @@ static bool metal_graph_encode_layer_ffn_batch(
  (uint32_t)hc_dim,
  n_tokens,
  DS4_RMS_EPS) != 0;
- if (ok) ok = ds4_gpu_matmul_f16_tensor(hc_mix_view,
- model->map,
- model->size,
- layer->hc_ffn_fn->abs_offset,
- hc_dim,
- mix_hc,
- g->batch_flat_hc,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_f16_via_tensor(hc_mix_view, model,
+  layer->hc_ffn_fn,
+  hc_dim, mix_hc,
+  g->batch_flat_hc, n_tokens) != 0;
  if (metal_graph_use_reference_hc_decode()) {
  if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
  hc_mix_view,
@@ -15074,14 +16080,10 @@ static bool metal_graph_encode_layer_ffn_batch(
  (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
  }
  DS4_METAL_PROFILE_FFN_STAGE("norm");
- if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_router_logits,
- model->map,
- model->size,
- layer->ffn_gate_inp->abs_offset,
- DS4_N_EMBD,
- DS4_N_EXPERT,
- g->batch_ffn_norm,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_f16_via_tensor(g->batch_router_logits, model,
+  layer->ffn_gate_inp,
+  DS4_N_EMBD, DS4_N_EXPERT,
+  g->batch_ffn_norm, n_tokens) != 0;
 
  if (ok) ok = ds4_gpu_router_select_batch_tensor(g->batch_router_selected,
  g->batch_router_weights,
@@ -15232,22 +16234,14 @@ static bool metal_graph_encode_layer_ffn_batch(
  (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
  }
  DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_gate,
- model->map,
- model->size,
- layer->ffn_gate_shexp->abs_offset,
- DS4_N_EMBD,
- shared_dim,
- g->batch_ffn_norm,
- n_tokens) != 0;
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_up,
- model->map,
- model->size,
- layer->ffn_up_shexp->abs_offset,
- DS4_N_EMBD,
- shared_dim,
- g->batch_ffn_norm,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_shared_gate, model,
+  layer->ffn_gate_shexp,
+  DS4_N_EMBD, shared_dim,
+  g->batch_ffn_norm, n_tokens) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_shared_up, model,
+  layer->ffn_up_shexp,
+  DS4_N_EMBD, shared_dim,
+  g->batch_ffn_norm, n_tokens) != 0;
  DS4_METAL_PROFILE_FFN_STAGE("shared_gate_up");
  if (ok) ok = ds4_gpu_swiglu_tensor(g->batch_shared_mid,
  g->batch_shared_gate,
@@ -15255,14 +16249,10 @@ static bool metal_graph_encode_layer_ffn_batch(
  (uint32_t)((uint64_t)n_tokens * shared_dim),
  0.0f,
  1.0f) != 0;
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_out,
- model->map,
- model->size,
- layer->ffn_down_shexp->abs_offset,
- shared_dim,
- DS4_N_EMBD,
- g->batch_shared_mid,
- n_tokens) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_shared_out, model,
+  layer->ffn_down_shexp,
+  shared_dim, DS4_N_EMBD,
+  g->batch_shared_mid, n_tokens) != 0;
  DS4_METAL_PROFILE_FFN_STAGE("shared_down");
  if (ok) {
  metal_graph_debug_dump_tensor("ffn_shexp", g->batch_shared_out,
@@ -15460,14 +16450,10 @@ static bool metal_graph_eval_mtp_draft_from_hc(
  mtp->enorm->abs_offset,
  DS4_N_EMBD,
  DS4_RMS_EPS) != 0;
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->mtp_eproj,
- mtp_model->map,
- mtp_model->size,
- mtp->e_proj->abs_offset,
- DS4_N_EMBD,
- DS4_N_EMBD,
- g->mtp_enorm,
- 1) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->mtp_eproj, mtp_model,
+  mtp->e_proj,
+  DS4_N_EMBD, DS4_N_EMBD,
+  g->mtp_enorm, 1) != 0;
  if (ok) ok = ds4_gpu_repeat_hc_tensor(g->mtp_eproj_hc,
  g->mtp_eproj,
  DS4_N_EMBD,
@@ -15480,14 +16466,10 @@ static bool metal_graph_eval_mtp_draft_from_hc(
  DS4_N_EMBD,
  DS4_N_HC,
  DS4_RMS_EPS) != 0;
- if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->mtp_hproj_hc,
- mtp_model->map,
- mtp_model->size,
- mtp->h_proj->abs_offset,
- DS4_N_EMBD,
- DS4_N_EMBD,
- g->mtp_hnorm_hc,
- DS4_N_HC) != 0;
+ if (ok) ok = ds4_matmul_q8_0_via_tensor(g->mtp_hproj_hc, mtp_model,
+  mtp->h_proj,
+  DS4_N_EMBD, DS4_N_EMBD,
+  g->mtp_hnorm_hc, DS4_N_HC) != 0;
  if (ok) ok = ds4_gpu_add_tensor(g->mtp_input_hc,
  g->mtp_eproj_hc,
  g->mtp_hproj_hc,
@@ -17158,6 +18140,12 @@ struct ds4_engine {
   * Owned by engine; opened in engine_open when opt->vqb2_pack_path
   * is set; closed in engine_close. NULL when --vqb2-pack absent. */
  struct ds4_vqb2_pack *vqb2_pack;
+ /* silv 2026-05-28 task #771 Phase 1 — Non-routed pack handle.
+  * Companion to vqb2_pack for non-routed tensors. Opened in engine_open
+  * when opt->nonrouted_pack_path is set; closed in engine_close.
+  * NULL when --nonrouted-pack absent. Phase 1 ships the diagnostic;
+  * Phase 2 wires the tensor-load lookup override. */
+ struct ds4_nrpk *nonrouted_pack;
 };
 
 static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine *e) {
@@ -20596,81 +21584,57 @@ static size_t engine_collect_cpu_moe_routed_ranges(const ds4_engine *e,
 }
 
 #ifndef DS4_NO_GPU
-/* Register Metal model views with the routed expert byte ranges for the
- * CPU-MoE layers punched out. The routed experts of those layers are read by
- * the CPU MoE handoff through the separate MAP_PRIVATE mmap, so excluding
- * them here keeps Metal's MTLBuffer set and MTLResidencySet limited to
- * attention/shared/router/embed plus the routed experts of the GPU-side
- * layers — letting a 150 GB Q4 model load on a 128 GB machine when N is
- * tuned. Layers with cpu_moe_layer[il] == false keep their routed experts in
- * the Metal view (GPU path runs normally). */
+/* Register Metal model views over the full tensor-data range.
+ *
+ * silv 2026-05-28 engineer-roster simplification (Knuth/Carmack/Linus/Pearl):
+ * collapsed the cpu-moe "punch holes in the view set" path into a single
+ * full-range mapping. The previous design had three subsystems each
+ * modifying g_model_views[]:
+ *   1. set_model_map_range — initial whole-file views (overlapping)
+ *   2. set_model_map_ranges — REPLACES view set with non-contiguous segments
+ *      (cpu-moe excluding routed-expert ranges)
+ *   3. prefill-metal-phases — activates a layer subset for Metal
+ *
+ * Subsystems (2) and (3) disagreed: cpu-moe assumed "all routed → CPU",
+ * but prefill-phases kept some routed on Metal. When a phase-activated
+ * routed-FFN kernel asked for a tensor in the cpu-moe-excluded range,
+ * wrap_model_range linear-searched the truncated view set, found no view,
+ * and emitted "Metal model range 8.37..8.89 GiB is not covered by mapped
+ * model views" → "prompt processing failed: metal prefill failed".
+ *
+ * The conflation of VIEW (what addresses Metal can resolve — must be total)
+ * with RESIDENCY (subset GPU-resident at the moment — may be partial) is
+ * the bug. After this rewrite: views always cover the full tensor-data
+ * range. cpu-moe still routes routed-FFN to CPU at the dispatch layer
+ * (ds4_routed_moe_apply_full); the residency optimization (~0.66 GiB
+ * skipped on this corpus) is forfeited but the bug surface is gone. If
+ * residency-side savings become load-bearing on a larger model, the right
+ * mechanism is MTLResidencySet membership trimming — orthogonal to views.
+ *
+ * Diagnostic: `engine_collect_cpu_moe_routed_ranges` still computes the
+ * routed-range list (used elsewhere); we just don't use it to restrict
+ * views. Print the byte count for observability. */
 static bool engine_map_metal_views_with_routed_holes(ds4_engine *e) {
  ds4_byte_range *routed = xmalloc((size_t)DS4_N_LAYER * 3 * sizeof(*routed));
  size_t nm = engine_collect_cpu_moe_routed_ranges(e, routed);
-
- if (nm == 0) {
- /* All layers run their routed MoE on the GPU; nothing to exclude. Fall
- * back to the standard whole-tensor-data mapping. */
- free(routed);
- return ds4_gpu_set_model_map_range(e->model.map, e->model.size,
- e->model.tensor_data_pos,
- e->model.size - e->model.tensor_data_pos,
- e->model.size) != 0;
- }
-
  uint64_t routed_bytes = 0;
  for (size_t i = 0; i < nm; i++) routed_bytes += routed[i].end - routed[i].start;
-
- const uint64_t lo = e->model.tensor_data_pos;
- const uint64_t hi = e->model.size;
- uint64_t cur = lo;
- uint32_t emitted = 0;
- bool ok = true;
-#if defined(__APPLE__)
- uint64_t *keep_offsets = xmalloc((nm + 1) * sizeof(*keep_offsets));
- uint64_t *keep_sizes = xmalloc((nm + 1) * sizeof(*keep_sizes));
- for (size_t i = 0; i < nm; i++) {
- const uint64_t seg_end = routed[i].start;
- if (seg_end > cur) {
- keep_offsets[emitted] = cur;
- keep_sizes[emitted] = seg_end - cur;
- emitted++;
- }
- cur = routed[i].end;
- }
- if (cur < hi) {
- keep_offsets[emitted] = cur;
- keep_sizes[emitted] = hi - cur;
- emitted++;
- }
- ok = emitted != 0 &&
- (ds4_gpu_set_model_map_ranges(e->model.map, e->model.size,
- keep_offsets, keep_sizes, emitted) != 0);
- free(keep_sizes);
- free(keep_offsets);
-#else
- for (size_t i = 0; i < nm && ok; i++) {
- const uint64_t seg_end = routed[i].start;
- if (seg_end > cur) {
- ok = (ds4_gpu_set_model_map_range(e->model.map, e->model.size,
- cur, seg_end - cur) != 0);
- if (ok) emitted++;
- }
- cur = routed[i].end;
- }
- if (ok && cur < hi) {
- ok = (ds4_gpu_set_model_map_range(e->model.map, e->model.size,
- cur, hi - cur) != 0);
- if (ok) emitted++;
- }
-#endif
-
- fprintf(stderr,
- "ds4: --cpu-moe: registered %u non-routed Metal segments, excluded "
- "%zu routed-expert ranges (%.2f GiB) from the Metal residency set\n",
- emitted, nm, (double)routed_bytes / (1024.0 * 1024.0 * 1024.0));
-
  free(routed);
+
+ const bool ok = (ds4_gpu_set_model_map_range(
+                      e->model.map, e->model.size,
+                      e->model.tensor_data_pos,
+                      e->model.size - e->model.tensor_data_pos,
+                      e->model.size) != 0);
+
+ if (nm > 0) {
+  fprintf(stderr,
+   "ds4: --cpu-moe: %zu routed-expert ranges (%.2f GiB) overlap with the "
+   "full Metal view set — residency exclusion DISABLED (engineer-roster "
+   "simplification: views cover all tensor-data; cpu-moe routes at dispatch "
+   "layer not residency layer)\n",
+   nm, (double)routed_bytes / (1024.0 * 1024.0 * 1024.0));
+ }
  return ok;
 }
 
@@ -21328,6 +22292,480 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
   *
   * Index path convention: <pack_path>.index.csv next to the pack file.
   * Pack handle is owned by the engine; closed in ds4_engine_close. */
+ /* silv 2026-05-28 task #771 Phase 1 — non-routed pack open + name-mapping
+  * coverage probe.
+  *
+  * Phase 1 opens the DS4NRPK1 pack (attention/embed/output/router/MTP/norms),
+  * validates the manifest, walks ALL GGUF tensors, translates each name to
+  * the pack convention (reverse of pack_to_gguf.py), and reports per-tensor
+  * hit/miss rate. This validates the mapping table BEFORE Phase 2 wires the
+  * actual data override (which also needs dtype conversion BF16/FP8_E4M3 →
+  * the model's expected GGUF dtype — silv-curated). */
+ if (opt->nonrouted_pack_path && opt->nonrouted_pack_path[0]) {
+  ds4_nrpk *nrpk = (ds4_nrpk *)calloc(1, sizeof(*nrpk));
+  if (!nrpk) {
+   fprintf(stderr, "ds4: --nonrouted-pack: calloc(ds4_nrpk) failed\n");
+  } else if (!ds4_nrpk_open(opt->nonrouted_pack_path, nrpk)) {
+   fprintf(stderr, "ds4: --nonrouted-pack: open failed (%s)\n",
+           opt->nonrouted_pack_path);
+   free(nrpk);
+  } else {
+   fprintf(stderr, "ds4: --nonrouted-pack: opened %s (%.2f GB, %u entries)\n",
+           opt->nonrouted_pack_path,
+           (double)nrpk->hdr->total_bytes / 1e9,
+           (unsigned)nrpk->n_entries);
+   /* Coverage tour: count entries in load-bearing prefixes so silv can
+    * see what the pack covers vs the model's expected non-routed names.
+    * The model_path field of ds4_engine_options doesn't carry the GGUF
+    * tensor-name list, so we just print prefix counts that match the
+    * pack_nonrouted.py categorization. */
+   const char *prefixes[] = {
+       "embed",                          /* embedding */
+       "head",                           /* output projection */
+       "norm",                           /* final norm */
+       "layers.0.",                      /* sample first layer (all kinds) */
+       "layers.22.",                     /* H2125 anchor layer */
+       "layers.42.",                     /* last layer */
+       "layers.0.attn",                  /* attention sub-block */
+       "layers.0.ffn",                   /* router + shared experts */
+       "layers.0.hc_",                   /* hadamard compression factors */
+       "mtp.0.",                         /* MTP draft block */
+   };
+   const size_t n_pfx = sizeof(prefixes) / sizeof(prefixes[0]);
+   for (size_t k = 0; k < n_pfx; k++) {
+    uint32_t c = ds4_nrpk_count_prefix(nrpk, prefixes[k]);
+    if (c > 0) {
+     fprintf(stderr, "ds4: --nonrouted-pack: %s.* → %u entries\n", prefixes[k], c);
+    }
+   }
+   /* Coverage probe: walk every GGUF tensor in the loaded model, translate
+    * its name to the pack convention, look up in the pack. Report hit/miss
+    * counts + a handful of misses for diagnostics. This validates the
+    * mapping table BEFORE Phase 2 wires the data override. */
+   {
+    uint64_t n_total = e->model.n_tensors;
+    uint64_t n_translatable = 0;
+    uint64_t n_hit = 0;
+    uint64_t n_miss_lookup = 0;
+    uint64_t n_routed_skipped = 0;
+    /* Track first few misses for diagnostics. */
+    char miss_examples[8][256];
+    int n_miss_examples = 0;
+    char pack_name[192];
+    for (uint64_t i = 0; i < n_total; i++) {
+     const ds4_tensor *t = &e->model.tensors[i];
+     /* Copy name to null-terminated buffer for strcmp. */
+     char gguf_name[192];
+     if (t->name.len >= sizeof(gguf_name)) continue;
+     memcpy(gguf_name, t->name.ptr, t->name.len);
+     gguf_name[t->name.len] = '\0';
+     /* Skip routed-FFN expert tensors — they live in VQB2 pack, not nrpk. */
+     if (strstr(gguf_name, "ffn_gate_exps") ||
+         strstr(gguf_name, "ffn_up_exps") ||
+         strstr(gguf_name, "ffn_down_exps")) {
+      n_routed_skipped++;
+      continue;
+     }
+     if (!ds4_nrpk_translate_gguf_name(gguf_name, pack_name, sizeof(pack_name))) {
+      if (n_miss_examples < 8) {
+       snprintf(miss_examples[n_miss_examples++], 256,
+                "%s (no translation)", gguf_name);
+      }
+      continue;
+     }
+     n_translatable++;
+     if (ds4_nrpk_lookup(nrpk, pack_name)) {
+      n_hit++;
+     } else {
+      n_miss_lookup++;
+      if (n_miss_examples < 8) {
+       snprintf(miss_examples[n_miss_examples++], 256,
+                "%s → %s (not in pack)", gguf_name, pack_name);
+      }
+     }
+    }
+    fprintf(stderr,
+            "ds4: --nonrouted-pack: coverage probe — total GGUF tensors=%llu\n"
+            "ds4: --nonrouted-pack:   routed (skipped, expected): %llu\n"
+            "ds4: --nonrouted-pack:   translatable: %llu (%.1f%% of non-routed)\n"
+            "ds4: --nonrouted-pack:   HIT in pack: %llu (%.1f%% of translatable)\n"
+            "ds4: --nonrouted-pack:   MISS (translated name not in pack): %llu\n",
+            (unsigned long long)n_total,
+            (unsigned long long)n_routed_skipped,
+            (unsigned long long)n_translatable,
+            n_total > n_routed_skipped
+              ? 100.0 * (double)n_translatable / (double)(n_total - n_routed_skipped)
+              : 0.0,
+            (unsigned long long)n_hit,
+            n_translatable > 0
+              ? 100.0 * (double)n_hit / (double)n_translatable
+              : 0.0,
+            (unsigned long long)n_miss_lookup);
+    if (n_miss_examples > 0) {
+     fprintf(stderr, "ds4: --nonrouted-pack: first misses:\n");
+     for (int k = 0; k < n_miss_examples; k++) {
+      fprintf(stderr, "ds4:   %s\n", miss_examples[k]);
+     }
+    }
+   }
+   /* silv 2026-05-28 task #771 Phase 2b — override-fill loop.
+    *
+    * For each GGUF tensor that maps to a pack entry:
+    *   - if pack source dtype matches GGUF tensor type AND byte count
+    *     matches: memcpy pack data into a heap override; set override_data
+    *   - if mismatch: log + skip (H2160 forbids lossy conversion; the
+    *     correct fix is BF16/FP8-aware GGUF + kernels — silv-curated)
+    *
+    * Identity-fill cases that work today: F32 → F32 (DS4_TENSOR_F32 == 0,
+    * pack DS4_NRPK_DTYPE_F32 == 1, but the bytes match so identity memcpy
+    * is safe). Other cases (BF16 → F16, FP8 → Q8_0, I64 → I32) require
+    * either lossy conversion (H2160-rejected) OR ds4.c BF16/FP8 kernel
+    * support (Phase 2b proper). Those tensors are SKIPPED with diagnostic;
+    * downstream readers continue to use GGUF mmap (stub data in minimal
+    * GGUF → garbage output for those tensors).
+    *
+    * The override mechanism itself is sound. As silv adds BF16/FP8 kernel
+    * paths, this loop's "skip" cases convert to "load" cases without any
+    * other change required. */
+   {
+    /* Pack dtype enum from ds4_nonrouted_pack.h:
+     *   DS4_NRPK_DTYPE_F32 = 1, F16 = 2, BF16 = 3, I8 = 4,
+     *   F8_E4M3 = 5, F8_E8M0 = 6
+     * Map to ds4_tensor type enum where exact match exists. */
+    uint64_t n_filled = 0;
+    uint64_t n_skip_dtype_mismatch = 0;
+    uint64_t n_skip_bytes_mismatch = 0;
+    uint64_t n_skip_alloc_fail = 0;
+    /* Cycle 5 ground rule: skip source-exact until kernels are wired to
+     * dispatch on tensor_effective_type. The override would land bytes
+     * in a different dtype than t->type, and downstream kernels still
+     * read using t->type — silent corruption. Counter tracks how many
+     * tensors WOULD have been source-exact-eligible, so the wiring
+     * cycle has visibility into the kernel-side TODO scope. */
+    uint64_t n_skip_source_exact_kernel_gap = 0;
+    /* #796 Increment 2 — MTLBuffer wrap success counter. Each filled tensor
+     * tries to wrap its heap-allocated bytes as an MTLBuffer (zero-copy).
+     * Wrap may return NULL if page-alignment fails; we surface the count so
+     * the dispatch-side wiring can audit how many tensors are
+     * GPU-addressable via the override path. */
+    uint64_t n_wrap_ok = 0;
+    uint64_t n_wrap_fail = 0;
+    uint64_t bytes_filled = 0;
+    /* silv 2026-05-28 high-resolution probe — per-tensor F16-mmap vs
+     * BF16-storage L2 error.  When BF16-for-F16 source-exact substitute
+     * is enabled (Increment 5), this records how much each weight
+     * differs from its F16-down-sampled mmap counterpart.  The probe is
+     * a static comparison (zero engine runs) — replaces hours of A/B
+     * engine work to identify which 192 BF16 tensors have the biggest
+     * lossy-down-sample error.
+     *
+     * RMS error per tensor; top-3 worst kept by name.  Aggregate stats:
+     * sum of N (total weights compared), sum of squared diff, max RMS.
+     * The top-3 list gives directional signal for follow-up:
+     *   - High RMS  → F16 down-sample was lossy on this tensor; BF16
+     *                 source-exact is meaningfully better
+     *   - Low RMS   → F16/BF16 indistinguishable; storage path is
+     *                 numerical noise (Increment 5 is dormant for it) */
+    uint64_t   probe_n_tensors = 0;
+    double     probe_sum_n = 0.0;       /* total weights compared */
+    double     probe_sum_sq = 0.0;      /* sum of (mmap_f16 - bf16)^2 */
+    double     probe_max_rms = 0.0;
+    char       probe_max_name[192] = {0};
+    /* Top-3 worst RMS tensors. */
+    double     probe_top_rms[3] = {0.0, 0.0, 0.0};
+    char       probe_top_name[3][192] = {{0}, {0}, {0}};
+    char first_skip_examples[6][256];
+    int n_skip_examples = 0;
+    char pack_name2[192];
+    for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+     ds4_tensor *t = &e->model.tensors[i];
+     char gguf_name[192];
+     if (t->name.len >= sizeof(gguf_name)) continue;
+     memcpy(gguf_name, t->name.ptr, t->name.len);
+     gguf_name[t->name.len] = '\0';
+     /* Skip routed-FFN tensors — handled by VQB2 pack, not nrpk. */
+     if (strstr(gguf_name, "ffn_gate_exps") ||
+         strstr(gguf_name, "ffn_up_exps") ||
+         strstr(gguf_name, "ffn_down_exps")) {
+      continue;
+     }
+     if (!ds4_nrpk_translate_gguf_name(gguf_name, pack_name2, sizeof(pack_name2))) continue;
+     const ds4_nrpk_entry *pe = ds4_nrpk_lookup(nrpk, pack_name2);
+     if (!pe) continue;
+     /* Determine the fill strategy:
+      *
+      *  - IDENTITY: pack source dtype matches GGUF-declared type → memcpy,
+      *    no source-exact tagging needed (the data is already what
+      *    downstream kernels expect).
+      *
+      *  - SOURCE-EXACT SUBSTITUTE (H2160): pack source is BF16 or FP8
+      *    paired, GGUF-declared type is lossy target (F16/F32/Q8_0).
+      *    Fill override_data with PACK source bytes (NOT lossy-converted),
+      *    tag t->override_source_type with the pack dtype so downstream
+      *    kernels can dispatch BF16/FP8 paths via tensor_effective_type().
+      *    tensor_expect_layout() permits this substitution.
+      *
+      *  - REJECTED: any combination that doesn't fit the above (e.g.,
+      *    GGUF declares Q8_0 with bytes computed from K-block packing,
+      *    pack provides BF16 with different total byte count → no safe
+      *    substitution). */
+     int identity_fill = 0;
+     int has_source_exact = 0;
+     uint32_t source_exact_type = 0;
+     switch (pe->dtype) {
+      case DS4_NRPK_DTYPE_F32:
+       /* F32 pack: identity when declared F32 (DS4_TENSOR_F32=0); source-exact
+        * substitute when GGUF declared lower-precision (emit_minimal_gguf.py
+        * lossy-downsampled some F32-source tensors to F16). */
+       if (t->type == DS4_TENSOR_F32) {
+        identity_fill = 1;
+       } else {
+        has_source_exact = 1;
+        source_exact_type = DS4_TENSOR_F32;
+       }
+       break;
+      case DS4_NRPK_DTYPE_F16:
+       if (t->type == DS4_TENSOR_F16) {
+        identity_fill = 1;
+       } else {
+        has_source_exact = 1;
+        source_exact_type = DS4_TENSOR_F16;
+       }
+       break;
+      case DS4_NRPK_DTYPE_BF16:
+       if (t->type == DS4_TENSOR_BF16) {
+        identity_fill = 1;
+       } else {
+        has_source_exact = 1;
+        source_exact_type = DS4_TENSOR_BF16;
+       }
+       break;
+      case DS4_NRPK_DTYPE_F8_E4M3:
+       has_source_exact = 1;
+       source_exact_type = DS4_TENSOR_FP8_E4M3;
+       break;
+      case DS4_NRPK_DTYPE_F8_E8M0:
+       has_source_exact = 1;
+       source_exact_type = DS4_TENSOR_FP8_E8M0;
+       break;
+      case DS4_NRPK_DTYPE_I8:
+       /* Rare in this pack; route via source-exact stub. */
+       break;
+      default:
+       /* Pack dtype not recognized (e.g., I64 tid2eid which the pack
+        * inspect labeled UNK). Phase 2b proper adds handling for these. */
+       break;
+     }
+     /* Strategy resolution: identity if dtype matches; otherwise
+      * source-exact substitute if pack dtype is BF16/FP8/F32-up. */
+     if (!identity_fill && !has_source_exact) {
+      n_skip_dtype_mismatch++;
+      if (n_skip_examples < 6) {
+       snprintf(first_skip_examples[n_skip_examples++], 256,
+                "%s: pack=%s gguf_type=%u (no source-exact substitute available)",
+                gguf_name, ds4_nrpk_dtype_name(pe->dtype), (unsigned)t->type);
+      }
+      continue;
+     }
+     /* Cycle 5 ground rule (defense in depth): refuse source-exact
+      * until downstream kernels are wired to dispatch on
+      * tensor_effective_type. Without that wiring, accepting a
+      * source-exact substitute means the kernel reads BF16/FP8 bytes
+      * as t->type (e.g. F16 or Q8_0) — silent corruption.
+      *
+      * Increment 5a (2026-05-28): selectively lift for combinations
+      * where the dispatcher CAN handle the storage dtype. The F16
+      * dispatcher (ds4_matmul_f16_via_tensor) now routes BF16 storage
+      * through ds4_gpu_matmul_bf16_storage when n_tok=1. Other source-
+      * exact combinations stay skipped pending kernel work:
+      *   - F32-for-F16/Q8_0:  no widening kernel yet
+      *   - F16-for-F32/Q8_0:  no demoting kernel yet
+      *   - BF16-for-Q8_0:     no BF16→Q8_0 kernel
+      *   - FP8 anything:      no FP8 kernel yet
+      *
+      * The "wired" combinations get heap-allocated + wrapped. The F16
+      * dispatcher detects storage.dtype != t->type at runtime and
+      * routes accordingly. Production sites already wired to the
+      * dispatcher (23 F16 + 19 Q8_0 sites) pick this up automatically. */
+     if (has_source_exact) {
+      const int wired_bf16_f16 = (source_exact_type == DS4_TENSOR_BF16 &&
+                                   t->type == DS4_TENSOR_F16);
+      if (!wired_bf16_f16) {
+       n_skip_source_exact_kernel_gap++;
+       if (n_skip_examples < 6) {
+        snprintf(first_skip_examples[n_skip_examples++], 256,
+                 "%s: pack=%s would be source-exact %u → kernel not yet wired (skipped)",
+                 gguf_name, ds4_nrpk_dtype_name(pe->dtype),
+                 (unsigned)source_exact_type);
+       }
+       continue;
+      }
+      /* Wired case: fall through to populate heap storage. The
+       * dispatcher will detect storage.dtype==BF16 at call time and
+       * route to the BF16 kernel. */
+     }
+     /* Bytes check: identity fill requires exact match. Source-exact
+      * substitute has its own pack-determined size — we accept whatever
+      * the pack manifest declares and trust the kernel to read it. */
+     if (identity_fill && pe->data_bytes != t->bytes) {
+      n_skip_bytes_mismatch++;
+      if (n_skip_examples < 6) {
+       snprintf(first_skip_examples[n_skip_examples++], 256,
+                "%s: pack=%llu B vs gguf=%llu B",
+                gguf_name,
+                (unsigned long long)pe->data_bytes,
+                (unsigned long long)t->bytes);
+      }
+      continue;
+     }
+     const void *src = ds4_nrpk_get_data(nrpk, pe);
+     if (!src) {
+      n_skip_alloc_fail++;
+      continue;
+     }
+     /* silv 2026-05-28 #796 Increment 2 — allocate page-aligned with
+      * length rounded up to page boundary. This lets ds4_gpu_wrap_heap_bytes
+      * succeed (Metal's newBufferWithBytesNoCopy requires page-aligned
+      * pointer + page-multiple length). Page on M1: 16 KB; per-tensor
+      * waste ≤ 16 KB ≈ negligible vs MB-scale tensors. */
+     const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+     const size_t padded = ((size_t)pe->data_bytes + page - 1) & ~(page - 1);
+     void *dst = NULL;
+     if (posix_memalign(&dst, page, padded) != 0 || !dst) {
+      n_skip_alloc_fail++;
+      continue;
+     }
+     memcpy(dst, src, (size_t)pe->data_bytes);
+     /* Cycle 5 unified storage: bytes + length + dtype + ownership in one
+      * struct. For identity-fill, storage.dtype = t->type. For source-exact
+      * fill, storage.dtype = source_exact_type (pack source dtype). The
+      * dtype field is ALWAYS meaningful when bytes is set — no flag-check
+      * needed in tensor_effective_type. Also fixes the dormant source-exact
+      * activation (the old `override_source_active` flag was never written;
+      * Cycle 5 makes the activation implicit in dtype != t->type). */
+     t->storage.bytes = dst;
+     t->storage.length = pe->data_bytes;
+     t->storage.dtype = has_source_exact ? source_exact_type : t->type;
+     t->storage.ownership = DS4_STORAGE_HEAP;
+     /* #796 Increment 2 — pre-wrap as MTLBuffer (zero-copy on M1 unified
+      * memory). May return NULL if the allocator failed page-alignment;
+      * dispatch falls back to mmap in that case. Wrap uses `padded` so
+      * the buffer covers the full aligned allocation (kernels read only
+      * up to storage.length). */
+     t->storage.metal_buffer = ds4_gpu_wrap_heap_bytes(dst, (uint64_t)padded);
+     if (t->storage.metal_buffer) n_wrap_ok++;
+     else n_wrap_fail++;
+     n_filled++;
+     bytes_filled += pe->data_bytes;
+     /* silv 2026-05-28 high-resolution probe — for BF16-for-F16 source-
+      * exact, compute static L2 between F16-mmap and BF16-storage
+      * decoded values.  This is the offline counterpart of a (~hours)
+      * engine-replay A/B per tensor: a millisecond pass over weight
+      * bytes reveals which tensors have meaningful F16-vs-BF16 delta.
+      * High RMS → BF16 source-exact preserves precision the F16
+      * down-sample lost; low RMS → the storage path is numerical noise
+      * (Increment 5 dormant for that tensor). */
+     if (has_source_exact &&
+         t->storage.dtype == DS4_TENSOR_BF16 &&
+         t->type == DS4_TENSOR_F16) {
+      const uint16_t *mmap_f16 = (const uint16_t *)(e->model.map + t->abs_offset);
+      const uint16_t *bf16_storage = (const uint16_t *)dst;
+      const uint64_t n_elems = t->elements;
+      double sum_sq = 0.0;
+      for (uint64_t k = 0; k < n_elems; k++) {
+       _Float16 hf16;
+       memcpy(&hf16, &mmap_f16[k], 2);
+       const float v_mmap = (float)hf16;
+       const uint32_t bf16_bits = (uint32_t)bf16_storage[k] << 16;
+       float v_bf16;
+       memcpy(&v_bf16, &bf16_bits, 4);
+       const double d = (double)v_mmap - (double)v_bf16;
+       sum_sq += d * d;
+      }
+      const double rms = sqrt(sum_sq / (double)n_elems);
+      /* Dump first-tensor raw bytes ONCE to diagnose the anomalously
+       * small RMS (~1e-10). Compare mmap_f16[0..3] vs bf16_storage[0..3]
+       * byte patterns and decoded values. */
+      if (probe_n_tensors == 0) {
+       _Float16 hf0, hf1;
+       memcpy(&hf0, &mmap_f16[0], 2);
+       memcpy(&hf1, &mmap_f16[1], 2);
+       const uint32_t bb0 = (uint32_t)bf16_storage[0] << 16;
+       const uint32_t bb1 = (uint32_t)bf16_storage[1] << 16;
+       float vb0, vb1;
+       memcpy(&vb0, &bb0, 4); memcpy(&vb1, &bb1, 4);
+       fprintf(stderr,
+               "ds4: --nonrouted-pack: L2 probe first-tensor byte audit: "
+               "mmap[0]=0x%04x→%.5e mmap[1]=0x%04x→%.5e "
+               "stor[0]=0x%04x→%.5e stor[1]=0x%04x→%.5e\n",
+               mmap_f16[0], (double)(float)hf0,
+               mmap_f16[1], (double)(float)hf1,
+               bf16_storage[0], (double)vb0,
+               bf16_storage[1], (double)vb1);
+      }
+      probe_n_tensors++;
+      probe_sum_n += (double)n_elems;
+      probe_sum_sq += sum_sq;
+      if (rms > probe_max_rms) {
+       probe_max_rms = rms;
+       snprintf(probe_max_name, sizeof(probe_max_name), "%.*s",
+                (int)t->name.len, t->name.ptr);
+      }
+      for (int j = 0; j < 3; j++) {
+       if (rms > probe_top_rms[j]) {
+        for (int kk = 2; kk > j; kk--) {
+         probe_top_rms[kk] = probe_top_rms[kk-1];
+         memcpy(probe_top_name[kk], probe_top_name[kk-1],
+                sizeof(probe_top_name[kk]));
+        }
+        probe_top_rms[j] = rms;
+        snprintf(probe_top_name[j], sizeof(probe_top_name[j]), "%.*s",
+                 (int)t->name.len, t->name.ptr);
+        break;
+       }
+      }
+     }
+    }
+    fprintf(stderr,
+            "ds4: --nonrouted-pack: override-fill — filled=%llu (%.2f GB), "
+            "skipped dtype_mismatch=%llu bytes_mismatch=%llu alloc_fail=%llu "
+            "source_exact_kernel_gap=%llu mtlbuf_wrap=%llu/%llu (ok/fail)\n",
+            (unsigned long long)n_filled,
+            (double)bytes_filled / 1e9,
+            (unsigned long long)n_skip_dtype_mismatch,
+            (unsigned long long)n_skip_bytes_mismatch,
+            (unsigned long long)n_skip_alloc_fail,
+            (unsigned long long)n_skip_source_exact_kernel_gap,
+            (unsigned long long)n_wrap_ok,
+            (unsigned long long)n_wrap_fail);
+    if (n_skip_examples > 0) {
+     fprintf(stderr, "ds4: --nonrouted-pack: first override-fill skips (Phase 2b will resolve):\n");
+     for (int k = 0; k < n_skip_examples; k++) {
+      fprintf(stderr, "ds4:   %s\n", first_skip_examples[k]);
+     }
+    }
+    if (probe_n_tensors > 0) {
+     /* High-resolution F16-mmap vs BF16-storage L2 audit. */
+     const double agg_rms = sqrt(probe_sum_sq / probe_sum_n);
+     fprintf(stderr,
+             "ds4: --nonrouted-pack: F16↔BF16 L2 audit — tensors=%llu "
+             "elems=%.2eG agg_rms=%.4e max_rms=%.4e (%s)\n",
+             (unsigned long long)probe_n_tensors,
+             probe_sum_n / 1e9, agg_rms, probe_max_rms, probe_max_name);
+     fprintf(stderr, "ds4: --nonrouted-pack: top-3 BF16↔F16 RMS:\n");
+     for (int j = 0; j < 3 && probe_top_rms[j] > 0.0; j++) {
+      fprintf(stderr, "ds4:   [%d] %.4e  %s\n", j, probe_top_rms[j], probe_top_name[j]);
+     }
+    }
+   }
+   fprintf(stderr,
+           "ds4: --nonrouted-pack: Phase 1+2b-scaffold ship complete — "
+           "identity-dtype overrides applied; BF16/FP8 kernel paths are "
+           "silv-curated to unblock skipped tensors.\n");
+   e->nonrouted_pack = nrpk;
+  }
+ }
+
  if (opt->vqb2_pack_path && opt->vqb2_pack_path[0]) {
   setenv("DS4_VQB2_PACK_PATH", opt->vqb2_pack_path, 0);
   char index_path[1280];
@@ -21443,6 +22881,24 @@ const char *ds4_mpp_mode_name(ds4_mpp_mode m) {
 
 void ds4_engine_close(ds4_engine *e) {
  if (!e) return;
+ /* silv 2026-05-28 #796 Increment 2c: dump storage-dispatch counters so we
+  * can see when the heap-storage path actually fires vs. the mmap fallback.
+  * Print only when at least one path was exercised — silent when neither
+  * (e.g., engine_close before any inference). */
+ if (s_n_storage_dispatch_f16 > 0 || s_n_storage_skip_multi_tok_f16 > 0) {
+  fprintf(stderr, "ds4: storage-dispatch f16 — heap=%llu skip_multi_tok=%llu\n",
+          (unsigned long long)s_n_storage_dispatch_f16,
+          (unsigned long long)s_n_storage_skip_multi_tok_f16);
+ }
+ if (s_n_storage_dispatch_q8_0 > 0) {
+  fprintf(stderr, "ds4: storage-dispatch q8_0 — heap=%llu\n",
+          (unsigned long long)s_n_storage_dispatch_q8_0);
+ }
+ if (s_n_storage_dispatch_bf16 > 0 || s_n_storage_dispatch_bf16_suppressed > 0) {
+  fprintf(stderr, "ds4: storage-dispatch bf16 — heap=%llu suppressed=%llu\n",
+          (unsigned long long)s_n_storage_dispatch_bf16,
+          (unsigned long long)s_n_storage_dispatch_bf16_suppressed);
+ }
  /* silv 2026-05-27 Phase 2: dump prefix cache stats if any activity, then free */
  if (e->prefix_cache.stat_lookups > 0 || e->prefix_cache.stat_stores > 0) {
    char statbuf[256];
@@ -21469,6 +22925,12 @@ void ds4_engine_close(ds4_engine *e) {
   ds4_vqb2_pack_close(e->vqb2_pack);
   free(e->vqb2_pack);
   e->vqb2_pack = NULL;
+ }
+ /* silv 2026-05-28 task #771 — release non-routed pack mmap if opened */
+ if (e->nonrouted_pack) {
+  ds4_nrpk_close(e->nonrouted_pack);
+  free(e->nonrouted_pack);
+  e->nonrouted_pack = NULL;
  }
  free(e);
 }

@@ -1,0 +1,58 @@
+ds4: --nonrouted-pack /Users/silv/cl/tlp/montyneg/ds4/nonrouted/ds4v4_nonrouted.pack
+ds4: --vqb2-pack /Users/silv/cl/tlp/montyneg/ds4/vqb2/DeepSeek-V4-Flash/nonrotated_layer22_k256_gateup_top4_20260528/pack/ds4_flash_nonrotated_layer22_k256_gateup_top4.vqb2pack
+ds4: --prefill-metal-phases auto: resolved N=3 (total=72.56 GiB, cap=48.00 GiB, headroom=14.00 GiB, per-phase budget=34.00 GiB)
+ds4: cpu-moe: layers 0..42 run their routed MoE on the CPU (first 43 of 43)
+ds4: Metal device Apple M1 Max, 64.00 GiB RAM
+ds4: Metal 4 TensorOps fast path disabled (pre-M5/pre-A19); MTL4 compute pipelines still active
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal expert inverse table uploaded (44032 bytes, 43*256 int32)
+ds4: Metal model views created in 0.169 ms, residency requested in 157.671 ms, warmup 1.741 ms (mapped 9237.23 MiB from offset 5.08 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+ds4: --cpu-moe: 1 routed-expert ranges (0.66 GiB) overlap with the full Metal view set — residency exclusion DISABLED (engineer-roster simplification: views cover all tensor-data; cpu-moe routes at dispatch layer not residency layer)
+ds4: metal backend initialized for graph diagnostics
+ds4: --nonrouted-pack: opened /Users/silv/cl/tlp/montyneg/ds4/nonrouted/ds4v4_nonrouted.pack (9.02 GB, 1603 entries)
+ds4: --nonrouted-pack: embed.* → 1 entries
+ds4: --nonrouted-pack: head.* → 1 entries
+ds4: --nonrouted-pack: norm.* → 1 entries
+ds4: --nonrouted-pack: layers.0..* → 29 entries
+ds4: --nonrouted-pack: layers.22..* → 40 entries
+ds4: --nonrouted-pack: layers.42..* → 40 entries
+ds4: --nonrouted-pack: layers.0.attn.* → 14 entries
+ds4: --nonrouted-pack: layers.0.ffn.* → 9 entries
+ds4: --nonrouted-pack: layers.0.hc_.* → 6 entries
+ds4: --nonrouted-pack: mtp.0..* → 39 entries
+ds4: --nonrouted-pack: coverage probe — total GGUF tensors=1359
+ds4: --nonrouted-pack:   routed (skipped, expected): 132
+ds4: --nonrouted-pack:   translatable: 1227 (100.0% of non-routed)
+ds4: --nonrouted-pack:   HIT in pack: 1227 (100.0% of translatable)
+ds4: --nonrouted-pack:   MISS (translated name not in pack): 0
+ds4: --nonrouted-pack: override-fill — filled=456 (1.77 GB), skipped dtype_mismatch=3 bytes_mismatch=0 alloc_fail=0 source_exact_kernel_gap=768 mtlbuf_wrap=456/0 (ok/fail)
+ds4: --nonrouted-pack: first override-fill skips (Phase 2b will resolve):
+ds4:   output_hc_fn.weight: pack=F32 would be source-exact 0 → kernel not yet wired (skipped)
+ds4:   output.weight: pack=BF16 would be source-exact 30 → kernel not yet wired (skipped)
+ds4:   blk.0.attn_kv_a_norm.weight: pack=BF16 would be source-exact 30 → kernel not yet wired (skipped)
+ds4:   blk.0.attn_q_a_norm.weight: pack=BF16 would be source-exact 30 → kernel not yet wired (skipped)
+ds4:   blk.0.attn_kv.weight: pack=F8_E4M3 would be source-exact 64 → kernel not yet wired (skipped)
+ds4:   blk.0.attn_output_a.weight: pack=F8_E4M3 would be source-exact 64 → kernel not yet wired (skipped)
+ds4: --nonrouted-pack: Phase 1+2b-scaffold ship complete — identity-dtype overrides applied; BF16/FP8 kernel paths are silv-curated to unblock skipped tensors.
+ds4: --vqb2-pack: opened /Users/silv/cl/tlp/montyneg/ds4/vqb2/DeepSeek-V4-Flash/nonrotated_layer22_k256_gateup_top4_20260528/pack/ds4_flash_nonrotated_layer22_k256_gateup_top4.vqb2pack (39.19 GB, 2752 entries)
+ds4: --vqb2-pack: hot-store not populated (set DS4_VQB2_PACK_HOT_LAYERS=L1,L2,... for legacy/icb/mtl4 paths;
+    PATH_FUSED reads pack directly so works without hot-store)
+ds4: context buffers 579.64 MiB (ctx=32768, backend=metal, prefill_chunk=2048, raw_kv_rows=2304, compressed_kv_rows=8194)
+processing 17 input tokens: 0/17 (0.0%)
+ds4: --cpu-moe: 1 routed-expert ranges (0.66 GiB) overlap with the full Metal view set — residency exclusion DISABLED (engineer-roster simplification: views cover all tensor-data; cpu-moe routes at dispatch layer not residency layer)
+ds4: --prefill-metal-phases: activated phase 0/3 (layers 0..13)
+processing 17 input tokens: 17/17 (100.0%)
+ds4: --cpu-moe: 1 routed-expert ranges (0.66 GiB) overlap with the full Metal view set — residency exclusion DISABLED (engineer-roster simplification: views cover all tensor-data; cpu-moe routes at dispatch layer not residency layer)
+ds4: --prefill-metal-phases: activated phase 1/3 (layers 14..27)
+processing 17 input tokens: 17/17 (100.0%)
+ds4: --cpu-moe: 1 routed-expert ranges (0.66 GiB) overlap with the full Metal view set — residency exclusion DISABLED (engineer-roster simplification: views cover all tensor-data; cpu-moe routes at dispatch layer not residency layer)
+ds4: --prefill-metal-phases: activated phase 2/3 (layers 28..42)
+processing 17 input tokens: 17/17 (100.0%)
+ds4: --cpu-moe: 1 routed-expert ranges (0.66 GiB) overlap with the full Metal view set — residency exclusion DISABLED (engineer-roster simplification: views cover all tensor-data; cpu-moe routes at dispatch layer not residency layer)
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: polar MTL4 pipeline initialized (threadExecutionWidth=32 maxThreadsPerTg=256)
+ds4: ds4_mul_mv_bf16_f32_mtl4 MTL4 pipeline initialized
+The blood (blood)
+ds4: prefill: 15.12 t/s, generation: 6.09 t/s
+ds4: storage-dispatch bf16 — heap=215

@@ -1545,6 +1545,9 @@ static cli_config parse_options(int argc, char **argv) {
              * journal trace. See ds4_metal.m for the H1672 pattern outline. */
             setenv("DS4_MTL4_MOE_ENABLE", "1", 1);
             fprintf(stderr, "ds4: --mtl4-moe enabled (DS4_MTL4_MOE_ENABLE=1)\n");
+        } else if (!strcmp(arg, "--nonrouted-pack")) {
+            c.engine.nonrouted_pack_path = need_arg(&i, argc, argv, arg);
+            fprintf(stderr, "ds4: --nonrouted-pack %s\n", c.engine.nonrouted_pack_path);
         } else if (!strcmp(arg, "--vqb2-pack")) {
             /* silv 2026-05-28 task #764 — VQB2 pack as active routed-FFN source
              * (Architecture B). Argument is the .vqb2pack file path; engine_open
@@ -2001,6 +2004,39 @@ int main(int argc, char **argv) {
         const uint32_t width = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
         return ds4_gpu_mtl4_moe_swiglu_weight_f16_canary(rows, width) ? 0 : 1;
     }
+    /* --moe-swiglu-weight-f16-rowblock-canary [n_rows [n_sel [n_rb]]] : codex
+     * H2186/H2187 row-block-aware SwiGLU self-test. Defaults are the DS4-Flash
+     * shape (n_rows=128, n_sel=6, n_rb=16). Uses position-dependent gate
+     * values to catch layout transpositions — uniform inputs would mask layout
+     * bugs by giving the same answer regardless of (rb, slot, row) ordering. */
+    if (argc >= 2 && !strcmp(argv[1], "--moe-swiglu-weight-f16-rowblock-canary")) {
+        extern int ds4_gpu_mtl4_moe_swiglu_weight_f16_rowblock_canary(uint32_t, uint32_t, uint32_t);
+        const uint32_t n_rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
+        const uint32_t n_sel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
+        const uint32_t n_rb   = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 16;
+        return ds4_gpu_mtl4_moe_swiglu_weight_f16_rowblock_canary(n_rows, n_sel, n_rb) ? 0 : 1;
+    }
+    /* --swiglu-fp32mid-canary [n_rows [n_sel [n_rb]]] : silv 2026-05-28 Tier 2.a
+     * Compares fp16-mid SwiGLU vs fp32-mid SwiGLU on adversarial gate/up to
+     * surface the actual precision gain. PASS if max abs delta >= 1e-4. */
+    if (argc >= 2 && !strcmp(argv[1], "--swiglu-fp32mid-canary")) {
+        extern int ds4_metal_vqb2_fused_swiglu_rowblock_fp32mid_canary(uint32_t, uint32_t, uint32_t);
+        const uint32_t n_rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
+        const uint32_t n_sel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
+        const uint32_t n_rb   = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 16;
+        return ds4_metal_vqb2_fused_swiglu_rowblock_fp32mid_canary(n_rows, n_sel, n_rb) ? 0 : 1;
+    }
+    /* --kahan-sum-precision-canary [out_dim [large_scale]] : silv 2026-05-28
+     * Tier 2.b validation. Generates adversarial fp16 inputs (mixed magnitudes
+     * with cancellations) and runs both naive and Kahan sum kernels, comparing
+     * each against fp64 reference. Returns 0 if Kahan beats naive by ≥10× on
+     * max_err, 1 otherwise. Defaults: out_dim=4096 (DS4 hidden), large_scale=1024. */
+    if (argc >= 2 && !strcmp(argv[1], "--kahan-sum-precision-canary")) {
+        extern int ds4_metal_vqb2_fused_sum_step_kahan_canary(uint32_t, float);
+        const uint32_t out_dim = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4096;
+        const float large_scale = (argc >= 4) ? (float)atof(argv[3]) : 1024.0f;
+        return ds4_metal_vqb2_fused_sum_step_kahan_canary(out_dim, large_scale) ? 0 : 1;
+    }
     /* --hc-split-sinkhorn-canary [n_rows [iters]] : task #690 Sinkhorn 4×4 */
     if (argc >= 2 && !strcmp(argv[1], "--hc-split-sinkhorn-canary")) {
         const uint32_t n_rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
@@ -2252,6 +2288,44 @@ int main(int argc, char **argv) {
         const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
         const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
         return ds4_gpu_mtl4_mul_mv_f16_f32_canary(m, n) ? 0 : 1;
+    }
+    /* --mul-mv-bf16-canary [M [N]] : #796 Increment 1 BF16 matvec */
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mv-bf16-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_mul_mv_bf16_f32_canary(m, n) ? 0 : 1;
+    }
+    /* --matmul-f16-storage-canary [M [N]] : #796 Increment 2b cross-validate */
+    if (argc >= 2 && !strcmp(argv[1], "--matmul-f16-storage-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_gpu_mtl4_matmul_f16_storage_canary(m, n) ? 0 : 1;
+    }
+    /* --via-tensor-canary [M [N [n_tok]]] : #796 Increment 2c/2d end-to-end dispatcher */
+    if (argc >= 2 && !strcmp(argv[1], "--via-tensor-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 1;
+        return ds4_via_tensor_canary_mt(m, n, k) ? 0 : 1;
+    }
+    /* --via-tensor-q8-0-canary [M [N [n_tok]]] : #796 Increment 3 Q8_0 dispatcher */
+    if (argc >= 2 && !strcmp(argv[1], "--via-tensor-q8-0-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 1;
+        return ds4_via_tensor_q8_0_canary(m, n, k) ? 0 : 1;
+    }
+    /* --via-tensor-bf16-canary [M [N]] : #796 Increment 4 BF16 dispatcher */
+    if (argc >= 2 && !strcmp(argv[1], "--via-tensor-bf16-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_via_tensor_bf16_canary(m, n) ? 0 : 1;
+    }
+    /* --via-tensor-source-exact-bf16-canary [M [N]] : #796 Increment 5a SEVERE TEST */
+    if (argc >= 2 && !strcmp(argv[1], "--via-tensor-source-exact-bf16-canary")) {
+        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
+        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        return ds4_via_tensor_source_exact_bf16_canary(m, n) ? 0 : 1;
     }
     /* --shared-down-hc-expand4-canary [M [N]] : task #728 */
     if (argc >= 2 && !strcmp(argv[1], "--shared-down-hc-expand4-canary")) {

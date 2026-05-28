@@ -24,6 +24,14 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
+
+/* silv 2026-05-28 task #784 — expose MTLBuffer handle + offset for callers
+ * that want to dispatch GPU kernels against the tensor directly (no CPU
+ * readback via tensor_contents). The "handle" is an opaque id<MTLBuffer>
+ * cast to void* — callers in .m files can __bridge it back to MTLBuffer.
+ * Both functions return NULL/0 for a NULL tensor. */
+void *ds4_gpu_tensor_mtl_buffer(const ds4_gpu_tensor *tensor);
+uint64_t ds4_gpu_tensor_mtl_offset(const ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
@@ -144,6 +152,18 @@ int ds4_gpu_matmul_q8_0_tensor(
  const ds4_gpu_tensor *x,
  uint64_t n_tok);
 
+/* silv 2026-05-28 #796 Increment 3 — heap-storage-aware Q8_0 matmul.
+ * Parallel to matmul_f16_storage. Goes through unified kernel_dispatch
+ * helper so all 4 paths (matvec/mul_mv_ext/NAX/mul_mm) are supported.
+ * weight_buf is opaque void* (id<MTLBuffer>); offset 0 within wrap. */
+int ds4_gpu_matmul_q8_0_storage(
+ ds4_gpu_tensor *out,
+ void *weight_buf,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok);
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
  ds4_gpu_tensor *gate,
  ds4_gpu_tensor *up,
@@ -162,6 +182,34 @@ int ds4_gpu_matmul_f16_tensor(
  const void *model_map,
  uint64_t model_size,
  uint64_t weight_offset,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok);
+
+/* silv 2026-05-28 #796 Increment 2b — heap-storage-aware F16 matvec.
+ * Same as matmul_f16_tensor but consumes a pre-wrapped MTLBuffer (from
+ * ds4_tensor_storage.metal_buffer set by Phase 2b override-fill) instead
+ * of doing ds4_gpu_wrap_model_range(map, size, offset). Single-token only
+ * for this turn (n_tok must be 1).  weight_buf is opaque void* (the
+ * id<MTLBuffer> across the ObjC boundary). */
+int ds4_gpu_matmul_f16_storage(
+ ds4_gpu_tensor *out,
+ void *weight_buf,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok);
+/* #796 Increment 2b canary — cross-validates wrap_heap_bytes + matmul_f16_storage. */
+int ds4_gpu_mtl4_matmul_f16_storage_canary(uint32_t M, uint32_t N);
+
+/* silv 2026-05-28 #796 Increment 4 — heap-storage-aware BF16 matvec.
+ * Single-token only (the underlying MSL kernel is matvec-only). Uses the
+ * existing g_mul_mv_bf16_f32_nsg4_mtl4_pipeline via standard MTL3 dispatch
+ * (the pipeline state is dispatch-mechanism-agnostic — no MTL4 overhead). */
+int ds4_gpu_matmul_bf16_storage(
+ ds4_gpu_tensor *out,
+ void *weight_buf,
  uint64_t in_dim,
  uint64_t out_dim,
  const ds4_gpu_tensor *x,
@@ -895,12 +943,38 @@ int ds4_gpu_remap_routed_for_trim(
 
 #endif
 
-/* project-side helpers (preserved across upstream merge): */
-int ds4_gpu_set_model_map_ranges(const void *model_map, uint64_t model_size,
- const uint64_t *map_offsets, const uint64_t *map_sizes,
- uint32_t n_ranges);
+/* project-side helpers (preserved across upstream merge):
+ * Note: ds4_gpu_set_model_map_ranges retired 2026-05-28 — view/residency
+ * separation (cpu-moe routes at dispatch layer, not residency layer) made
+ * its sole caller redundant. */
 int ds4_gpu_add_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
 int ds4_gpu_set_skip_next_warmup(int skip);
+
+/* silv 2026-05-28 #796 Increment 2 — heap-bytes-to-MTLBuffer wrapping.
+ *
+ * Phase 2b override-fill writes heap-allocated tensor data to
+ * t->storage.bytes. These bytes are GPU-addressable on M1 Max (unified
+ * memory) but only AFTER they're wrapped as an MTLBuffer.
+ *
+ * ds4_gpu_wrap_heap_bytes: wrap `bytes` of `length` bytes as a Metal
+ *   shared-storage MTLBuffer (zero-copy on M1 Max). Returns an opaque
+ *   void* (type-erased id<MTLBuffer>) or NULL on failure. The caller
+ *   stores this in ds4_tensor_storage.metal_buffer.
+ *
+ * ds4_gpu_release_heap_buffer: releases the wrap (the underlying bytes
+ *   are still owned by the caller — this releases only the MTLBuffer
+ *   handle). Safe to call with NULL.
+ *
+ * ds4_gpu_heap_buffer_gpu_address: return the gpuAddress of the wrapped
+ *   buffer (for argument-table dispatch). Returns 0 on NULL input.
+ *
+ * Lifetime: the heap bytes MUST outlive the wrap. The MTLBuffer holds a
+ * pointer into the heap; freeing the heap before releasing the wrap
+ * would dangle. Currently the wrap is created at engine_open and
+ * released in model_free_overrides — same lifetime as the heap. */
+void *ds4_gpu_wrap_heap_bytes(void *bytes, uint64_t length);
+void  ds4_gpu_release_heap_buffer(void *opaque);
+uint64_t ds4_gpu_heap_buffer_gpu_address(void *opaque);
 
 /* Polar p8_m2 MTL4 dot canary (port of codex H1725). Dispatches a synthetic
  * polar-dot kernel through the M1 Max Metal 4 path: compile MSL via
@@ -1476,6 +1550,11 @@ int ds4_gpu_mtl4_dsv4_q8_hc_expand4_q8_0_canary(uint32_t M, uint32_t N);
  * mul_mv_f32_f32; src0 element type is half. FC pattern via the
  * refactored ds4_mtl4_build_kernel_pipeline helper. */
 int ds4_gpu_mtl4_mul_mv_f16_f32_canary(uint32_t M, uint32_t N);
+/* silv 2026-05-28 #796 Increment 1 — BF16 input variant of mul_mv_f16_f32.
+ * Selected at dispatch time when tensor_effective_type() == DS4_TENSOR_BF16.
+ * Same dispatch grid, same arg table, same FC. Only the kernel's read path
+ * differs (ushort → upper-16-bits-of-f32 cast). */
+int ds4_gpu_mtl4_mul_mv_bf16_f32_canary(uint32_t M, uint32_t N);
 
 /* silv 2026-05-28 task #728 — dsv4_shared_down_hc_expand4_q8_0 MTL4.
  * Q8_0 shared-down matvec + routed_out add + 4-channel HC expansion.
@@ -1795,6 +1874,34 @@ int ds4_metal_vqb2_fused_swiglu_step(void *gate_buf, void *up_buf,
                                       void *mid_buf,
                                       uint32_t n_rows, uint32_t n_selected,
                                       float clamp_value);
+
+/* Row-block-aware sibling — codex H2186/H2187, silv 2026-05-28.
+ *
+ * Use this when gate/up come from the fused decode-matmul output, which
+ * lays them out as [n_row_blocks][n_selected][n_rows] (row-block-major).
+ * The 2D _step variant above treats gate/up as flat [n_sel * n_rows]
+ * slot-major; composing it with row-block-major input silently drops
+ * 15/16 of the rows and yields garbage at the seam.
+ *
+ *   in_idx  = ((row_block * n_selected + slot) * n_rows + row)
+ *   out_idx = (slot * (n_row_blocks * n_rows) + row_block * n_rows + row)
+ *
+ * mid_buf must have capacity ≥ n_selected * n_row_blocks * n_rows halves.
+ * DOWN dispatch then reads mid with stride = n_row_blocks * n_rows.
+ *
+ * Self-test: ds4_gpu_mtl4_moe_swiglu_weight_f16_rowblock_canary, exposed
+ * via `--moe-swiglu-weight-f16-rowblock-canary [n_rows [n_sel [n_rb]]]`. */
+int ds4_metal_vqb2_fused_swiglu_rowblock_step(void *gate_buf, void *up_buf,
+                                               void *route_weights_buf,
+                                               void *mid_buf,
+                                               uint32_t n_rows,
+                                               uint32_t n_selected,
+                                               uint32_t n_row_blocks,
+                                               float clamp_value);
+
+int ds4_gpu_mtl4_moe_swiglu_weight_f16_rowblock_canary(uint32_t n_rows,
+                                                       uint32_t n_selected,
+                                                       uint32_t n_row_blocks);
 
 /* silv 2026-05-28 task #523 item D — shared MTL4 canary boilerplate.
  *

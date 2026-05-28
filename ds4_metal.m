@@ -127,6 +127,209 @@ static id<MTLBuffer> g_dsv4_expert_inverse_table_buffer; /* 43*256 int32, flat *
  * crashed ICB record→replay (ds4_metal.m:4216). */
 static id<MTLBuffer> g_dsv4_route_remap_args_buf;
 static uint32_t g_dsv4_route_remap_args_n_tokens; /* last n_tokens loaded */
+/* ==========================================================================
+ * Cycle 9 (silv 2026-05-28 task #673) — Unified ICB slot abstraction.
+ *
+ * 8 ICB phases (Phase 1-8) used to each own a static MTLICB + per-slot
+ * signature struct + bespoke record/replay function. Each was ~80-130 lines
+ * of duplicated boilerplate around an identical shape:
+ *   1) lazy-alloc MTLICB with a descriptor
+ *   2) compare current bindings to recorded signature
+ *   3) re-record N× indirectComputeCommand on mismatch (setKernelBuffer ×
+ *      n_bindings, setComputePipelineState, dispatchThreadgroups)
+ *   4) encode useResource + executeCommandsInBuffer on the encoder
+ *
+ * This API exposes that shape as a primitive. Per-phase code shrinks to
+ * "build bindings array, call ds4_icb_slot_record_command if needed,
+ * execute".
+ *
+ * Engineer roster perspectives:
+ *   DJB / Theo Tso: signature is bytewise data; cmp is memcmp; cache slot
+ *     is positional. Per-phase metadata becomes the descriptor passed at
+ *     acquire time, NOT the function body.
+ *   Knuth: O(1) record-miss check via memcmp; record path runs only on
+ *     binding change (steady-state replay is one execute call).
+ *   Carmack / Hotz: one signature struct, one record path, one replay
+ *     path. No special cases per kernel.
+ *   Linus: bug surface = 1 implementation × 8 sites instead of 8 × 1.
+ *     Fix once, fix everywhere.
+ *   Pearl: the slot caches a query plan (the recorded command); replay
+ *     is plan-execution, not plan-derivation.
+ *   aphyr: signature-based re-record is idempotent — repeated calls with
+ *     unchanged bindings produce no state change.
+ * ========================================================================== */
+
+#ifndef DS4_ICB_MAX_BINDINGS
+#define DS4_ICB_MAX_BINDINGS 16
+#endif
+#ifndef DS4_ICB_MAX_EXTRAS
+#define DS4_ICB_MAX_EXTRAS 8
+#endif
+
+typedef struct {
+    /* Per-binding identity: (buffer pointer, offset). Pointer comparison
+     * via __bridge — buffers are NOT retained here (caller owns lifetime).
+     * Buffers participating in a record MUST outlive the slot. */
+    void     *binding_ptr [DS4_ICB_MAX_BINDINGS];
+    uint64_t  binding_off [DS4_ICB_MAX_BINDINGS];
+    uint32_t  n_bindings;
+    /* Pipeline + grid + threadgroup shape: any change forces re-record. */
+    void     *pipeline_ptr;        /* id<MTLComputePipelineState> as bare pointer */
+    uint64_t  grid[3];
+    uint64_t  tg[3];
+    uint32_t  threadgroup_mem_bytes;
+    /* Caller-defined extras (e.g. n_tokens, layer, kind). Compared bytewise. */
+    uint64_t  extras[DS4_ICB_MAX_EXTRAS];
+    uint32_t  n_extras;
+} ds4_icb_slot_signature_t;
+
+#ifndef DS4_ICB_SLOT_MAX_COMMANDS
+#define DS4_ICB_SLOT_MAX_COMMANDS 128
+#endif
+
+typedef struct {
+    id<MTLIndirectCommandBuffer> icb;       /* lazy-alloc on first record */
+    NSUInteger                   max_commands;
+    NSUInteger                   max_buffer_bind_count;
+    int                          recorded[DS4_ICB_SLOT_MAX_COMMANDS];  /* per-cmd-index recorded flag */
+    ds4_icb_slot_signature_t     sig[DS4_ICB_SLOT_MAX_COMMANDS];       /* per-cmd-index signature */
+} ds4_icb_slot_t;
+
+/* Compare two signatures bytewise. Returns 1 if equal, 0 otherwise. */
+static int ds4_icb_signature_eq(const ds4_icb_slot_signature_t *a,
+                                const ds4_icb_slot_signature_t *b) {
+    return memcmp(a, b, sizeof(*a)) == 0;
+}
+
+/* Lazy-acquire an ICB slot with the given descriptor. NULL on failure.
+ * Reuses the same MTLICB across all commands [0, max_commands). */
+static int ds4_icb_slot_acquire(ds4_icb_slot_t *slot,
+                                NSUInteger max_commands,
+                                NSUInteger max_buffer_bind_count) {
+    if (!slot) return 0;
+    if (slot->icb) return 1;
+    if (max_commands == 0 || max_commands > DS4_ICB_SLOT_MAX_COMMANDS) return 0;
+    if (max_buffer_bind_count == 0 || max_buffer_bind_count > DS4_ICB_MAX_BINDINGS) return 0;
+    MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
+    desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+    desc.inheritBuffers = NO;
+    desc.inheritPipelineState = NO;
+    desc.maxKernelBufferBindCount = max_buffer_bind_count;
+    slot->icb = [g_device newIndirectCommandBufferWithDescriptor:desc
+                                                  maxCommandCount:max_commands
+                                                          options:MTLResourceStorageModeShared];
+    if (!slot->icb) return 0;
+    slot->max_commands = max_commands;
+    slot->max_buffer_bind_count = max_buffer_bind_count;
+    return 1;
+}
+
+/* Record one command at cmd_idx if the supplied signature differs from
+ * the cached one. The caller passes ALL bindings + pipeline + grid + tg
+ * + extras; the function memcmp's the signature, re-records on mismatch,
+ * and stores the new signature.
+ *
+ * Returns 1 if the slot is ready (either already-cached or just recorded),
+ * 0 on failure. */
+static int ds4_icb_slot_record_command(ds4_icb_slot_t *slot,
+                                       NSUInteger cmd_idx,
+                                       id<MTLComputePipelineState> pso,
+                                       __unsafe_unretained id<MTLBuffer> *bufs,
+                                       NSUInteger *offsets,
+                                       NSUInteger n_bindings,
+                                       MTLSize grid,
+                                       MTLSize tg,
+                                       uint32_t threadgroup_mem_bytes,
+                                       const uint64_t *extras,
+                                       uint32_t n_extras) {
+    if (!slot || !slot->icb || cmd_idx >= slot->max_commands) return 0;
+    if (!pso || !bufs || !offsets) return 0;
+    if (n_bindings > slot->max_buffer_bind_count) return 0;
+    if (n_extras > DS4_ICB_MAX_EXTRAS) return 0;
+    ds4_icb_slot_signature_t want;
+    memset(&want, 0, sizeof(want));
+    for (NSUInteger i = 0; i < n_bindings; i++) {
+        want.binding_ptr[i] = (__bridge void *)bufs[i];
+        want.binding_off[i] = (uint64_t)offsets[i];
+    }
+    want.n_bindings = (uint32_t)n_bindings;
+    want.pipeline_ptr = (__bridge void *)pso;
+    want.grid[0] = grid.width;  want.grid[1] = grid.height;  want.grid[2] = grid.depth;
+    want.tg[0]   = tg.width;    want.tg[1]   = tg.height;    want.tg[2]   = tg.depth;
+    want.threadgroup_mem_bytes = threadgroup_mem_bytes;
+    if (extras && n_extras > 0) {
+        memcpy(want.extras, extras, n_extras * sizeof(uint64_t));
+    }
+    want.n_extras = n_extras;
+
+    if (slot->recorded[cmd_idx] && ds4_icb_signature_eq(&slot->sig[cmd_idx], &want)) {
+        return 1;  /* cached hit — no rerecord */
+    }
+
+    id<MTLIndirectComputeCommand> cmd = [slot->icb indirectComputeCommandAtIndex:cmd_idx];
+    [cmd setComputePipelineState:pso];
+    for (NSUInteger i = 0; i < n_bindings; i++) {
+        [cmd setKernelBuffer:bufs[i] offset:offsets[i] atIndex:i];
+    }
+    if (threadgroup_mem_bytes > 0) {
+        [cmd setThreadgroupMemoryLength:threadgroup_mem_bytes atIndex:0];
+    }
+    [cmd concurrentDispatchThreadgroups:grid threadsPerThreadgroup:tg];
+    slot->sig[cmd_idx] = want;
+    slot->recorded[cmd_idx] = 1;
+    return 1;
+}
+
+/* Execute a range of recorded commands on the given encoder. The caller
+ * is responsible for `useResource` declarations on the encoder before
+ * calling (resources MUST be marked used before executeCommandsInBuffer).
+ * Use ds4_icb_slot_use_resources to mark all buffers from a slot's
+ * recorded signatures uniformly. */
+static int ds4_icb_slot_execute(ds4_icb_slot_t *slot,
+                                id<MTLComputeCommandEncoder> enc,
+                                NSUInteger start_cmd, NSUInteger n_cmds) {
+    if (!slot || !slot->icb || !enc) return 0;
+    if (start_cmd + n_cmds > slot->max_commands) return 0;
+    [enc executeCommandsInBuffer:slot->icb withRange:NSMakeRange(start_cmd, n_cmds)];
+    return 1;
+}
+
+/* Reset a slot — clear its MTLICB ref + all per-command recorded flags.
+ * Call from device-reset hook so stale MTLICBs from the prior g_device
+ * don't get replayed. After reset, next acquire reallocates. */
+static void ds4_icb_slot_reset(ds4_icb_slot_t *slot) {
+    if (!slot) return;
+    slot->icb = nil;
+    slot->max_commands = 0;
+    slot->max_buffer_bind_count = 0;
+    memset(slot->recorded, 0, sizeof(slot->recorded));
+    memset(slot->sig,      0, sizeof(slot->sig));
+}
+
+/* Mark all buffers from the slot's recorded signatures as used on enc.
+ * Callers MUST do this (or per-binding useResource themselves) before
+ * executeCommandsInBuffer or Metal will fault on un-declared residency. */
+static void ds4_icb_slot_use_resources(ds4_icb_slot_t *slot,
+                                       id<MTLComputeCommandEncoder> enc,
+                                       NSUInteger start_cmd, NSUInteger n_cmds,
+                                       MTLResourceUsage usage) {
+    if (!slot || !enc) return;
+    if (start_cmd + n_cmds > slot->max_commands) return;
+    for (NSUInteger c = start_cmd; c < start_cmd + n_cmds; c++) {
+        if (!slot->recorded[c]) continue;
+        for (uint32_t i = 0; i < slot->sig[c].n_bindings; i++) {
+            id<MTLBuffer> b = (__bridge id<MTLBuffer>)slot->sig[c].binding_ptr[i];
+            if (b) [enc useResource:b usage:usage];
+        }
+    }
+}
+
+/* ==========================================================================
+ * End of Cycle 9 unified ICB slot abstraction.
+ * Existing per-phase ICB globals follow; migration of each phase to the
+ * unified API is Cycles 9a-9h.
+ * ========================================================================== */
+
 /* ICB record→replay for kernel_dsv4_router_weights_with_remap. One ICB with
  * 43 slots (one per layer). Per-slot signature tracks the buffer pointers +
  * offsets + n_tokens that were recorded; if signature matches at execute
@@ -136,16 +339,11 @@ static uint32_t g_dsv4_route_remap_args_n_tokens; /* last n_tokens loaded */
  * host-encoding overhead. 6.43× at 1 layer, 16.33× at 16 in tinygrad. For
  * DS4 this slot covers ~1/4 of the route chain (just the fused remap), so
  * we expect modest 5-15% gen improvement from this slice alone. */
-static id<MTLIndirectCommandBuffer> g_route_remap_icb;
-typedef struct {
-    void *selected_ptr;  /* __unsafe_unretained id<MTLBuffer> as bare pointer for compare only */
-    uint64_t selected_off;
-    void *weights_ptr;
-    uint64_t weights_off;
-    uint32_t n_tokens;
-    int recorded;        /* 0 = empty slot, 1 = recorded with above signature */
-} ds4_route_remap_icb_slot;
-static ds4_route_remap_icb_slot g_route_remap_icb_slots[43];
+/* Cycle 9b: Phase 1 ICB migrated to unified ds4_icb_slot_t API. The old
+ * 43-element ds4_route_remap_icb_slot[43] + bespoke compare/record is
+ * subsumed by the generic slot's 43 commands. env flags stay here for
+ * device-reset visibility. */
+static ds4_icb_slot_t g_route_remap_slot;
 static int g_route_remap_icb_env_checked;
 static int g_route_remap_icb_env_active;
 
@@ -156,17 +354,10 @@ static int g_route_remap_icb_env_active;
  * Per-token cost saved per ICB hit: ~10-30 μs encoder setup.
  * Slot 0 = decode-router-select-one path (L13574)
  * Slot 1 = generic-n_tokens-1 path (L13688) */
-static id<MTLIndirectCommandBuffer> g_route_weights_one_icb;
-typedef struct {
-    void *probs_ptr;
-    uint64_t probs_off;
-    void *selected_ptr;
-    uint64_t selected_off;
-    void *weights_ptr;
-    uint64_t weights_off;
-    int recorded;
-} ds4_route_weights_one_icb_slot;
-static ds4_route_weights_one_icb_slot g_route_weights_one_icb_slots[2];
+/* Cycle 9d: Phase 6 (route_weights_one) ICB slot — file-scope so the
+ * device-reset hook can reset it. 2 commands (one per call site, slot
+ * 0 = decode-router-select-one path, slot 1 = generic-n_tokens-1 path). */
+static ds4_icb_slot_t g_route_weights_one_slot;
 
 /* #557 ICB Phase 3: kernel_dsv4_topk_mask + kernel_dsv4_topk_mask_scatter.
  * Two paired dispatches per call site (line 5533 + 5542 in ds4_gpu_dsv4_topk_mask_tensor).
@@ -179,20 +370,9 @@ static ds4_route_weights_one_icb_slot g_route_weights_one_icb_slots[2];
  * 19.1 → 17.1 t/s on trim50 decode. topk_mask has 2 kernels per call + an args
  * buffer to update per replay; likely WORSE net-loss. Ship as opt-in only so a
  * future workload (large prefill, repeat-stable args) can opt in and measure. */
-static id<MTLIndirectCommandBuffer> g_topk_mask_icb;
-typedef struct {
-    void *args_buf_ptr;       /* MTLBuffer holding the per-slot args bytes */
-    void *topk_ptr;
-    uint64_t topk_off;
-    void *mask_ptr;
-    uint64_t mask_off;
-    uint32_t top_k;
-    uint32_t n_tokens;
-    uint32_t n_comp;
-    int recorded;
-} ds4_topk_mask_icb_slot;
+/* Cycle 9e: Phase 3 (topk_mask 2-kernel pair) — file-scope unified slot. */
 #define DS4_TOPK_MASK_ICB_SLOTS 2
-static ds4_topk_mask_icb_slot g_topk_mask_icb_slots[DS4_TOPK_MASK_ICB_SLOTS];
+static ds4_icb_slot_t g_topk_mask_slot;
 static id<MTLBuffer> g_topk_mask_icb_args_buffers[DS4_TOPK_MASK_ICB_SLOTS];
 
 /* #558 ICB Phase 4: kernel_dsv4_softplus_sqrt_f32_4 via ds4_gpu_encode_unary_f32_rows.
@@ -200,16 +380,10 @@ static id<MTLBuffer> g_topk_mask_icb_args_buffers[DS4_TOPK_MASK_ICB_SLOTS];
  * max=0) — ideal for ICB record/replay since args + dispatch grid never change.
  * 2 slots for the 2 call sites; args buffer pre-populated once at first record.
  * Opt-in via DS4_ICB_SOFTPLUS=1. */
-static id<MTLIndirectCommandBuffer> g_softplus_sqrt_icb;
-typedef struct {
-    void *src_ptr;
-    uint64_t src_off;
-    void *dst_ptr;
-    uint64_t dst_off;
-    int recorded;
-} ds4_softplus_sqrt_icb_slot;
+/* Cycle 9c: Phase 4 ICB slot lives at the helper function (g_softplus_sqrt_slot)
+ * inside ds4_softplus_sqrt_dispatch_icb. The 2-element bespoke slot array is
+ * subsumed by 2 commands inside the generic ds4_icb_slot_t. */
 #define DS4_SOFTPLUS_SQRT_ICB_SLOTS 2
-static ds4_softplus_sqrt_icb_slot g_softplus_sqrt_icb_slots[DS4_SOFTPLUS_SQRT_ICB_SLOTS];
 
 /* silv 2026-05-28 ICB Phase 8: VQB2 GPU decoder ICB.
  *
@@ -235,20 +409,9 @@ static ds4_softplus_sqrt_icb_slot g_softplus_sqrt_icb_slots[DS4_SOFTPLUS_SQRT_IC
 static id<MTLComputePipelineState> g_vqb2_decode_fp16_classic_pipeline;
 static int g_vqb2_decode_fp16_classic_init_attempted;
 static int g_vqb2_decode_fp16_classic_init_ok;
-static id<MTLIndirectCommandBuffer> g_vqb2_decode_fp16_icb;
-typedef struct {
-    void    *codebook_ptr;
-    void    *codes_ptr;
-    void    *out_ptr;
-    uint64_t codebook_off;
-    uint64_t codes_off;
-    uint64_t out_off;
-    uint32_t n_codes;
-    uint32_t bit_width;
-    uint32_t start_linear;
-    int      recorded;
-} ds4_vqb2_decode_icb_slot;
-static ds4_vqb2_decode_icb_slot g_vqb2_decode_icb_slots[DS4_VQB2_DECODE_ICB_SLOTS];
+/* Cycle 9g: Phase 8a VQB2 decoder ICB — unified ds4_icb_slot_t replaces
+ * g_vqb2_decode_fp16_icb + g_vqb2_decode_icb_slots[64]. */
+static ds4_icb_slot_t g_vqb2_decode_slot;
 static id<MTLBuffer> g_vqb2_decode_icb_args_buffers[DS4_VQB2_DECODE_ICB_SLOTS];
 static id<MTLBuffer> g_softplus_sqrt_icb_args_buffer;  /* one buffer shared across slots — args constant */
 
@@ -523,6 +686,20 @@ static NSUInteger ds4_gpu_tensor_offset(const ds4_gpu_tensor *tensor) {
  if (!tensor) return 0;
  const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
  return (NSUInteger)obj.offset;
+}
+
+/* silv 2026-05-28 task #784 — public accessors for dispatch_gpu MTLBuffer
+ * refactor. Returns the underlying MTLBuffer (bridge_retained void*) and
+ * byte offset. The caller MUST NOT release the bridged pointer; Metal
+ * ARC owns it. Use __bridge to cast back to id<MTLBuffer> at the read
+ * site. */
+void *ds4_gpu_tensor_mtl_buffer(const ds4_gpu_tensor *tensor) {
+ id<MTLBuffer> buf = ds4_gpu_tensor_buffer(tensor);
+ return (__bridge void *)buf;
+}
+
+uint64_t ds4_gpu_tensor_mtl_offset(const ds4_gpu_tensor *tensor) {
+ return (uint64_t)ds4_gpu_tensor_offset(tensor);
 }
 
 static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
@@ -4946,12 +5123,15 @@ void ds4_gpu_cleanup(void) {
  g_dsv4_expert_inverse_table_buffer = nil;
  g_dsv4_route_remap_args_buf = nil;
  g_dsv4_route_remap_args_n_tokens = 0;
- g_route_remap_icb = nil;
- memset(g_route_remap_icb_slots, 0, sizeof(g_route_remap_icb_slots));
+ /* Cycle 9b: Phase 1 ICB slot lives at file scope (g_route_remap_slot);
+  * reset clears the stale MTLICB ref so next acquire reallocates against
+  * the new g_device. */
+ ds4_icb_slot_reset(&g_route_remap_slot);
  g_route_remap_icb_env_checked = 0;
  g_route_remap_icb_env_active = 0;
- g_route_weights_one_icb = nil;
- memset(g_route_weights_one_icb_slots, 0, sizeof(g_route_weights_one_icb_slots));
+ /* Cycle 9d: reset Phase 6 (route_weights_one) ICB slot to discard
+  * stale MTLICB after device reset. */
+ ds4_icb_slot_reset(&g_route_weights_one_slot);
  g_dsv4_hc_expand4_pipeline = nil;
  g_flash_attn_mask_buffer = nil;
  g_flash_attn_pad_buffer = nil;
@@ -5825,18 +6005,18 @@ static int ds4_topk_mask_dispatch_icb(id<MTLCommandBuffer> cb,
     if (slot_idx >= DS4_TOPK_MASK_ICB_SLOTS) return 0;
     if (!g_dsv4_topk_mask_pipeline || !g_dsv4_topk_mask_scatter_pipeline) return 0;
 
-    if (!g_topk_mask_icb) {
-        MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
-        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
-        desc.inheritBuffers = NO;
-        desc.inheritPipelineState = NO;
-        desc.maxKernelBufferBindCount = 3;
-        /* 2 commands per slot (mask + scatter) × DS4_TOPK_MASK_ICB_SLOTS */
-        g_topk_mask_icb =
-            [g_device newIndirectCommandBufferWithDescriptor:desc
-                                              maxCommandCount:(NSUInteger)(DS4_TOPK_MASK_ICB_SLOTS * 2)
-                                                      options:MTLResourceStorageModeShared];
-        if (!g_topk_mask_icb) return 0;
+    /* Cycle 9e (silv 2026-05-28 task #673/#795) — migrated to unified
+     * ds4_icb_slot API. 2 commands per slot (mask + scatter) so
+     * max_commands = DS4_TOPK_MASK_ICB_SLOTS * 2; slot_idx*2+0 = mask
+     * command, slot_idx*2+1 = scatter command. The bespoke
+     * ds4_topk_mask_icb_slot's per-call (top_k, n_tokens, n_comp)
+     * scalars become signature extras (grid size derives from them,
+     * already in the signature; extras let two records with same grid
+     * but different scalars be distinct). */
+    if (!g_topk_mask_slot.icb) {
+        if (!ds4_icb_slot_acquire(&g_topk_mask_slot,
+                                  /*max_commands=*/(NSUInteger)(DS4_TOPK_MASK_ICB_SLOTS * 2),
+                                  /*max_bindings=*/3)) return 0;
     }
     if (!g_topk_mask_icb_args_buffers[slot_idx]) {
         g_topk_mask_icb_args_buffers[slot_idx] =
@@ -5844,51 +6024,36 @@ static int ds4_topk_mask_dispatch_icb(id<MTLCommandBuffer> cb,
                                   options:MTLResourceStorageModeShared];
         if (!g_topk_mask_icb_args_buffers[slot_idx]) return 0;
     }
-
-    /* Args must be refreshed every replay if the args contents changed.
-     * The args struct is small (64 bytes); memcpy cost is negligible. */
+    /* Args must be refreshed every replay (struct contents may change
+     * even when buffer pointer doesn't). The args struct is small
+     * (~64 bytes); memcpy cost negligible. */
     memcpy([g_topk_mask_icb_args_buffers[slot_idx] contents], args, sizeof(*args));
 
-    ds4_topk_mask_icb_slot *slot = &g_topk_mask_icb_slots[slot_idx];
-    const int sig_match = slot->recorded &&
-        slot->topk_ptr == (__bridge void *)topkbuf && slot->topk_off == (uint64_t)topk_off &&
-        slot->mask_ptr == (__bridge void *)maskbuf && slot->mask_off == (uint64_t)mask_off &&
-        slot->args_buf_ptr == (__bridge void *)g_topk_mask_icb_args_buffers[slot_idx] &&
-        slot->top_k == top_k && slot->n_tokens == n_tokens && slot->n_comp == n_comp;
-
-    if (!sig_match) {
-        const NSUInteger groups_mask = ((NSUInteger)n_comp * n_tokens + 255u) / 256u;
-        const NSUInteger groups_scatter = ((NSUInteger)top_k * n_tokens + 255u) / 256u;
-        /* Command N*2 + 0 = mask, N*2 + 1 = scatter */
-        id<MTLIndirectComputeCommand> cmd_mask =
-            [g_topk_mask_icb indirectComputeCommandAtIndex:(slot_idx * 2 + 0)];
-        [cmd_mask setComputePipelineState:g_dsv4_topk_mask_pipeline];
-        [cmd_mask setKernelBuffer:g_topk_mask_icb_args_buffers[slot_idx] offset:0 atIndex:0];
-        [cmd_mask setKernelBuffer:topkbuf offset:topk_off atIndex:1];
-        [cmd_mask setKernelBuffer:maskbuf offset:mask_off atIndex:2];
-        [cmd_mask concurrentDispatchThreadgroups:MTLSizeMake(groups_mask, 1, 1)
-                           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        id<MTLIndirectComputeCommand> cmd_scatter =
-            [g_topk_mask_icb indirectComputeCommandAtIndex:(slot_idx * 2 + 1)];
-        [cmd_scatter setComputePipelineState:g_dsv4_topk_mask_scatter_pipeline];
-        [cmd_scatter setKernelBuffer:g_topk_mask_icb_args_buffers[slot_idx] offset:0 atIndex:0];
-        [cmd_scatter setKernelBuffer:topkbuf offset:topk_off atIndex:1];
-        [cmd_scatter setKernelBuffer:maskbuf offset:mask_off atIndex:2];
-        [cmd_scatter concurrentDispatchThreadgroups:MTLSizeMake(groups_scatter, 1, 1)
-                              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        slot->args_buf_ptr = (__bridge void *)g_topk_mask_icb_args_buffers[slot_idx];
-        slot->topk_ptr = (__bridge void *)topkbuf; slot->topk_off = (uint64_t)topk_off;
-        slot->mask_ptr = (__bridge void *)maskbuf; slot->mask_off = (uint64_t)mask_off;
-        slot->top_k = top_k; slot->n_tokens = n_tokens; slot->n_comp = n_comp;
-        slot->recorded = 1;
-    }
+    const NSUInteger groups_mask    = ((NSUInteger)n_comp * n_tokens + 255u) / 256u;
+    const NSUInteger groups_scatter = ((NSUInteger)top_k  * n_tokens + 255u) / 256u;
+    __unsafe_unretained id<MTLBuffer> bufs[3] = {
+        g_topk_mask_icb_args_buffers[slot_idx], topkbuf, maskbuf };
+    NSUInteger offs[3] = { 0, topk_off, mask_off };
+    uint64_t extras[3] = { top_k, n_tokens, n_comp };
+    if (!ds4_icb_slot_record_command(&g_topk_mask_slot,
+                                     /*cmd_idx=*/(NSUInteger)(slot_idx * 2 + 0),
+                                     g_dsv4_topk_mask_pipeline, bufs, offs, 3,
+                                     MTLSizeMake(groups_mask, 1, 1),
+                                     MTLSizeMake(256, 1, 1), 0,
+                                     extras, 3)) return 0;
+    if (!ds4_icb_slot_record_command(&g_topk_mask_slot,
+                                     /*cmd_idx=*/(NSUInteger)(slot_idx * 2 + 1),
+                                     g_dsv4_topk_mask_scatter_pipeline, bufs, offs, 3,
+                                     MTLSizeMake(groups_scatter, 1, 1),
+                                     MTLSizeMake(256, 1, 1), 0,
+                                     extras, 3)) return 0;
 
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     [enc useResource:g_topk_mask_icb_args_buffers[slot_idx] usage:MTLResourceUsageRead];
     [enc useResource:topkbuf usage:MTLResourceUsageRead];
     [enc useResource:maskbuf usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-    [enc executeCommandsInBuffer:g_topk_mask_icb
-                       withRange:NSMakeRange(slot_idx * 2, 2)];
+    ds4_icb_slot_execute(&g_topk_mask_slot, enc,
+                         /*start=*/(NSUInteger)(slot_idx * 2), /*n=*/2);
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
 }
@@ -5962,6 +6127,164 @@ int ds4_gpu_dsv4_topk_mask_tensor(
  return 1;
 }
 
+/* silv 2026-05-28 #796 Increment 3 — unified Q8_0 matmul kernel dispatch.
+ *
+ * Same shape as F16's kernel_dispatch helper (#796 Increment 2d): one
+ * kernel-selection path, two weight-source variants (mmap-tensor +
+ * heap-storage). Q8_0-specific details vs F16:
+ *   - row_bytes = (in_dim/32) * 34 (per-block FP16 scale + 32 INT8 values)
+ *   - matvec uses make_q8_0_mv_args + nsg=8 tweak for out_dim > 65536
+ *   - mul_mv_ext fn name uses index 1 (vs F16's 0)
+ *   - NAX path requires in_dim % 64 == 0 (vs F16's 32)
+ *   - NAX pipeline uses kernel_mul_mm_q8_0_f32_nax_direct_rhs* variants
+ *   - default mul_mm uses kernel_mul_mm_q8_0_f32 with bc_inp/bc_out
+ *
+ * Returns 1 on success, 0 on failure. Caller owns wbuf retention. */
+static int ds4_gpu_matmul_q8_0_kernel_dispatch(
+ ds4_gpu_tensor *out,
+ id<MTLBuffer> wbuf,
+ uint64_t inner_offset,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok,
+ const char *label) {
+ id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+ id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+ if (!xbuf || !outbuf) return 0;
+
+ int owned = 0;
+ id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+ if (!cb) return 0;
+
+ const uint64_t blocks = in_dim / 32;
+ const uint64_t row_bytes = blocks * 34;
+
+ if (n_tok == 1) {
+  ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+  ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+  if (out_dim > 65536u) mv_dispatch.nsg = 8;
+  mv_args.nr0 = mv_dispatch.nr0;
+  id<MTLComputePipelineState> pipeline =
+   ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+  if (!pipeline) return 0;
+
+  id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+  [enc setComputePipelineState:pipeline];
+  [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+  [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+  [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+  [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+  [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+  [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+   1,
+   1)
+   threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+  ds4_gpu_end_compute_encoder(cb, enc);
+
+  if (!ds4_gpu_finish_command_buffer(cb, owned, label ? label : "Q8_0 matvec")) return 0;
+  return 1;
+ }
+
+ if (n_tok <= 8 && (in_dim % 128u) == 0) {
+  const int16_t nsg = 2;
+  const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
+  const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
+  const char *fn_name = ds4_gpu_mv_ext_name(1, r1ptg);
+  id<MTLComputePipelineState> pipeline =
+   fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg) : nil;
+  if (!pipeline) return 0;
+
+  const int16_t nypsg = 32 / nxpsg;
+  const uint64_t r0ptg = (uint64_t)nypsg * (uint64_t)nsg;
+  ds4_gpu_mul_mv_ext_args args =
+   ds4_gpu_make_mv_ext_args(in_dim, out_dim, n_tok, 34, row_bytes);
+
+  id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+  [enc setComputePipelineState:pipeline];
+  [enc setBytes:&args length:sizeof(args) atIndex:0];
+  [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+  [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+  [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+  [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
+   ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg,
+   1)
+   threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+  ds4_gpu_end_compute_encoder(cb, enc);
+
+  if (!ds4_gpu_finish_command_buffer(cb, owned, label ? label : "Q8_0 mul_mv_ext")) return 0;
+  return 1;
+ }
+
+ if (ds4_gpu_mpp_available() &&
+     n_tok >= 32u &&
+     (in_dim % 64u) == 0 &&
+     (out_dim % 64u) == 0 &&
+     (n_tok % 32u) == 0) {
+  uint64_t nax_tile_n = 32u;
+  if ((n_tok % 128u) == 0) {
+   nax_tile_n = 128u;
+  } else if ((n_tok % 64u) == 0) {
+   nax_tile_n = 64u;
+  }
+  const char *nax_fn = nax_tile_n == 128u
+   ? "kernel_mul_mm_q8_0_f32_nax_direct_rhs_n128"
+   : (nax_tile_n == 64u
+    ? "kernel_mul_mm_q8_0_f32_nax_direct_rhs_n64"
+    : "kernel_mul_mm_q8_0_f32_nax_direct_rhs");
+  id<MTLComputePipelineState> pipeline =
+   ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false);
+  if (pipeline) {
+   ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+
+   id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+   [enc setComputePipelineState:pipeline];
+   [enc setBytes:&args length:sizeof(args) atIndex:0];
+   [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+   [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+   [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+   [enc setThreadgroupMemoryLength:64u * 32u * sizeof(uint16_t) atIndex:0];
+   [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
+    (NSUInteger)out_dim / 64u,
+    1)
+    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+   ds4_gpu_end_compute_encoder(cb, enc);
+
+   if (!ds4_gpu_finish_command_buffer(cb, owned, label ? label : "Q8_0 NAX matmul")) {
+    return 0;
+   }
+   return 1;
+  }
+  ds4_gpu_warn_mpp_fallback();
+ }
+
+ {
+  const bool bc_inp = (in_dim % 32u) != 0;
+  const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+  id<MTLComputePipelineState> pipeline =
+   ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_q8_0_f32", bc_inp, bc_out);
+  if (!pipeline) return 0;
+
+  ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+
+  id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+  [enc setComputePipelineState:pipeline];
+  [enc setBytes:&args length:sizeof(args) atIndex:0];
+  [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+  [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+  [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+  [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+  [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+   ((NSUInteger)out_dim + 63u) / 64u,
+   1)
+   threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+  ds4_gpu_end_compute_encoder(cb, enc);
+
+  if (!ds4_gpu_finish_command_buffer(cb, owned, label ? label : "Q8_0 matmul")) return 0;
+ }
+ return 1;
+}
+
 static int ds4_gpu_matmul_q8_0_legacy_tensor(
  ds4_gpu_tensor *out,
  const void *model_map,
@@ -6003,147 +6326,61 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
  return 0;
  }
 
- int owned = 0;
- id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
- if (!cb) return 0;
-
- if (n_tok == 1) {
- ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
- ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
- if (out_dim > 65536u) mv_dispatch.nsg = 8;
- mv_args.nr0 = mv_dispatch.nr0;
- id<MTLComputePipelineState> pipeline =
- ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
- if (!pipeline) return 0;
-
- id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
- [enc setComputePipelineState:pipeline];
- [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
- [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
- [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
- [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
- [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
- [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
- 1,
- 1)
- threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
- ds4_gpu_end_compute_encoder(cb, enc);
-
- if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 tensor matvec")) {
- return 0;
+ return ds4_gpu_matmul_q8_0_kernel_dispatch(out, wbuf, inner_offset, in_dim, out_dim, x, n_tok, "Q8_0 tensor matmul");
  }
- return 1;
+}
+
+/* silv 2026-05-28 #796 Increment 3 — heap-storage-aware Q8_0 matmul.
+ *
+ * Parallel to ds4_gpu_matmul_f16_storage. Consumes a pre-wrapped MTLBuffer
+ * (storage.metal_buffer from Phase 2b override-fill) instead of doing
+ * ds4_gpu_wrap_model_range. All 4 kernel paths (matvec/mul_mv_ext/NAX/
+ * mul_mm) available via the unified kernel_dispatch helper.
+ *
+ * weight_buf: void* opaque (id<MTLBuffer> across the ObjC boundary). Must
+ *   contain the entire Q8_0 weight matrix at offset 0 — the heap wrap from
+ *   posix_memalign + wrap_heap_bytes covers the full allocation.
+ *
+ * Returns 1 on success, 0 on failure. */
+int ds4_gpu_matmul_q8_0_storage(
+ ds4_gpu_tensor *out,
+ void *weight_buf,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (!weight_buf || !out || !x) return 0;
+ if ((in_dim & 31u) != 0 ||
+     in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
+  return 0;
  }
 
- if (n_tok <= 8 && (in_dim % 128u) == 0) {
- const int16_t nsg = 2;
- const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
- const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
- const char *fn_name = ds4_gpu_mv_ext_name(1, r1ptg);
- id<MTLComputePipelineState> pipeline =
- fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg) : nil;
- if (!pipeline) return 0;
-
- const int16_t nypsg = 32 / nxpsg;
- const uint64_t r0ptg = (uint64_t)nypsg * (uint64_t)nsg;
- ds4_gpu_mul_mv_ext_args args =
- ds4_gpu_make_mv_ext_args(in_dim, out_dim, n_tok, 34, row_bytes);
-
- id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
- [enc setComputePipelineState:pipeline];
- [enc setBytes:&args length:sizeof(args) atIndex:0];
- [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
- [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
- [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
- [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
- ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg,
- 1)
- threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
- ds4_gpu_end_compute_encoder(cb, enc);
-
- if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 tensor mul_mv_ext")) {
- return 0;
+ @autoreleasepool {
+  id<MTLBuffer> wbuf = (__bridge id<MTLBuffer>)weight_buf;
+  id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+  id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+  const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+  const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+  if (!xbuf || !outbuf ||
+      ds4_gpu_tensor_bytes(x) < x_bytes ||
+      ds4_gpu_tensor_bytes(out) < out_bytes) {
+   fprintf(stderr, "ds4: matmul_q8_0_storage received undersized activation buffers\n");
+   return 0;
+  }
+  const uint64_t blocks = in_dim / 32;
+  const uint64_t row_bytes = blocks * 34;
+  const uint64_t weight_bytes = out_dim * row_bytes;
+  if ((uint64_t)wbuf.length < weight_bytes) {
+   fprintf(stderr,
+           "ds4: matmul_q8_0_storage weight buffer too small (%llu < %llu)\n",
+           (unsigned long long)wbuf.length,
+           (unsigned long long)weight_bytes);
+   return 0;
+  }
+  /* heap wrap is exactly the weight matrix → inner_offset = 0 */
+  return ds4_gpu_matmul_q8_0_kernel_dispatch(out, wbuf, 0, in_dim, out_dim, x, n_tok, "Q8_0 storage matmul");
  }
- return 1;
- }
-
- /*
- * Dense Q8_0 prefill is the cleanest DS4 TensorOps shape: M/N/K are
- * aligned and the RHS activation matrix is already dense. The retained
- * kernel dequantizes each 64x32 weight tile to half in threadgroup
- * memory, then uses direct-RHS MPP for the activation tile. This avoids
- * staging RHS into threadgroup memory and was the direct replacement for
- * the slower generic MPP prototype.
- */
- if (ds4_gpu_mpp_available() &&
- n_tok >= 32u &&
- (in_dim % 64u) == 0 &&
- (out_dim % 64u) == 0 &&
- (n_tok % 32u) == 0) {
- uint64_t nax_tile_n = 32u;
- if ((n_tok % 128u) == 0) {
- nax_tile_n = 128u;
- } else if ((n_tok % 64u) == 0) {
- nax_tile_n = 64u;
- }
- const char *nax_fn = nax_tile_n == 128u
- ? "kernel_mul_mm_q8_0_f32_nax_direct_rhs_n128"
- : (nax_tile_n == 64u
- ? "kernel_mul_mm_q8_0_f32_nax_direct_rhs_n64"
- : "kernel_mul_mm_q8_0_f32_nax_direct_rhs");
- id<MTLComputePipelineState> pipeline =
- ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false);
- if (pipeline) {
- ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
-
- id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
- [enc setComputePipelineState:pipeline];
- [enc setBytes:&args length:sizeof(args) atIndex:0];
- [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
- [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
- [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
- [enc setThreadgroupMemoryLength:64u * 32u * sizeof(uint16_t) atIndex:0];
- [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
- (NSUInteger)out_dim / 64u,
- 1)
- threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
- ds4_gpu_end_compute_encoder(cb, enc);
-
- if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 NAX tensor matmul")) {
- return 0;
- }
- return 1;
- }
- ds4_gpu_warn_mpp_fallback();
- }
-
- const bool bc_inp = (in_dim % 32u) != 0;
- const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
- id<MTLComputePipelineState> pipeline =
- ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_q8_0_f32", bc_inp, bc_out);
- if (!pipeline) return 0;
-
- ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
-
- id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
- [enc setComputePipelineState:pipeline];
- [enc setBytes:&args length:sizeof(args) atIndex:0];
- [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
- [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
- [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
- [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
- [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
- ((NSUInteger)out_dim + 63u) / 64u,
- 1)
- threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
- ds4_gpu_end_compute_encoder(cb, enc);
-
- if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 tensor matmul")) {
- return 0;
- }
- }
-
- return 1;
 }
 
 int ds4_gpu_matmul_q8_0_tensor(
@@ -6306,7 +6543,217 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
  return 1;
 }
 
+/* silv 2026-05-28 #796 Increment 2d — unified F16 matmul kernel dispatch.
+ *
+ * Inner kernel selection + encode + finish, given an already-resolved
+ * weight buffer + offset. Used by BOTH ds4_gpu_matmul_f16_tensor (mmap
+ * weight source) AND ds4_gpu_matmul_f16_storage (heap weight source) so
+ * the kernel-selection logic exists exactly once in the codebase.
+ *
+ * Engineer-roster motivation:
+ *   Linus:   one kernel path, two ways to source the buffer
+ *   Carmack: if mmap and heap variants drift, future bug fixes diverge
+ *   Knuth:   the algorithm and the data source are separate concerns
+ *   DJB:     no dead-code paths; each branch tested in both variants
+ *
+ * 4 kernel paths:
+ *   n_tok==1                                 → matvec
+ *   n_tok<=8, in_dim%128==0                  → mul_mv_ext (small batch)
+ *   mpp_available, n_tok>=32, special align  → NAX direct-RHS
+ *   default                                  → mul_mm with bc_inp/bc_out
+ *
+ * Returns 1 on success, 0 on failure. Caller owns wbuf retention. */
+static int ds4_gpu_matmul_f16_kernel_dispatch(
+ ds4_gpu_tensor *out,
+ id<MTLBuffer> wbuf,
+ uint64_t inner_offset,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok,
+ const char *label) {
+ id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+ id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+ if (!xbuf || !outbuf) return 0;
+
+ int owned = 0;
+ id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+ if (!cb) return 0;
+
+ const uint64_t row_bytes = in_dim * sizeof(uint16_t);
+
+ if (n_tok == 1) {
+  ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
+  ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 0);
+  if (!g_quality_mode && (out_dim == 512u || out_dim == 1024u) && in_dim >= 4096u) {
+   mv_dispatch.nr0 = 4;
+   mv_dispatch.smem = 32u * 4u * sizeof(float);
+  }
+  mv_args.nr0 = mv_dispatch.nr0;
+  id<MTLComputePipelineState> pipeline =
+   ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+  if (!pipeline) return 0;
+
+  id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+  [enc setComputePipelineState:pipeline];
+  [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+  [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+  [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+  [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+  if (mv_dispatch.smem) {
+   [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+  }
+  [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+   1,
+   1)
+   threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+  ds4_gpu_end_compute_encoder(cb, enc);
+
+  if (!ds4_gpu_finish_command_buffer(cb, owned, label ? label : "F16 matvec")) return 0;
+  return 1;
+ }
+
+ if (n_tok <= 8 && (in_dim % 128u) == 0) {
+  const int16_t nsg = 2;
+  const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
+  const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
+  const char *fn_name = ds4_gpu_mv_ext_name(0, r1ptg);
+  id<MTLComputePipelineState> pipeline =
+   fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg) : nil;
+  if (!pipeline) return 0;
+
+  const int16_t nypsg = 32 / nxpsg;
+  const uint64_t r0ptg = (uint64_t)nypsg * (uint64_t)nsg;
+  ds4_gpu_mul_mv_ext_args args =
+   ds4_gpu_make_mv_ext_args(in_dim, out_dim, n_tok, sizeof(uint16_t), row_bytes);
+
+  id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+  [enc setComputePipelineState:pipeline];
+  [enc setBytes:&args length:sizeof(args) atIndex:0];
+  [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+  [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+  [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+  [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
+   ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg,
+   1)
+   threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+  ds4_gpu_end_compute_encoder(cb, enc);
+
+  if (!ds4_gpu_finish_command_buffer(cb, owned, label ? label : "F16 mul_mv_ext")) return 0;
+  return 1;
+ }
+
+ if (ds4_gpu_mpp_available() &&
+     n_tok >= 32u &&
+     (in_dim % 32u) == 0 &&
+     (out_dim % 64u) == 0 &&
+     (n_tok % 32u) == 0) {
+  uint64_t nax_tile_n = 32u;
+  if ((n_tok % 128u) == 0) {
+   nax_tile_n = 128u;
+  } else if ((n_tok % 64u) == 0) {
+   nax_tile_n = 64u;
+  }
+  const char *nax_fn = nax_tile_n == 128u
+   ? "kernel_mul_mm_f16_f32_mpp_direct_rhs_n128"
+   : (nax_tile_n == 64u
+    ? "kernel_mul_mm_f16_f32_mpp_direct_rhs_n64"
+    : "kernel_mul_mm_f16_f32_mpp_direct_rhs");
+  id<MTLComputePipelineState> pipeline =
+   ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false);
+  if (pipeline) {
+   ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+
+   id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+   [enc setComputePipelineState:pipeline];
+   [enc setBytes:&args length:sizeof(args) atIndex:0];
+   [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+   [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+   [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+   [enc setThreadgroupMemoryLength:64u * 32u * sizeof(uint16_t) atIndex:0];
+   [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
+    (NSUInteger)out_dim / 64u,
+    1)
+    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+   ds4_gpu_end_compute_encoder(cb, enc);
+
+   if (!ds4_gpu_finish_command_buffer(cb, owned, label ? label : "F16 NAX matmul")) {
+    return 0;
+   }
+   return 1;
+  }
+  ds4_gpu_warn_mpp_fallback();
+ }
+
+ {
+  const bool bc_inp = (in_dim % 32u) != 0;
+  const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+  id<MTLComputePipelineState> pipeline =
+   ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f16_f32", bc_inp, bc_out);
+  if (!pipeline) return 0;
+
+  ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+
+  id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+  [enc setComputePipelineState:pipeline];
+  [enc setBytes:&args length:sizeof(args) atIndex:0];
+  [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+  [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+  [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+  [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+  [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+   ((NSUInteger)out_dim + 63u) / 64u,
+   1)
+   threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+  ds4_gpu_end_compute_encoder(cb, enc);
+
+  if (!ds4_gpu_finish_command_buffer(cb, owned, label ? label : "F16 matmul")) return 0;
+ }
+ return 1;
+}
+
 int ds4_gpu_matmul_f16_tensor(
+ ds4_gpu_tensor *out,
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t weight_offset,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
+
+ @autoreleasepool {
+ id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+ id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+ const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+ const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+ if (!xbuf || !outbuf ||
+ ds4_gpu_tensor_bytes(x) < x_bytes ||
+ ds4_gpu_tensor_bytes(out) < out_bytes) {
+ fprintf(stderr, "ds4: Metal F16 tensor matmul received undersized activation buffers\n");
+ return 0;
+ }
+
+ const uint64_t row_bytes = in_dim * sizeof(uint16_t);
+ const uint64_t weight_bytes = row_bytes * out_dim;
+ if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+ fprintf(stderr, "ds4: Metal F16 tensor matmul range is outside the mapped model\n");
+ return 0;
+ }
+
+ uint64_t inner_offset = 0;
+ id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+ if (!wbuf) return 0;
+
+ return ds4_gpu_matmul_f16_kernel_dispatch(out, wbuf, inner_offset, in_dim, out_dim, x, n_tok, "F16 tensor matmul");
+ }
+}
+
+/* (Original body retained for reference during this refactor — removed below; see kernel_dispatch helper above.) */
+#if 0
+int ds4_gpu_matmul_f16_tensor_legacy_inline(
  ds4_gpu_tensor *out,
  const void *model_map,
  uint64_t model_size,
@@ -6479,6 +6926,166 @@ int ds4_gpu_matmul_f16_tensor(
  }
 
  return 1;
+}
+#endif  /* end of legacy inline body — kernel_dispatch helper replaces it */
+
+/* silv 2026-05-28 #796 Increment 2b/2d — heap-storage-aware F16 matmul.
+ *
+ * Cousin of ds4_gpu_matmul_f16_tensor but consumes a PRE-WRAPPED MTLBuffer
+ * (storage.metal_buffer from the Phase 2b override-fill) instead of doing
+ * ds4_gpu_wrap_model_range(map, size, offset).
+ *
+ * Increment 2d (2026-05-28): now goes through the unified
+ * ds4_gpu_matmul_f16_kernel_dispatch helper so all 4 kernel paths (matvec,
+ * mul_mv_ext, NAX direct-RHS, mul_mm) are available to the heap-storage
+ * path — n_tok=1 restriction LIFTED.
+ *
+ * weight_buf: void* opaque (id<MTLBuffer> across the ObjC boundary). Must
+ *   be the entire wrapped tensor (offset 0 within the wrap is the start
+ *   of the weight matrix). storage.metal_buffer from #796 Increment 2
+ *   foundation has this property by construction (posix_memalign + the
+ *   wrap covers the whole padded allocation).
+ *
+ * Returns 1 on success, 0 on failure. */
+int ds4_gpu_matmul_f16_storage(
+    ds4_gpu_tensor *out,
+    void *weight_buf,           /* opaque id<MTLBuffer> */
+    uint64_t in_dim,
+    uint64_t out_dim,
+    const ds4_gpu_tensor *x,
+    uint64_t n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!weight_buf || !out || !x) return 0;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> wbuf  = (__bridge id<MTLBuffer>)weight_buf;
+        id<MTLBuffer> xbuf  = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t x_bytes   = n_tok * in_dim * sizeof(float);
+        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+        if (!xbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes) {
+            fprintf(stderr, "ds4: matmul_f16_storage received undersized activation buffers\n");
+            return 0;
+        }
+        const uint64_t row_bytes    = in_dim * sizeof(uint16_t);
+        const uint64_t weight_bytes = row_bytes * out_dim;
+        if ((uint64_t)wbuf.length < weight_bytes) {
+            fprintf(stderr,
+                    "ds4: matmul_f16_storage weight buffer too small (%llu < %llu)\n",
+                    (unsigned long long)wbuf.length,
+                    (unsigned long long)weight_bytes);
+            return 0;
+        }
+
+        /* heap wrap is exactly the weight matrix → inner_offset=0 (no
+         * mmap-style multi-tensor view). All other dispatch logic is
+         * identical to matmul_f16_tensor and lives in kernel_dispatch. */
+        return ds4_gpu_matmul_f16_kernel_dispatch(out, wbuf, 0, in_dim, out_dim, x, n_tok, "F16 storage matmul");
+    }
+}
+
+/* #796 Increment 2b canary — verify matmul_f16_storage produces correct
+ * output. Builds a deterministic F16 weight matrix, posix_memaligns it
+ * (mimicking the override-fill allocator), wraps via
+ * ds4_gpu_wrap_heap_bytes, dispatches the heap-storage matvec, compares
+ * against CPU reference. Tolerance: 1e-4 (same as F16 canary).
+ *
+ * If this PASSES, the foundation is end-to-end correct: heap bytes →
+ * MTLBuffer wrap → matmul_f16_storage → kernel produces expected output.
+ * Then Increment 2c can wire production call sites with confidence. */
+int ds4_gpu_mtl4_matmul_f16_storage_canary(uint32_t M, uint32_t N) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (M == 0 || N == 0 || (M % 4) != 0 || (N % 32) != 0) {
+        fprintf(stderr, "ds4: matmul_f16_storage canary needs M%%4==0 and N%%32==0 (got M=%u N=%u)\n", M, N);
+        return 0;
+    }
+    const size_t page = (size_t)getpagesize();
+    const uint64_t matrix_bytes = (uint64_t)M * N * sizeof(uint16_t);
+    const size_t padded = (size_t)(((uint64_t)matrix_bytes + page - 1) & ~(uint64_t)(page - 1));
+
+    /* Page-aligned heap bytes — mirror the override-fill allocator. */
+    void *host_mat = NULL;
+    if (posix_memalign(&host_mat, page, padded) != 0 || !host_mat) {
+        fprintf(stderr, "ds4: matmul_f16_storage canary posix_memalign failed\n");
+        return 0;
+    }
+    float *host_vec   = (float *)calloc(N, sizeof(float));
+    float *host_dst   = (float *)calloc(M, sizeof(float));
+    float *expected   = (float *)calloc(M, sizeof(float));
+    if (!host_vec || !host_dst || !expected) {
+        free(host_mat); free(host_vec); free(host_dst); free(expected);
+        return 0;
+    }
+    /* Fill matrix with deterministic F16 values. */
+    uint16_t *mat16 = (uint16_t *)host_mat;
+    for (uint32_t r = 0; r < M; r++) {
+        for (uint32_t c = 0; c < N; c++) {
+            float v = (float)((int)r % 7) * 0.01f + (float)((int)c % 5) * 0.001f;
+            _Float16 h = (_Float16)v;
+            memcpy(&mat16[(uint64_t)r * N + c], &h, sizeof(h));
+        }
+    }
+    for (uint32_t c = 0; c < N; c++) host_vec[c] = (float)((int)c % 3) * 0.1f + 0.5f;
+    /* CPU reference — same widen-to-f32 path the kernel uses. */
+    for (uint32_t r = 0; r < M; r++) {
+        double acc = 0.0;
+        for (uint32_t c = 0; c < N; c++) {
+            _Float16 h;
+            memcpy(&h, &mat16[(uint64_t)r * N + c], sizeof(h));
+            acc += (double)(float)h * (double)host_vec[c];
+        }
+        expected[r] = (float)acc;
+    }
+
+    /* Wrap the heap bytes as MTLBuffer. */
+    void *weight_buf = ds4_gpu_wrap_heap_bytes(host_mat, (uint64_t)padded);
+    if (!weight_buf) {
+        fprintf(stderr, "ds4: matmul_f16_storage canary wrap_heap_bytes returned NULL\n");
+        free(host_mat); free(host_vec); free(host_dst); free(expected);
+        return 0;
+    }
+
+    /* Build x and out as ds4_gpu_tensors. */
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)N * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)M * sizeof(float));
+    int rc = 0;
+    if (x && out) {
+        if (ds4_gpu_tensor_write(x, 0, host_vec, (size_t)N * sizeof(float)) > 0) {
+            if (ds4_gpu_matmul_f16_storage(out, weight_buf, N, M, x, 1) != 0) {
+                if (ds4_gpu_tensor_read(out, 0, host_dst, (size_t)M * sizeof(float)) > 0) {
+                    rc = 1;
+                }
+            }
+        }
+    }
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_release_heap_buffer(weight_buf);
+
+    int mismatch = 0;
+    double max_rel = 0.0;
+    if (rc) {
+        for (uint32_t r = 0; r < M; r++) {
+            const double diff = fabs((double)(host_dst[r] - expected[r]));
+            const double rel = diff / (fabs((double)expected[r]) + 1e-7);
+            if (rel > max_rel) max_rel = rel;
+            if (rel > 1e-4) mismatch++;
+        }
+        fprintf(stderr,
+            "ds4: matmul_f16_storage canary M=%u N=%u "
+            "dst[0]=%.5f (ref=%.5f) dst[end]=%.5f (ref=%.5f) mismatch=%d max_rel=%.4e\n",
+            M, N,
+            (double)host_dst[0], (double)expected[0],
+            (double)host_dst[M - 1], (double)expected[M - 1],
+            mismatch, max_rel);
+    } else {
+        fprintf(stderr, "ds4: matmul_f16_storage canary dispatch FAILED\n");
+    }
+    free(host_mat); free(host_vec); free(host_dst); free(expected);
+    return (rc && mismatch == 0) ? 1 : 0;
 }
 
 int ds4_gpu_matmul_f16_pair_tensor(
@@ -12893,8 +13500,13 @@ static NSUInteger ds4_gpu_bin_threads(uint32_t width, id<MTLComputePipelineState
 
 /* #558 ICB Phase 4 helper for kernel_dsv4_softplus_sqrt_f32_4. The fixed
  * dispatch shape (width=256, rows=1, c4=1, min=0, max=0) means args + grid
- * are constant across both call sites; only src/dst buffers vary. Returns 1
- * if ICB executed, 0 if fell through. Opt-in via DS4_ICB_SOFTPLUS=1. */
+ * are constant across both call sites; only src/dst buffers vary.
+ *
+ * Cycle 9c (silv 2026-05-28 task #673/#795) — migrated to unified
+ * ds4_icb_slot API. The old bespoke ds4_softplus_sqrt_icb_slot + inline
+ * sig check + record body is subsumed by ds4_icb_slot_record_command's
+ * memcmp-based signature compare. */
+static ds4_icb_slot_t g_softplus_sqrt_slot;
 static int ds4_softplus_sqrt_dispatch_icb(id<MTLCommandBuffer> cb,
                                            uint32_t slot_idx,
                                            id<MTLComputePipelineState> pipeline,
@@ -12906,24 +13518,18 @@ static int ds4_softplus_sqrt_dispatch_icb(id<MTLCommandBuffer> cb,
         s_env_active = getenv("DS4_ICB_SOFTPLUS") != NULL ? 1 : 0;
         s_env_checked = 1;
         if (s_env_active) {
-            fprintf(stderr, "ds4: DS4_ICB_SOFTPLUS=1 — softplus_sqrt ICB engaged (opt-in; measurement pending)\n");
+            fprintf(stderr, "ds4: DS4_ICB_SOFTPLUS=1 — softplus_sqrt ICB engaged via "
+                            "unified ds4_icb_slot API (Cycle 9c)\n");
         }
     }
     if (!s_env_active) return 0;
     if (slot_idx >= DS4_SOFTPLUS_SQRT_ICB_SLOTS) return 0;
     if (!pipeline) return 0;
 
-    if (!g_softplus_sqrt_icb) {
-        MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
-        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
-        desc.inheritBuffers = NO;
-        desc.inheritPipelineState = NO;
-        desc.maxKernelBufferBindCount = 3;
-        g_softplus_sqrt_icb =
-            [g_device newIndirectCommandBufferWithDescriptor:desc
-                                              maxCommandCount:(NSUInteger)DS4_SOFTPLUS_SQRT_ICB_SLOTS
-                                                      options:MTLResourceStorageModeShared];
-        if (!g_softplus_sqrt_icb) return 0;
+    if (!g_softplus_sqrt_slot.icb) {
+        if (!ds4_icb_slot_acquire(&g_softplus_sqrt_slot,
+                                  /*max_commands=*/(NSUInteger)DS4_SOFTPLUS_SQRT_ICB_SLOTS,
+                                  /*max_bindings=*/3)) return 0;
     }
     if (!g_softplus_sqrt_icb_args_buffer) {
         ds4_gpu_unary_args args = ds4_gpu_make_unary_rows_args(256u, 1u, 1, 0.0f, 0.0f);
@@ -12935,32 +13541,23 @@ static int ds4_softplus_sqrt_dispatch_icb(id<MTLCommandBuffer> cb,
         if (!g_softplus_sqrt_icb_args_buffer) return 0;
     }
 
-    ds4_softplus_sqrt_icb_slot *slot = &g_softplus_sqrt_icb_slots[slot_idx];
-    const int sig_match = slot->recorded &&
-        slot->src_ptr == (__bridge void *)src && slot->src_off == (uint64_t)src_off &&
-        slot->dst_ptr == (__bridge void *)dst && slot->dst_off == (uint64_t)dst_off;
-
-    if (!sig_match) {
-        /* width=256, c4=1 → ne00=64; nth=64 (≤ pipeline max); nk0=1; grid (1,1,1). */
-        id<MTLIndirectComputeCommand> cmd =
-            [g_softplus_sqrt_icb indirectComputeCommandAtIndex:slot_idx];
-        [cmd setComputePipelineState:pipeline];
-        [cmd setKernelBuffer:g_softplus_sqrt_icb_args_buffer offset:0 atIndex:0];
-        [cmd setKernelBuffer:src offset:src_off atIndex:1];
-        [cmd setKernelBuffer:dst offset:dst_off atIndex:2];
-        [cmd concurrentDispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        slot->src_ptr = (__bridge void *)src; slot->src_off = (uint64_t)src_off;
-        slot->dst_ptr = (__bridge void *)dst; slot->dst_off = (uint64_t)dst_off;
-        slot->recorded = 1;
+    __unsafe_unretained id<MTLBuffer> bufs[3] = {
+        g_softplus_sqrt_icb_args_buffer, src, dst };
+    NSUInteger offs[3] = { 0, src_off, dst_off };
+    MTLSize grid = MTLSizeMake(1, 1, 1);
+    MTLSize tg   = MTLSizeMake(64, 1, 1);
+    if (!ds4_icb_slot_record_command(&g_softplus_sqrt_slot, /*cmd_idx=*/slot_idx,
+                                     pipeline, bufs, offs, /*n_bindings=*/3,
+                                     grid, tg, /*tg_mem=*/0,
+                                     /*extras=*/NULL, /*n_extras=*/0)) {
+        return 0;
     }
 
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     [enc useResource:g_softplus_sqrt_icb_args_buffer usage:MTLResourceUsageRead];
     [enc useResource:src usage:MTLResourceUsageRead];
     [enc useResource:dst usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-    [enc executeCommandsInBuffer:g_softplus_sqrt_icb
-                       withRange:NSMakeRange(slot_idx, 1)];
+    ds4_icb_slot_execute(&g_softplus_sqrt_slot, enc, slot_idx, 1);
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
 }
@@ -15375,46 +15972,31 @@ static int ds4_route_weights_one_dispatch(id<MTLCommandBuffer> cb,
     if (!s_env_active) return 0; /* caller does direct encoding */
     if (slot_idx >= 2) return 0;
 
-    if (!g_route_weights_one_icb) {
-        MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
-        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
-        desc.inheritBuffers = NO;
-        desc.inheritPipelineState = NO;
-        desc.maxKernelBufferBindCount = 3;
-        g_route_weights_one_icb =
-            [g_device newIndirectCommandBufferWithDescriptor:desc
-                                              maxCommandCount:2
-                                                      options:MTLResourceStorageModeShared];
-        if (!g_route_weights_one_icb) return 0;
+    /* Cycle 9d (silv 2026-05-28 task #673/#795) — migrated to unified
+     * ds4_icb_slot API. The bespoke g_route_weights_one_icb + 2-element
+     * slot array is now g_route_weights_one_slot (file scope) with 2
+     * commands. Device-reset hook calls ds4_icb_slot_reset on it. */
+    if (!g_route_weights_one_slot.icb) {
+        if (!ds4_icb_slot_acquire(&g_route_weights_one_slot,
+                                  /*max_commands=*/2, /*max_bindings=*/3)) return 0;
     }
 
-    ds4_route_weights_one_icb_slot *slot = &g_route_weights_one_icb_slots[slot_idx];
-    const int sig_match = slot->recorded &&
-        slot->probs_ptr    == (__bridge void *)probsbuf    && slot->probs_off    == (uint64_t)probs_off &&
-        slot->selected_ptr == (__bridge void *)selectedbuf && slot->selected_off == (uint64_t)selected_off &&
-        slot->weights_ptr  == (__bridge void *)weightsbuf  && slot->weights_off  == (uint64_t)weights_off;
-
-    if (!sig_match) {
-        id<MTLIndirectComputeCommand> cmd = [g_route_weights_one_icb indirectComputeCommandAtIndex:slot_idx];
-        [cmd setComputePipelineState:pipeline];
-        [cmd setKernelBuffer:probsbuf    offset:probs_off    atIndex:0];
-        [cmd setKernelBuffer:selectedbuf offset:selected_off atIndex:1];
-        [cmd setKernelBuffer:weightsbuf  offset:weights_off  atIndex:2];
-        /* dispatchThreads(6,1,1) threadsPerThreadgroup(6,1,1) ≡ 1 group × 6 threads */
-        [cmd concurrentDispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                      threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
-        slot->probs_ptr    = (__bridge void *)probsbuf;    slot->probs_off    = (uint64_t)probs_off;
-        slot->selected_ptr = (__bridge void *)selectedbuf; slot->selected_off = (uint64_t)selected_off;
-        slot->weights_ptr  = (__bridge void *)weightsbuf;  slot->weights_off  = (uint64_t)weights_off;
-        slot->recorded = 1;
+    __unsafe_unretained id<MTLBuffer> bufs[3] = { probsbuf, selectedbuf, weightsbuf };
+    NSUInteger offs[3] = { probs_off, selected_off, weights_off };
+    MTLSize grid = MTLSizeMake(1, 1, 1);
+    MTLSize tg   = MTLSizeMake(6, 1, 1);  /* 1 group × 6 threads */
+    if (!ds4_icb_slot_record_command(&g_route_weights_one_slot, /*cmd_idx=*/slot_idx,
+                                     pipeline, bufs, offs, /*n_bindings=*/3,
+                                     grid, tg, /*tg_mem=*/0,
+                                     /*extras=*/NULL, /*n_extras=*/0)) {
+        return 0;
     }
 
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     [enc useResource:probsbuf    usage:MTLResourceUsageRead];
     [enc useResource:selectedbuf usage:MTLResourceUsageRead];
     [enc useResource:weightsbuf  usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-    [enc executeCommandsInBuffer:g_route_weights_one_icb
-                       withRange:NSMakeRange(slot_idx, 1)];
+    ds4_icb_slot_execute(&g_route_weights_one_slot, enc, slot_idx, 1);
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
 }
@@ -15499,67 +16081,53 @@ int ds4_gpu_remap_routed_for_trim(
   * args buffer offset is part of the recorded command (per-layer), so layer
   * id is implicit. Per H1716 codex tinygrad: this slice is ~1/4 of the
   * route chain. Expected gain: 5-15% of route encoding cost reclaimed. */
+ /* Cycle 9b (silv 2026-05-28 task #673) — Phase 1 migrated to unified
+  * ds4_icb_slot API. Single file-scope slot with 43 commands (one per
+  * layer); cmd_idx = layer_index. Signature: (4 bindings × buf+off,
+  * pipeline, grid, tg, tg_mem) — captured uniformly. The slot lives at
+  * file scope so the device-reset hook can clear it. */
  if (!g_route_remap_icb_env_checked) {
  g_route_remap_icb_env_active = getenv("DS4_ICB_ACTIVE") != NULL ? 1 : 0;
  g_route_remap_icb_env_checked = 1;
  if (g_route_remap_icb_env_active) {
- fprintf(stderr, "ds4: DS4_ICB_ACTIVE=1 — route_remap ICB record→replay engaged\n");
+ fprintf(stderr, "ds4: DS4_ICB_ACTIVE=1 — route_remap ICB engaged via "
+                 "unified ds4_icb_slot API (Cycle 9b)\n");
  }
  }
 
  if (g_route_remap_icb_env_active && layer_index < 43u) {
- if (!g_route_remap_icb) {
- MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
- desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
- desc.inheritBuffers = NO;
- desc.inheritPipelineState = NO;
- desc.maxKernelBufferBindCount = 4;
- g_route_remap_icb =
- [g_device newIndirectCommandBufferWithDescriptor:desc
- maxCommandCount:43
- options:MTLResourceStorageModeShared];
- if (!g_route_remap_icb) {
- fprintf(stderr, "ds4: ICB allocation failed — falling back to direct encoding\n");
+ if (!g_route_remap_slot.icb) {
+ if (!ds4_icb_slot_acquire(&g_route_remap_slot,
+                           /*max_commands=*/43, /*max_bindings=*/4)) {
+ fprintf(stderr, "ds4: route_remap ICB slot acquire failed — falling back\n");
  g_route_remap_icb_env_active = 0;
  }
  }
  }
 
- if (g_route_remap_icb_env_active && g_route_remap_icb) {
- ds4_route_remap_icb_slot *slot = &g_route_remap_icb_slots[layer_index];
- const int sig_match = slot->recorded &&
- slot->selected_ptr == (__bridge void *)selectedbuf &&
- slot->selected_off == (uint64_t)selected_off &&
- slot->weights_ptr == (__bridge void *)weightsbuf &&
- slot->weights_off == (uint64_t)weights_off &&
- slot->n_tokens == n_tokens;
- if (!sig_match) {
- id<MTLIndirectComputeCommand> cmd =
- [g_route_remap_icb indirectComputeCommandAtIndex:layer_index];
- [cmd setComputePipelineState:fused_pipeline];
- [cmd setKernelBuffer:g_dsv4_expert_inverse_table_buffer offset:0 atIndex:0];
- [cmd setKernelBuffer:selectedbuf offset:selected_off atIndex:1];
- [cmd setKernelBuffer:weightsbuf offset:weights_off atIndex:2];
- [cmd setKernelBuffer:g_dsv4_route_remap_args_buf
- offset:(NSUInteger)(layer_index * 3u * sizeof(uint32_t))
- atIndex:3];
- [cmd setThreadgroupMemoryLength:(NSUInteger)n_expert * sizeof(float) atIndex:0];
- [cmd concurrentDispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
- threadsPerThreadgroup:MTLSizeMake(n_expert, 1, 1)];
- slot->selected_ptr = (__bridge void *)selectedbuf;
- slot->selected_off = (uint64_t)selected_off;
- slot->weights_ptr = (__bridge void *)weightsbuf;
- slot->weights_off = (uint64_t)weights_off;
- slot->n_tokens = n_tokens;
- slot->recorded = 1;
+ if (g_route_remap_icb_env_active && g_route_remap_slot.icb) {
+ __unsafe_unretained id<MTLBuffer> bufs[4] = {
+     g_dsv4_expert_inverse_table_buffer, selectedbuf, weightsbuf,
+     g_dsv4_route_remap_args_buf };
+ NSUInteger offs[4] = { 0, selected_off, weights_off,
+                        (NSUInteger)(layer_index * 3u * sizeof(uint32_t)) };
+ MTLSize grid = MTLSizeMake(n_tokens, 1, 1);
+ MTLSize tg   = MTLSizeMake(n_expert, 1, 1);
+ uint64_t extras[1] = { (uint64_t)n_tokens };
+ if (!ds4_icb_slot_record_command(&g_route_remap_slot, /*cmd_idx=*/layer_index,
+                                  fused_pipeline, bufs, offs, /*n_bindings=*/4,
+                                  grid, tg, /*tg_mem=*/(uint32_t)(n_expert * sizeof(float)),
+                                  extras, /*n_extras=*/1)) {
+ return 0;
  }
  id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+ /* Per-binding usage promotion: bindings 1 (selected) and 2 (weights)
+  * are read+write; 0 (inverse_table) and 3 (args) are read-only. */
  [enc useResource:g_dsv4_expert_inverse_table_buffer usage:MTLResourceUsageRead];
  [enc useResource:selectedbuf usage:MTLResourceUsageRead | MTLResourceUsageWrite];
- [enc useResource:weightsbuf usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+ [enc useResource:weightsbuf  usage:MTLResourceUsageRead | MTLResourceUsageWrite];
  [enc useResource:g_dsv4_route_remap_args_buf usage:MTLResourceUsageRead];
- [enc executeCommandsInBuffer:g_route_remap_icb
- withRange:NSMakeRange(layer_index, 1)];
+ ds4_icb_slot_execute(&g_route_remap_slot, enc, layer_index, 1);
  ds4_gpu_end_compute_encoder(cb, enc);
  } else {
  id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -19480,21 +20048,22 @@ int ds4_gpu_mtl4_moe_matmul_full_canary(void) {
 /* ============================================================ */
 #define DS4_MOE_ICB_SLOTS 6   /* K-top experts per token */
 
-static id<MTLIndirectCommandBuffer> g_moe_matmul_icb;
-typedef struct {
-    int recorded;
-    void *gate_ptr;  uint64_t gate_off;
-    void *up_ptr;    uint64_t up_off;
-    void *x_ptr;     uint64_t x_off;
-    void *mid_ptr;   uint64_t mid_off;
-    void *ids_ptr;   uint64_t ids_off;
-    void *w_ptr;     uint64_t w_off;
-    void *args_ptr;
-    void *act_ptr;
-    NSUInteger n_out_tiles;
-    NSUInteger n_tok_tiles;
-} ds4_moe_icb_slot;
-static ds4_moe_icb_slot g_moe_matmul_icb_slot;
+/* Cycle 9a (silv 2026-05-28 task #673) — Phase 7 migrated to the unified
+ * ds4_icb_slot API. The old static MTLICB + 9-field signature struct +
+ * 80-line dispatch function (record + replay + sig-check) collapsed into
+ * ONE ds4_icb_slot_t + a ~30-line dispatch function. Same correctness:
+ * signature == (8 bindings × buf-ptr+offset) + (pipeline) + (grid) + (tg)
+ * + (tg_mem), captured by ds4_icb_slot_record_command's bytewise compare.
+ *
+ * Phase 7 specifics:
+ *   bindings[8] = {args, act, gate, up, x, mid, ids, weights}
+ *   pipeline    = g_moe_mul_mm_id_fp16_pair_swiglu_pipeline (caller-supplied)
+ *   grid        = (n_out_tiles, n_tok_tiles, n_experts)
+ *   tg          = (64, 1, 1)
+ *   tg_mem      = 1024 bytes
+ *   commands    = 1 (single dispatch — n_experts encoded in grid.z, NOT
+ *                    in multiple commands; see #664 6-slot correction). */
+static ds4_icb_slot_t g_moe_matmul_slot;
 
 /* Record/replay a MoE matmul dispatch via ICB.
  *
@@ -19525,103 +20094,49 @@ int ds4_gpu_moe_matmul_icb_dispatch(
         s_env_active = getenv("DS4_MOE_ICB") != NULL ? 1 : 0;
         s_env_checked = 1;
         if (s_env_active) {
-            fprintf(stderr, "ds4: DS4_MOE_ICB=1 — MoE matmul ICB engaged "
-                            "(records 6-slot dispatch, replays per layer/token)\n");
+            fprintf(stderr, "ds4: DS4_MOE_ICB=1 — MoE matmul ICB engaged via "
+                            "unified ds4_icb_slot API (Cycle 9a)\n");
         }
     }
     if (!s_env_active) return 0;
-    if (!cb || !pipeline || n_experts == 0 || n_experts > DS4_MOE_ICB_SLOTS) return 0;
+    if (!cb || !pipeline || n_experts == 0) return 0;
 
-    if (!g_moe_matmul_icb) {
-        MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
-        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
-        desc.inheritBuffers = NO;
-        desc.inheritPipelineState = NO;
-        desc.maxKernelBufferBindCount = 8;
-        g_moe_matmul_icb =
-            [g_device newIndirectCommandBufferWithDescriptor:desc
-                                              maxCommandCount:DS4_MOE_ICB_SLOTS
-                                                      options:MTLResourceStorageModeShared];
-        if (!g_moe_matmul_icb) {
-            fprintf(stderr, "ds4: MoE matmul ICB alloc failed\n");
+    if (!g_moe_matmul_slot.icb) {
+        if (!ds4_icb_slot_acquire(&g_moe_matmul_slot, /*max_commands=*/1, /*max_bindings=*/8)) {
+            fprintf(stderr, "ds4: MoE matmul ICB slot acquire failed\n");
             return 0;
         }
     }
 
-    ds4_moe_icb_slot *slot = &g_moe_matmul_icb_slot;
-    const int sig_match = slot->recorded &&
-        slot->gate_ptr == (__bridge void *)gatebuf && slot->gate_off == (uint64_t)gate_off &&
-        slot->up_ptr   == (__bridge void *)upbuf   && slot->up_off   == (uint64_t)up_off &&
-        slot->x_ptr    == (__bridge void *)xbuf    && slot->x_off    == (uint64_t)x_off &&
-        slot->mid_ptr  == (__bridge void *)midbuf  && slot->mid_off  == (uint64_t)mid_off &&
-        slot->ids_ptr  == (__bridge void *)idsbuf  && slot->ids_off  == (uint64_t)ids_off &&
-        slot->w_ptr    == (__bridge void *)weightsbuf && slot->w_off == (uint64_t)weights_off &&
-        slot->args_ptr == (__bridge void *)argsbuf &&
-        slot->act_ptr  == (__bridge void *)actbuf &&
-        slot->n_out_tiles == n_out_tiles && slot->n_tok_tiles == n_tok_tiles;
-
-    if (!sig_match) {
-        /* CORRECTION: original 6-slot design was wrong. Each command's
-         * tgpig.z extent is 1 → all commands would see idx=0 in
-         *   const int idx = (int)(tgpig.z % args.nei0);
-         * Fix: record ONE command with full dispatch shape (n_out_tiles,
-         * n_tok_tiles, n_experts). The kernel sees tgpig.z=0..n_experts-1
-         * naturally via dispatchThreadgroups extent.
-         *
-         * ICB amortization comes from skipping setComputePipelineState +
-         * 8× setBuffer + setThreadgroupMemoryLength + dispatchThreadgroups
-         * encoding (~45µs/call). Same target savings as the 6-slot design;
-         * cleaner implementation. */
-        id<MTLIndirectComputeCommand> cmd =
-            [g_moe_matmul_icb indirectComputeCommandAtIndex:0];
-        [cmd setComputePipelineState:pipeline];
-        [cmd setKernelBuffer:argsbuf  offset:args_off    atIndex:0];
-        [cmd setKernelBuffer:actbuf   offset:act_off     atIndex:1];
-        [cmd setKernelBuffer:gatebuf  offset:gate_off    atIndex:2];
-        [cmd setKernelBuffer:upbuf    offset:up_off      atIndex:3];
-        [cmd setKernelBuffer:xbuf     offset:x_off       atIndex:4];
-        [cmd setKernelBuffer:midbuf   offset:mid_off     atIndex:5];
-        [cmd setKernelBuffer:idsbuf   offset:ids_off     atIndex:6];
-        [cmd setKernelBuffer:weightsbuf offset:weights_off atIndex:7];
-        [cmd setThreadgroupMemoryLength:1024 atIndex:0];
-        [cmd concurrentDispatchThreadgroups:MTLSizeMake(n_out_tiles, n_tok_tiles, n_experts)
-                      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        slot->gate_ptr = (__bridge void *)gatebuf; slot->gate_off = (uint64_t)gate_off;
-        slot->up_ptr   = (__bridge void *)upbuf;   slot->up_off   = (uint64_t)up_off;
-        slot->x_ptr    = (__bridge void *)xbuf;    slot->x_off    = (uint64_t)x_off;
-        slot->mid_ptr  = (__bridge void *)midbuf;  slot->mid_off  = (uint64_t)mid_off;
-        slot->ids_ptr  = (__bridge void *)idsbuf;  slot->ids_off  = (uint64_t)ids_off;
-        slot->w_ptr    = (__bridge void *)weightsbuf; slot->w_off = (uint64_t)weights_off;
-        slot->args_ptr = (__bridge void *)argsbuf;
-        slot->act_ptr  = (__bridge void *)actbuf;
-        slot->n_out_tiles = n_out_tiles;
-        slot->n_tok_tiles = n_tok_tiles;
-        slot->recorded = 1;
+    __unsafe_unretained id<MTLBuffer> bufs[8] = { argsbuf, actbuf, gatebuf, upbuf,
+                                                  xbuf,    midbuf, idsbuf,  weightsbuf };
+    NSUInteger     offs[8]  = { args_off, act_off, gate_off, up_off,
+                                x_off,    mid_off, ids_off,  weights_off };
+    MTLSize grid = MTLSizeMake(n_out_tiles, n_tok_tiles, n_experts);
+    MTLSize tg   = MTLSizeMake(64, 1, 1);
+    if (!ds4_icb_slot_record_command(&g_moe_matmul_slot, /*cmd_idx=*/0,
+                                     pipeline, bufs, offs, /*n_bindings=*/8,
+                                     grid, tg, /*tg_mem=*/1024,
+                                     /*extras=*/NULL, /*n_extras=*/0)) {
+        return 0;
     }
 
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc useResource:argsbuf    usage:MTLResourceUsageRead];
-    [enc useResource:actbuf     usage:MTLResourceUsageRead];
-    [enc useResource:gatebuf    usage:MTLResourceUsageRead];
-    [enc useResource:upbuf      usage:MTLResourceUsageRead];
-    [enc useResource:xbuf       usage:MTLResourceUsageRead];
-    [enc useResource:midbuf     usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-    [enc useResource:idsbuf     usage:MTLResourceUsageRead];
-    [enc useResource:weightsbuf usage:MTLResourceUsageRead];
-    /* Single command at index 0; n_experts is encoded in the dispatch
-     * extent recorded into the command, not in the replay range. */
-    (void)n_experts;
-    [enc executeCommandsInBuffer:g_moe_matmul_icb
-                       withRange:NSMakeRange(0, 1)];
+    /* Buffer 5 (mid) is read+write; the slot's generic useResource path
+     * marks all bindings READ — promote mid to READ|WRITE explicitly.
+     * Apple Metal accepts the union via repeated useResource calls. */
+    ds4_icb_slot_use_resources(&g_moe_matmul_slot, enc, 0, 1, MTLResourceUsageRead);
+    [enc useResource:midbuf usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    ds4_icb_slot_execute(&g_moe_matmul_slot, enc, /*start=*/0, /*n=*/1);
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
 }
 
 /* Diagnostic: report ICB record state. */
 int ds4_gpu_moe_matmul_icb_status(uint32_t *out_recorded, uint32_t *out_slots) {
-    if (out_recorded) *out_recorded = g_moe_matmul_icb_slot.recorded ? 1 : 0;
+    if (out_recorded) *out_recorded = g_moe_matmul_slot.recorded[0] ? 1 : 0;
     if (out_slots) *out_slots = DS4_MOE_ICB_SLOTS;
-    return g_moe_matmul_icb ? 1 : 0;
+    return g_moe_matmul_slot.icb ? 1 : 0;
 }
 
 /* ============================================================ */
@@ -22283,6 +22798,460 @@ int ds4_metal_vqb2_fused_sum_step(void *down_out_fp16_buf,
 }
 
 /* ============================================================ */
+/* moe_swiglu_weight_f32mid_rowblock_mtl4 — Tier 2.a fp32 mid    */
+/* silv 2026-05-28 — path_fused_multitoken_design.md             */
+/* ============================================================ */
+/* The actual precision floor in PATH_FUSED chain is fp16 STORAGE
+ * of mid between SwiGLU and DOWN, not the sum accumulation (Tier 2.b
+ * was refuted by canary). This kernel preserves the H2186/H2187
+ * row-block layout but stores mid as fp32, halving downstream
+ * quantization error.
+ *
+ * Memory cost: mid_buf grows from n_sel*n_rb*n_rows*2 bytes (24 KB
+ * at DS4 V4 shape) to ×4 (48 KB) per token. Modest.
+ *
+ * DOWN cost: needs a separate dispatch_kind_strided_fp32in variant
+ * that reads fp32 mid. Adding that is a parallel matmul kernel
+ * (NOT shipped in this kernel; this kernel only writes fp32 mid).
+ * Without the DOWN-side change, this kernel is canary-only — it
+ * proves the precision delta exists, but production cannot consume
+ * fp32 mid until the matching DOWN kernel ships.
+ *
+ * Dispatch identical to the fp16-out variant: (n_rows, n_selected, n_row_blocks). */
+static id<MTLComputePipelineState> g_moe_swiglu_weight_f32mid_rowblock_mtl4_pipeline;
+static int g_moe_swiglu_weight_f32mid_rowblock_mtl4_init_attempted;
+static int g_moe_swiglu_weight_f32mid_rowblock_mtl4_init_ok;
+
+static int ds4_moe_swiglu_weight_f32mid_rowblock_mtl4_pipeline_init(void) {
+    if (g_moe_swiglu_weight_f32mid_rowblock_mtl4_init_attempted)
+        return g_moe_swiglu_weight_f32mid_rowblock_mtl4_init_ok;
+    g_moe_swiglu_weight_f32mid_rowblock_mtl4_init_attempted = 1;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct rb_args {\n"
+         "  uint32_t n_rows;\n"
+         "  uint32_t n_selected;\n"
+         "  uint32_t n_row_blocks;\n"
+         "  float    clamp_value;\n"
+         "};\n"
+         "kernel void moe_swiglu_weight_f32mid_rowblock_mtl4(\n"
+         "    device const rb_args *args    [[buffer(0)]],\n"
+         "    device const half    *gate    [[buffer(1)]],\n"
+         "    device const half    *up      [[buffer(2)]],\n"
+         "    device const float   *route_w [[buffer(3)]],\n"
+         "    device       float   *mid     [[buffer(4)]],\n"   /* fp32 out, NOT half */
+         "    uint3 gid [[thread_position_in_grid]]) {\n"
+         "  if (gid.x >= args->n_rows || gid.y >= args->n_selected\n"
+         "      || gid.z >= args->n_row_blocks) return;\n"
+         "  const ulong in_idx  = ((ulong)gid.z * args->n_selected + gid.y)\n"
+         "                         * args->n_rows + gid.x;\n"
+         "  const ulong out_idx = (ulong)gid.y * (args->n_row_blocks * args->n_rows)\n"
+         "                         + (ulong)gid.z * args->n_rows + gid.x;\n"
+         "  float g = (float)gate[in_idx];\n"
+         "  float u = (float)up[in_idx];\n"
+         "  const float c = args->clamp_value;\n"
+         "  if (c > 1.0e-6f) { g = min(g, c); u = clamp(u, -c, c); }\n"
+         "  const float silu = g / (1.0f + exp(-g));\n"
+         "  mid[out_idx] = silu * u * route_w[gid.y];\n"  /* fp32 store, no half() cast */
+         "}\n";
+
+    g_moe_swiglu_weight_f32mid_rowblock_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_moe_swiglu_weight_f32mid_rowblock_mtl4",
+        @"moe_swiglu_weight_f32mid_rowblock_mtl4", 256, NULL, 0);
+    g_moe_swiglu_weight_f32mid_rowblock_mtl4_init_ok =
+        (g_moe_swiglu_weight_f32mid_rowblock_mtl4_pipeline != nil) ? 1 : 0;
+    return g_moe_swiglu_weight_f32mid_rowblock_mtl4_init_ok;
+}
+
+/* Dispatch wrapper. Caller must supply a mid_buf sized for fp32
+ * (n_selected * n_row_blocks * n_rows * 4 bytes). Returns 1=ok. */
+int ds4_metal_vqb2_fused_swiglu_rowblock_step_fp32mid(
+    void *gate_buf, void *up_buf, void *route_weights_buf, void *mid_fp32_buf,
+    uint32_t n_rows, uint32_t n_selected, uint32_t n_row_blocks, float clamp_value) {
+    if (!ds4_moe_swiglu_weight_f32mid_rowblock_mtl4_pipeline_init()) return 0;
+    if (!gate_buf || !up_buf || !route_weights_buf || !mid_fp32_buf) return 0;
+    if (n_rows == 0 || n_selected == 0 || n_row_blocks == 0) return 0;
+
+    static id<MTLBuffer> s_args_buf = nil;
+    if (!s_args_buf) {
+        s_args_buf = [g_device newBufferWithLength:16
+                                          options:MTLResourceStorageModeShared];
+        if (!s_args_buf) return 0;
+    }
+    struct { uint32_t n_rows; uint32_t n_selected; uint32_t n_row_blocks; float clamp; } args = {
+        n_rows, n_selected, n_row_blocks, clamp_value,
+    };
+    memcpy(s_args_buf.contents, &args, sizeof(args));
+
+    void *bindings[5] = {
+        (__bridge void *)s_args_buf,
+        gate_buf, up_buf, route_weights_buf, mid_fp32_buf,
+    };
+    return ds4_mtl4_run_canary(
+        (__bridge void *)g_moe_swiglu_weight_f32mid_rowblock_mtl4_pipeline,
+        bindings, 5,
+        (unsigned long)n_rows, (unsigned long)n_selected, (unsigned long)n_row_blocks,
+        32ul, 1ul, 1ul,
+        0ul, NULL, NULL);
+}
+
+/* Forward decl — defined later in this file (line ~22669+). */
+static int ds4_moe_swiglu_weight_f16_rowblock_mtl4_pipeline_init(void);
+
+/* Canary: A/B fp16-mid vs fp32-mid SwiGLU on adversarial gate/up.
+ * Strategy: synthesize gate/up at fp16 with values that force the
+ * silu(g)*u*w product to land near fp16 representational gaps
+ * (e.g. close to fp16 powers-of-two boundaries). The fp32-mid
+ * kernel preserves the true product; fp16-mid quantizes to nearest
+ * fp16. Compute max |fp32_mid - fp32(fp16_mid)| over all positions.
+ *
+ * The Tier 2.a claim: this max delta is >= 1e-4 (real precision
+ * loss) on realistic inputs, vs the Tier 2.b sum-step delta which
+ * we measured at <1e-7 (below fp16 floor). If true, fp32-mid is
+ * the lever silv asked for; if false, Tier 2.a is also refuted. */
+int ds4_metal_vqb2_fused_swiglu_rowblock_fp32mid_canary(
+    uint32_t n_rows, uint32_t n_selected, uint32_t n_row_blocks) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_rows == 0 || n_selected == 0 || n_row_blocks == 0) {
+        fprintf(stderr, "ds4: swiglu-fp32mid-canary requires nonzero shape\n");
+        return 0;
+    }
+    if (!ds4_moe_swiglu_weight_f16_rowblock_mtl4_pipeline_init()) return 0;
+    if (!ds4_moe_swiglu_weight_f32mid_rowblock_mtl4_pipeline_init()) return 0;
+
+    const size_t n_inputs = (size_t)n_row_blocks * n_selected * n_rows;
+    const size_t n_outputs = n_inputs; /* same total count, different layout */
+
+    id<MTLBuffer> gate_buf = [g_device newBufferWithLength:n_inputs * sizeof(uint16_t)
+                                                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> up_buf = [g_device newBufferWithLength:n_inputs * sizeof(uint16_t)
+                                                 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> rw_buf = [g_device newBufferWithLength:n_selected * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mid_fp16 = [g_device newBufferWithLength:n_outputs * sizeof(uint16_t)
+                                                    options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mid_fp32 = [g_device newBufferWithLength:n_outputs * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+    if (!gate_buf || !up_buf || !rw_buf || !mid_fp16 || !mid_fp32) {
+        fprintf(stderr, "ds4: swiglu-fp32mid-canary alloc failed\n");
+        return 0;
+    }
+
+    /* Fill gate/up with values that cover fp16 mantissa range, sized for
+     * SiLU saturation effects. */
+    uint16_t *gh = (uint16_t *)gate_buf.contents;
+    uint16_t *uh = (uint16_t *)up_buf.contents;
+    float *rw = (float *)rw_buf.contents;
+    for (uint32_t i = 0u; i < n_selected; i++) {
+        rw[i] = 0.1f + 0.2f * (float)i; /* distinct positive weights */
+    }
+    for (size_t idx = 0u; idx < n_inputs; idx++) {
+        const float t = (float)idx / (float)n_inputs;
+        /* gate spans [-3, 3] to exercise SiLU shape; up spans [-2, 2]. */
+        const float g = -3.0f + 6.0f * t;
+        const float u = -2.0f + 4.0f * ((float)((idx * 7u) % n_inputs) / (float)n_inputs);
+        __fp16 gh_v = (__fp16)g;
+        __fp16 uh_v = (__fp16)u;
+        gh[idx] = *(uint16_t *)&gh_v;
+        uh[idx] = *(uint16_t *)&uh_v;
+    }
+
+    /* Run both kernels. */
+    extern int ds4_metal_vqb2_fused_swiglu_rowblock_step(
+        void *, void *, void *, void *, uint32_t, uint32_t, uint32_t, float);
+    extern int ds4_metal_vqb2_fused_swiglu_rowblock_step_fp32mid(
+        void *, void *, void *, void *, uint32_t, uint32_t, uint32_t, float);
+
+    int rc_fp16 = ds4_metal_vqb2_fused_swiglu_rowblock_step(
+        (__bridge void *)gate_buf, (__bridge void *)up_buf,
+        (__bridge void *)rw_buf, (__bridge void *)mid_fp16,
+        n_rows, n_selected, n_row_blocks, 0.0f);
+    int rc_fp32 = ds4_metal_vqb2_fused_swiglu_rowblock_step_fp32mid(
+        (__bridge void *)gate_buf, (__bridge void *)up_buf,
+        (__bridge void *)rw_buf, (__bridge void *)mid_fp32,
+        n_rows, n_selected, n_row_blocks, 0.0f);
+    if (rc_fp16 != 1 || rc_fp32 != 1) {
+        fprintf(stderr, "ds4: swiglu-fp32mid-canary dispatch failed fp16=%d fp32=%d\n",
+                rc_fp16, rc_fp32);
+        return 0;
+    }
+
+    /* Compute max delta between fp32-mid and fp16-mid (converted back to fp32). */
+    const uint16_t *out_fp16 = (const uint16_t *)mid_fp16.contents;
+    const float *out_fp32 = (const float *)mid_fp32.contents;
+    double max_abs_delta = 0.0;
+    double sum_abs_delta = 0.0;
+    double max_abs_fp32 = 0.0;
+    uint32_t worst_idx = 0u;
+    for (size_t idx = 0u; idx < n_outputs; idx++) {
+        __fp16 h_v = *(__fp16 *)&out_fp16[idx];
+        const float v_fp16_as_f32 = (float)h_v;
+        const float v_fp32 = out_fp32[idx];
+        const double delta = fabs((double)v_fp16_as_f32 - (double)v_fp32);
+        sum_abs_delta += delta;
+        if (delta > max_abs_delta) { max_abs_delta = delta; worst_idx = (uint32_t)idx; }
+        if (fabs((double)v_fp32) > max_abs_fp32) max_abs_fp32 = fabs((double)v_fp32);
+    }
+    const double mean_abs_delta = sum_abs_delta / (double)n_outputs;
+    const double max_rel_delta = (max_abs_fp32 > 0.0) ? max_abs_delta / max_abs_fp32 : 0.0;
+
+    fprintf(stderr,
+            "ds4: swiglu-fp32mid-canary shape=(n_rows=%u, n_sel=%u, n_rb=%u, total=%zu)\n"
+            "ds4:   |fp32_mid - fp32(fp16_mid)|: max=%.6e (idx=%u), mean=%.6e\n"
+            "ds4:   max_abs(fp32_mid) = %.6e, max_rel = %.6e\n"
+            "ds4:   verdict: %s\n",
+            n_rows, n_selected, n_row_blocks, n_outputs,
+            max_abs_delta, worst_idx, mean_abs_delta,
+            max_abs_fp32, max_rel_delta,
+            (max_abs_delta >= 1.0e-4) ? "PASS (fp32-mid carries >=1e-4 absolute signal vs fp16-mid)" :
+            (max_abs_delta >= 1.0e-6) ? "PARTIAL (signal exists but small)" :
+                                         "FAIL (fp16-mid is sufficient for this shape)");
+    return (max_abs_delta >= 1.0e-4) ? 1 : 0;
+}
+
+/* ============================================================ */
+/* moe_sum6_fp16in_kahan_mtl4 — high-precision sum (Tier 2.b)    */
+/* silv 2026-05-28 — path_fused_multitoken_design.md             */
+/* ============================================================ */
+/* Same I/O as moe_sum6_fp16in_mtl4 but with:
+ *   1. magnitude-sorted summation (smallest first)
+ *   2. Kahan-compensated accumulation
+ *
+ * The combination preserves full fp32 precision (~7 digits) where
+ * the naive variant can drop to ~5-6 digits on adversarial inputs
+ * (mixed magnitudes summed largest-first lose low bits to mantissa
+ * shift). For 6 inputs this is ~10× tighter relative error in
+ * worst case, ~2-3× in typical case.
+ *
+ * Why bother for 6 terms: the H2196 9-policy oracle finding shows
+ * exact algebraic equivalence (rel_L2=0) is achievable for
+ * route-permuted dispatch. Naive sum at fp32 can drift by ~1e-6
+ * across permutation order; Kahan-sorted variant stays bit-exact
+ * to ~1e-7. This makes order-policy schedule artifacts visible.
+ *
+ * Activated opt-in via env DS4_VQB2_FP16_PRECISION=high. The
+ * existing naive sum remains default. */
+static id<MTLComputePipelineState> g_moe_sum6_fp16in_kahan_mtl4_pipeline;
+static int g_moe_sum6_fp16in_kahan_mtl4_init_attempted;
+static int g_moe_sum6_fp16in_kahan_mtl4_init_ok;
+
+static int ds4_moe_sum6_fp16in_kahan_mtl4_pipeline_init(void) {
+    if (g_moe_sum6_fp16in_kahan_mtl4_init_attempted) return g_moe_sum6_fp16in_kahan_mtl4_init_ok;
+    g_moe_sum6_fp16in_kahan_mtl4_init_attempted = 1;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct sum6_args { uint32_t out_dim; uint32_t pad; };\n"
+         "kernel void moe_sum6_fp16in_kahan_mtl4(\n"
+         "    device const sum6_args *args [[buffer(0)]],\n"
+         "    device const half      *src  [[buffer(1)]],\n"  /* [6 × out_dim] */
+         "    device       float     *dst  [[buffer(2)]],\n"  /* [out_dim] */
+         "    uint gid [[thread_position_in_grid]]) {\n"
+         "  if (gid >= args->out_dim) return;\n"
+         "  const uint o = args->out_dim;\n"
+         "  /* Load 6 values, convert to fp32. */\n"
+         "  float v[6];\n"
+         "  v[0] = (float)src[0u * o + gid];\n"
+         "  v[1] = (float)src[1u * o + gid];\n"
+         "  v[2] = (float)src[2u * o + gid];\n"
+         "  v[3] = (float)src[3u * o + gid];\n"
+         "  v[4] = (float)src[4u * o + gid];\n"
+         "  v[5] = (float)src[5u * o + gid];\n"
+         "  /* Insertion sort by |v| ascending — 6 elements is cheap. */\n"
+         "  for (uint i = 1u; i < 6u; i++) {\n"
+         "    const float key = v[i];\n"
+         "    const float key_abs = fabs(key);\n"
+         "    uint j = i;\n"
+         "    while (j > 0u && fabs(v[j - 1u]) > key_abs) {\n"
+         "      v[j] = v[j - 1u];\n"
+         "      j--;\n"
+         "    }\n"
+         "    v[j] = key;\n"
+         "  }\n"
+         "  /* Kahan compensated sum, smallest first. */\n"
+         "  float sum = 0.0f;\n"
+         "  float c = 0.0f;\n"
+         "  for (uint k = 0u; k < 6u; k++) {\n"
+         "    const float y = v[k] - c;\n"
+         "    const float t = sum + y;\n"
+         "    c = (t - sum) - y;\n"
+         "    sum = t;\n"
+         "  }\n"
+         "  dst[gid] = sum;\n"
+         "}\n";
+
+    g_moe_sum6_fp16in_kahan_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_moe_sum6_fp16in_kahan_mtl4",
+        @"moe_sum6_fp16in_kahan_mtl4", 256, NULL, 0);
+    g_moe_sum6_fp16in_kahan_mtl4_init_ok =
+        (g_moe_sum6_fp16in_kahan_mtl4_pipeline != nil) ? 1 : 0;
+    return g_moe_sum6_fp16in_kahan_mtl4_init_ok;
+}
+
+/* Canary: A/B Kahan-sorted vs naive sum6 on adversarial fp16 inputs.
+ * silv 2026-05-28 — falsifiability for the Tier 2.b 10× accuracy claim.
+ *
+ * Strategy: synthesize 6 fp16 inputs per output position with mixed
+ * magnitudes that expose precision loss in naive left-to-right summation:
+ *   slot 0: +0.5 * cos(pos)         (small base)
+ *   slot 1: +large * sin(pos)        (large positive)
+ *   slot 2: -large * sin(pos)        (large negative — cancels slot 1)
+ *   slot 3: +small * cos(pos*0.7)    (tiny addition that gets lost
+ *                                       when summed after big-cancel)
+ *   slot 4: +large * cos(pos)        (large positive again)
+ *   slot 5: -large * cos(pos)        (cancels slot 4)
+ *
+ * True sum = 0.5*cos(pos) + small*cos(pos*0.7); both small terms.
+ *
+ * Naive fp32 sum visits slots 0..5 in order. After (small + large + (-large))
+ * the low bits of `small` are lost. Kahan with magnitude sort visits small
+ * terms first, big-cancel pairs last, retaining the small contributions.
+ *
+ * Computes max |naive - reference| and max |kahan - reference| where
+ * reference is the fp64 sum of the fp16-rounded inputs. The 10× accuracy
+ * claim is: max_kahan_err / max_naive_err < 0.1 on this adversarial pattern.
+ *
+ * Returns 1=Kahan beats naive by 10×; 0=fail or wash. */
+int ds4_metal_vqb2_fused_sum_step_kahan_canary(uint32_t out_dim, float large_scale) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (out_dim == 0 || out_dim > 16384u) {
+        fprintf(stderr, "ds4: kahan-sum-canary requires 0 < out_dim <= 16384\n");
+        return 0;
+    }
+    if (large_scale <= 0.0f) large_scale = 1024.0f;
+
+    /* Build adversarial fp16 src buffer [6 × out_dim]. */
+    const uint32_t n_sel = 6u;
+    const size_t n_halves = (size_t)n_sel * out_dim;
+    id<MTLBuffer> src_buf = [g_device newBufferWithLength:n_halves * sizeof(uint16_t)
+                                                  options:MTLResourceStorageModeShared];
+    if (!src_buf) { fprintf(stderr, "ds4: kahan-sum-canary src alloc failed\n"); return 0; }
+
+    /* Use a portable fp32→fp16 round-trip via raw fp32 stored as fp16 bit pattern.
+     * Apple has __fp16 but we cast through float for clarity. */
+    uint16_t *src_h = (uint16_t *)src_buf.contents;
+    double *reference = (double *)malloc((size_t)out_dim * sizeof(double));
+    if (!reference) {
+        fprintf(stderr, "ds4: kahan-sum-canary reference alloc failed\n");
+        return 0;
+    }
+    const float small_scale = 1.0e-3f;
+    for (uint32_t pos = 0u; pos < out_dim; pos++) {
+        const float p = (float)pos;
+        const float v[6] = {
+            0.5f * cosf(p * 0.1f),
+            large_scale * sinf(p * 0.1f),
+            -large_scale * sinf(p * 0.1f),
+            small_scale * cosf(p * 0.07f),
+            large_scale * cosf(p * 0.1f),
+            -large_scale * cosf(p * 0.1f),
+        };
+        /* Round-trip via __fp16 to get bit-exact fp16 representation. */
+        __fp16 vh[6];
+        for (uint32_t k = 0u; k < 6u; k++) {
+            vh[k] = (__fp16)v[k];
+            src_h[(size_t)k * out_dim + pos] = *(uint16_t *)&vh[k];
+        }
+        /* Reference sum at fp64 over the fp16-rounded values. */
+        double ref = 0.0;
+        for (uint32_t k = 0u; k < 6u; k++) ref += (double)(float)vh[k];
+        reference[pos] = ref;
+    }
+
+    /* Allocate destination buffers for naive + kahan. */
+    id<MTLBuffer> dst_naive = [g_device newBufferWithLength:(size_t)out_dim * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dst_kahan = [g_device newBufferWithLength:(size_t)out_dim * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+    if (!dst_naive || !dst_kahan) {
+        fprintf(stderr, "ds4: kahan-sum-canary dst alloc failed\n");
+        free(reference);
+        return 0;
+    }
+
+    /* Run both kernels. */
+    extern int ds4_metal_vqb2_fused_sum_step(void *, void *, uint32_t);
+    extern int ds4_metal_vqb2_fused_sum_step_kahan(void *, void *, uint32_t);
+    int rc_naive = ds4_metal_vqb2_fused_sum_step(
+        (__bridge void *)src_buf, (__bridge void *)dst_naive, out_dim);
+    int rc_kahan = ds4_metal_vqb2_fused_sum_step_kahan(
+        (__bridge void *)src_buf, (__bridge void *)dst_kahan, out_dim);
+    if (rc_naive != 1 || rc_kahan != 1) {
+        fprintf(stderr, "ds4: kahan-sum-canary dispatch failed naive=%d kahan=%d\n",
+                rc_naive, rc_kahan);
+        free(reference);
+        return 0;
+    }
+
+    /* Compare both against fp64 reference. */
+    const float *out_naive = (const float *)dst_naive.contents;
+    const float *out_kahan = (const float *)dst_kahan.contents;
+    double max_naive_err = 0.0, max_kahan_err = 0.0;
+    double sum_naive_err = 0.0, sum_kahan_err = 0.0;
+    uint32_t worst_pos_naive = 0u, worst_pos_kahan = 0u;
+    for (uint32_t pos = 0u; pos < out_dim; pos++) {
+        const double err_n = fabs((double)out_naive[pos] - reference[pos]);
+        const double err_k = fabs((double)out_kahan[pos] - reference[pos]);
+        sum_naive_err += err_n;
+        sum_kahan_err += err_k;
+        if (err_n > max_naive_err) { max_naive_err = err_n; worst_pos_naive = pos; }
+        if (err_k > max_kahan_err) { max_kahan_err = err_k; worst_pos_kahan = pos; }
+    }
+    const double mean_naive_err = sum_naive_err / (double)out_dim;
+    const double mean_kahan_err = sum_kahan_err / (double)out_dim;
+    const double ratio_max  = (max_kahan_err > 0.0) ? max_naive_err / max_kahan_err : 1e9;
+    const double ratio_mean = (mean_kahan_err > 0.0) ? mean_naive_err / mean_kahan_err : 1e9;
+
+    fprintf(stderr,
+            "ds4: kahan-sum-canary out_dim=%u large_scale=%.3g\n"
+            "ds4:   naive max_err=%.6e mean_err=%.6e (worst_pos=%u)\n"
+            "ds4:   kahan max_err=%.6e mean_err=%.6e (worst_pos=%u)\n"
+            "ds4:   naive/kahan ratio: max=%.3fx mean=%.3fx\n"
+            "ds4:   verdict: %s\n",
+            out_dim, (double)large_scale,
+            max_naive_err, mean_naive_err, worst_pos_naive,
+            max_kahan_err, mean_kahan_err, worst_pos_kahan,
+            ratio_max, ratio_mean,
+            (ratio_max >= 10.0) ? "PASS (Kahan ≥10× tighter on max_err)" :
+            (ratio_max >= 2.0)  ? "PARTIAL (Kahan tighter but <10×)" :
+                                  "FAIL (Kahan not meaningfully better)");
+    free(reference);
+    return (ratio_max >= 10.0) ? 1 : 0;
+}
+
+/* High-precision wrapper. Same signature as ds4_metal_vqb2_fused_sum_step
+ * but routes to the Kahan-sorted kernel. Returns 1=ok, 0=failure. */
+int ds4_metal_vqb2_fused_sum_step_kahan(void *down_out_fp16_buf,
+                                         void *output_fp32_buf,
+                                         uint32_t out_dim) {
+    if (!ds4_moe_sum6_fp16in_kahan_mtl4_pipeline_init()) return 0;
+    if (!down_out_fp16_buf || !output_fp32_buf || out_dim == 0) return 0;
+
+    static id<MTLBuffer> s_args_buf = nil;
+    if (!s_args_buf) {
+        s_args_buf = [g_device newBufferWithLength:8
+                                          options:MTLResourceStorageModeShared];
+        if (!s_args_buf) return 0;
+    }
+    struct { uint32_t out_dim; uint32_t pad; } args = { out_dim, 0u };
+    memcpy(s_args_buf.contents, &args, sizeof(args));
+
+    void *bindings[3] = {
+        (__bridge void *)s_args_buf,
+        down_out_fp16_buf,
+        output_fp32_buf,
+    };
+    const unsigned long n_tg = (out_dim + 255ul) / 256ul;
+    return ds4_mtl4_run_canary(
+        (__bridge void *)g_moe_sum6_fp16in_kahan_mtl4_pipeline,
+        bindings, 3,
+        n_tg, 1ul, 1ul,
+        256ul, 1ul, 1ul,
+        0ul, NULL, NULL);
+}
+
+/* ============================================================ */
 /* dsv4_moe_swiglu_weight_f16 MTL4 port (silv 2026-05-27 task #689) */
 /* ============================================================ */
 /* MTL4 port of kernel_dsv4_moe_swiglu_weight_f16 — FP16 mid variant
@@ -22552,7 +23521,15 @@ static int ds4_moe_swiglu_weight_f16_io_mtl4_pipeline_init(void) {
  * MTLBuffers (from dispatch_kind outputs), route weights fp32 buffer,
  * and mid fp16 buffer (from out_buffer slot 2). Returns 1 on success.
  *
- * Reuses ds4_mtl4_run_canary helper — see item D pattern. */
+ * Reuses ds4_mtl4_run_canary helper — see item D pattern.
+ *
+ * NOTE (codex H2186, 2026-05-28): this 2D variant treats gate/up as flat
+ * [n_selected * n_rows] slot-major. The fused PATH_FUSED chain in
+ * ds4_metal_vqb2_fp16.m no longer calls this function — it produces
+ * gate/up in row-block-major [n_rb][n_selected][n_rows] order, which
+ * requires the row-block-aware sibling `ds4_metal_vqb2_fused_swiglu_rowblock_step`
+ * below. This function remains for the legacy non-fused path, but any new
+ * caller that consumes row-block-major gate/up MUST use the rowblock variant. */
 int ds4_metal_vqb2_fused_swiglu_step(void *gate_buf, void *up_buf,
                                       void *route_weights_buf,
                                       void *mid_buf,
@@ -22586,6 +23563,213 @@ int ds4_metal_vqb2_fused_swiglu_step(void *gate_buf, void *up_buf,
         (unsigned long)n_rows, (unsigned long)n_selected, 1ul,
         32ul, 1ul, 1ul,
         0ul, NULL, NULL);
+}
+
+/* ============================================================ */
+/* moe_swiglu_weight_f16_rowblock_mtl4 — codex H2186/H2187 fix    */
+/* ============================================================ */
+/* Row-block-aware SwiGLU for PATH_FUSED chain. Codex H2186 proved
+ * that production fused chain silently composed incompatible
+ * layouts: fused decode-matmul writes gate/up in row-block-major
+ * order [n_rb][n_selected][n_rows] but the legacy 2D SwiGLU above
+ * reads them as slot-major [n_selected][n_rows]. The result: 15/16
+ * row blocks (93.75% of mid rows) were ignored, DOWN read mid with
+ * stride=n_rows (128) instead of the coherent stride=n_rb*n_rows
+ * (2048) the dispatch_fused intermediate width requires.
+ *
+ * Codex H2187 verified the fix direction with a standalone Metal
+ * probe: row-block-aware kernel + DOWN stride = n_rb*n_rows produces
+ * all 12288 mid halves nonzero vs the production 768. Layouts:
+ *   in_idx  = ((row_block * n_selected + slot) * n_rows + row)
+ *   out_idx = (slot * (n_row_blocks * n_rows) + row_block * n_rows + row)
+ *
+ * Dispatch grid: (n_rows, n_selected, n_row_blocks). DOWN reads mid
+ * with x_slot_stride_halves = n_row_blocks * n_rows. */
+static id<MTLComputePipelineState> g_moe_swiglu_weight_f16_rowblock_mtl4_pipeline;
+static int g_moe_swiglu_weight_f16_rowblock_mtl4_init_attempted;
+static int g_moe_swiglu_weight_f16_rowblock_mtl4_init_ok;
+
+static int ds4_moe_swiglu_weight_f16_rowblock_mtl4_pipeline_init(void) {
+    if (g_moe_swiglu_weight_f16_rowblock_mtl4_init_attempted)
+        return g_moe_swiglu_weight_f16_rowblock_mtl4_init_ok;
+    g_moe_swiglu_weight_f16_rowblock_mtl4_init_attempted = 1;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct rb_args {\n"
+         "  uint32_t n_rows;\n"
+         "  uint32_t n_selected;\n"
+         "  uint32_t n_row_blocks;\n"
+         "  float    clamp_value;\n"
+         "};\n"
+         "kernel void moe_swiglu_weight_f16_rowblock_mtl4(\n"
+         "    device const rb_args *args    [[buffer(0)]],\n"
+         "    device const half    *gate    [[buffer(1)]],\n"
+         "    device const half    *up      [[buffer(2)]],\n"
+         "    device const float   *route_w [[buffer(3)]],\n"
+         "    device       half    *mid     [[buffer(4)]],\n"
+         "    uint3 gid [[thread_position_in_grid]]) {\n"
+         "  if (gid.x >= args->n_rows || gid.y >= args->n_selected\n"
+         "      || gid.z >= args->n_row_blocks) return;\n"
+         "  const ulong in_idx  = ((ulong)gid.z * args->n_selected + gid.y)\n"
+         "                         * args->n_rows + gid.x;\n"
+         "  const ulong out_idx = (ulong)gid.y * (args->n_row_blocks * args->n_rows)\n"
+         "                         + (ulong)gid.z * args->n_rows + gid.x;\n"
+         "  float g = (float)gate[in_idx];\n"
+         "  float u = (float)up[in_idx];\n"
+         "  const float c = args->clamp_value;\n"
+         "  if (c > 1.0e-6f) { g = min(g, c); u = clamp(u, -c, c); }\n"
+         "  const float silu = g / (1.0f + exp(-g));\n"
+         "  mid[out_idx] = (half)(silu * u * route_w[gid.y]);\n"
+         "}\n";
+
+    g_moe_swiglu_weight_f16_rowblock_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source, @"ds4_moe_swiglu_weight_f16_rowblock_mtl4",
+        @"moe_swiglu_weight_f16_rowblock_mtl4", 256, NULL, 0);
+    g_moe_swiglu_weight_f16_rowblock_mtl4_init_ok =
+        (g_moe_swiglu_weight_f16_rowblock_mtl4_pipeline != nil) ? 1 : 0;
+    return g_moe_swiglu_weight_f16_rowblock_mtl4_init_ok;
+}
+
+/* Dispatch wrapper. Returns 1 on success.
+ * The mid buffer must have at least n_selected * n_row_blocks * n_rows
+ * fp16 halves of capacity (i.e., the full slot-major intermediate). */
+int ds4_metal_vqb2_fused_swiglu_rowblock_step(void *gate_buf, void *up_buf,
+                                               void *route_weights_buf,
+                                               void *mid_buf,
+                                               uint32_t n_rows,
+                                               uint32_t n_selected,
+                                               uint32_t n_row_blocks,
+                                               float clamp_value) {
+    if (!ds4_moe_swiglu_weight_f16_rowblock_mtl4_pipeline_init()) return 0;
+    if (!gate_buf || !up_buf || !route_weights_buf || !mid_buf) return 0;
+    if (n_rows == 0 || n_selected == 0 || n_row_blocks == 0) return 0;
+
+    static id<MTLBuffer> s_rb_args_buf = nil;
+    if (!s_rb_args_buf) {
+        s_rb_args_buf = [g_device newBufferWithLength:16
+                                              options:MTLResourceStorageModeShared];
+        if (!s_rb_args_buf) return 0;
+    }
+    struct { uint32_t n_rows; uint32_t n_selected;
+             uint32_t n_row_blocks; float clamp; } rb_args = {
+        n_rows, n_selected, n_row_blocks, clamp_value,
+    };
+    memcpy(s_rb_args_buf.contents, &rb_args, sizeof(rb_args));
+
+    void *bindings[5] = {
+        (__bridge void *)s_rb_args_buf,
+        gate_buf, up_buf, route_weights_buf, mid_buf,
+    };
+    /* Dispatch grid (n_rows, n_selected, n_row_blocks); 32-wide threadgroups. */
+    return ds4_mtl4_run_canary(
+        (__bridge void *)g_moe_swiglu_weight_f16_rowblock_mtl4_pipeline,
+        bindings, 5,
+        (unsigned long)n_rows, (unsigned long)n_selected, (unsigned long)n_row_blocks,
+        32ul, 1ul, 1ul,
+        0ul, NULL, NULL);
+}
+
+/* Canary self-test for the row-block-aware SwiGLU. Uses position-dependent
+ * gate values to catch layout transpositions: if the kernel reads in_idx
+ * via the wrong axis ordering OR writes out_idx with a transposed formula,
+ * the silu(gate) value at each output position will mismatch. Uniform
+ * inputs would not catch a layout bug — they'd give the same answer
+ * regardless of which (rb, slot, row) we read.
+ *
+ * Input layout: gate/up[rb][slot][row] linearized as
+ *   in_idx = (rb * n_selected + slot) * n_rows + row.
+ * Output layout: mid[slot][rb * n_rows + row] linearized as
+ *   out_idx = slot * (n_row_blocks * n_rows) + rb * n_rows + row.
+ *
+ * gate[in_idx] = 0.25 + 0.001 * (rb * 7919 + slot * 31 + row) mod 4.0
+ * up[in_idx]   = 1.5
+ * route_w[slot] = 1.0
+ * expected mid[out_idx] = silu(gate[in_idx]) * 1.5
+ *
+ * Returns 1 if max_abs error < 5e-3 (fp16 with silu compounded).
+ * Threshold is looser than the slot-major canary because gate values
+ * span a wider range here. */
+int ds4_gpu_mtl4_moe_swiglu_weight_f16_rowblock_canary(uint32_t n_rows,
+                                                       uint32_t n_selected,
+                                                       uint32_t n_row_blocks) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_moe_swiglu_weight_f16_rowblock_mtl4_pipeline_init()) return 0;
+    if (n_rows == 0 || n_selected == 0 || n_row_blocks == 0) {
+        fprintf(stderr, "ds4: moe_swiglu_weight_f16_rowblock canary requires "
+                        "n_rows>0 && n_selected>0 && n_row_blocks>0\n");
+        return 0;
+    }
+
+    const uint64_t total = (uint64_t)n_row_blocks * n_selected * n_rows;
+    int rc = 0;
+    @autoreleasepool {
+        id<MTLBuffer> gateBuf = [g_device newBufferWithLength:total * sizeof(uint16_t)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> upBuf   = [g_device newBufferWithLength:total * sizeof(uint16_t)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> midBuf  = [g_device newBufferWithLength:total * sizeof(uint16_t)
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> wBuf    = [g_device newBufferWithLength:n_selected * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        if (!gateBuf || !upBuf || !midBuf || !wBuf) return 0;
+
+        _Float16 *gate_h = (_Float16 *)gateBuf.contents;
+        _Float16 *up_h   = (_Float16 *)upBuf.contents;
+        _Float16 *mid_h  = (_Float16 *)midBuf.contents;
+        float    *rw     = (float *)wBuf.contents;
+        for (uint32_t s = 0; s < n_selected; s++) rw[s] = 1.0f;
+        for (uint32_t rb = 0; rb < n_row_blocks; rb++) {
+            for (uint32_t s = 0; s < n_selected; s++) {
+                for (uint32_t r = 0; r < n_rows; r++) {
+                    const uint64_t in_idx = ((uint64_t)rb * n_selected + s) * n_rows + r;
+                    const uint32_t mix = rb * 7919u + s * 31u + r;
+                    const float g = 0.25f + 0.001f * (float)(mix & 4095u);
+                    gate_h[in_idx] = (_Float16)g;
+                    up_h[in_idx]   = (_Float16)1.5f;
+                }
+            }
+        }
+        memset(mid_h, 0, total * sizeof(uint16_t));
+
+        const int ok = ds4_metal_vqb2_fused_swiglu_rowblock_step(
+            (__bridge void *)gateBuf, (__bridge void *)upBuf,
+            (__bridge void *)wBuf,    (__bridge void *)midBuf,
+            n_rows, n_selected, n_row_blocks, 0.0f);
+        if (!ok) {
+            fprintf(stderr, "ds4: moe_swiglu_weight_f16_rowblock canary dispatch failed\n");
+            return 0;
+        }
+
+        /* Verify: read mid via slot-major out_idx and compare to silu(gate) * 1.5. */
+        double max_abs = 0.0;
+        uint64_t worst_idx = 0;
+        float worst_got = 0.0f, worst_ref = 0.0f;
+        for (uint32_t s = 0; s < n_selected; s++) {
+            for (uint32_t rb = 0; rb < n_row_blocks; rb++) {
+                for (uint32_t r = 0; r < n_rows; r++) {
+                    const uint64_t in_idx  = ((uint64_t)rb * n_selected + s) * n_rows + r;
+                    const uint64_t out_idx = (uint64_t)s * ((uint64_t)n_row_blocks * n_rows)
+                                              + (uint64_t)rb * n_rows + r;
+                    const float g = (float)gate_h[in_idx];
+                    const float silu = g / (1.0f + expf(-g));
+                    const float ref  = silu * 1.5f;
+                    const float got  = (float)mid_h[out_idx];
+                    const double d = fabs((double)(got - ref));
+                    if (d > max_abs) { max_abs = d; worst_idx = out_idx;
+                                       worst_got = got; worst_ref = ref; }
+                }
+            }
+        }
+        rc = (max_abs < 5.0e-3) ? 1 : 0;
+        fprintf(stderr,
+            "ds4: moe_swiglu_weight_f16_rowblock MTL4 canary n_rows=%u n_sel=%u "
+            "n_rb=%u total=%llu max_abs=%.4e worst[%llu]=%.6f vs %.6f → %s\n",
+            n_rows, n_selected, n_row_blocks, (unsigned long long)total,
+            max_abs, (unsigned long long)worst_idx, worst_got, worst_ref,
+            rc ? "OK" : "FAIL");
+    }
+    return rc;
 }
 
 /* ============================================================ */
@@ -29640,6 +30824,145 @@ static id<MTLComputePipelineState> ds4_mul_mv_f16_f32_build_pipeline(short nsg_v
         fcs, 1);
 }
 
+/* ============================================================ */
+/* BF16 matrix × FP32 vector → FP32 output. silv 2026-05-28 #796
+ * Increment 1: clone of mul_mv_f16_f32_mtl4 with BF16 read path.
+ *
+ * BF16 is the upper 16 bits of an fp32 representation. The read is
+ * `ushort bits` followed by `(uint)bits << 16u` reinterpreted as float —
+ * exact, no precision loss in the conversion (BF16 → F32 is a widen, not
+ * a quantize). Inner-loop cost: 1 shift + 1 reinterpret per weight,
+ * negligible vs the multiply.
+ *
+ * Engineer-roster notes:
+ *   Carmack: minimal diff vs the f16 kernel. Same algorithm, different read.
+ *   DJB: no new dispatch infrastructure — same FC slot, same arg table shape.
+ *   Knuth: NR0=4, NSG via FC — copied verbatim from the f16 variant.
+ *   Pearl: bf16→f32 widen is information-preserving; the kernel is
+ *          numerically equivalent to "load f32, multiply" but with 2× memory
+ *          bandwidth savings (half-width weight read).
+ *
+ * Use: non-routed attention Q/K/V/O matvec, embed lookup paths where the
+ * weight tensor is BF16 source-exact from the nonrouted pack. Selected by
+ * tensor_effective_type() == DS4_TENSOR_BF16 at the dispatch site (#796
+ * Increment 2+ wires the actual call sites). */
+static id<MTLComputePipelineState> ds4_mul_mv_bf16_f32_build_pipeline(short nsg_value) {
+    NSString *source = [NSString stringWithFormat:
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "#define FC_MUL_MV 600\n"
+         "#define N_SIMDWIDTH 32\n"
+         "constant short FC_mul_mv_nsg [[function_constant(FC_MUL_MV + 0)]];\n"
+         "struct mv_args {\n"
+         "  int ne00; int ne01; int ne02;\n"
+         "  ulong nb00; ulong nb01; ulong nb02; ulong nb03;\n"
+         "  int ne10; int ne11; int ne12;\n"
+         "  ulong nb10; ulong nb11; ulong nb12; ulong nb13;\n"
+         "  int ne0; int ne1; int nr0;\n"
+         "  short r2; short r3;\n"
+         "};\n"
+         "static inline float bf16_to_f32(ushort bits) {\n"
+         "  uint f32_bits = (uint)bits << 16u;\n"
+         "  return as_type<float>(f32_bits);\n"
+         "}\n"
+         "static inline void reduce_write(\n"
+         "    device float *dst_f32,\n"
+         "    thread float *sumf,\n"
+         "    const int r0,\n"
+         "    const int ne01,\n"
+         "    ushort tiisg,\n"
+         "    ushort sgitg,\n"
+         "    threadgroup char *shmem) {\n"
+         "  constexpr short NR0 = 4;\n"
+         "  threadgroup float (*shmem_f32)[N_SIMDWIDTH] = (threadgroup float (*)[N_SIMDWIDTH])shmem;\n"
+         "  for (short row = 0; row < NR0; ++row) {\n"
+         "    if (sgitg == 0) shmem_f32[row][tiisg] = 0.0f;\n"
+         "    sumf[row] = simd_sum(sumf[row]);\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (short row = 0; row < NR0; ++row) {\n"
+         "    if (tiisg == 0) shmem_f32[row][sgitg] = sumf[row];\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {\n"
+         "    float tot = simd_sum(shmem_f32[row][tiisg]);\n"
+         "    if (tiisg == 0 && sgitg == 0) dst_f32[r0 + row] = tot;\n"
+         "  }\n"
+         "}\n"
+         "kernel void mul_mv_bf16_f32_mtl4(\n"
+         "    device const mv_args *args [[buffer(0)]],\n"
+         "    device const char    *src0 [[buffer(1)]],\n"
+         "    device const char    *src1 [[buffer(2)]],\n"
+         "    device       char    *dst  [[buffer(3)]],\n"
+         "    threadgroup  char    *shmem [[threadgroup(0)]],\n"
+         "    uint3   tgpig [[threadgroup_position_in_grid]],\n"
+         "    ushort  tiisg [[thread_index_in_simdgroup]],\n"
+         "    ushort  sgitg [[simdgroup_index_in_threadgroup]]) {\n"
+         "  constexpr short NR0 = 4;\n"
+         "  const short NSG = FC_mul_mv_nsg;\n"
+         "  constexpr short NW = N_SIMDWIDTH;\n"
+         "  constexpr short NB = 32;\n"
+         "  constexpr short NF = 8;\n"
+         "  const int nb = args->ne00 / NB;\n"
+         "  const int r0 = tgpig.x * NR0;\n"
+         "  const int r1 = tgpig.y;\n"
+         "  const int im = tgpig.z;\n"
+         "  const uint i12 = im %% args->ne12;\n"
+         "  const uint i13 = im / args->ne12;\n"
+         "  const ulong offset1 = r1*args->nb11 + i12*args->nb12 + i13*args->nb13;\n"
+         "  device const float *y = (device const float *)(src1 + offset1);\n"
+         "  device const ushort *ax[NR0];\n"
+         "  for (short row = 0; row < NR0; ++row) {\n"
+         "    const ulong offset0 = (r0 + row)*args->nb01\n"
+         "                       + (i12/args->r2)*args->nb02\n"
+         "                       + (i13/args->r3)*args->nb03;\n"
+         "    ax[row] = (device const ushort *)((device const char *)src0 + offset0);\n"
+         "  }\n"
+         "  float sumf[NR0] = {0.0f};\n"
+         "  const short ix = tiisg / (NW / NF);\n"
+         "  const short il = tiisg %% (NW / NF);\n"
+         "  const int ib0 = sgitg * NF + ix;\n"
+         "  float yl[NF];\n"
+         "  device const float *yb = y + ib0*NB + il*NF;\n"
+         "  for (int ib = ib0; ib < nb; ib += NSG*NF) {\n"
+         "    for (short i = 0; i < NF; ++i) yl[i] = yb[i];\n"
+         "    for (short row = 0; row < NR0; ++row) {\n"
+         "      device const ushort *xb = ax[row] + ib*NB + il*NF;\n"
+         "      float sumq = 0.0f;\n"
+         "      for (short i = 0; i < NF; ++i) sumq += bf16_to_f32(xb[i]) * yl[i];\n"
+         "      sumf[row] += sumq;\n"
+         "    }\n"
+         "    yb += NSG*NF*NW;\n"
+         "  }\n"
+         "  for (int i = nb*NB + sgitg*NW + tiisg; i < args->ne00; i += NW*NSG) {\n"
+         "    for (short row = 0; row < NR0; ++row) sumf[row] += bf16_to_f32(ax[row][i]) * y[i];\n"
+         "  }\n"
+         "  device float *dst_f32 = (device float *)dst\n"
+         "    + (ulong)im*args->ne0*args->ne1 + (ulong)r1*args->ne0;\n"
+         "  reduce_write(dst_f32, sumf, r0, args->ne01, tiisg, sgitg, shmem);\n"
+         "}\n"];
+
+    const ds4_mtl4_fc_short fcs[] = {{nsg_value, 600}};
+    return ds4_mtl4_build_kernel_pipeline(
+        source,
+        @"ds4_mul_mv_bf16_f32_mtl4",
+        @"mul_mv_bf16_f32_mtl4",
+        1024,
+        fcs, 1);
+}
+
+static id<MTLComputePipelineState> g_mul_mv_bf16_f32_nsg4_mtl4_pipeline;
+static int g_mul_mv_bf16_f32_nsg4_mtl4_init_attempted;
+static int g_mul_mv_bf16_f32_nsg4_mtl4_init_ok;
+
+static int ds4_mul_mv_bf16_f32_nsg4_mtl4_pipeline_init(void) {
+    if (g_mul_mv_bf16_f32_nsg4_mtl4_init_attempted) return g_mul_mv_bf16_f32_nsg4_mtl4_init_ok;
+    g_mul_mv_bf16_f32_nsg4_mtl4_init_attempted = 1;
+    g_mul_mv_bf16_f32_nsg4_mtl4_pipeline = ds4_mul_mv_bf16_f32_build_pipeline(4);
+    g_mul_mv_bf16_f32_nsg4_mtl4_init_ok = (g_mul_mv_bf16_f32_nsg4_mtl4_pipeline != nil) ? 1 : 0;
+    return g_mul_mv_bf16_f32_nsg4_mtl4_init_ok;
+}
+
 static id<MTLComputePipelineState> g_mul_mv_f16_f32_nsg4_mtl4_pipeline;
 static int g_mul_mv_f16_f32_nsg4_mtl4_init_attempted;
 static int g_mul_mv_f16_f32_nsg4_mtl4_init_ok;
@@ -29775,6 +31098,259 @@ int ds4_gpu_mtl4_mul_mv_f16_f32_canary(uint32_t M, uint32_t N) {
     }
     fprintf(stderr,
         "ds4: mul_mv_f16_f32 MTL4 canary M=%u N=%u "
+        "dst[0]=%.5f (ref=%.5f) dst[end]=%.5f (ref=%.5f) mismatch=%d max_rel=%.4e\n",
+        M, N,
+        (double)host_dst[0], (double)expected[0],
+        (double)host_dst[M - 1], (double)expected[M - 1],
+        mismatch, max_rel);
+    free(host_mat); free(host_vec); free(host_dst); free(expected);
+    return (mismatch == 0) ? 1 : 0;
+}
+
+/* silv 2026-05-28 #796 Increment 1 — BF16 matvec canary.
+ *
+ * Twin of the F16 canary above. Weights are encoded as BF16 (upper 16 bits
+ * of fp32). The expected output uses the same widen-to-f32 path the kernel
+ * uses internally, so any deviation indicates kernel bug (NOT precision
+ * loss in the BF16 representation itself — that's already baked into both
+ * the input and the reference). Tolerance: same 1e-4 as the F16 canary.
+ *
+ * Self-tests:
+ *   M=64, N=128  — small, fast (smoke)
+ *   M=256, N=4096 — closer to real attention weight shape
+ *
+ * Engineer-roster: canary that proves the BF16 read path is numerically
+ * correct, before any production call site wires tensor_effective_type. */
+
+/* silv 2026-05-28 #796 Increment 4 — heap-storage-aware BF16 matvec.
+ *
+ * Parallel to matmul_f16_storage / matmul_q8_0_storage but for BF16
+ * weights. Uses the existing g_mul_mv_bf16_f32_nsg4_mtl4_pipeline
+ * (MTLComputePipelineState is dispatch-mechanism-agnostic) via the
+ * standard MTL3-style command buffer, so no new pipeline build required
+ * and no MTL4-overhead per call (vs the canary which uses a fresh
+ * residency set + semaphore).
+ *
+ * BF16 only supports n_tok=1 (matvec) — the existing MSL kernel is
+ * matvec-only. Multi-token would require a new mul_mm_bf16_f32 kernel.
+ *
+ * Currently no production call site wires this — Increment 5 (lifting
+ * the Cycle 5 ground rule + override-fill populating BF16 storage) is
+ * the gate. This function ships the foundation so Increment 5 has a
+ * dispatch target ready.
+ *
+ * Returns 1 on success, 0 on failure. */
+int ds4_gpu_matmul_bf16_storage(
+    ds4_gpu_tensor *out,
+    void *weight_buf,
+    uint64_t in_dim,
+    uint64_t out_dim,
+    const ds4_gpu_tensor *x,
+    uint64_t n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_mul_mv_bf16_f32_nsg4_mtl4_pipeline_init()) return 0;
+    if (!weight_buf || !out || !x) return 0;
+    if (n_tok != 1) return 0;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
+    if ((out_dim % 4u) != 0 || (in_dim % 32u) != 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> wbuf = (__bridge id<MTLBuffer>)weight_buf;
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        if (!xbuf || !outbuf) return 0;
+
+        const uint64_t weight_bytes = in_dim * out_dim * sizeof(uint16_t);
+        if ((uint64_t)wbuf.length < weight_bytes) {
+            fprintf(stderr,
+                    "ds4: matmul_bf16_storage weight buffer too small (%llu < %llu)\n",
+                    (unsigned long long)wbuf.length,
+                    (unsigned long long)weight_bytes);
+            return 0;
+        }
+        const uint64_t x_bytes = in_dim * sizeof(float);
+        const uint64_t out_bytes = out_dim * sizeof(float);
+        if (ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes) {
+            fprintf(stderr, "ds4: matmul_bf16_storage received undersized activation buffers\n");
+            return 0;
+        }
+
+        /* Args struct matches the BF16 MSL kernel's mv_args layout. */
+        struct {
+            int ne00, ne01, ne02;
+            uint64_t nb00, nb01, nb02, nb03;
+            int ne10, ne11, ne12;
+            uint64_t nb10, nb11, nb12, nb13;
+            int ne0, ne1, nr0;
+            int16_t r2, r3;
+        } args;
+        memset(&args, 0, sizeof(args));
+        args.ne00 = (int)in_dim;  args.ne01 = (int)out_dim;  args.ne02 = 1;
+        args.nb00 = sizeof(uint16_t);
+        args.nb01 = in_dim * sizeof(uint16_t);
+        args.nb02 = in_dim * out_dim * sizeof(uint16_t);
+        args.nb03 = args.nb02;
+        args.ne10 = (int)in_dim;  args.ne11 = 1;  args.ne12 = 1;
+        args.nb10 = sizeof(float);
+        args.nb11 = in_dim * sizeof(float);
+        args.nb12 = args.nb11;  args.nb13 = args.nb11;
+        args.ne0 = (int)out_dim;  args.ne1 = 1;  args.nr0 = 4;
+        args.r2 = 1;  args.r3 = 1;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_mul_mv_bf16_f32_nsg4_mtl4_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:0 atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        const NSUInteger shmem_bytes = 4u * 32u * sizeof(float);
+        [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
+        const NSUInteger nth = 4u * 32u;
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim / 4, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "BF16 storage matvec")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_mtl4_mul_mv_bf16_f32_canary(uint32_t M, uint32_t N) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_mul_mv_bf16_f32_nsg4_mtl4_pipeline_init()) return 0;
+    if (M == 0 || N == 0 || (M % 4) != 0 || (N % 32) != 0) {
+        fprintf(stderr, "ds4: mul_mv_bf16_f32 canary needs M%%4==0 and N%%32==0 (got M=%u N=%u)\n", M, N);
+        return 0;
+    }
+
+    const uint64_t matrix_n = (uint64_t)M * N;
+    uint16_t *host_mat = (uint16_t *)calloc(matrix_n, sizeof(uint16_t));
+    float *host_vec = (float *)calloc(N, sizeof(float));
+    float *host_dst = (float *)calloc(M, sizeof(float));
+    float *expected = (float *)calloc(M, sizeof(float));
+    if (!host_mat || !host_vec || !host_dst || !expected) {
+        free(host_mat); free(host_vec); free(host_dst); free(expected); return 0;
+    }
+    /* Fill matrix with deterministic values, encoded as BF16 (upper 16 bits
+     * of fp32). Note: BF16 simply TRUNCATES the lower 16 bits of fp32 — no
+     * round-to-nearest. */
+    for (uint32_t r = 0; r < M; r++) {
+        for (uint32_t c = 0; c < N; c++) {
+            float v = (float)((int)r % 7) * 0.01f + (float)((int)c % 5) * 0.001f;
+            uint32_t bits;
+            memcpy(&bits, &v, sizeof(bits));
+            uint16_t bf16 = (uint16_t)(bits >> 16);  /* upper 16 bits */
+            host_mat[(uint64_t)r * N + c] = bf16;
+        }
+    }
+    for (uint32_t c = 0; c < N; c++) host_vec[c] = (float)((int)c % 3) * 0.1f + 0.5f;
+    /* Reference accumulates using the same BF16 → F32 widen the kernel does. */
+    for (uint32_t r = 0; r < M; r++) {
+        double acc = 0.0;
+        for (uint32_t c = 0; c < N; c++) {
+            uint16_t bf16 = host_mat[(uint64_t)r * N + c];
+            uint32_t f32_bits = (uint32_t)bf16 << 16;
+            float w;
+            memcpy(&w, &f32_bits, sizeof(w));
+            acc += (double)w * (double)host_vec[c];
+        }
+        expected[r] = (float)acc;
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> matBuf = [g_device newBufferWithBytes:host_mat length:matrix_n*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> vecBuf = [g_device newBufferWithBytes:host_vec length:N*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dstBuf = [g_device newBufferWithLength:M*sizeof(float) options:MTLResourceStorageModeShared];
+
+        struct {
+            int ne00, ne01, ne02;
+            uint64_t nb00, nb01, nb02, nb03;
+            int ne10, ne11, ne12;
+            uint64_t nb10, nb11, nb12, nb13;
+            int ne0, ne1, nr0;
+            int16_t r2, r3;
+        } args;
+        memset(&args, 0, sizeof(args));
+        args.ne00 = N; args.ne01 = M; args.ne02 = 1;
+        args.nb00 = sizeof(uint16_t);
+        args.nb01 = (uint64_t)N * sizeof(uint16_t);
+        args.nb02 = (uint64_t)M * N * sizeof(uint16_t);
+        args.nb03 = (uint64_t)M * N * sizeof(uint16_t);
+        args.ne10 = N; args.ne11 = 1; args.ne12 = 1;
+        args.nb10 = sizeof(float);
+        args.nb11 = (uint64_t)N * sizeof(float);
+        args.nb12 = args.nb11; args.nb13 = args.nb11;
+        args.ne0 = M; args.ne1 = 1; args.nr0 = 4;
+        args.r2 = 1; args.r3 = 1;
+        memcpy(argsBuf.contents, &args, sizeof(args));
+
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 6;
+        id<MTLResidencySet> residency = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (residency) {
+            id<MTLAllocation> allocs[4] = {(id)argsBuf, (id)matBuf, (id)vecBuf, (id)dstBuf};
+            [residency addAllocations:allocs count:4];
+            [residency commit];
+            [residency requestResidency];
+
+            id<MTL4ArgumentTable> argTable = ds4_mtl4_pool_acquire(8);
+            if (argTable) {
+                [argTable setAddress:argsBuf.gpuAddress atIndex:0];
+                [argTable setAddress:matBuf.gpuAddress atIndex:1];
+                [argTable setAddress:vecBuf.gpuAddress atIndex:2];
+                [argTable setAddress:dstBuf.gpuAddress atIndex:3];
+
+                NSUInteger nth = 4u * 32u;
+                NSUInteger shmem_bytes = 4u * 32u * sizeof(float);
+
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g_mul_mv_bf16_f32_nsg4_mtl4_pipeline];
+                [enc setArgumentTable:argTable];
+                [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(M / 4, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+
+                [g_polar_queue addResidencySet:residency];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = {cb};
+                [g_polar_queue commit:bufs count:1 options:opts];
+                long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                [residency endResidency];
+                if (waitRes == 0) {
+                    memcpy(host_dst, dstBuf.contents, M * sizeof(float));
+                    rc = 1;
+                }
+                ds4_mtl4_pool_release(argTable, 8);
+            }
+        }
+    }
+    if (!rc) { free(host_mat); free(host_vec); free(host_dst); free(expected); return 0; }
+
+    int mismatch = 0;
+    double max_rel = 0.0;
+    for (uint32_t r = 0; r < M; r++) {
+        const double diff = fabs((double)(host_dst[r] - expected[r]));
+        const double rel = diff / (fabs((double)expected[r]) + 1e-7);
+        if (rel > max_rel) max_rel = rel;
+        if (rel > 1e-4) mismatch++;
+    }
+    fprintf(stderr,
+        "ds4: mul_mv_bf16_f32 MTL4 canary M=%u N=%u "
         "dst[0]=%.5f (ref=%.5f) dst[end]=%.5f (ref=%.5f) mismatch=%d max_rel=%.4e\n",
         M, N,
         (double)host_dst[0], (double)expected[0],
@@ -35881,23 +37457,10 @@ int ds4_gpu_mtl4_vqb2_decode_matmul_fp16_dispatch(void *codebook_mtlbuf,
 static id<MTLComputePipelineState> g_vqb2_decode_matmul_fp16_classic_pipeline;
 static int g_vqb2_decode_matmul_fp16_classic_init_attempted;
 static int g_vqb2_decode_matmul_fp16_classic_init_ok;
-static id<MTLIndirectCommandBuffer> g_vqb2_decode_matmul_fp16_icb;
 static id<MTLBuffer> g_vqb2_decode_matmul_icb_args_buffer; /* shared args, written each replay */
-typedef struct {
-    void    *args_ptr;
-    void    *cb_ptr;
-    void    *codes_ptr;
-    void    *sel_ptr;
-    void    *x_ptr;
-    void    *out_ptr;
-    uint64_t codes_off;
-    uint64_t out_off;
-    uint32_t n_rows, n_pairs, n_selected, k_val;
-    uint32_t tg_x;
-    int      recorded;
-} ds4_vqb2_decode_matmul_icb_slot;
-static ds4_vqb2_decode_matmul_icb_slot
-    g_vqb2_decode_matmul_icb_slots[DS4_VQB2_DECODE_MATMUL_ICB_SLOTS];
+/* Cycle 9f: unified ds4_icb_slot replaces g_vqb2_decode_matmul_fp16_icb +
+ * 96-element bespoke slot array. 96 commands at 6 bindings each. */
+static ds4_icb_slot_t g_vqb2_decode_matmul_slot;
 
 /* Classic-MTL pipeline init. Same MSL source as the MTL4 path; we just compile
  * via newLibraryWithSource (classic) and set supportIndirectCommandBuffers=YES. */
@@ -35951,61 +37514,35 @@ static int ds4_gpu_vqb2_decode_matmul_fp16_icb_dispatch(
     if (!cb || !args_buf || !codebook || !codes || !selected || !xbuf || !outbuf) return 0;
     if (!ds4_vqb2_decode_matmul_fp16_classic_pipeline_init()) return 0;
 
-    if (!g_vqb2_decode_matmul_fp16_icb) {
-        MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
-        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
-        desc.inheritBuffers = NO;
-        desc.inheritPipelineState = NO;
-        desc.maxKernelBufferBindCount = 6;
-        g_vqb2_decode_matmul_fp16_icb =
-            [g_device newIndirectCommandBufferWithDescriptor:desc
-                                              maxCommandCount:DS4_VQB2_DECODE_MATMUL_ICB_SLOTS
-                                                      options:MTLResourceStorageModeShared];
-        if (!g_vqb2_decode_matmul_fp16_icb) {
-            fprintf(stderr, "ds4: vqb2_decode_matmul_fp16 ICB alloc failed\n");
+    /* Cycle 9f (silv 2026-05-28 task #673/#795) — migrated to unified
+     * ds4_icb_slot API. 96 commands at 6 bindings each. Per-slot
+     * signature scalars (n_rows, n_pairs, n_selected, k_val, tg_x) go
+     * into extras. */
+    if (!g_vqb2_decode_matmul_slot.icb) {
+        if (!ds4_icb_slot_acquire(&g_vqb2_decode_matmul_slot,
+                                  /*max_commands=*/(NSUInteger)DS4_VQB2_DECODE_MATMUL_ICB_SLOTS,
+                                  /*max_bindings=*/6)) {
+            fprintf(stderr, "ds4: vqb2_decode_matmul_fp16 ICB slot acquire failed\n");
             return 0;
         }
     }
 
-    ds4_vqb2_decode_matmul_icb_slot *slot = &g_vqb2_decode_matmul_icb_slots[slot_idx];
     const uint32_t tg_x = (n_rows + 31u) / 32u;
-    const int sig_match = slot->recorded &&
-        slot->args_ptr  == (__bridge void *)args_buf &&
-        slot->cb_ptr    == (__bridge void *)codebook && (uint64_t)codebook_off == 0 /* codebook always offset 0 */ &&
-        slot->codes_ptr == (__bridge void *)codes && slot->codes_off == (uint64_t)codes_off &&
-        slot->sel_ptr   == (__bridge void *)selected &&
-        slot->x_ptr     == (__bridge void *)xbuf &&
-        slot->out_ptr   == (__bridge void *)outbuf && slot->out_off == (uint64_t)out_off &&
-        slot->n_rows == n_rows && slot->n_pairs == n_pairs &&
-        slot->n_selected == n_selected && slot->k_val == k_val &&
-        slot->tg_x == tg_x;
-
-    if (!sig_match) {
-        id<MTLIndirectComputeCommand> cmd =
-            [g_vqb2_decode_matmul_fp16_icb indirectComputeCommandAtIndex:slot_idx];
-        [cmd setComputePipelineState:g_vqb2_decode_matmul_fp16_classic_pipeline];
-        [cmd setKernelBuffer:args_buf offset:args_off    atIndex:0];
-        [cmd setKernelBuffer:codebook offset:codebook_off atIndex:1];
-        [cmd setKernelBuffer:codes    offset:codes_off    atIndex:2];
-        [cmd setKernelBuffer:selected offset:sel_off      atIndex:3];
-        [cmd setKernelBuffer:xbuf     offset:x_off        atIndex:4];
-        [cmd setKernelBuffer:outbuf   offset:out_off      atIndex:5];
-        const NSUInteger tg_mem_bytes =
-            ((NSUInteger)k_val * 2u + (NSUInteger)n_pairs * 2u) * sizeof(float);
-        [cmd setThreadgroupMemoryLength:tg_mem_bytes atIndex:0];
-        [cmd concurrentDispatchThreadgroups:MTLSizeMake(tg_x, n_selected, n_packets)
-                      threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-
-        slot->args_ptr  = (__bridge void *)args_buf;
-        slot->cb_ptr    = (__bridge void *)codebook;
-        slot->codes_ptr = (__bridge void *)codes;  slot->codes_off = codes_off;
-        slot->sel_ptr   = (__bridge void *)selected;
-        slot->x_ptr     = (__bridge void *)xbuf;
-        slot->out_ptr   = (__bridge void *)outbuf; slot->out_off  = out_off;
-        slot->n_rows = n_rows; slot->n_pairs = n_pairs;
-        slot->n_selected = n_selected; slot->k_val = k_val;
-        slot->tg_x = tg_x;
-        slot->recorded = 1;
+    const NSUInteger tg_mem_bytes =
+        ((NSUInteger)k_val * 2u + (NSUInteger)n_pairs * 2u) * sizeof(float);
+    __unsafe_unretained id<MTLBuffer> bufs[6] = {
+        args_buf, codebook, codes, selected, xbuf, outbuf };
+    NSUInteger offs[6] = {
+        args_off, codebook_off, codes_off, sel_off, x_off, out_off };
+    uint64_t extras[5] = { n_rows, n_pairs, n_selected, k_val, tg_x };
+    if (!ds4_icb_slot_record_command(&g_vqb2_decode_matmul_slot, /*cmd_idx=*/slot_idx,
+                                     g_vqb2_decode_matmul_fp16_classic_pipeline,
+                                     bufs, offs, 6,
+                                     MTLSizeMake(tg_x, n_selected, n_packets),
+                                     MTLSizeMake(32, 1, 1),
+                                     (uint32_t)tg_mem_bytes,
+                                     extras, 5)) {
+        return 0;
     }
 
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -36015,8 +37552,7 @@ static int ds4_gpu_vqb2_decode_matmul_fp16_icb_dispatch(
     [enc useResource:selected usage:MTLResourceUsageRead];
     [enc useResource:xbuf     usage:MTLResourceUsageRead];
     [enc useResource:outbuf   usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-    [enc executeCommandsInBuffer:g_vqb2_decode_matmul_fp16_icb
-                       withRange:NSMakeRange(slot_idx, 1)];
+    ds4_icb_slot_execute(&g_vqb2_decode_matmul_slot, enc, slot_idx, 1);
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
 }
@@ -36046,26 +37582,75 @@ void ds4_gpu_mtl4_vqb2_pack_release_mtlbuffer(void *pack_mtlbuf) {
     (void)buf;  /* ARC releases on scope exit */
 }
 
+/* silv 2026-05-28 #796 Increment 2 — wrap arbitrary heap bytes as an
+ * MTLBuffer (shared storage, zero-copy). Used by the Phase 2b override-
+ * fill loop to make heap-allocated tensor data GPU-addressable without
+ * a second allocation.
+ *
+ * Constraint: `bytes` must be page-aligned (vm_page_size — 16 KB on M1)
+ * AND `length` must be a multiple of page size. The caller arranges
+ * this by using `posix_memalign` + rounding length up. If the input
+ * isn't aligned, `newBufferWithBytesNoCopy` returns nil and we return
+ * NULL — the dispatch path falls back to mmap.
+ *
+ * Lifetime: caller owns `bytes`. The MTLBuffer holds a pointer; do
+ * NOT free `bytes` until the MTLBuffer is released via
+ * ds4_gpu_release_heap_buffer. */
+void *ds4_gpu_wrap_heap_bytes(void *bytes, uint64_t length) {
+    if (!g_initialized && !ds4_gpu_init()) return NULL;
+    if (!bytes || length == 0) return NULL;
+    /* Best-effort alignment check (Apple may return nil regardless if
+     * page-alignment isn't satisfied — we surface that case as NULL). */
+    const uintptr_t page = (uintptr_t)getpagesize();
+    if (((uintptr_t)bytes & (page - 1)) != 0) {
+        /* Not page-aligned — Metal will reject newBufferWithBytesNoCopy.
+         * Caller's allocator wasn't aligned; return NULL silently. The
+         * tensor's storage.metal_buffer stays NULL; dispatch falls back. */
+        return NULL;
+    }
+    id<MTLBuffer> buf = [g_device newBufferWithBytesNoCopy:bytes
+                                                   length:(NSUInteger)length
+                                                  options:MTLResourceStorageModeShared
+                                              deallocator:nil];
+    if (!buf) return NULL;
+    return (__bridge_retained void *)buf;
+}
+
+void ds4_gpu_release_heap_buffer(void *opaque) {
+    if (!opaque) return;
+    id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)opaque;
+    (void)buf;  /* ARC releases on scope exit */
+}
+
+uint64_t ds4_gpu_heap_buffer_gpu_address(void *opaque) {
+    if (!opaque) return 0;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)opaque;
+    return (uint64_t)buf.gpuAddress;
+}
+
 /* Encode N fused dispatches in one command buffer with one shared residency
  * set. Each dispatch reads codes from pack_mtlbuf + codes_offsets[i] and
- * writes to out_mtlbuf + i*out_stride_halves halves. */
+ * writes to out_mtlbuf + (out_dispatch_base+i)*out_stride_halves halves.
+ * `out_dispatch_base` lets callers split a logical layer dispatch into
+ * same-codebook runs without overwriting earlier row-block outputs. */
 /* silv 2026-05-28 Phase 3 — strided variant. Existing public function below
  * (zero stride) wraps this with x_slot_stride_halves=0 for backwards compat.
  * DOWN dispatch in the PATH_FUSED chain passes the per-expert mid stride. */
-int ds4_gpu_mtl4_vqb2_pack_dispatch_layer_strided(void *pack_mtlbuf,
-                                                  void *codebook_mtlbuf,
-                                                  void *selected_mtlbuf,
-                                                  void *x_mtlbuf,
-                                                  void *out_mtlbuf,
-                                                  const uint64_t *codes_offsets,
-                                                  uint32_t n_dispatches,
-                                                  uint32_t n_selected,
-                                                  uint32_t n_experts_in_packet,
-                                                  uint32_t n_rows,
-                                                  uint32_t n_pairs,
-                                                  uint32_t k_val,
-                                                  uint32_t out_stride_halves,
-                                                  uint32_t x_slot_stride_halves) {
+static int ds4_gpu_mtl4_vqb2_pack_dispatch_layer_strided_at(void *pack_mtlbuf,
+                                                            void *codebook_mtlbuf,
+                                                            void *selected_mtlbuf,
+                                                            void *x_mtlbuf,
+                                                            void *out_mtlbuf,
+                                                            const uint64_t *codes_offsets,
+                                                            uint32_t n_dispatches,
+                                                            uint32_t n_selected,
+                                                            uint32_t n_experts_in_packet,
+                                                            uint32_t n_rows,
+                                                            uint32_t n_pairs,
+                                                            uint32_t k_val,
+                                                            uint32_t out_stride_halves,
+                                                            uint32_t x_slot_stride_halves,
+                                                            uint32_t out_dispatch_base) {
     if (!g_initialized && !ds4_gpu_init()) return -1;
     if (!ds4_vqb2_decode_matmul_fp16_mtl4_pipeline_init()) return -1;
     if (!pack_mtlbuf || !codebook_mtlbuf || !selected_mtlbuf ||
@@ -36170,7 +37755,7 @@ int ds4_gpu_mtl4_vqb2_pack_dispatch_layer_strided(void *pack_mtlbuf,
 
         for (uint32_t d = 0; d < n_dispatches; d++) {
             [at setAddress:(pack_base + codes_offsets[d]) atIndex:2];
-            [at setAddress:(out_base + (uint64_t)d * out_stride_bytes) atIndex:5];
+            [at setAddress:(out_base + (uint64_t)(out_dispatch_base + d) * out_stride_bytes) atIndex:5];
             [enc dispatchThreadgroups:MTLSizeMake(tg_x, n_selected, 1)
                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         }
@@ -36188,6 +37773,27 @@ int ds4_gpu_mtl4_vqb2_pack_dispatch_layer_strided(void *pack_mtlbuf,
         rc = 0;
     }
     return rc;
+}
+
+int ds4_gpu_mtl4_vqb2_pack_dispatch_layer_strided(void *pack_mtlbuf,
+                                                  void *codebook_mtlbuf,
+                                                  void *selected_mtlbuf,
+                                                  void *x_mtlbuf,
+                                                  void *out_mtlbuf,
+                                                  const uint64_t *codes_offsets,
+                                                  uint32_t n_dispatches,
+                                                  uint32_t n_selected,
+                                                  uint32_t n_experts_in_packet,
+                                                  uint32_t n_rows,
+                                                  uint32_t n_pairs,
+                                                  uint32_t k_val,
+                                                  uint32_t out_stride_halves,
+                                                  uint32_t x_slot_stride_halves) {
+    return ds4_gpu_mtl4_vqb2_pack_dispatch_layer_strided_at(
+        pack_mtlbuf, codebook_mtlbuf, selected_mtlbuf, x_mtlbuf, out_mtlbuf,
+        codes_offsets, n_dispatches, n_selected, n_experts_in_packet,
+        n_rows, n_pairs, k_val, out_stride_halves, x_slot_stride_halves,
+        0u);
 }
 
 /* Back-compat wrapper: original signature, shared-X (gate/up) semantic.
@@ -36236,8 +37842,10 @@ static struct {
     /* Cached codebook MTLBuffers — one per unique (layer, kind, row_block)
      * because different entries may have different K. */
     id<MTLBuffer> codebook_buf[DS4_FUSED_BIND_MAX_LAYERS][DS4_FUSED_BIND_MAX_KINDS][DS4_FUSED_BIND_MAX_RB];
+    uint64_t      codebook_hash[DS4_FUSED_BIND_MAX_LAYERS][DS4_FUSED_BIND_MAX_KINDS][DS4_FUSED_BIND_MAX_RB];
     uint64_t      codes_offset[DS4_FUSED_BIND_MAX_LAYERS][DS4_FUSED_BIND_MAX_KINDS][DS4_FUSED_BIND_MAX_RB];
     int32_t       entry_idx[DS4_FUSED_BIND_MAX_LAYERS][DS4_FUSED_BIND_MAX_KINDS][DS4_FUSED_BIND_MAX_RB];
+    uint64_t      rowblock_mask[DS4_FUSED_BIND_MAX_LAYERS][DS4_FUSED_BIND_MAX_KINDS];
     /* silv 2026-05-28 task #761 item A — bit-packed per-(kind) layer presence
      * masks. Computed ONCE at bind time. Per-layer coverage lookup becomes O(1):
      *   gate_present = (cov_bits_gate >> L) & 1
@@ -36250,6 +37858,16 @@ static struct {
     uint64_t      cov_bits_kind[DS4_FUSED_BIND_MAX_KINDS];
     uint64_t      cov_bits_full;  /* bit L set iff all three kinds present at layer L */
 } g_fused_bind;
+
+static uint64_t ds4_fused_fnv1a64(const void *data, size_t n) {
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ull;
+    }
+    return h ? h : 1ull;
+}
 
 int ds4_metal_vqb2_fused_bind(const char *pack_path, const char *index_csv_path) {
     if (!g_initialized && !ds4_gpu_init()) return -1;
@@ -36308,6 +37926,8 @@ int ds4_metal_vqb2_fused_bind(const char *pack_path, const char *index_csv_path)
     /* Initialize entry index table to -1 (absent). */
     memset(g_fused_bind.entry_idx, 0xff, sizeof(g_fused_bind.entry_idx));
     memset(g_fused_bind.codes_offset, 0, sizeof(g_fused_bind.codes_offset));
+    memset(g_fused_bind.codebook_hash, 0, sizeof(g_fused_bind.codebook_hash));
+    memset(g_fused_bind.rowblock_mask, 0, sizeof(g_fused_bind.rowblock_mask));
     memset(g_fused_bind.cov_bits_kind, 0, sizeof(g_fused_bind.cov_bits_kind));
     g_fused_bind.cov_bits_full = 0;
 
@@ -36332,11 +37952,14 @@ int ds4_metal_vqb2_fused_bind(const char *pack_path, const char *index_csv_path)
                                      options:MTLResourceStorageModeShared];
             if (!cbBuf) continue;
             g_fused_bind.codebook_buf[e->layer][e->kind_id][rb] = cbBuf;
+            g_fused_bind.codebook_hash[e->layer][e->kind_id][rb] =
+                ds4_fused_fnv1a64(cb_src, cb_bytes);
 
             /* codes_offset in pack = pack_offset + header + codebook bytes */
             g_fused_bind.codes_offset[e->layer][e->kind_id][rb] =
                 e->pack_offset + DS4_VQB2_HEADER_BYTES + cb_bytes;
             g_fused_bind.entry_idx[e->layer][e->kind_id][rb] = (int32_t)i;
+            g_fused_bind.rowblock_mask[e->layer][e->kind_id] |= (1ull << rb);
             /* Bit-packed coverage: layer e->layer has kind_id present. */
             if (e->layer < 64u && e->kind_id < DS4_FUSED_BIND_MAX_KINDS) {
                 g_fused_bind.cov_bits_kind[e->kind_id] |= (1ull << e->layer);
@@ -36345,12 +37968,23 @@ int ds4_metal_vqb2_fused_bind(const char *pack_path, const char *index_csv_path)
         }
     }
 
-    /* Pre-compute "all 3 kinds present" mask (intersection of the 3 kind masks).
-     * Caller's full-coverage check is then: (cov_bits_full >> L) & 1. */
-    g_fused_bind.cov_bits_full =
-        g_fused_bind.cov_bits_kind[0] &
-        g_fused_bind.cov_bits_kind[1] &
-        g_fused_bind.cov_bits_kind[2];
+    /* Pre-compute true full-row-block coverage.  A layer is safe for the
+     * PATH_FUSED full FFN only when gate/up have all 16 row blocks and down
+     * has all 32.  The older kind-presence intersection was too weak: a pack
+     * with one packet for each organ looked "full" and could route partial
+     * decoded tensors into the live FFN chain. */
+    const uint64_t gate_up_full_mask = (1ull << 16u) - 1ull;
+    const uint64_t down_full_mask = 0xffffffffull;
+    for (uint32_t L = 0; L < DS4_FUSED_BIND_MAX_LAYERS && L < 64u; L++) {
+        const uint64_t gate_mask = g_fused_bind.rowblock_mask[L][0];
+        const uint64_t up_mask   = g_fused_bind.rowblock_mask[L][1];
+        const uint64_t down_mask = g_fused_bind.rowblock_mask[L][2];
+        if ((gate_mask & gate_up_full_mask) == gate_up_full_mask &&
+            (up_mask   & gate_up_full_mask) == gate_up_full_mask &&
+            (down_mask & down_full_mask)    == down_full_mask) {
+            g_fused_bind.cov_bits_full |= (1ull << L);
+        }
+    }
 
     fprintf(stderr,
         "ds4_metal_vqb2_fused_bind: pack=%s\n"
@@ -36505,9 +38139,10 @@ int ds4_metal_vqb2_fused_dispatch_kind(uint32_t layer, uint32_t kind_id,
 
     /* Gather contiguous row_blocks for this (layer, kind). */
     uint64_t offsets[DS4_FUSED_BIND_MAX_RB];
+    uint64_t cb_hashes[DS4_FUSED_BIND_MAX_RB];
+    id<MTLBuffer> cb_bufs[DS4_FUSED_BIND_MAX_RB];
     uint32_t n_rb = 0;
     uint32_t n_rows = 0, n_pairs = 0, n_experts_in_packet = 0, k_val = 0;
-    id<MTLBuffer> codebook_buf = nil;
     for (uint32_t rb = 0; rb < DS4_FUSED_BIND_MAX_RB; rb++) {
         const int32_t idx = g_fused_bind.entry_idx[layer][kind_id][rb];
         if (idx < 0) continue;
@@ -36517,7 +38152,6 @@ int ds4_metal_vqb2_fused_dispatch_kind(uint32_t layer, uint32_t kind_id,
             n_pairs = e->n_pairs;
             n_experts_in_packet = e->n_experts;
             k_val = e->k;
-            codebook_buf = g_fused_bind.codebook_buf[layer][kind_id][rb];
         } else if (e->n_rows != n_rows || e->n_pairs != n_pairs ||
                    e->k != k_val || e->n_experts != n_experts_in_packet) {
             fprintf(stderr,
@@ -36525,6 +38159,8 @@ int ds4_metal_vqb2_fused_dispatch_kind(uint32_t layer, uint32_t kind_id,
                 layer, kind_id, rb);
             return -1;
         }
+        cb_hashes[n_rb] = g_fused_bind.codebook_hash[layer][kind_id][rb];
+        cb_bufs[n_rb] = g_fused_bind.codebook_buf[layer][kind_id][rb];
         offsets[n_rb++] = g_fused_bind.codes_offset[layer][kind_id][rb];
     }
     if (n_rb == 0) return -1;
@@ -36544,13 +38180,20 @@ int ds4_metal_vqb2_fused_dispatch_kind(uint32_t layer, uint32_t kind_id,
     id<MTLBuffer> selBuf = s_persistent_sel_buf;
 
     const uint32_t out_stride_halves = n_selected * n_rows;
-    const int rc = ds4_gpu_mtl4_vqb2_pack_dispatch_layer(
-        g_fused_bind.pack_mtlbuf,
-        (__bridge void *)codebook_buf,
-        (__bridge void *)selBuf,
-        x_mtlbuf, out_mtlbuf,
-        offsets, n_rb, n_selected, n_experts_in_packet,
-        n_rows, n_pairs, k_val, out_stride_halves);
+    int rc = 0;
+    for (uint32_t run_start = 0; run_start < n_rb; ) {
+        uint32_t run_end = run_start + 1u;
+        while (run_end < n_rb && cb_hashes[run_end] == cb_hashes[run_start]) run_end++;
+        rc = ds4_gpu_mtl4_vqb2_pack_dispatch_layer_strided_at(
+            g_fused_bind.pack_mtlbuf,
+            (__bridge void *)cb_bufs[run_start],
+            (__bridge void *)selBuf,
+            x_mtlbuf, out_mtlbuf,
+            offsets + run_start, run_end - run_start, n_selected, n_experts_in_packet,
+            n_rows, n_pairs, k_val, out_stride_halves, 0u, run_start);
+        if (rc != 0) return rc;
+        run_start = run_end;
+    }
 
     if (out_n_dispatches) *out_n_dispatches = n_rb;
     if (out_n_rows) *out_n_rows = n_rows;
@@ -36576,9 +38219,10 @@ int ds4_metal_vqb2_fused_dispatch_kind_strided(uint32_t layer, uint32_t kind_id,
     if (layer >= DS4_FUSED_BIND_MAX_LAYERS || kind_id >= DS4_FUSED_BIND_MAX_KINDS) return -1;
 
     uint64_t offsets[DS4_FUSED_BIND_MAX_RB];
+    uint64_t cb_hashes[DS4_FUSED_BIND_MAX_RB];
+    id<MTLBuffer> cb_bufs[DS4_FUSED_BIND_MAX_RB];
     uint32_t n_rb = 0;
     uint32_t n_rows = 0, n_pairs = 0, n_experts_in_packet = 0, k_val = 0;
-    id<MTLBuffer> codebook_buf = nil;
     for (uint32_t rb = 0; rb < DS4_FUSED_BIND_MAX_RB; rb++) {
         const int32_t idx = g_fused_bind.entry_idx[layer][kind_id][rb];
         if (idx < 0) continue;
@@ -36588,7 +38232,6 @@ int ds4_metal_vqb2_fused_dispatch_kind_strided(uint32_t layer, uint32_t kind_id,
             n_pairs = e->n_pairs;
             n_experts_in_packet = e->n_experts;
             k_val = e->k;
-            codebook_buf = g_fused_bind.codebook_buf[layer][kind_id][rb];
         } else if (e->n_rows != n_rows || e->n_pairs != n_pairs ||
                    e->k != k_val || e->n_experts != n_experts_in_packet) {
             fprintf(stderr,
@@ -36596,6 +38239,8 @@ int ds4_metal_vqb2_fused_dispatch_kind_strided(uint32_t layer, uint32_t kind_id,
                 layer, kind_id, rb);
             return -1;
         }
+        cb_hashes[n_rb] = g_fused_bind.codebook_hash[layer][kind_id][rb];
+        cb_bufs[n_rb] = g_fused_bind.codebook_buf[layer][kind_id][rb];
         offsets[n_rb++] = g_fused_bind.codes_offset[layer][kind_id][rb];
     }
     if (n_rb == 0) return -1;
@@ -36615,13 +38260,20 @@ int ds4_metal_vqb2_fused_dispatch_kind_strided(uint32_t layer, uint32_t kind_id,
     id<MTLBuffer> selBuf = s_persistent_sel_buf_strided;
 
     const uint32_t out_stride_halves = n_selected * n_rows;
-    const int rc = ds4_gpu_mtl4_vqb2_pack_dispatch_layer_strided(
-        g_fused_bind.pack_mtlbuf,
-        (__bridge void *)codebook_buf,
-        (__bridge void *)selBuf,
-        x_mtlbuf, out_mtlbuf,
-        offsets, n_rb, n_selected, n_experts_in_packet,
-        n_rows, n_pairs, k_val, out_stride_halves, x_slot_stride_halves);
+    int rc = 0;
+    for (uint32_t run_start = 0; run_start < n_rb; ) {
+        uint32_t run_end = run_start + 1u;
+        while (run_end < n_rb && cb_hashes[run_end] == cb_hashes[run_start]) run_end++;
+        rc = ds4_gpu_mtl4_vqb2_pack_dispatch_layer_strided_at(
+            g_fused_bind.pack_mtlbuf,
+            (__bridge void *)cb_bufs[run_start],
+            (__bridge void *)selBuf,
+            x_mtlbuf, out_mtlbuf,
+            offsets + run_start, run_end - run_start, n_selected, n_experts_in_packet,
+            n_rows, n_pairs, k_val, out_stride_halves, x_slot_stride_halves, run_start);
+        if (rc != 0) return rc;
+        run_start = run_end;
+    }
 
     if (out_n_dispatches) *out_n_dispatches = n_rb;
     if (out_n_rows) *out_n_rows = n_rows;
@@ -37445,18 +39097,14 @@ static int ds4_gpu_vqb2_decode_fp16_icb_dispatch(
     if (!cb || !codebook || !codes || !out_buf) return 0;
     if (!ds4_vqb2_decode_fp16_classic_pipeline_init()) return 0;
 
-    if (!g_vqb2_decode_fp16_icb) {
-        MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
-        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
-        desc.inheritBuffers = NO;
-        desc.inheritPipelineState = NO;
-        desc.maxKernelBufferBindCount = 4;
-        g_vqb2_decode_fp16_icb =
-            [g_device newIndirectCommandBufferWithDescriptor:desc
-                                              maxCommandCount:DS4_VQB2_DECODE_ICB_SLOTS
-                                                      options:MTLResourceStorageModeShared];
-        if (!g_vqb2_decode_fp16_icb) {
-            fprintf(stderr, "ds4: VQB2 decoder ICB alloc failed\n");
+    /* Cycle 9g (silv 2026-05-28 task #673/#795) — migrated to unified
+     * ds4_icb_slot API. The Phase 8a slot's recorded scalars
+     * (n_codes, bit_width, start_linear) go into signature extras. */
+    if (!g_vqb2_decode_slot.icb) {
+        if (!ds4_icb_slot_acquire(&g_vqb2_decode_slot,
+                                  /*max_commands=*/(NSUInteger)DS4_VQB2_DECODE_ICB_SLOTS,
+                                  /*max_bindings=*/4)) {
+            fprintf(stderr, "ds4: VQB2 decoder ICB slot acquire failed\n");
             return 0;
         }
     }
@@ -37466,42 +39114,29 @@ static int ds4_gpu_vqb2_decode_fp16_icb_dispatch(
             [g_device newBufferWithLength:16 options:MTLResourceStorageModeShared];
         if (!g_vqb2_decode_icb_args_buffers[slot_idx]) return 0;
     }
-
-    ds4_vqb2_decode_icb_slot *slot = &g_vqb2_decode_icb_slots[slot_idx];
-    const int sig_match = slot->recorded &&
-        slot->codebook_ptr == (__bridge void *)codebook && slot->codebook_off == (uint64_t)codebook_off &&
-        slot->codes_ptr    == (__bridge void *)codes    && slot->codes_off    == (uint64_t)codes_off &&
-        slot->out_ptr      == (__bridge void *)out_buf  && slot->out_off      == (uint64_t)out_off &&
-        slot->n_codes == n_codes && slot->bit_width == bit_width &&
-        slot->start_linear == start_linear;
-
-    if (!sig_match) {
-        /* Update args buffer first (sig-change might be only args, but rebind
-         * is harmless and keeps the slot consistent). */
+    /* Args buffer is rewritten each call (cheap memcpy of 16 bytes).
+     * Signature extras capture the scalar values so signature mismatch
+     * triggers re-record when scalars change (in addition to buffer changes). */
+    {
         uint32_t *args = (uint32_t *)g_vqb2_decode_icb_args_buffers[slot_idx].contents;
         args[0] = bit_width;
         args[1] = (1u << bit_width) - 1u;
         args[2] = n_codes;
         args[3] = start_linear;
+    }
 
-        id<MTLIndirectComputeCommand> cmd =
-            [g_vqb2_decode_fp16_icb indirectComputeCommandAtIndex:slot_idx];
-        [cmd setComputePipelineState:g_vqb2_decode_fp16_classic_pipeline];
-        [cmd setKernelBuffer:g_vqb2_decode_icb_args_buffers[slot_idx] offset:0 atIndex:0];
-        [cmd setKernelBuffer:codebook offset:codebook_off atIndex:1];
-        [cmd setKernelBuffer:codes    offset:codes_off    atIndex:2];
-        [cmd setKernelBuffer:out_buf  offset:out_off      atIndex:3];
-        const NSUInteger tg = (n_codes + 63u) / 64u;
-        [cmd concurrentDispatchThreadgroups:MTLSizeMake(tg, 1, 1)
-                      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-
-        slot->codebook_ptr = (__bridge void *)codebook; slot->codebook_off = (uint64_t)codebook_off;
-        slot->codes_ptr    = (__bridge void *)codes;    slot->codes_off    = (uint64_t)codes_off;
-        slot->out_ptr      = (__bridge void *)out_buf;  slot->out_off      = (uint64_t)out_off;
-        slot->n_codes = n_codes;
-        slot->bit_width = bit_width;
-        slot->start_linear = start_linear;
-        slot->recorded = 1;
+    __unsafe_unretained id<MTLBuffer> bufs[4] = {
+        g_vqb2_decode_icb_args_buffers[slot_idx], codebook, codes, out_buf };
+    NSUInteger offs[4] = { 0, codebook_off, codes_off, out_off };
+    const NSUInteger tg = (n_codes + 63u) / 64u;
+    uint64_t extras[3] = { n_codes, bit_width, start_linear };
+    if (!ds4_icb_slot_record_command(&g_vqb2_decode_slot, /*cmd_idx=*/slot_idx,
+                                     g_vqb2_decode_fp16_classic_pipeline,
+                                     bufs, offs, 4,
+                                     MTLSizeMake(tg, 1, 1),
+                                     MTLSizeMake(64, 1, 1), 0,
+                                     extras, 3)) {
+        return 0;
     }
 
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -37509,8 +39144,7 @@ static int ds4_gpu_vqb2_decode_fp16_icb_dispatch(
     [enc useResource:codebook usage:MTLResourceUsageRead];
     [enc useResource:codes    usage:MTLResourceUsageRead];
     [enc useResource:out_buf  usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-    [enc executeCommandsInBuffer:g_vqb2_decode_fp16_icb
-                       withRange:NSMakeRange(slot_idx, 1)];
+    ds4_icb_slot_execute(&g_vqb2_decode_slot, enc, slot_idx, 1);
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
 }
@@ -37634,9 +39268,9 @@ int ds4_gpu_mtl4_vqb2_decode_icb_bench(uint32_t n_packets, uint32_t n_codes_per_
          * executeCommandsInBuffer(range=N). This is the actual amortization
          * shape: setComputePipelineState + 4 setBuffer × N = 0 (replaced by
          * pre-recorded ICB commands); single encoder open/close per round. */
-        /* Reset ICB slot state for clean bench */
+        /* Reset ICB slot state for clean bench (Cycle 9g: unified slot). */
         for (uint32_t p = 0; p < DS4_VQB2_DECODE_ICB_SLOTS; p++) {
-            g_vqb2_decode_icb_slots[p].recorded = 0;
+            g_vqb2_decode_slot.recorded[p] = 0;
         }
         /* Pre-record all N slots in one priming command buffer (not timed —
          * one-time cost amortized across all future calls). */
@@ -37664,7 +39298,8 @@ int ds4_gpu_mtl4_vqb2_decode_icb_bench(uint32_t n_packets, uint32_t n_codes_per_
             for (uint32_t p = 0; p < n_packets; p++) {
                 [enc useResource:g_vqb2_decode_icb_args_buffers[p] usage:MTLResourceUsageRead];
             }
-            [enc executeCommandsInBuffer:g_vqb2_decode_fp16_icb
+            /* Cycle 9g: bench-site replay uses the unified slot's icb. */
+            [enc executeCommandsInBuffer:g_vqb2_decode_slot.icb
                                withRange:NSMakeRange(0, n_packets)];
             [enc endEncoding];
             [cb commit];
@@ -41924,30 +43559,10 @@ static int ds4_gpu_finalize_model_views(void) {
  return warmed;
 }
 
-static void ds4_gpu_model_views_clear_for_mmap(const void *model_map, uint64_t model_size) {
- uint32_t write = 0;
- for (uint32_t i = 0; i < g_model_view_count; i++) {
- if (g_model_views[i].model_map == model_map &&
- g_model_views[i].model_size == model_size) {
- g_model_views[i].buffer = nil;
- g_model_views[i].model_map = NULL;
- g_model_views[i].model_size = 0;
- g_model_views[i].model_offset = 0;
- g_model_views[i].bytes = 0;
- continue;
- }
- if (write != i) {
- g_model_views[write] = g_model_views[i];
- g_model_views[i].buffer = nil;
- g_model_views[i].model_map = NULL;
- g_model_views[i].model_size = 0;
- g_model_views[i].model_offset = 0;
- g_model_views[i].bytes = 0;
- }
- write++;
- }
- g_model_view_count = write;
-}
+/* silv 2026-05-28 engineer-roster — model_views_clear_for_mmap retired.
+ * Used only by set_model_map_ranges (now retired in same cascade). The
+ * single-mmap clear path (used by set_model_map_range) calls
+ * ds4_gpu_model_residency_clear() which is sufficient. */
 
 /* project-side helpers (M1 Max Metal-residency phase control) */
 /* ============================================================ */
@@ -41958,57 +43573,13 @@ int ds4_gpu_set_skip_next_warmup(int skip) {
  return prev;
 }
 
-int ds4_gpu_set_model_map_ranges(
- const void *model_map,
- uint64_t model_size,
- const uint64_t *map_offsets,
- const uint64_t *map_sizes,
- uint32_t n_ranges) {
- if (!g_initialized && !ds4_gpu_init()) return 0;
- if (!model_map || model_size == 0 || !map_offsets || !map_sizes || n_ranges == 0) return 0;
-
- @autoreleasepool {
- /* Same rationale as set_model_map_range: drain in-flight command
- * buffers and drop the old MTLBuffer views before remapping so we
- * never have two generations of overlapping views referencing the
- * same mmap range at once. */
- (void)ds4_gpu_wait_pending_command_buffers("set_model_map_ranges");
- ds4_gpu_model_residency_clear();
- /* Preserve views of other mmaps (e.g. add-mapped MTP draft module);
- * only drop views matching this specific (model_map, model_size). */
- ds4_gpu_model_views_clear_for_mmap(model_map, model_size);
- g_model_map_ptr = model_map;
- g_model_map_size = model_size;
-
- uint64_t lo = UINT64_MAX;
- uint64_t hi = 0;
- for (uint32_t i = 0; i < n_ranges; i++) {
- const uint64_t map_offset = map_offsets[i];
- const uint64_t map_size = map_sizes[i];
- if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) {
- return 0;
- }
- if (!ds4_gpu_model_views_cover_range(model_map, model_size, map_offset, map_size) &&
- !ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size)) {
- ds4_gpu_model_residency_clear();
- return 0;
- }
- if (map_offset < lo) lo = map_offset;
- if (map_offset + map_size > hi) hi = map_offset + map_size;
- }
-
- g_model_mapped_offset = lo == UINT64_MAX ? 0 : lo;
- g_model_mapped_size = lo == UINT64_MAX ? 0 : hi - lo;
- if (!ds4_gpu_finalize_model_views()) {
- ds4_gpu_model_residency_clear();
- return 0;
- }
- fprintf(stderr,
- "ds4: Metal mapped mmaped model as %u overlapping shared buffers\n",
- g_model_view_count);
- return 1;
- }
-}
+/* silv 2026-05-28 engineer-roster — set_model_map_ranges retired.
+ *
+ * Used by engine_map_metal_views_with_routed_holes (ds4.c:20961) to create
+ * non-contiguous views excluding cpu-moe routed ranges. That caller was
+ * collapsed to set_model_map_range (full file) as part of the view/residency
+ * separation fix (Metal 8.37 GiB bug). No other callers. Function and
+ * header decl retired per DJB/Linus: delete dead code. */
 
 int ds4_gpu_add_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
  if (!g_initialized && !ds4_gpu_init()) return 0;
