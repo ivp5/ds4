@@ -3,9 +3,12 @@
 /ds4-bench
 /ds4-eval
 /ds4-agent
+/ds4-logitlens
+/ds4_cpu
 /ds4_native
 /ds4_server_test
 /ds4_test
+/tests/cuda_long_context_smoke
 /ds4flash.gguf
 /TODO.md
 /gguf/
