@@ -13364,17 +13364,10 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline_for_tile(u
     }
 }
 
-/* silv merge 2026-05-27: backward-compat wrappers for the pre-wide-tile
- * call sites in ds4_gpu_encode_routed_batch_moe. The wide-tile dispatcher
- * (_for_tile) is the new primary; legacy callers default to the 32-token
- * tile, matching antirez's pre-merge semantics. */
-static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
-    return ds4_gpu_routed_mm_pipeline_for_tile(type, 32u);
-}
-
-static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t type) {
-    return ds4_gpu_routed_mm_f16_rhs_pipeline_for_tile(type, 32u);
-}
+/* silv 2026-05-28: the backward-compat ds4_gpu_routed_mm_pipeline and
+ * ds4_gpu_routed_mm_f16_rhs_pipeline wrappers (called nothing — every
+ * call site now uses *_for_tile directly with explicit tile size) were
+ * removed here. The _for_tile primaries below carry the dispatch. */
 
 static int ds4_gpu_encode_mul_mv_id(
  id<MTLCommandBuffer> cb,
@@ -26572,7 +26565,6 @@ static int ds4_rms_norm_mul_f32_4_mtl4_pipeline_init(void) {
     g_rms_norm_mul_f32_4_mtl4_init_attempted = 1;
     if (!ds4_polar_pipeline_init()) return 0;
 
-    NSError *err = nil;
     /* args layout matches ds4_metal_args_norm: ne00, ne00_t, nb1, nb2, nb3, eps,
      * nef1[3], nef2[3], nef3[3], nbf1[3], nbf2[3], nbf3[3]. src0/src1_0 used
      * (src1_1 ignored for F=2). */
@@ -27341,7 +27333,6 @@ static int ds4_bin_fuse_add_f32_mtl4_pipeline_init(void) {
     g_bin_fuse_add_f32_mtl4_init_attempted = 1;
     if (!ds4_polar_pipeline_init()) return 0;
 
-    NSError *err = nil;
     /* Args layout mirrors ds4_metal_args_bin (FC_F=1 only needs o1[0]) but we
      * size for all 8 to match the host-side struct. */
     NSString *source =
@@ -35942,17 +35933,6 @@ static int ds4_vqb2_decode_matmul_fp16_classic_pipeline_init(void) {
     return 1;
 }
 
-/* Returns 1 if env var set; otherwise 0 (caller uses MTL4 path). */
-static int ds4_icb_vqb2_decode_matmul_enabled(void) {
-    static int checked = 0, active = 0;
-    if (!checked) {
-        active = getenv("DS4_ICB_VQB2_DECODE_MATMUL") != NULL ? 1 : 0;
-        checked = 1;
-        if (active) fprintf(stderr, "ds4: DS4_ICB_VQB2_DECODE_MATMUL=1 — fused-matmul ICB engaged\n");
-    }
-    return active;
-}
-
 /* Dispatch a single fused decode-matmul via classic-MTL ICB.
  * Slot is keyed by all the args; signature mismatch triggers re-record.
  * Replays cost ~5 µs vs ~60 µs for MTL4 dispatch overhead per call. */
@@ -38221,12 +38201,6 @@ int ds4_gpu_mtl4_vqb2_decode_stacked_speedup_bench(uint32_t n_packets,
             t_A_ms / t_E_ms, gbs_E);
         return 1;
     }
-    return 0;
-}
-
-/* Old fprintf path used when @autoreleasepool exited early — wrapped above. */
-static int ds4_gpu_mtl4_vqb2_decode_stacked_speedup_bench_legacy_print(double a, double b, double c) {
-    (void)a; (void)b; (void)c;
     return 0;
 }
 
