@@ -22451,6 +22451,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     uint64_t n_wrap_ok = 0;
     uint64_t n_wrap_fail = 0;
     uint64_t bytes_filled = 0;
+    /* silv 2026-05-28 speedup — pack tensors whose src pointer is
+     * page-aligned skip the malloc+memcpy and wrap the pack mmap
+     * directly. Saves ~170 ms of startup memcpy + ~1.77 GB of redundant
+     * heap copy for the BF16 source-exact tensors. */
+    uint64_t n_zerocopy = 0;
+    /* silv 2026-05-28 — source-exact skip histogram. Bucket the 768 remaining
+     * skips by (source_exact_type, t->type) to size the next kernel work. */
+    uint64_t skip_hist_pack_dtype[8] = {0};  /* keyed by ds4_nrpk_dtype enum (0..7) */
+    uint64_t skip_hist_gguf_dtype[80] = {0}; /* keyed by t->type (F16=1, Q8=8, BF16=30, FP8=64) */
     /* silv 2026-05-28 high-resolution probe — per-tensor F16-mmap vs
      * BF16-storage L2 error.  When BF16-for-F16 source-exact substitute
      * is enabled (Increment 5), this records how much each weight
@@ -22592,6 +22601,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                    t->type == DS4_TENSOR_F16);
       if (!wired_bf16_f16) {
        n_skip_source_exact_kernel_gap++;
+       /* Histogram by source dtype (pack) AND target dtype (GGUF t->type)
+        * to surface the highest-leverage next-kernel targets. */
+       if ((unsigned)pe->dtype < 8) skip_hist_pack_dtype[pe->dtype]++;
+       if ((unsigned)t->type < 80)  skip_hist_gguf_dtype[t->type]++;
        if (n_skip_examples < 6) {
         snprintf(first_skip_examples[n_skip_examples++], 256,
                  "%s: pack=%s would be source-exact %u → kernel not yet wired (skipped)",
@@ -22623,19 +22636,42 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
       n_skip_alloc_fail++;
       continue;
      }
-     /* silv 2026-05-28 #796 Increment 2 — allocate page-aligned with
-      * length rounded up to page boundary. This lets ds4_gpu_wrap_heap_bytes
-      * succeed (Metal's newBufferWithBytesNoCopy requires page-aligned
-      * pointer + page-multiple length). Page on M1: 16 KB; per-tensor
-      * waste ≤ 16 KB ≈ negligible vs MB-scale tensors. */
+     /* silv 2026-05-28 high-resolution speedup — zero-copy fast path.
+      *
+      * If the pack's tensor data pointer is already page-aligned AND the
+      * payload length rounds to a page multiple within the pack's mmap
+      * extent, we can skip the posix_memalign + memcpy and wrap the pack
+      * mmap region directly as an MTLBuffer. Saves the per-tensor
+      * memcpy (1.77 GB total at ~10 GB/s ≈ 170 ms startup) and the heap
+      * allocation (1.77 GB of redundant RAM).
+      *
+      * Ownership becomes DS4_STORAGE_PACK so engine_close leaves the
+      * bytes alone (the pack mmap unmaps them when the pack closes).
+      * model_free_overrides already respects this ownership flag. */
      const size_t page = (size_t)sysconf(_SC_PAGESIZE);
      const size_t padded = ((size_t)pe->data_bytes + page - 1) & ~(page - 1);
+     const int src_page_aligned = (((uintptr_t)src & (page - 1)) == 0);
+     /* zero_copy_eligible: src is page-aligned; the wrap covers `padded`
+      * bytes which extend beyond pe->data_bytes if the tail isn't page-
+      * aligned. The pack mmap is much larger than any single tensor so
+      * the tail bytes are valid memory (other tensors live there). The
+      * kernel reads only `pe->data_bytes` worth (matrix shape governs);
+      * the extra padded bytes are never touched. */
      void *dst = NULL;
-     if (posix_memalign(&dst, page, padded) != 0 || !dst) {
+     uint8_t store_ownership = DS4_STORAGE_HEAP;
+     uint64_t store_length = pe->data_bytes;
+     if (src_page_aligned) {
+      /* Zero-copy: storage borrows the pack mmap pointer. */
+      dst = (void *)src;
+      store_ownership = DS4_STORAGE_PACK;
+      n_zerocopy++;
+     } else if (posix_memalign(&dst, page, padded) != 0 || !dst) {
       n_skip_alloc_fail++;
       continue;
      }
-     memcpy(dst, src, (size_t)pe->data_bytes);
+     if (store_ownership == DS4_STORAGE_HEAP) {
+      memcpy(dst, src, (size_t)pe->data_bytes);
+     }
      /* Cycle 5 unified storage: bytes + length + dtype + ownership in one
       * struct. For identity-fill, storage.dtype = t->type. For source-exact
       * fill, storage.dtype = source_exact_type (pack source dtype). The
@@ -22644,9 +22680,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
       * activation (the old `override_source_active` flag was never written;
       * Cycle 5 makes the activation implicit in dtype != t->type). */
      t->storage.bytes = dst;
-     t->storage.length = pe->data_bytes;
+     t->storage.length = store_length;
      t->storage.dtype = has_source_exact ? source_exact_type : t->type;
-     t->storage.ownership = DS4_STORAGE_HEAP;
+     t->storage.ownership = store_ownership;
      /* #796 Increment 2 — pre-wrap as MTLBuffer (zero-copy on M1 unified
       * memory). May return NULL if the allocator failed page-alignment;
       * dispatch falls back to mmap in that case. Wrap uses `padded` so
@@ -22729,7 +22765,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     fprintf(stderr,
             "ds4: --nonrouted-pack: override-fill — filled=%llu (%.2f GB), "
             "skipped dtype_mismatch=%llu bytes_mismatch=%llu alloc_fail=%llu "
-            "source_exact_kernel_gap=%llu mtlbuf_wrap=%llu/%llu (ok/fail)\n",
+            "source_exact_kernel_gap=%llu mtlbuf_wrap=%llu/%llu (ok/fail) "
+            "zerocopy=%llu\n",
             (unsigned long long)n_filled,
             (double)bytes_filled / 1e9,
             (unsigned long long)n_skip_dtype_mismatch,
@@ -22737,11 +22774,30 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             (unsigned long long)n_skip_alloc_fail,
             (unsigned long long)n_skip_source_exact_kernel_gap,
             (unsigned long long)n_wrap_ok,
-            (unsigned long long)n_wrap_fail);
+            (unsigned long long)n_wrap_fail,
+            (unsigned long long)n_zerocopy);
     if (n_skip_examples > 0) {
      fprintf(stderr, "ds4: --nonrouted-pack: first override-fill skips (Phase 2b will resolve):\n");
      for (int k = 0; k < n_skip_examples; k++) {
       fprintf(stderr, "ds4:   %s\n", first_skip_examples[k]);
+     }
+    }
+    /* Source-exact skip histogram — sizes the next kernel-work targets. */
+    if (n_skip_source_exact_kernel_gap > 0) {
+     fprintf(stderr, "ds4: --nonrouted-pack: source-exact skip histogram by pack dtype:\n");
+     for (int d = 1; d < 8; d++) {
+      if (skip_hist_pack_dtype[d] > 0) {
+       fprintf(stderr, "ds4:   pack=%s  count=%llu\n",
+               ds4_nrpk_dtype_name((ds4_nrpk_dtype)d),
+               (unsigned long long)skip_hist_pack_dtype[d]);
+      }
+     }
+     fprintf(stderr, "ds4: --nonrouted-pack: source-exact skip histogram by GGUF dtype:\n");
+     for (int d = 0; d < 80; d++) {
+      if (skip_hist_gguf_dtype[d] > 0) {
+       fprintf(stderr, "ds4:   gguf_type=%u  count=%llu\n",
+               (unsigned)d, (unsigned long long)skip_hist_gguf_dtype[d]);
+      }
      }
     }
     if (probe_n_tensors > 0) {
@@ -22898,6 +22954,23 @@ void ds4_engine_close(ds4_engine *e) {
   fprintf(stderr, "ds4: storage-dispatch bf16 — heap=%llu suppressed=%llu\n",
           (unsigned long long)s_n_storage_dispatch_bf16,
           (unsigned long long)s_n_storage_dispatch_bf16_suppressed);
+ }
+ /* silv 2026-05-28 — PATH_FUSED ICB-eligibility probe summary. Reports
+  * what fraction of PATH_FUSED calls would have HIT an 8-way per-layer
+  * sig cache. Sizes the upside of wiring PATH_FUSED through ICB
+  * capture+replay. */
+ {
+  extern void ds4_metal_vqb2_fp16_pf_icb_eligibility(uint64_t *, uint64_t *);
+  uint64_t pf_h = 0, pf_m = 0;
+  ds4_metal_vqb2_fp16_pf_icb_eligibility(&pf_h, &pf_m);
+  if (pf_h > 0 || pf_m > 0) {
+   const uint64_t total = pf_h + pf_m;
+   fprintf(stderr,
+           "ds4: PATH_FUSED ICB-eligibility — hits=%llu misses=%llu total=%llu (%.1f%% would replay)\n",
+           (unsigned long long)pf_h, (unsigned long long)pf_m,
+           (unsigned long long)total,
+           total > 0 ? (100.0 * (double)pf_h / (double)total) : 0.0);
+  }
  }
  /* silv 2026-05-27 Phase 2: dump prefix cache stats if any activity, then free */
  if (e->prefix_cache.stat_lookups > 0 || e->prefix_cache.stat_stores > 0) {

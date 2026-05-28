@@ -169,16 +169,32 @@ static id<MTLBuffer>               s_icb_uniforms        = nil;  /* lazy alloc *
 static uint64_t                    s_icb_ticket          = 0;
 static uint64_t                    s_icb_hits            = 0;
 static uint64_t                    s_icb_misses          = 0;
+/* silv 2026-05-28 — PATH_FUSED ICB-eligibility probe (no behavior change). */
+static uint64_t                    s_pf_icb_eligible_hits   = 0;
+static uint64_t                    s_pf_icb_eligible_misses = 0;
 static uint64_t                    s_icb_evicts          = 0;
 
-/* Top-level path selection */
+/* Top-level path selection.
+ *
+ * Cycle 6' (silv 2026-05-28 engineer-roster, task #785): the legacy/icb/mtl4
+ * paths use `kernel_vqb2_fp16_gate_up` which reads input as complex pairs
+ * (re, im) — correct for POLAR-CODEC encoded data (rows × pairs × 2),
+ * WRONG for DS4 V4 Flash routed FFN which is vanilla matvec (rows × cols
+ * single-floats). PATH_FUSED uses the H2186/H2187 row-block kernels which
+ * are vanilla.
+ *
+ * Default flipped from PATH_LEGACY → PATH_FUSED. Explicit selection of
+ * legacy/icb/mtl4 emits a stderr warning naming the polar-codec assumption
+ * so silent miscompute on DS4 data can't happen unannounced. Chesterton's
+ * fence on the polar codec: kept (it's the right kernel for polar-encoded
+ * data, just not for DS4 vanilla); see tasks #554, #565-573, #770. */
 typedef enum {
     PATH_LEGACY = 0,
     PATH_ICB    = 1,
     PATH_MTL4   = 2,
     PATH_FUSED  = 3,  /* silv 2026-05-28 task #758 — code-direct fused decode-matmul. */
 } dispatch_path_t;
-static dispatch_path_t             s_active_path         = PATH_LEGACY;
+static dispatch_path_t             s_active_path         = PATH_FUSED;
 static bool                        s_path_resolved       = false;
 static bool                        s_profile_enabled     = false;
 #endif /* __APPLE__ */
@@ -203,6 +219,19 @@ void ds4_metal_vqb2_fp16_icb_stats(uint64_t *hits, uint64_t *misses, uint64_t *e
     if (hits)   *hits   = 0;
     if (misses) *misses = 0;
     if (evicts) *evicts = 0;
+#endif
+}
+
+/* silv 2026-05-28 — PATH_FUSED ICB-eligibility stats accessor. Tells how
+ * many PATH_FUSED dispatches would have hit an ICB cache (sized 8/layer
+ * LRU). Drives the ICB-integration build-or-skip decision. */
+void ds4_metal_vqb2_fp16_pf_icb_eligibility(uint64_t *hits, uint64_t *misses) {
+#ifdef __APPLE__
+    if (hits)   *hits   = s_pf_icb_eligible_hits;
+    if (misses) *misses = s_pf_icb_eligible_misses;
+#else
+    if (hits)   *hits   = 0;
+    if (misses) *misses = 0;
 #endif
 }
 
@@ -857,6 +886,26 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
             else if (strcmp(e, "fused") == 0) s_active_path = PATH_FUSED;
             else                              s_active_path = PATH_LEGACY;
             fprintf(stderr, "ds4_vqb2_fp16: path = %s\n", e);
+            /* Cycle 6' polar-codec warning: legacy/icb/mtl4 dispatch the
+             * polar-codec kernel (kernel_vqb2_fp16_gate_up reads input as
+             * complex (re, im) pairs). DS4 V4 Flash routed FFN is vanilla
+             * matvec — these paths produce wrong outputs on DS4 data.
+             * PATH_FUSED is the correct path for DS4. The legacy/icb/mtl4
+             * paths remain available for polar-encoded data (Chesterton's
+             * fence — they're a working codec family). */
+            if (s_active_path == PATH_LEGACY ||
+                s_active_path == PATH_ICB    ||
+                s_active_path == PATH_MTL4) {
+                fprintf(stderr,
+                        "ds4_vqb2_fp16: WARNING — path '%s' uses polar-codec "
+                        "kernels (complex-pair input layout). DS4 V4 Flash is "
+                        "vanilla matvec; outputs will be WRONG on DS4 data. Use "
+                        "DS4_VQB2_FP16_PATH=fused for DS4.\n", e);
+            }
+        } else {
+            /* Cycle 6' default: PATH_FUSED. Silent default to a polar-codec
+             * path was the #761(1) bug surface. */
+            fprintf(stderr, "ds4_vqb2_fp16: path = fused (default, DS4 vanilla)\n");
         }
         s_path_resolved = true;
     }
@@ -917,6 +966,55 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
             if (s_fused_bind_ok) {
                 if (ds4_metal_vqb2_fused_layer_fully_covered(layer)) {
                     s_full_cov_attempts++;
+                    /* silv 2026-05-28 — PATH_FUSED ICB-eligibility probe.
+                     *
+                     * silv pointed out: "your PATH_FUSED does not currently
+                     * replay through ICB" — the chain dispatches via direct
+                     * compute encoder. To size the build/skip decision for
+                     * the integration, count what fraction of (layer,
+                     * selected_exps) signatures would HIT a small per-layer
+                     * cache. High hit rate → big ICB upside; low rate → tiny.
+                     *
+                     * 8-way LRU per layer, keyed by sig. No behavior change,
+                     * only counters. */
+                    {
+                        static uint64_t s_pf_sig_cache[DS4_N_LAYER][8] = {{0}};
+                        static uint8_t  s_pf_lru_stamp[DS4_N_LAYER][8] = {{0}};
+                        const uint64_t pf_sig = expert_signature(layer, selected_exps, N_EXPERT_USED);
+                        int hit_idx = -1;
+                        for (int i = 0; i < 8; i++) {
+                            if (s_pf_sig_cache[layer][i] == pf_sig && pf_sig != 0) {
+                                hit_idx = i; break;
+                            }
+                        }
+                        if (hit_idx >= 0) {
+                            s_pf_icb_eligible_hits++;
+                            /* Bump LRU stamp on this slot (high = recent). */
+                            s_pf_lru_stamp[layer][hit_idx] = 7;
+                            /* Decay other slots' stamps. */
+                            for (int i = 0; i < 8; i++) {
+                                if (i != hit_idx && s_pf_lru_stamp[layer][i] > 0) {
+                                    s_pf_lru_stamp[layer][i]--;
+                                }
+                            }
+                        } else {
+                            s_pf_icb_eligible_misses++;
+                            /* Find LRU-oldest slot. */
+                            int evict = 0; uint8_t low = s_pf_lru_stamp[layer][0];
+                            for (int i = 1; i < 8; i++) {
+                                if (s_pf_lru_stamp[layer][i] < low) {
+                                    low = s_pf_lru_stamp[layer][i]; evict = i;
+                                }
+                            }
+                            s_pf_sig_cache[layer][evict] = pf_sig;
+                            s_pf_lru_stamp[layer][evict] = 7;
+                            for (int i = 0; i < 8; i++) {
+                                if (i != evict && s_pf_lru_stamp[layer][i] > 0) {
+                                    s_pf_lru_stamp[layer][i]--;
+                                }
+                            }
+                        }
+                    }
                     /* task #761 — full FFN chain. Gen-only (n_tokens==1) for
                      * now; prefill falls through to MTL4. Any chain step that
                      * fails also falls through.
@@ -932,7 +1030,20 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
                      * The shape adapter, out-slot pool, swiglu/sum helpers, and
                      * strided dispatch_kind all exist as separate APIs. This
                      * block stitches them. */
-                    if (n_tokens == 1u) {
+                    /* silv 2026-05-28: extended to multi-token (Tier 1 of
+                     * path_fused_multitoken_design.md). The buffers (x_buf,
+                     * gate/up/mid/down, rw) are sized for ONE token's worth
+                     * and are reused across tokens — the chain runs per-token
+                     * in sequence. If ANY token's chain fails, the whole call
+                     * falls back to MTL4 (per-token partial success would
+                     * leave the KV cache in an inconsistent state).
+                     *
+                     * Tier 2+ optimizations (expert-union pre-decode, fused
+                     * batched matmul) are next-session work; see the design
+                     * memo. This Tier 1 unblocks PATH_FUSED prefill at
+                     * gen-equivalent per-token speed.
+                     */
+                    if (n_tokens >= 1u) {
                         extern void *ds4_metal_vqb2_fused_x_adapter_fp32_to_fp16(const float *, uint32_t);
                         extern void *ds4_metal_vqb2_fused_out_buffer(uint32_t, uint32_t);
                         extern int   ds4_metal_vqb2_fused_dispatch_kind(uint32_t, uint32_t,
@@ -943,32 +1054,54 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
                                                                                  const uint32_t *, uint32_t,
                                                                                  void *, void *, uint32_t,
                                                                                  uint32_t *, uint32_t *, uint32_t *);
-                        extern int   ds4_metal_vqb2_fused_swiglu_step(void *, void *, void *, void *,
-                                                                       uint32_t, uint32_t, float);
+                        /* The 2D ds4_metal_vqb2_fused_swiglu_step (declared in ds4_gpu.h)
+                         * was used here pre-H2186; it silently composed with row-block-major
+                         * gate/up by treating them as flat slot-major, ignoring 15/16 of the
+                         * row blocks. Replaced below by ds4_metal_vqb2_fused_swiglu_rowblock_step.
+                         * The 2D function remains in ds4_metal.m for any non-fused caller but
+                         * no longer participates in PATH_FUSED. */
+                        extern int   ds4_metal_vqb2_fused_swiglu_rowblock_step(void *, void *, void *, void *,
+                                                                                uint32_t, uint32_t, uint32_t, float);
                         extern int   ds4_metal_vqb2_fused_sum_step(void *, void *, uint32_t);
+                        extern int   ds4_metal_vqb2_fused_sum_step_kahan(void *, void *, uint32_t);
+
+                        /* silv 2026-05-28 Tier 2.b — high-precision sum opt-in.
+                         * Env DS4_VQB2_FP16_PRECISION=high routes the final
+                         * 6-slot sum through magnitude-sorted Kahan-compensated
+                         * accumulation, lifting the noise floor from ~2e-5
+                         * (naive fp32 of fp16) to ~1e-7 (Kahan-corrected). This
+                         * makes small route-policy aberrations visible. */
+                        static int s_precision_high_checked = 0;
+                        static int s_precision_high = 0;
+                        if (!s_precision_high_checked) {
+                            const char *p = getenv("DS4_VQB2_FP16_PRECISION");
+                            s_precision_high = (p && strcmp(p, "high") == 0) ? 1 : 0;
+                            if (s_precision_high) {
+                                fprintf(stderr,
+                                        "ds4_vqb2_fp16: PATH_FUSED PRECISION=high — "
+                                        "Kahan-sorted sum kernel engaged\n");
+                            }
+                            s_precision_high_checked = 1;
+                        }
 
                         /* DS4 active experts = 6; cap for safety. */
                         const uint32_t n_sel = 6u;
-                        uint32_t sel_u32[16];
-                        for (uint32_t i = 0; i < n_sel; i++) sel_u32[i] = (uint32_t)selected_exps[i];
-
-                        /* Shape adapter — 4096 fp32 → MTLBuffer of fp16 in
-                         * 2048 pairs × 2 = 8192 halves linear layout. */
                         const uint32_t hidden = 4096u;
                         const uint32_t intermediate = 2048u;
-                        void *x_buf = ds4_metal_vqb2_fused_x_adapter_fp32_to_fp16((const float *)input_fp32, hidden);
 
-                        /* Output buffer slots: 0=gate, 1=up, 2=mid, 3=down. */
+                        /* Output buffer slots: 0=gate, 1=up, 2=mid, 3=down.
+                         * Sized for one token's worth, reused across tokens. */
                         const uint32_t gate_bytes = n_sel * intermediate * 2u;
                         const uint32_t up_bytes   = gate_bytes;
                         const uint32_t mid_bytes  = gate_bytes;
                         const uint32_t down_bytes = n_sel * hidden * 2u;
-                        void *gate_buf = x_buf ? ds4_metal_vqb2_fused_out_buffer(0u, gate_bytes) : NULL;
+                        void *gate_buf = ds4_metal_vqb2_fused_out_buffer(0u, gate_bytes);
                         void *up_buf   = gate_buf ? ds4_metal_vqb2_fused_out_buffer(1u, up_bytes) : NULL;
                         void *mid_buf  = up_buf   ? ds4_metal_vqb2_fused_out_buffer(2u, mid_bytes) : NULL;
                         void *down_buf = mid_buf  ? ds4_metal_vqb2_fused_out_buffer(3u, down_bytes) : NULL;
 
-                        /* route_weights buffer wrap (fp32, n_sel elements). */
+                        /* route_weights buffer wrap (fp32, n_sel elements).
+                         * Static; refreshed per-token below. */
                         static id<MTLBuffer> s_rw_buf = nil;
                         static uint32_t s_rw_cap = 0;
                         if (s_rw_cap < n_sel) {
@@ -977,48 +1110,193 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
                                                               options:MTLResourceStorageModeShared];
                             s_rw_cap = n_sel;
                         }
-                        if (s_rw_buf) memcpy(s_rw_buf.contents, expert_weights, n_sel * sizeof(float));
                         void *rw_void = (__bridge void *)s_rw_buf;
 
-                        int chain_ok = 0;
-                        if (x_buf && gate_buf && up_buf && mid_buf && down_buf && rw_void) {
+                        /* silv 2026-05-28 engineer-roster cycle 3 — CRASH FIX:
+                         * sum_step's output must be a real MTLBuffer because
+                         * run_canary casts bindings[i] to id<MTLAllocation>
+                         * (line 18589 of ds4_metal.m) which crashes on a CPU
+                         * pointer. The caller (dispatch_gpu) passes a CPU
+                         * pointer for output_fp32 (it's ds4_gpu_tensor_contents
+                         * of the output GPU tensor — valid unified-memory
+                         * pointer but NOT an MTLBuffer).
+                         *
+                         * Fix: allocate a static fp32 sum-output MTLBuffer,
+                         * dispatch sum_step into it, memcpy result to the
+                         * caller's CPU pointer. Adds one memcpy of `hidden`
+                         * floats per token (16KB at hidden=4096) but removes
+                         * the segfault. Cycle 3 proper (MTLBuffer dispatch
+                         * end-to-end) eliminates the memcpy too. */
+                        static id<MTLBuffer> s_sum_out_buf = nil;
+                        static uint32_t s_sum_out_cap = 0;
+                        if (s_sum_out_cap < hidden) {
+                            extern id<MTLDevice> g_device;
+                            s_sum_out_buf = [g_device newBufferWithLength:(NSUInteger)hidden * sizeof(float)
+                                                                  options:MTLResourceStorageModeShared];
+                            s_sum_out_cap = hidden;
+                        }
+                        void *sum_out_void = (__bridge void *)s_sum_out_buf;
+
+                        int all_tokens_ok = (gate_buf && up_buf && mid_buf && down_buf && rw_void) ? 1 : 0;
+                        uint32_t failed_token = 0;
+                        int last_rcg = 0, last_rcu = 0, last_rcs = 0, last_rcd = 0, last_rcsum = 0;
+
+                        /* silv 2026-05-28 engineer-roster cycle 3 — chain step trace.
+                         * Env-gated stderr print before each chain step with fflush.
+                         * When the binary segfaults, the last printed line localizes
+                         * the failing step. Cost: ~6 fprintf+fflush per token per layer
+                         * when DS4_PATH_FUSED_TRACE=1; zero when unset. */
+                        static int s_trace_checked = 0;
+                        static int s_trace_enabled = 0;
+                        if (!s_trace_checked) {
+                            const char *te = getenv("DS4_PATH_FUSED_TRACE");
+                            s_trace_enabled = (te && *te && *te != '0') ? 1 : 0;
+                            s_trace_checked = 1;
+                            if (s_trace_enabled) {
+                                fprintf(stderr,
+                                        "ds4_vqb2_fp16: DS4_PATH_FUSED_TRACE=1 — chain step tracing on\n");
+                            }
+                        }
+                        #define DS4_CHAIN_TRACE(STEP) do { \
+                            if (s_trace_enabled) { \
+                                fprintf(stderr, "ds4_vqb2_fp16: L%u t=%u/%u step=%s\n", \
+                                        layer, t, n_tokens, (STEP)); \
+                                fflush(stderr); \
+                            } \
+                        } while (0)
+
+                        for (uint32_t t = 0; t < n_tokens && all_tokens_ok; t++) {
+                            const int32_t *sel_t = selected_exps + (size_t)t * n_sel;
+                            const float   *w_t   = expert_weights + (size_t)t * n_sel;
+                            const float   *in_t  = ((const float *)input_fp32) + (size_t)t * hidden;
+                            float         *out_t = ((float *)output_fp32) + (size_t)t * hidden;
+
+                            uint32_t sel_u32[16];
+                            for (uint32_t i = 0; i < n_sel; i++) sel_u32[i] = (uint32_t)sel_t[i];
+                            DS4_CHAIN_TRACE("sel_u32_load");
+
+                            /* Shape adapter — 4096 fp32 → MTLBuffer of fp16 in
+                             * 2048 pairs × 2 = 8192 halves linear layout. */
+                            DS4_CHAIN_TRACE("x_adapter_pre");
+                            void *x_buf = ds4_metal_vqb2_fused_x_adapter_fp32_to_fp16(in_t, hidden);
+                            DS4_CHAIN_TRACE("x_adapter_post");
+                            if (!x_buf) { all_tokens_ok = 0; failed_token = t; break; }
+
+                            DS4_CHAIN_TRACE("rw_memcpy_pre");
+                            memcpy(s_rw_buf.contents, w_t, n_sel * sizeof(float));
+                            DS4_CHAIN_TRACE("rw_memcpy_post");
+
                             uint32_t g_n_rb = 0, g_n_rows = 0, g_n_pairs = 0;
                             uint32_t u_n_rb = 0, u_n_rows = 0, u_n_pairs = 0;
                             uint32_t d_n_rb = 0, d_n_rows = 0, d_n_pairs = 0;
+                            DS4_CHAIN_TRACE("dispatch_kind_gate_pre");
                             int rcg = ds4_metal_vqb2_fused_dispatch_kind(layer, 0u, sel_u32, n_sel,
                                                                           x_buf, gate_buf,
                                                                           &g_n_rb, &g_n_rows, &g_n_pairs);
+                            DS4_CHAIN_TRACE("dispatch_kind_gate_post");
+                            DS4_CHAIN_TRACE("dispatch_kind_up_pre");
                             int rcu = (rcg == 0) ?
                                 ds4_metal_vqb2_fused_dispatch_kind(layer, 1u, sel_u32, n_sel,
                                                                     x_buf, up_buf,
                                                                     &u_n_rb, &u_n_rows, &u_n_pairs) : -1;
-                            /* SwiGLU produces n_sel × g_n_rows fp16 mid. */
-                            int rcs = (rcu == 0 && g_n_rows == u_n_rows) ?
-                                ds4_metal_vqb2_fused_swiglu_step(gate_buf, up_buf, rw_void, mid_buf,
-                                                                  g_n_rows, n_sel, 0.0f) : 0;
-                            /* DOWN reads per-slot X with stride=g_n_rows halves. */
+                            DS4_CHAIN_TRACE("dispatch_kind_up_post");
+                            /* Codex H2186/H2187 fix: gate/up come from fused
+                             * decode-matmul in row-block-major layout
+                             * [n_rb][n_sel][n_rows]. The legacy 2D SwiGLU
+                             * silently treated them as [n_sel][n_rows], so 15/16
+                             * row blocks of decoded mid were ignored and DOWN
+                             * read mid with stride=n_rows (768 of 12288 unique).
+                             *
+                             * Row-block-aware SwiGLU consumes the full
+                             * [n_rb][n_sel][n_rows] gate/up and writes mid in
+                             * slot-major [n_sel][n_rb * n_rows] layout. DOWN
+                             * then reads per-slot mid with stride = n_rb * n_rows.
+                             *
+                             * Invariant guard: gate/up must agree on n_rb and
+                             * n_rows or the seam is incoherent. */
+                            const uint32_t shapes_match =
+                                (g_n_rb == u_n_rb && g_n_rows == u_n_rows
+                                 && g_n_rb > 0 && g_n_rows > 0) ? 1u : 0u;
+                            if (rcu == 0 && !shapes_match && (s_full_cov_attempts & 1023) == 1) {
+                                fprintf(stderr,
+                                        "ds4_vqb2_fp16: PATH_FUSED L%u shape mismatch — "
+                                        "gate(rb=%u rows=%u) vs up(rb=%u rows=%u); falling back\n",
+                                        layer, g_n_rb, g_n_rows, u_n_rb, u_n_rows);
+                            }
+                            /* Bounds check: mid_buf was allocated for n_sel * intermediate
+                             * (2048) halves; row-block-aware SwiGLU writes n_sel * n_rb *
+                             * n_rows. If the dispatched shape ever exceeds the allocation
+                             * we'd corrupt neighbouring buffers. Production: n_rb*n_rows
+                             * = 16*128 = 2048 = intermediate, so equality holds; the
+                             * check guards future shape changes. */
+                            const uint64_t mid_writes   = (uint64_t)n_sel * g_n_rb * g_n_rows;
+                            const uint64_t mid_capacity = (uint64_t)n_sel * intermediate;
+                            const uint32_t mid_fits = (mid_writes <= mid_capacity) ? 1u : 0u;
+                            if (rcu == 0 && shapes_match && !mid_fits
+                                && (s_full_cov_attempts & 1023) == 1) {
+                                fprintf(stderr,
+                                        "ds4_vqb2_fp16: PATH_FUSED L%u mid_buf undersized — "
+                                        "writes=%llu (n_sel=%u * n_rb=%u * n_rows=%u) > "
+                                        "capacity=%llu; falling back\n",
+                                        layer, (unsigned long long)mid_writes,
+                                        n_sel, g_n_rb, g_n_rows,
+                                        (unsigned long long)mid_capacity);
+                            }
+                            DS4_CHAIN_TRACE("swiglu_rowblock_pre");
+                            int rcs = (rcu == 0 && shapes_match && mid_fits) ?
+                                ds4_metal_vqb2_fused_swiglu_rowblock_step(
+                                    gate_buf, up_buf, rw_void, mid_buf,
+                                    g_n_rows, n_sel, g_n_rb, 0.0f) : 0;
+                            DS4_CHAIN_TRACE("swiglu_rowblock_post");
+                            /* DOWN reads per-slot X with stride = n_rb * n_rows
+                             * halves — the full slot-major intermediate width. */
+                            const uint32_t intermediate_stride = g_n_rb * g_n_rows;
+                            DS4_CHAIN_TRACE("dispatch_kind_strided_down_pre");
                             int rcd = (rcs == 1) ?
                                 ds4_metal_vqb2_fused_dispatch_kind_strided(layer, 2u, sel_u32, n_sel,
-                                                                            mid_buf, down_buf, g_n_rows,
+                                                                            mid_buf, down_buf, intermediate_stride,
                                                                             &d_n_rb, &d_n_rows, &d_n_pairs) : -1;
+                            DS4_CHAIN_TRACE("dispatch_kind_strided_down_post");
+                            DS4_CHAIN_TRACE("sum_step_pre");
+                            /* sum_step writes into s_sum_out_buf (real MTLBuffer)
+                             * to avoid run_canary's CPU-pointer-as-MTLBuffer cast
+                             * crash. After success, copy MTLBuffer contents to
+                             * the caller's CPU pointer out_t. The MTLBuffer is
+                             * shared-storage on Apple Silicon so .contents is
+                             * the unified-memory pointer — memcpy is direct. */
                             int rcsum = (rcd == 0) ?
-                                ds4_metal_vqb2_fused_sum_step(down_buf, output_fp32, hidden) : 0;
-                            chain_ok = (rcsum == 1);
-                            if (!chain_ok && (s_full_cov_attempts & 1023) == 1) {
-                                fprintf(stderr,
-                                        "ds4_vqb2_fp16: PATH_FUSED L%u chain failed "
-                                        "(rcg=%d rcu=%d rcs=%d rcd=%d rcsum=%d) — fallback\n",
-                                        layer, rcg, rcu, rcs, rcd, rcsum);
+                                (s_precision_high
+                                    ? ds4_metal_vqb2_fused_sum_step_kahan(down_buf, sum_out_void, hidden)
+                                    : ds4_metal_vqb2_fused_sum_step      (down_buf, sum_out_void, hidden))
+                                : 0;
+                            DS4_CHAIN_TRACE("sum_step_post");
+                            if (rcsum == 1) {
+                                memcpy(out_t, s_sum_out_buf.contents, (size_t)hidden * sizeof(float));
+                            }
+                            int token_ok = (rcsum == 1);
+                            if (!token_ok) {
+                                all_tokens_ok = 0;
+                                failed_token = t;
+                                last_rcg = rcg; last_rcu = rcu; last_rcs = rcs;
+                                last_rcd = rcd; last_rcsum = rcsum;
                             }
                         }
-                        if (chain_ok) {
+
+                        if (all_tokens_ok) {
                             if ((s_full_cov_attempts & 1023) == 1) {
                                 fprintf(stderr,
                                         "ds4_vqb2_fp16: PATH_FUSED L%u chain ok "
-                                        "(attempts=%llu)\n",
-                                        layer, (unsigned long long)s_full_cov_attempts);
+                                        "(attempts=%llu, n_tokens=%u)\n",
+                                        layer, (unsigned long long)s_full_cov_attempts, n_tokens);
                             }
                             return 0;
+                        }
+                        if ((s_full_cov_attempts & 1023) == 1) {
+                            fprintf(stderr,
+                                    "ds4_vqb2_fp16: PATH_FUSED L%u chain failed at t=%u/%u "
+                                    "(rcg=%d rcu=%d rcs=%d rcd=%d rcsum=%d) — fallback\n",
+                                    layer, failed_token, n_tokens,
+                                    last_rcg, last_rcu, last_rcs, last_rcd, last_rcsum);
                         }
                     }
                     if ((s_full_cov_attempts & 1023) == 1) {
@@ -1069,7 +1347,10 @@ int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *store,
                                      struct ds4_gpu_tensor *input,
                                      struct ds4_gpu_tensor *output) {
     if (!store || !selected || !weights || !input || !output) return -1;
-    if (n_tokens != 1) return -2;
+    /* silv 2026-05-28: multi-token PATH_FUSED enabled (Tier 1). The inner
+     * dispatcher loops over tokens when n_tokens > 1; previously this gate
+     * rejected anything but n_tokens==1. */
+    if (n_tokens == 0u) return -2;
 
     const int32_t *sel = (const int32_t *)ds4_gpu_tensor_contents(selected);
     const float   *w   = (const float   *)ds4_gpu_tensor_contents(weights);
