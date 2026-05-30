@@ -33,6 +33,7 @@
 #include <sys/stat.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
+#include <mach/mach.h>      /* host_statistics64: live system-wide wired memory (panic-axis guard) */
 #endif
 #include <stdarg.h>
 #include <time.h>
@@ -1335,6 +1336,47 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
  * walks the huge tensor payload. */
+/* silv 2026-05-30 — memory instrumentation (measure, don't guess: 4 mislocated
+ * fixes came from reasoning about the panic instead of seeing the numbers).
+ * Prints process RSS + system-wide wired + physical at each load stage, FLUSHED
+ * immediately so the last line survives a kernel panic (the 05-30 panic log
+ * truncated because stderr was buffered). Disable with DS4_NO_MEM_LOG=1. */
+static uint64_t ds4_physical_ram_bytes(void);
+static uint64_t ds4_current_wired_bytes(void);
+/* Non-static so ds4_metal.m can trace the residency/views stages too. */
+void ds4_log_mem(const char *stage) {
+ if (getenv("DS4_NO_MEM_LOG")) return;
+ uint64_t phys = ds4_physical_ram_bytes();
+ uint64_t wired = ds4_current_wired_bytes();
+ uint64_t rss = 0;
+#if defined(__APPLE__)
+ mach_task_basic_info_data_t ti;
+ mach_msg_type_number_t cnt = MACH_TASK_BASIC_INFO_COUNT;
+ if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&ti, &cnt) == KERN_SUCCESS)
+  rss = ti.resident_size;
+#endif
+ char line[320];
+ int n = snprintf(line, sizeof(line),
+  "ds4: MEM[%s] rss=%.2f GB  sys-wired=%.2f GB  phys=%.2f GB  free-est=%.2f GB\n",
+  stage, rss / 1e9, wired / 1e9, phys / 1e9,
+  (phys > wired ? (double)(phys - wired) / 1e9 : 0.0));
+ if (n < 0) return;
+ fputs(line, stderr);
+ fflush(stderr);
+ /* DURABLE: append + fsync to a file so the LAST line survives a kernel panic
+  * (stderr buffering ate the 05-30 panic's real numbers). Path: DS4_MEM_LOG_FILE
+  * (default /tmp/ds4_mem_trace.log). */
+ const char *fp = getenv("DS4_MEM_LOG_FILE");
+ if (!fp || !fp[0]) fp = "/tmp/ds4_mem_trace.log";
+ int fd = open(fp, O_WRONLY | O_CREAT | O_APPEND, 0644);
+ if (fd >= 0) { (void)write(fd, line, (size_t)n); fsync(fd); close(fd); }
+ /* DELAY: give the fsync + the prior stage's VM/GPU work a window to settle
+  * before the next allocation, so the trace lands ahead of any panic. Default
+  * 150 ms; DS4_MEM_LOG_DELAY_MS overrides. */
+ const char *dms = getenv("DS4_MEM_LOG_DELAY_MS");
+ useconds_t delay = (dms && dms[0]) ? (useconds_t)(atoi(dms) * 1000) : 150000u;
+ if (delay) usleep(delay);
+}
 static void model_open(ds4_model *m, const char *path, bool metal_mapping,
  bool prefetch_cpu) {
  memset(m, 0, sizeof(*m));
@@ -1360,12 +1402,16 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
  * avoids that VM accounting path while preserving normal file-backed reads.
  */
  const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
+ fprintf(stderr, "ds4: about to mmap model %.1f GB (%s)\n",
+         (double)st.st_size / 1e9, metal_mapping ? "MAP_SHARED" : "MAP_PRIVATE");
+ ds4_log_mem(metal_mapping ? "pre-mmap-metal" : "pre-mmap-cpu");
  void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
  if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
 
  m->fd = fd;
  m->map = map;
  m->size = (uint64_t)st.st_size;
+ ds4_log_mem(metal_mapping ? "post-mmap-metal" : "post-mmap-cpu");
 
  ds4_cursor c = cursor_at(m, 0);
  uint32_t magic;
@@ -1682,6 +1728,7 @@ static int tensor_dtype_can_substitute(const ds4_tensor *t, uint32_t expected) {
       t->type == DS4_TENSOR_FP8_E4M3)) return 1;
  if (expected == DS4_TENSOR_Q8_0 &&
      (t->type == DS4_TENSOR_BF16 ||
+      t->type == DS4_TENSOR_F16 ||
       t->type == DS4_TENSOR_FP8_E4M3 ||
       t->type == DS4_TENSOR_F32)) return 1;
  /* IQ2_XXS substitution intentionally NOT added (silv 2026-05-28): the
@@ -8066,6 +8113,21 @@ static void layer_routed_moe_tokens_parallel(
 
 /* Default prefill FFN path. HC and shared expert are batched, while routed
  * experts can run either token-parallel or expert-grouped depending on size. */
+/* silv 2026-05-31 — FFN-input (gate/up routed-expert input) full-vector dump for >=4096-token
+ * activation-aware codec calibration. Env DS4_DUMP_FFN_IN_DIR=<dir>: per layer, append the
+ * [n_tok x DS4_N_EMBD] float32 ffn_norm output (exactly the x in ||(W-Wq)x||) to <dir>/ffn_in_L<il>.bin.
+ * Captured from the proven engine forward (M1), shipped to both boxes for codec sweeps. */
+static void ds4_ffn_in_dump_layer(uint32_t il, const float *norm, uint32_t n_tok, uint32_t dim) {
+ const char *dir = getenv("DS4_DUMP_FFN_IN_DIR");
+ if (!dir || !dir[0]) return;
+ char path[1024];
+ snprintf(path, sizeof(path), "%s/ffn_in_L%u.bin", dir, il);
+ FILE *fp = fopen(path, "ab");
+ if (!fp) { fprintf(stderr, "DS4_DUMP_FFN_IN_DIR: failed to open %s\n", path); return; }
+ fwrite(norm, sizeof(float), (size_t)n_tok * dim, fp);
+ fclose(fp);
+}
+
 static void layer_ffn_shared_batch(
  float * out_hc,
  const ds4_model * model,
@@ -8112,6 +8174,8 @@ static void layer_ffn_shared_batch(
  comb,
  n_tok);
  if (profile) t_hc_norm = now_sec() - t0;
+
+ ds4_ffn_in_dump_layer(il, norm, n_tok, DS4_N_EMBD);  /* calib capture (env-gated) */
 
  t0 = profile ? now_sec() : 0.0;
  if (routed_token_parallel) {
@@ -9911,6 +9975,27 @@ static void ds4_residual_split_dump(
  const double cos_am = (a_n > 1e-12 && m_n > 1e-12) ? dot_am / (a_n * m_n) : 0.0;
  fprintf(g_residual_split_fp, "%u,%u,%.6e,%.6e,%.6f,%.6f,%.6f\n",
    pos, il, a_n, m_n, cos_xa, cos_xm, cos_am);
+}
+
+/* silv 2026-05-29 #818 — per-layer activation binary dump for offline A/B vs
+ * the torch reference (model.py). Writes a 16-byte self-describing header
+ * {magic 'DS4H', n_tokens, hc_dim, il} then raw float32 [n_tokens × hc_dim] to
+ * <dir>/L<il>.bin (il<0 → embed.bin). One prefill run dumps every layer; all
+ * analysis (per-element relerror, cosine, per-channel) happens offline with no
+ * re-run. This is the order-of-magnitude accuracy refinement: the existing
+ * HC_PROBE collapses the same buffer to a single max_abs scalar; this keeps
+ * every element so small aberrations are recoverable. */
+static void ds4_dump_hc_layer(const char *dir, int il, uint32_t n_tokens,
+                              uint32_t hc_dim, const float *buf, uint64_t n_elems) {
+ char path[1024];
+ if (il < 0) snprintf(path, sizeof(path), "%s/embed.bin", dir);
+ else        snprintf(path, sizeof(path), "%s/L%02d.bin", dir, il);
+ FILE *fp = fopen(path, "wb");
+ if (!fp) { fprintf(stderr, "ds4: DS4_DUMP_HC_DIR: cannot open %s\n", path); return; }
+ const uint32_t hdr[4] = { 0x44533448u, n_tokens, hc_dim, (uint32_t)il };
+ fwrite(hdr, sizeof(uint32_t), 4, fp);
+ fwrite(buf, sizeof(float), (size_t)n_elems, fp);
+ fclose(fp);
 }
 
 static void forward_token_raw_swa_cpu_decode_scratch(
@@ -11994,9 +12079,10 @@ static int ds4_routed_moe_apply_full(
  ds4_routed_moe_env_init();
 
  const bool is_cpu_moe_layer = (!force_metal_moe && g->cpu_moe_layer[il]);
+ const bool has_path_fused_pack = getenv("DS4_VQB2_PACK_PATH") != NULL;
 
  /* If neither branch applies, return 0 — caller runs default Metal path. */
- if (!is_cpu_moe_layer && !ds4_routed_moe_env_hot_metal) {
+ if (!is_cpu_moe_layer && !ds4_routed_moe_env_hot_metal && !has_path_fused_pack) {
   return 0;
  }
 
@@ -12017,6 +12103,22 @@ static int ds4_routed_moe_apply_full(
  if (!contents_ok) {
   ds4_gpu_begin_commands();
   return -1;
+ }
+
+ if (!is_cpu_moe_layer && !ds4_routed_moe_env_hot_metal && has_path_fused_pack) {
+  extern int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *,
+                                               uint32_t, uint32_t,
+                                               struct ds4_gpu_tensor *,
+                                               struct ds4_gpu_tensor *,
+                                               struct ds4_gpu_tensor *,
+                                               struct ds4_gpu_tensor *);
+  memset(out, 0, (size_t)DS4_N_EMBD * sizeof(float));
+  const int dr = ds4_metal_vqb2_fp16_dispatch_gpu(
+   NULL, il, 1u,
+   g->router_selected, g->router_weights,
+   g->ffn_norm, g->routed_out);
+  if (ds4_gpu_begin_commands() == 0) return -1;
+  return dr == 0 ? 1 : -1;
  }
 
  /* Decide the backend now that we have sel for pinning checks. */
@@ -12106,6 +12208,13 @@ static uint64_t s_n_storage_dispatch_f16 = 0;
 static uint64_t s_n_storage_skip_multi_tok_f16 = 0;
 static uint64_t s_n_storage_dispatch_q8_0 = 0;
 static uint64_t s_n_storage_dispatch_bf16 = 0;
+/* silv 2026-05-29 #816 — FP8 dispatch counter. With 375 FP8_E4M3 attn
+ * tensors paired with E8M0 scales in the new pack, we need to know if
+ * the FP8 storage matmul path is actually firing at inference. If this
+ * stays 0 after a decode, the callers aren't routing FP8 through the
+ * via_tensor effective-type-aware dispatcher (or the via_tensor wrapper
+ * isn't called for attn matmuls). */
+static uint64_t s_n_storage_dispatch_fp8 = 0;
 /* silv 2026-05-28 high-resolution review — counter for BF16 storage path
  * SUPPRESSED via env var. When DS4_BF16_STORAGE_DISABLE=1 is set, the F16
  * dispatcher falls through to mmap even when storage.dtype==BF16. This
@@ -12178,6 +12287,29 @@ static int ds4_matmul_q8_0_via_tensor(ds4_gpu_tensor *dst,
   * a generic buffer-size message. */
  if (t != NULL && t->storage.metal_buffer != NULL) {
 	  if (t->storage.dtype != DS4_TENSOR_Q8_0) {
+	   if (t->storage.dtype == DS4_TENSOR_FP8_E4M3 &&
+	       t->storage.scale_metal_buffer != NULL &&
+	       t->storage.scale_dtype == DS4_TENSOR_FP8_E8M0) {
+	    s_n_storage_dispatch_fp8++;
+	    return ds4_gpu_matmul_fp8_e4m3_e8m0_storage(dst,
+	                                                t->storage.metal_buffer,
+	                                                t->storage.scale_metal_buffer,
+	                                                t->storage.scale_length,
+	                                                in_dim,
+	                                                out_dim,
+	                                                src,
+	                                                n_tok);
+	   }
+	   if (t->storage.dtype == DS4_TENSOR_F16) {
+	    s_n_storage_dispatch_f16++;
+	    return ds4_gpu_matmul_f16_storage(dst, t->storage.metal_buffer,
+	                                      in_dim, out_dim, src, n_tok);
+	   }
+	   if (t->storage.dtype == DS4_TENSOR_BF16 && n_tok == 1) {
+	    s_n_storage_dispatch_bf16++;
+	    return ds4_gpu_matmul_bf16_storage(dst, t->storage.metal_buffer,
+	                                       in_dim, out_dim, src, n_tok);
+	   }
 	   static int once = 0;
 	   if (!once) {
 	    once = 1;
@@ -12185,15 +12317,17 @@ static int ds4_matmul_q8_0_via_tensor(ds4_gpu_tensor *dst,
 	     fprintf(stderr,
 	      "ds4: Q8_0 dispatcher — storage.dtype=FP8_E4M3 with scale=%s "
 	      "(%llu B); paired source-exact storage is loaded but the FP8/E8M0 "
-	      "matmul kernel is not wired yet.\n",
+	      "matmul kernel refused this shape/path.\n",
 	      t->storage.scale_metal_buffer ? "mtlbuf" : "missing",
 	      (unsigned long long)t->storage.scale_length);
 	    } else {
 	     fprintf(stderr,
-	      "ds4: Q8_0 dispatcher — storage.dtype=%u (not Q8_0=8); pack-direct "
-	      "fill used a source-exact substitute that lacks a Q8_0-layout "
-	      "kernel.\n",
-	      (unsigned)t->storage.dtype);
+	      "ds4: Q8_0 dispatcher — tensor=%.*s storage.dtype=%u (not Q8_0=8), "
+	      "n_tok=%llu; pack-direct fill used a source-exact substitute that "
+	      "lacks a Q8_0-layout kernel.\n",
+	      (int)t->name.len, t->name.ptr,
+	      (unsigned)t->storage.dtype,
+	      (unsigned long long)n_tok);
 	    }
 	   }
 	   /* Do not fall through to mmap: metadata-only pack-direct would read
@@ -12244,6 +12378,18 @@ static int ds4_matmul_f16_via_tensor(ds4_gpu_tensor *dst,
     return ds4_gpu_matmul_bf16_storage(dst, t->storage.metal_buffer,
                                         in_dim, out_dim, src, n_tok);
    }
+  } else if (eff == DS4_TENSOR_FP8_E4M3 &&
+             t->storage.scale_metal_buffer != NULL &&
+             t->storage.scale_dtype == DS4_TENSOR_FP8_E8M0) {
+   s_n_storage_dispatch_q8_0++;
+   return ds4_gpu_matmul_fp8_e4m3_e8m0_storage(dst,
+                                                t->storage.metal_buffer,
+                                                t->storage.scale_metal_buffer,
+                                                t->storage.scale_length,
+                                                in_dim,
+                                                out_dim,
+                                                src,
+                                                n_tok);
   } else if (eff == DS4_TENSOR_F16) {
    s_n_storage_dispatch_f16++;
    return ds4_gpu_matmul_f16_storage(dst, t->storage.metal_buffer,
@@ -13344,10 +13490,58 @@ static bool metal_graph_encode_decode_layer(
  if (ok) {
  metal_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
  }
+ const bool attn_output_q8_native =
+ tensor_effective_type(layer->attn_output_a) == DS4_TENSOR_Q8_0 &&
+ tensor_effective_type(layer->attn_output_b) == DS4_TENSOR_Q8_0;
+ /* silv 2026-05-29 #816 — bisect FP8 attention bug. Setting
+  * DS4_DISABLE_FP8_ATTN_OUT=1 forces the FP8 attention-output dispatch
+  * to be skipped, falling through to the Q8_0 / legacy path. If the
+  * prompt-invariant 1.84e+37 logit disappears with this disabled,
+  * the bug lives inside the FP8 attention chain. */
+ static int s_disable_fp8_attn_out_checked = 0;
+ static int s_disable_fp8_attn_out = 0;
+ if (!s_disable_fp8_attn_out_checked) {
+  s_disable_fp8_attn_out = getenv("DS4_DISABLE_FP8_ATTN_OUT") != NULL ? 1 : 0;
+  s_disable_fp8_attn_out_checked = 1;
+  if (s_disable_fp8_attn_out) {
+   fprintf(stderr, "ds4: DS4_DISABLE_FP8_ATTN_OUT=1 — FP8 attn output path disabled (bisect probe)\n");
+  }
+ }
+ const bool attn_output_fp8_storage =
+ !s_disable_fp8_attn_out &&
+ layer->attn_output_a->storage.dtype == DS4_TENSOR_FP8_E4M3 &&
+ layer->attn_output_b->storage.dtype == DS4_TENSOR_FP8_E4M3 &&
+ layer->attn_output_a->storage.metal_buffer != NULL &&
+ layer->attn_output_b->storage.metal_buffer != NULL &&
+ layer->attn_output_a->storage.scale_metal_buffer != NULL &&
+ layer->attn_output_b->storage.scale_metal_buffer != NULL &&
+ layer->attn_output_a->storage.scale_dtype == DS4_TENSOR_FP8_E8M0 &&
+ layer->attn_output_b->storage.scale_dtype == DS4_TENSOR_FP8_E8M0;
  const bool fuse_attn_out_hc =
  !metal_graph_directional_steering_attn_enabled(g) &&
- !metal_graph_use_reference_attn_out_hc();
- if (ok && fuse_attn_out_hc) {
+ !metal_graph_use_reference_attn_out_hc() &&
+ attn_output_q8_native;
+ if (ok && attn_output_fp8_storage) {
+ ok = ds4_gpu_attention_output_low_fp8_e4m3_e8m0_storage(g->attn_low,
+ layer->attn_output_a->storage.metal_buffer,
+ layer->attn_output_a->storage.scale_metal_buffer,
+ layer->attn_output_a->storage.scale_length,
+ group_dim,
+ rank,
+ n_groups,
+ g->heads,
+ 1) != 0;
+ if (ok) {
+ ok = ds4_gpu_matmul_fp8_e4m3_e8m0_storage(g->attn_out,
+ layer->attn_output_b->storage.metal_buffer,
+ layer->attn_output_b->storage.scale_metal_buffer,
+ layer->attn_output_b->storage.scale_length,
+ (uint64_t)n_groups * rank,
+ DS4_N_EMBD,
+ g->attn_low,
+ 1) != 0;
+ }
+ } else if (ok && fuse_attn_out_hc) {
  ok = ds4_gpu_attention_output_low_q8_tensor(g->attn_low,
  model->map,
  model->size,
@@ -14685,8 +14879,26 @@ static bool metal_graph_upload_prompt_embeddings_hc_cpu(
  float *hc = xmalloc((size_t)total * sizeof(hc[0]));
  float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(plain[0]));
 
+ /* silv 2026-05-29 — embed-injection probe (#816 prompt-invariant bug).
+  * Env DS4_EMBED_PROBE=1 prints per-token embed-row hash + first-3 floats.
+  * If hashes differ across prompts → embed is fine, bug is downstream.
+  * If hashes constant across prompts → embed lookup or storage is broken. */
+ const int embed_probe = getenv("DS4_EMBED_PROBE") != NULL;
  for (uint32_t t = 0; t < n_tokens; t++) {
  embed_token_f16(model, weights, prompt->v[pos0 + t], plain);
+ if (embed_probe) {
+  /* Cheap rolling hash of the 4096-dim embedding row */
+  uint64_t h64 = 1469598103934665603ULL;
+  const uint8_t *p = (const uint8_t *)plain;
+  for (size_t i = 0; i < (size_t)DS4_N_EMBD * sizeof(plain[0]); i++) {
+   h64 ^= p[i]; h64 *= 1099511628211ULL;
+  }
+  fprintf(stderr,
+   "ds4: embed_probe pos=%u token=%d hash=%016llx first3=[%.6e %.6e %.6e]\n",
+   pos0 + t, prompt->v[pos0 + t],
+   (unsigned long long)h64,
+   (double)plain[0], (double)plain[1], (double)plain[2]);
+ }
  float *dst = hc + (uint64_t)t * hc_dim;
  for (uint32_t h = 0; h < DS4_N_HC; h++) {
  memcpy(dst + (uint64_t)h * DS4_N_EMBD,
@@ -14951,6 +15163,39 @@ static bool metal_graph_encode_layer_attention_batch(
  (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
  }
  DS4_METAL_PROFILE_ATTN_STAGE("hc_pre");
+ /* silv 2026-05-29 #816 stage probe — DS4_L1_STAGE_PROBE=1 dumps last-pos max-abs
+  * of selected intermediate buffers during il==1 only. The catastrophe is
+  * at L01 last position; we want to know WHICH KERNEL inside L01 first emits
+  * NaN. Helper expands into a sync+read+printf gated by the env var. */
+#define DS4_L1_PROBE(label, tensor, n_elems_per_tok) do { \
+    if (ok && il == 1u && getenv("DS4_L1_STAGE_PROBE") != NULL) { \
+        if (ds4_gpu_end_commands() != 0) { \
+            const uint64_t _ne = (uint64_t)(n_elems_per_tok); \
+            const uint64_t _total = (uint64_t)n_tokens * _ne; \
+            float *_buf = (float*)malloc(_total * sizeof(float)); \
+            if (_buf && ds4_gpu_tensor_read((tensor), 0, _buf, \
+                                              _total * sizeof(float)) != 0) { \
+                float _ma_last = 0.0f, _ma_first = 0.0f; \
+                uint64_t _nan_last = 0, _nan_first = 0; \
+                const uint64_t _off_last = (uint64_t)(n_tokens - 1u) * _ne; \
+                for (uint64_t i = 0; i < _ne; i++) { \
+                    float v0 = _buf[i], v1 = _buf[_off_last + i]; \
+                    if (v0 != v0) _nan_first++; else if (fabsf(v0) > _ma_first) _ma_first = fabsf(v0); \
+                    if (v1 != v1) _nan_last++;  else if (fabsf(v1) > _ma_last)  _ma_last  = fabsf(v1); \
+                } \
+                fprintf(stderr, \
+                        "ds4: L1_PROBE %-14s first(max|nan)=%.4g/%llu  last(max|nan)=%.4g/%llu  last[0..3]= %.4g %.4g %.4g %.4g\n", \
+                        label, _ma_first, (unsigned long long)_nan_first, \
+                        _ma_last, (unsigned long long)_nan_last, \
+                        _buf[_off_last + 0], _buf[_off_last + 1], \
+                        _buf[_off_last + 2], _buf[_off_last + 3]); \
+            } \
+            free(_buf); \
+            ok = ds4_gpu_begin_commands() != 0; \
+        } \
+    } \
+} while (0)
+ DS4_L1_PROBE("attn_cur(post hc)", g->batch_attn_cur, DS4_N_EMBD);
  if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_attn_norm,
  g->batch_attn_cur,
  model->map,
@@ -14963,6 +15208,7 @@ static bool metal_graph_encode_layer_attention_batch(
  metal_graph_debug_dump_tensor("attn_norm", g->batch_attn_norm,
  (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
  }
+ DS4_L1_PROBE("attn_norm", g->batch_attn_norm, DS4_N_EMBD);
  DS4_METAL_PROFILE_ATTN_STAGE("norm");
  DS4_METAL_PROFILE_Q_STAGE("pre_q");
  if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_qr, model,
@@ -14973,6 +15219,7 @@ static bool metal_graph_encode_layer_attention_batch(
  metal_graph_debug_dump_tensor("q_lora", g->batch_qr,
  (uint64_t)n_tokens * q_rank, il, pos0);
  }
+ DS4_L1_PROBE("q_lora", g->batch_qr, q_rank);
  DS4_METAL_PROFILE_Q_STAGE("q_a");
  if (qkv_rms_fused) {
  if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_kv_raw, model,
@@ -15051,6 +15298,7 @@ static bool metal_graph_encode_layer_attention_batch(
  metal_graph_debug_dump_tensor("Qcur", g->batch_q,
  (uint64_t)n_tokens * q_dim, il, pos0);
  }
+ DS4_L1_PROBE("Qcur(post-RoPE)", g->batch_q, q_dim);
  DS4_METAL_PROFILE_Q_STAGE("rope");
  DS4_METAL_PROFILE_ATTN_STAGE("q_path");
  if (!qkv_rms_fused) {
@@ -15101,6 +15349,7 @@ static bool metal_graph_encode_layer_attention_batch(
  metal_graph_debug_dump_tensor("KVcur", g->batch_kv,
  (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
  }
+ DS4_L1_PROBE("KVcur(quant)", g->batch_kv, DS4_N_HEAD_DIM);
  DS4_METAL_PROFILE_ATTN_STAGE("kv_path");
  /*
  * Static graph order is q, kv, cpy_k(raw SWA), then attention. For a
@@ -15131,6 +15380,8 @@ static bool metal_graph_encode_layer_attention_batch(
  DS4_N_HEAD,
  DS4_N_HEAD_DIM) != 0;
  if (ok) batch_attention_done = true;
+ DS4_L1_PROBE("batch_heads(post-attn)", g->batch_heads,
+              (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM);
  } else if (ok && !zero_prefix && ratio == 0 && n_tokens <= g->raw_cap) {
  /*
  * The ubatch path stores the whole batch in the SWA cache, then runs
@@ -16089,8 +16340,42 @@ static bool metal_graph_encode_layer_attention_batch(
  metal_graph_debug_dump_tensor("kqv_back", g->batch_heads,
  (uint64_t)n_tokens * q_dim, il, pos0);
  }
+ DS4_L1_PROBE("kqv_back(inv-RoPE)", g->batch_heads, q_dim);
  DS4_METAL_PROFILE_ATTN_STAGE("inv_rope");
- if (ok) ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out,
+ /* silv 2026-05-29 #816 — bisect FP8 attn (batch path). Same env var as
+  * the decode path at ~line 13412. */
+ const bool attn_output_fp8_storage =
+ getenv("DS4_DISABLE_FP8_ATTN_OUT") == NULL &&
+ layer->attn_output_a->storage.dtype == DS4_TENSOR_FP8_E4M3 &&
+ layer->attn_output_b->storage.dtype == DS4_TENSOR_FP8_E4M3 &&
+ layer->attn_output_a->storage.metal_buffer != NULL &&
+ layer->attn_output_b->storage.metal_buffer != NULL &&
+ layer->attn_output_a->storage.scale_metal_buffer != NULL &&
+ layer->attn_output_b->storage.scale_metal_buffer != NULL &&
+ layer->attn_output_a->storage.scale_dtype == DS4_TENSOR_FP8_E8M0 &&
+ layer->attn_output_b->storage.scale_dtype == DS4_TENSOR_FP8_E8M0;
+ if (ok && attn_output_fp8_storage) {
+ ok = ds4_gpu_attention_output_low_fp8_e4m3_e8m0_storage(g->batch_attn_low,
+ layer->attn_output_a->storage.metal_buffer,
+ layer->attn_output_a->storage.scale_metal_buffer,
+ layer->attn_output_a->storage.scale_length,
+ group_dim,
+ rank,
+ n_groups,
+ g->batch_heads,
+ n_tokens) != 0;
+ if (ok) {
+ ok = ds4_gpu_matmul_fp8_e4m3_e8m0_storage(g->batch_attn_out,
+ layer->attn_output_b->storage.metal_buffer,
+ layer->attn_output_b->storage.scale_metal_buffer,
+ layer->attn_output_b->storage.scale_length,
+ (uint64_t)n_groups * rank,
+ DS4_N_EMBD,
+ g->batch_attn_low,
+ n_tokens) != 0;
+ }
+ } else if (ok) {
+ ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out,
  g->batch_attn_low,
  g->batch_group_tmp,
  g->batch_low_tmp,
@@ -16104,16 +16389,19 @@ static bool metal_graph_encode_layer_attention_batch(
  DS4_N_EMBD,
  g->batch_heads,
  n_tokens) != 0;
+ }
  if (ok) {
  metal_graph_debug_dump_tensor("attn_low", g->batch_attn_low,
  (uint64_t)n_tokens * n_groups * rank,
  il,
  pos0);
  }
+ DS4_L1_PROBE("attn_low(FP8-low)", g->batch_attn_low, (uint64_t)n_groups * rank);
  if (ok) {
  metal_graph_debug_dump_tensor("attn_out", g->batch_attn_out,
  (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
  }
+ DS4_L1_PROBE("attn_out(FP8-final)", g->batch_attn_out, DS4_N_EMBD);
  DS4_METAL_PROFILE_ATTN_STAGE("output_proj");
  if (ok && metal_graph_directional_steering_attn_enabled(g)) {
  ok = metal_graph_apply_directional_steering_attn(g, g->batch_attn_out, il, n_tokens);
@@ -16128,6 +16416,7 @@ static bool metal_graph_encode_layer_attention_batch(
  metal_graph_debug_dump_tensor("hc_attn_post", g->batch_after_attn_hc,
  (uint64_t)n_tokens * hc_dim, il, pos0);
  }
+ DS4_L1_PROBE("hc_attn_post(after expand+resid)", g->batch_after_attn_hc, hc_dim);
  DS4_METAL_PROFILE_ATTN_STAGE("hc_post");
  ds4_gpu_tensor_free(after_attn_hc_view);
  ds4_gpu_tensor_free(attn_cur_view);
@@ -16253,6 +16542,7 @@ static bool metal_graph_encode_layer_ffn_batch(
  metal_graph_debug_dump_tensor("hc_ffn_pre", g->batch_ffn_cur,
  (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
  }
+ DS4_L1_PROBE("ffn_cur(hc_pre)", g->batch_ffn_cur, DS4_N_EMBD);
  DS4_METAL_PROFILE_FFN_STAGE("hc_pre");
  if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_ffn_norm,
  g->batch_ffn_cur,
@@ -16266,12 +16556,35 @@ static bool metal_graph_encode_layer_ffn_batch(
  metal_graph_debug_dump_tensor("ffn_norm", g->batch_ffn_norm,
  (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
  }
+ DS4_L1_PROBE("ffn_norm", g->batch_ffn_norm, DS4_N_EMBD);
  DS4_METAL_PROFILE_FFN_STAGE("norm");
  if (ok) ok = ds4_matmul_f16_via_tensor(g->batch_router_logits, model,
   layer->ffn_gate_inp,
   DS4_N_EMBD, DS4_N_EXPERT,
   g->batch_ffn_norm, n_tokens) != 0;
 
+ /* silv 2026-05-29 #817 — verify tid2eid pack-direct wiring. The hash-mode
+  * router uses abs_offset to look up the table via wrap_model_range, which
+  * relies on a synthetic view being registered for the tid2eid storage. If
+  * the storage.metal_buffer is NULL (override-fill didn't wire I32 tensors)
+  * the kernel ends up reading past-EOF garbage. Env-gated print. */
+ if (ok && layer->ffn_gate_tid2eid && getenv("DS4_HASH_ROUTER_PROBE") != NULL) {
+     static int s_t_printed[DS4_N_LAYER] = {0};
+     if (il < DS4_N_LAYER && !s_t_printed[il]) {
+         s_t_printed[il] = 1;
+         fprintf(stderr,
+                 "ds4: TID2EID_PROBE L%u abs_offset=%llu storage.metal_buffer=%s storage.dtype=%u storage.length=%llu t->type=%u dim=[%llu,%llu]\n",
+                 il,
+                 (unsigned long long)layer->ffn_gate_tid2eid->abs_offset,
+                 layer->ffn_gate_tid2eid->storage.metal_buffer ? "WIRED" : "NULL",
+                 (unsigned)layer->ffn_gate_tid2eid->storage.dtype,
+                 (unsigned long long)layer->ffn_gate_tid2eid->storage.length,
+                 (unsigned)layer->ffn_gate_tid2eid->type,
+                 (unsigned long long)layer->ffn_gate_tid2eid->dim[0],
+                 (unsigned long long)layer->ffn_gate_tid2eid->dim[1]);
+         fflush(stderr);
+     }
+ }
  if (ok) ok = ds4_gpu_router_select_batch_tensor(g->batch_router_selected,
  g->batch_router_weights,
  g->batch_router_probs,
@@ -16317,7 +16630,24 @@ static bool metal_graph_encode_layer_ffn_batch(
  }
  DS4_METAL_PROFILE_FFN_STAGE("router");
 
- if (ok && g->cpu_moe_layer[il]) {
+	 const bool has_path_fused_pack = getenv("DS4_VQB2_PACK_PATH") != NULL;
+	 if (ok && has_path_fused_pack && !g->cpu_moe_layer[il]) {
+	 extern int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *,
+	                                              uint32_t, uint32_t,
+	                                              struct ds4_gpu_tensor *,
+	                                              struct ds4_gpu_tensor *,
+	                                              struct ds4_gpu_tensor *,
+	                                              struct ds4_gpu_tensor *);
+	 ok = (ds4_gpu_end_commands() != 0);
+	 if (ok) {
+	  const int dr = ds4_metal_vqb2_fp16_dispatch_gpu(
+	   NULL, il, (uint32_t)n_tokens,
+	   g->batch_router_selected, g->batch_router_weights,
+	   g->batch_ffn_norm, g->batch_routed_out);
+	  ok = (dr == 0);
+	 }
+	 if (ds4_gpu_begin_commands() == 0) ok = false;
+	 } else if (ok && g->cpu_moe_layer[il]) {
  /* Async cpu-moe handoff. The previous layer's CPU expert worker (if
  * any) must be joined before we drain the GPU command buffer here,
  * because the ffn_out add encoded after that earlier layer reads
@@ -16420,6 +16750,7 @@ static bool metal_graph_encode_layer_ffn_batch(
  metal_graph_debug_dump_tensor("ffn_moe_out", g->batch_routed_out,
  (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
  }
+ DS4_L1_PROBE("ffn_moe_out(VQB2 routed)", g->batch_routed_out, DS4_N_EMBD);
  DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
  if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_shared_gate, model,
   layer->ffn_gate_shexp,
@@ -16445,6 +16776,7 @@ static bool metal_graph_encode_layer_ffn_batch(
  metal_graph_debug_dump_tensor("ffn_shexp", g->batch_shared_out,
  (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
  }
+ DS4_L1_PROBE("ffn_shexp(shared out)", g->batch_shared_out, DS4_N_EMBD);
 
  /* Bridge between async cpu-moe and the routed-out consumers below. The
  * shared-expert chain just encoded does NOT depend on batch_routed_out
@@ -16493,7 +16825,9 @@ static bool metal_graph_encode_layer_ffn_batch(
  metal_graph_debug_dump_tensor("hc_ffn_post", g->batch_next_hc,
  (uint64_t)n_tokens * hc_dim, il, pos0);
  }
+ DS4_L1_PROBE("hc_ffn_post(end of L1)", g->batch_next_hc, hc_dim);
  DS4_METAL_PROFILE_FFN_STAGE("hc_post");
+#undef DS4_L1_PROBE
  ds4_gpu_tensor_free(next_hc_view);
  ds4_gpu_tensor_free(ffn_cur_view);
  ds4_gpu_tensor_free(hc_split_view);
@@ -17229,10 +17563,54 @@ static bool metal_graph_prefill_layer_major(
                                                 il,
                                                 start,
                                                 n_tokens);
+            /* silv 2026-05-29 #816 — per-layer residual probe.
+             * After each layer encode, sync GPU + read back batch_cur_hc,
+             * compute max-abs. The layer where this first goes huge is the
+             * broken layer. Gated by DS4_LAYER_HC_PROBE=1. */
+            {
+                const int hc_probe = getenv("DS4_LAYER_HC_PROBE") != NULL;
+                const char *hc_dump_dir = getenv("DS4_DUMP_HC_DIR");
+                const int hc_dump = (hc_dump_dir && hc_dump_dir[0]);
+                if (ok && (hc_probe || hc_dump) && ds4_gpu_end_commands() != 0) {
+                    const uint64_t hc_dim_probe = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+                    const uint64_t n_elems = (uint64_t)n_tokens * hc_dim_probe;
+                    float *buf = (float*)malloc(n_elems * sizeof(float));
+                    if (buf && ds4_gpu_tensor_read(g->batch_cur_hc, 0, buf,
+                                                    n_elems * sizeof(float)) != 0) {
+                        if (hc_probe) {
+                            float max_abs = 0.0f; uint64_t n_huge = 0, n_nan = 0;
+                            uint64_t at = 0;
+                            for (uint64_t i = 0; i < n_elems; i++) {
+                                float v = buf[i];
+                                if (v != v) { n_nan++; continue; }
+                                float av = fabsf(v);
+                                if (av > 1e+20f) n_huge++;
+                                if (av > max_abs) { max_abs = av; at = i; }
+                            }
+                            /* Last-token last-position probe: row = n_tokens-1,
+                             * h=0, embd=0..3 */
+                            const uint64_t last_off = (uint64_t)(n_tokens - 1u) * hc_dim_probe;
+                            fprintf(stderr,
+                                    "ds4: HC_PROBE post-L%02u max_abs=%.4g at=%llu huge=%llu nan=%llu last_pos[0..3]= %.4g %.4g %.4g %.4g\n",
+                                    il, max_abs, (unsigned long long)at,
+                                    (unsigned long long)n_huge, (unsigned long long)n_nan,
+                                    buf[last_off + 0], buf[last_off + 1],
+                                    buf[last_off + 2], buf[last_off + 3]);
+                        }
+                        if (hc_dump) {
+                            ds4_dump_hc_layer(hc_dump_dir, (int)il, n_tokens,
+                                              (uint32_t)hc_dim_probe, buf, n_elems);
+                        }
+                    }
+                    free(buf);
+                    ok = ds4_gpu_begin_commands() != 0;
+                }
+            }
             if (show_progress) {
                 fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
                 fflush(stderr);
             }
+            { char _mst[40]; snprintf(_mst, sizeof(_mst), "gpu-prefill-L%u", il + 1); ds4_log_mem(_mst); }
         }
         if (show_progress) fputc('\n', stderr);
         if (display_progress)
@@ -18313,6 +18691,7 @@ struct ds4_engine {
  bool quality;
  bool metal_ready;
  bool mtp_ready;
+ bool mtp_model_aliased;   /* #674: mtp_model aliases model (embedded head) — skip close */
  bool cpu_moe;
  bool cpu_model_ready;
  bool cpu_moe_layer[DS4_N_LAYER];
@@ -21591,6 +21970,49 @@ static uint64_t ds4_physical_ram_bytes(void) {
 #endif
 }
 
+/* Live system-wide WIRED physical memory in bytes (pages the kernel cannot
+ * evict), or 0 if unavailable. This is the axis that PANICS: once total wired
+ * exceeds physical RAM the kernel cannot reclaim and dies (it does not swap).
+ * engine_resolve_auto_phases budgets the Metal residency against
+ * (phys - this - reserve), so --prefill-metal-phases auto is self-protecting
+ * against ANY concurrent wired consumer (a co-running MLX sweep, a second ds4)
+ * with no cooperative lock. Root cause of the 2026-05-29 panic: this engine
+ * wired its ~62 GiB phase budget (cap from TOTAL ram) while a concurrent MLX
+ * probe wired several GiB more, exceeding the 64 GiB machine. */
+static uint64_t ds4_current_wired_bytes(void) {
+#if defined(__APPLE__)
+    mach_port_t host = mach_host_self();
+    vm_size_t page = 0;
+    if (host_page_size(host, &page) != KERN_SUCCESS || page == 0) return 0;
+    vm_statistics64_data_t st;
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&st, &cnt) != KERN_SUCCESS)
+        return 0;
+    return (uint64_t)st.wire_count * (uint64_t)page;
+#else
+    return 0;
+#endif
+}
+
+/* silv 2026-05-30 (MEASURED root cause of the M1 panics): returns 1 if wiring
+ * `add_bytes` of GPU memory NOW would over-commit physical RAM (the kernel-panic
+ * axis — wired pages cannot be evicted), else 0. Live system-wide wired via
+ * host_statistics64 also catches concurrent consumers. reserve from
+ * DS4_WIRE_RESERVE_MIB (default 6 GiB). Used by the Metal residency commit to
+ * DEGRADE to demand-paging instead of wiring a >RAM model: the 2026-05-30 trace
+ * showed the cpu-moe view set covers the full 82.7 GB IQ2_XXS and requestResidency
+ * wired all of it on a 68.7 GB box (sys-wired 3->45 GB by prefill layer 1). */
+int ds4_mem_would_overcommit(uint64_t add_bytes) {
+ const uint64_t phys = ds4_physical_ram_bytes();
+ if (phys == 0) return 0;
+ const uint64_t wired = ds4_current_wired_bytes();
+ uint64_t reserve = (uint64_t)6 << 30;
+ const char *r = getenv("DS4_WIRE_RESERVE_MIB");
+ if (r && r[0]) reserve = (uint64_t)strtoull(r, NULL, 10) << 20;
+ const uint64_t avail = (phys > wired + reserve) ? (phys - wired - reserve) : 0;
+ return add_bytes > avail ? 1 : 0;
+}
+
 /* Read `iogpu.wired_limit_mb` (macOS Metal wired-memory cap) and return it
  * in bytes. Returns 0 when the sysctl is unavailable or its value is 0
  * (the latter is macOS's "auto, ~75% of RAM" default and is not a usable
@@ -21669,6 +22091,36 @@ static uint32_t engine_resolve_auto_phases(const ds4_engine *e) {
  "both unavailable); specify an explicit N or set "
  "DS4_PREFILL_METAL_PHASES_WIRED_LIMIT_MIB\n");
  return 0;
+ }
+
+ /* Self-protect against concurrent WIRED-memory consumers (2026-05-29 panic:
+  * a co-running MLX sweep wired Metal memory while this engine wired its phase
+  * budget, exceeding the 64 GiB machine -> kernel panic; wired pages cannot be
+  * evicted). `cap` above is from TOTAL ram; additionally cap by what physically
+  * fits NOW given live system-wide wired use, read via host_statistics64 (no
+  * cooperative lock). Another GPU/MLX job running -> `fits` shrinks -> more
+  * phases; if it already ate the budget the cap<=headroom check below balks. */
+ {
+  const uint64_t phys_now = ds4_physical_ram_bytes();
+  const uint64_t wired_now = ds4_current_wired_bytes();
+  if (phys_now > 0 && wired_now > 0) {
+   uint64_t reserve = (uint64_t)8 * 1024ull * 1024ull * 1024ull;
+   (void)ds4_env_mib_to_bytes("DS4_PREFILL_METAL_PHASES_WIRED_RESERVE_MIB", &reserve);
+   const uint64_t fits = (phys_now > wired_now + reserve)
+                       ? (phys_now - wired_now - reserve) : 0;
+   if (fits < cap) {
+    fprintf(stderr,
+     "ds4: --prefill-metal-phases auto: live system wired %.2f GiB leaves only %.2f GiB "
+     "safely wireable (phys %.2f - wired - %.2f reserve); capping budget from %.2f GiB. "
+     "Stop other GPU/MLX jobs for fewer phases.\n",
+     (double)wired_now / (1024.0 * 1024.0 * 1024.0),
+     (double)fits / (1024.0 * 1024.0 * 1024.0),
+     (double)phys_now / (1024.0 * 1024.0 * 1024.0),
+     (double)reserve / (1024.0 * 1024.0 * 1024.0),
+     (double)cap / (1024.0 * 1024.0 * 1024.0));
+    cap = fits;
+   }
+  }
  }
 
  uint64_t headroom = (uint64_t)14 * 1024ull * 1024ull * 1024ull;
@@ -21970,42 +22422,40 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
   * cannot be mmapped+resident under the default Metal-only path without
   * panicking the kernel. Past panics: 2026-05-19, 2026-05-23, 2026-05-28.
   *
-  * Refuse the launch unless EITHER:
-  *   --cpu-moe                  (routed MoE on CPU, Metal fits without)
-  *   --n-cpu-moe N (N > 0)      (partial CPU MoE)
-  *   --prefill-metal-phases X   (phase-split residency; X = -1 auto or >0)
-  *   --backend cpu              (pure CPU, no Metal residency)
+  * Refuse the launch if the model exceeds 52 GiB — UNCONDITIONALLY (no flag exempts).
   *
-  * Threshold is 52 GB — silv's chosen project ceiling (above the wired
-  * cap, below the M1 Max 96 GB RAM ceiling). A safety-flagged launch
-  * with model > 52 GB passes; a flag-free launch fails BEFORE any mmap
-  * call so no kernel pressure builds. Stat is cheap (~ms); the binary
-  * exits with rc=2 and an explicit remediation hint.
+  * CORRECTED 2026-05-30 (empirical, earned by thrashing silv's machine): the safety
+  * flags (--prefill-metal-phases, --cpu-moe, ...) prevent the kernel PANIC but NOT
+  * unusability. A >RAM model under the residency gate SKIPS the wire and then
+  * DEMAND-PAGES its >RAM working set during prefill -> the system THRASHES into
+  * unresponsiveness. Verified 2026-05-30: --prefill-metal-phases auto + --vqb2-pack,
+  * residency correctly SKIPPED (no panic, reached prefill L38/43), but the machine
+  * became unusable ~20s in. "No panic" != "usable". So a model > 52 GiB does NOT run
+  * usably on this 64 GB M1 Max by ANY residency strategy (wire->panic, page->thrash).
+  * Balk on size alone, regardless of flags. The prior code exempted safety-flagged
+  * launches — that exemption is what let the 80.8 GB IQ2 through into the thrash.
   *
-  * The MTP model is checked separately when it loads (small file, but
-  * the rule applies to any GGUF this binary opens). */
+  * 52 GiB = silv's deployable ceiling. A <=52 GiB model/pack RUNS (M1 stays in scope
+  * for sweeps + quantization search + the deployable pack); a >52 GiB model is refused
+  * BEFORE any mmap so no memory pressure builds. Stat is cheap (~ms); rc=2 + hint.
+  * NOTE: when the pack-direct loader (#771) lands and stops loading the full base,
+  * switch this from base-file-size to the actual resident footprint (pack + non-routed
+  * + KV) so a 39 GB pack-direct config passes while the 80.8 GB base it overlays does not.
+  * Applies to any GGUF this binary opens (MTP model checked separately at load). */
  if (opt->model_path && opt->model_path[0]) {
   struct stat _ds4_tripwire_st;
   if (stat(opt->model_path, &_ds4_tripwire_st) == 0) {
    const uint64_t _DS4_SAFETY_BYTES = 52ULL * 1024ULL * 1024ULL * 1024ULL;
    const uint64_t fsz = (uint64_t)_ds4_tripwire_st.st_size;
-   const int safe_flag_set =
-    opt->cpu_moe ||
-    opt->n_cpu_moe_layers > 0 ||
-    opt->prefill_metal_phases != 0 ||
-    opt->backend == DS4_BACKEND_CPU;
-   if (fsz > _DS4_SAFETY_BYTES && !safe_flag_set) {
+   if (fsz > _DS4_SAFETY_BYTES) {
     fprintf(stderr,
-     "\nds4: TRIPWIRE — refusing to load %s (%.1f GiB > 52 GiB safety cap)\n"
-     "    Direct Metal residency at this size exceeds M1 Max wired-memory\n"
-     "    cap (~48-60 GB) and panics the kernel. Past panics: 2026-05-19,\n"
-     "    2026-05-23, 2026-05-28.\n\n"
-     "    Add ONE of the following safety flags and retry:\n"
-     "      --prefill-metal-phases auto    (recommended; phase-split residency)\n"
-     "      --cpu-moe                      (routed MoE on CPU)\n"
-     "      --n-cpu-moe N                  (partial CPU MoE, N layers)\n"
-     "      --backend cpu                  (pure CPU, no Metal residency)\n\n"
-     "    To bypass (NOT RECOMMENDED — kernel-panic risk):\n"
+     "\nds4: MEMORY-CEILING BALK — refusing to load %s (%.1f GiB > 52 GiB ceiling)\n"
+     "    A model larger than 52 GiB does not run usably on this 64 GB M1 Max by\n"
+     "    ANY residency strategy: wiring it -> kernel panic (2026-05-19/23/28);\n"
+     "    skipping the wire -> demand-pages the >RAM working set -> THRASH/unusable\n"
+     "    (2026-05-30, even WITH --prefill-metal-phases auto). 'No panic' != 'usable'.\n\n"
+     "    Use a <=52 GiB model/pack (the deployable target), or run this model on\n"
+     "    AMD/nvidia. To bypass at your own risk (panic/thrash):\n"
      "      DS4_DISABLE_SIZE_TRIPWIRE=1 ds4 ...\n\n",
      opt->model_path, (double)fsz / (1024.0 * 1024.0 * 1024.0));
     if (!getenv("DS4_DISABLE_SIZE_TRIPWIRE")) {
@@ -22014,7 +22464,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
      return 2;
     }
     fprintf(stderr,
-     "ds4: DS4_DISABLE_SIZE_TRIPWIRE=1 set — proceeding at silv's own risk.\n");
+     "ds4: DS4_DISABLE_SIZE_TRIPWIRE=1 set — proceeding at silv's own risk (panic/thrash).\n");
    }
   } else {
    /* stat failure is non-fatal here; the GGUF loader downstream will
@@ -22277,6 +22727,19 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
  opt->mtp_path,
  e->mtp_draft_tokens);
+ } else if (getenv("DS4_MTP_EMBED") && e->mtp_draft_tokens > 1 &&
+            model_find_tensor(&e->model, "mtp.0.hc_head_base.weight")) {
+ /* #674 path-2 probe: drive spec-decode off the EMBEDDED mtp.0.* head (pack-direct,
+  * no separate GGUF). Alias mtp_model=model (shares map+descriptors; close-guarded by
+  * mtp_model_aliased) + bind the embedded head. Guarded by DS4_MTP_EMBED (default off):
+  * empirically tests whether the draft forward works off pack-served weights or needs
+  * the bytes-path fix (DECODE_PROFILE_REAL_BOTTLENECK_2026_05_29.md). */
+ e->mtp_model = e->model;
+ e->mtp_model_aliased = true;
+ mtp_weights_bind(&e->mtp_weights, &e->model);
+ e->mtp_ready = true;
+ fprintf(stderr, "ds4: MTP embedded-head spec-decode enabled (DS4_MTP_EMBED, draft=%d) — pack-direct probe\n",
+ e->mtp_draft_tokens);
  }
 
 #ifndef DS4_NO_GPU
@@ -22335,7 +22798,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  *out = NULL;
  return 1;
  }
- if (e->mtp_ready &&
+ if (e->mtp_ready && !e->mtp_model_aliased &&
  !ds4_gpu_add_model_map_range(e->mtp_model.map,
  e->mtp_model.size,
  e->mtp_model.tensor_data_pos,
@@ -22624,10 +23087,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     * paths, this loop's "skip" cases convert to "load" cases without any
     * other change required. */
    {
-    /* Pack dtype enum from ds4_nonrouted_pack.h:
-     *   DS4_NRPK_DTYPE_F32 = 1, F16 = 2, BF16 = 3, I8 = 4,
-     *   F8_E4M3 = 5, F8_E8M0 = 6
-     * Map to ds4_tensor type enum where exact match exists. */
+	    /* Pack dtype enum from ds4_nonrouted_pack.h:
+	     *   DS4_NRPK_DTYPE_F32 = 1, F16 = 2, BF16 = 3, I8 = 4,
+	     *   F8_E4M3 = 5, F8_E8M0 = 6, I32 = 7
+	     * Map to ds4_tensor type enum where exact match exists. */
     uint64_t n_filled = 0;
     uint64_t n_skip_dtype_mismatch = 0;
     uint64_t n_skip_bytes_mismatch = 0;
@@ -22758,14 +23221,16 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
        has_source_exact = 1;
        source_exact_type = DS4_TENSOR_FP8_E8M0;
        break;
-      case DS4_NRPK_DTYPE_I8:
-       /* Rare in this pack; route via source-exact stub. */
-       break;
-      default:
-       /* Pack dtype not recognized (e.g., I64 tid2eid which the pack
-        * inspect labeled UNK). Phase 2b proper adds handling for these. */
-       break;
-     }
+	      case DS4_NRPK_DTYPE_I8:
+	       /* Rare in this pack; route via source-exact stub. */
+	       break;
+	      case DS4_NRPK_DTYPE_I32:
+	       if (t->type == DS4_TENSOR_I32) identity_fill = 1;
+	       break;
+	      default:
+	       /* Pack dtype not recognized. */
+	       break;
+	     }
      /* Strategy resolution: identity if dtype matches; otherwise
       * source-exact substitute if pack dtype is BF16/FP8/F32-up. */
      if (!identity_fill && !has_source_exact) {
@@ -23392,6 +23857,14 @@ void ds4_engine_close(ds4_engine *e) {
           (unsigned long long)s_n_storage_dispatch_bf16,
           (unsigned long long)s_n_storage_dispatch_bf16_suppressed);
  }
+ /* silv 2026-05-29 #816 — FP8 dispatch counter. ALWAYS prints (even at 0)
+  * because zero is the diagnostic verdict for "callers bypass via_tensor
+  * dispatcher". With the new pack having 375 FP8 attn tensors, a healthy
+  * decode should produce 43 layers × N attn matmuls = O(thousands). Zero
+  * = caller-routing bug. Nonzero = at least some FP8 path fires; bug is
+  * downstream (kernel arithmetic). */
+ fprintf(stderr, "ds4: storage-dispatch fp8 — heap=%llu (zero = via_tensor not called for FP8 attn weights)\n",
+         (unsigned long long)s_n_storage_dispatch_fp8);
  /* silv 2026-05-28 — PATH_FUSED ICB-eligibility probe summary. Reports
   * what fraction of PATH_FUSED calls would have HIT an 8-way per-layer
   * sig cache. Sizes the upside of wiring PATH_FUSED through ICB
@@ -23421,7 +23894,7 @@ void ds4_engine_close(ds4_engine *e) {
  weights_free(&e->weights);
  vocab_free(&e->vocab);
  ds4_threads_shutdown();
- if (e->mtp_ready) model_close(&e->mtp_model);
+ if (e->mtp_ready && !e->mtp_model_aliased) model_close(&e->mtp_model);
  if (e->cpu_model_ready) model_close(&e->cpu_model);
  model_close(&e->model);
 #ifndef DS4_NO_GPU
