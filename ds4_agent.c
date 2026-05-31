@@ -6697,7 +6697,14 @@ static char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
         while (job->running && now_sec() - start < 1.0) {
             agent_bash_poll(job);
             if (!job->running) break;
-            usleep(20000);
+            /* Event-driven: pipe EOF (POLLHUP) wakes us the instant the child
+             * dies, so we observe job termination without a 20 ms polling slop. */
+            if (job->pipe_fd >= 0) {
+                struct pollfd pfd = {.fd = job->pipe_fd, .events = POLLIN};
+                poll(&pfd, 1, 20);
+            } else {
+                usleep(20000);  /* pipe already closed; fall back to short sleep */
+            }
         }
         if (job->running) {
             kill(-job->pid, SIGKILL);

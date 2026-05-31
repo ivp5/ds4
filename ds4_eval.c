@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -1777,11 +1778,12 @@ static void *input_thread_main(void *arg) {
     char buf[64];
 
     while (global_input.running) {
+        /* Event-driven on stdin; 50 ms heartbeat caps shutdown latency
+         * (pthread_join in tui_stop_input observes the cleared running flag). */
+        struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
+        if (poll(&pfd, 1, 50) <= 0) continue;
         ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
-        if (n <= 0) {
-            usleep(5000);
-            continue;
-        }
+        if (n <= 0) continue;
         for (ssize_t i = 0; i < n; i++) {
             unsigned char c = (unsigned char)buf[i];
             if (esc_state == 0) {
@@ -3305,7 +3307,9 @@ static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
     double start = now_sec();
     tui_refresh(ui, phase);
     while (ui->paused) {
-        usleep(50000);
+        /* Event-driven on stdin; 50 ms refresh heartbeat preserves UI cadence. */
+        struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
+        poll(&pfd, 1, 50);
         tui_consume_input(ui);
         tui_refresh(ui, phase);
     }

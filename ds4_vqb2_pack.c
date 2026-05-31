@@ -8,6 +8,7 @@
  */
 
 #include "ds4_vqb2_pack.h"
+#include "ds4_pack_io.h"
 #include "ds4_expert_table.h"  /* ds4_hot_pin_expert_from_vqb2 */
 
 #include <errno.h>
@@ -195,30 +196,12 @@ bool ds4_vqb2_pack_open(const char *pack_path,
         return false;
     }
 
-    int fd = open(pack_path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "ds4_vqb2_pack: open pack %s failed: %s\n", pack_path, strerror(errno));
+    if (!ds4_pack_mmap_open_flags(pack_path, "ds4_vqb2_pack", NULL, 1, MAP_SHARED,
+                                  &out->map, &out->map_size, &out->fd)) {
         ds4_vqb2_pack_close(out);
         return false;
     }
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        fprintf(stderr, "ds4_vqb2_pack: fstat %s failed: %s\n", pack_path, strerror(errno));
-        close(fd);
-        ds4_vqb2_pack_close(out);
-        return false;
-    }
-    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) {
-        fprintf(stderr, "ds4_vqb2_pack: mmap %s failed: %s\n", pack_path, strerror(errno));
-        close(fd);
-        ds4_vqb2_pack_close(out);
-        return false;
-    }
-    out->fd = fd;
-    out->map = map;
-    out->map_size = (size_t)st.st_size;
-    out->pack_size = (uint64_t)st.st_size;
+    out->pack_size = (uint64_t)out->map_size;
 
     /* Validate every entry's offset+bytes fits within pack */
     for (uint32_t i = 0; i < out->n_entries; i++) {
@@ -239,8 +222,7 @@ bool ds4_vqb2_pack_open(const char *pack_path,
 
 void ds4_vqb2_pack_close(ds4_vqb2_pack *p) {
     if (!p) return;
-    if (p->map && p->map != MAP_FAILED) munmap(p->map, p->map_size);
-    if (p->fd >= 0) close(p->fd);
+    ds4_pack_munmap_close(&p->map, &p->map_size, &p->fd);
     free(p->entries);
     free(p->lookup);
     memset(p, 0, sizeof(*p));

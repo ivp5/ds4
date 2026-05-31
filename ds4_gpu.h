@@ -180,6 +180,20 @@ int ds4_gpu_matmul_q8_0_storage(
  const ds4_gpu_tensor *x,
  uint64_t n_tok);
 
+/* Source-exact FP8_E4M3 + FP8_E8M0 storage matmul for pack-direct
+ * non-routed tensors that substitute GGUF Q8_0 declarations. The scale grid
+ * is ceil(out_dim/128) × ceil(in_dim/128), matching DeepSeek's upstream
+ * safetensor/pack format. */
+int ds4_gpu_matmul_fp8_e4m3_e8m0_storage(
+ ds4_gpu_tensor *out,
+ void *weight_buf,
+ void *scale_buf,
+ uint64_t scale_bytes,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok);
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
  ds4_gpu_tensor *gate,
  ds4_gpu_tensor *up,
@@ -631,6 +645,17 @@ int ds4_gpu_attention_output_low_q8_tensor(
  uint32_t n_groups,
  const ds4_gpu_tensor *heads);
 
+int ds4_gpu_attention_output_low_fp8_e4m3_e8m0_storage(
+ ds4_gpu_tensor *low,
+ void *weight_buf,
+ void *scale_buf,
+ uint64_t scale_bytes,
+ uint64_t group_dim,
+ uint64_t rank,
+ uint32_t n_groups,
+ const ds4_gpu_tensor *heads,
+ uint32_t n_tokens);
+
 /* =========================================================================
  * Router, Shared Expert, and Routed MoE.
  * =========================================================================
@@ -1002,6 +1027,12 @@ uint64_t ds4_gpu_heap_buffer_gpu_address(void *opaque);
  * Smoke-test surface for task #563 (polar MTL4 inference integration).
  * Returns 1 on success, 0 on failure. */
 int ds4_gpu_mtl4_polar_dot_canary(uint32_t packets, uint32_t pairs);
+/* ICB dense-path canary (task #822) — bit-exact: direct vs ICB-replay of the dense Q8_0 matvec. */
+int ds4_gpu_dense_matvec_icb_canary(uint32_t M, uint32_t N);
+/* ICB dense-path speed bench (task #822) — A/B ms/forward, direct vs ICB cached-replay, no model. */
+int ds4_gpu_dense_matvec_icb_bench(uint32_t M, uint32_t N, uint32_t n_gemv, uint32_t n_iter);
+/* MTL4 canary: record a compute command into classic MTLICB, replay it from an MTL4 compute encoder. */
+int ds4_gpu_mtl4_icb_execute_canary(uint32_t n_floats, uint32_t rounds);
 
 /* H1729 tile×row×batch variant of the polar canary. Stores mag/phase/levels
  * ONCE across all (tile, row) packets; streams `batches` hidden vectors
@@ -1717,6 +1748,142 @@ int ds4_gpu_mtl4_vqb2_decode_matmul_fp16_canary(uint32_t n_packets,
                                                 uint32_t n_pairs,
                                                 uint32_t k_val,
                                                 uint32_t rounds);
+
+/* CDX3-native MTL4 decode-matmul canary. Opens a real DS4-CDX3 pack/index,
+ * runs one record's D8 codebook + log-U8 scales + bitpacked indices directly
+ * on GPU, and compares against ds4_cdx3_reader scalar decode. */
+int ds4_gpu_mtl4_cdx3_decode_matmul_canary(const char *pack_path,
+                                           const char *index_path,
+                                           uint32_t layer,
+                                           uint32_t expert,
+                                           uint32_t kind,
+                                           uint32_t rows,
+                                           uint32_t rounds);
+
+/* CDX3-native fused gate+up+SwiGLU canary. Opens one real routed expert,
+ * decodes gate/up D8 records inside a single MTL4 kernel, applies DS4's clamp
+ * and SiLU product, and compares against scalar CDX3 reader output. */
+int ds4_gpu_mtl4_cdx3_gateup_swiglu_canary(const char *pack_path,
+                                           const char *index_path,
+                                           uint32_t layer,
+                                           uint32_t expert,
+                                           uint32_t rows,
+                                           uint32_t rounds,
+                                           float route_weight,
+                                           float swiglu_limit);
+
+/* Same correctness canary as above, but binds the entire CDX3 mmap as one
+ * no-copy MTL buffer and passes pack offsets to the kernel. This verifies the
+ * production direction: no codebook/scale/index staging copies on the hot path. */
+int ds4_gpu_mtl4_cdx3_gateup_swiglu_pack_canary(const char *pack_path,
+                                                const char *index_path,
+                                                uint32_t layer,
+                                                uint32_t expert,
+                                                uint32_t rows,
+                                                uint32_t rounds,
+                                                float route_weight,
+                                                float swiglu_limit);
+
+/* Selected-expert CDX3 gate+up canary. This is the M1-runtime target shape:
+ * one dispatch computes all selected experts after their scale/index payloads
+ * are available as fixed-stride planes. Current canary stages from CDX3 records;
+ * the production encoding should store those planes directly. */
+int ds4_gpu_mtl4_cdx3_gateup_swiglu_selected_canary(const char *pack_path,
+                                                    const char *index_path,
+                                                    uint32_t layer,
+                                                    const uint32_t *experts,
+                                                    uint32_t n_experts,
+                                                    uint32_t rows,
+                                                    uint32_t rounds,
+                                                    float swiglu_limit);
+
+/* Direct M1R fixed-plane selected-expert canary. This reads the runtime-native
+ * pack directly: no CDX3 framed records and no host-side expert staging. */
+int ds4_gpu_mtl4_m1r_gateup_swiglu_selected_canary(const char *m1r_path,
+                                                   uint32_t layer,
+                                                   const uint32_t *experts,
+                                                   uint32_t n_experts,
+                                                   uint32_t rows,
+                                                   uint32_t rounds,
+                                                   float swiglu_limit);
+
+/* Direct M1R selected down-projection canary. Takes synthetic per-slot mid
+ * activations and writes the routed out vector in one selected-expert sum. */
+int ds4_gpu_mtl4_m1r_down_selected_canary(const char *m1r_path,
+                                          uint32_t layer,
+                                          const uint32_t *experts,
+                                          uint32_t n_experts,
+                                          uint32_t rows,
+                                          uint32_t rounds);
+int ds4_gpu_mtl4_d8m_down_selected_canary(const char *d8m_path,
+                                          const uint32_t *experts,
+                                          uint32_t n_experts,
+                                          uint32_t rows,
+                                          uint32_t rounds);
+int ds4_gpu_mtl4_d8m_down_selected_batch_canary(const char *d8m_path,
+                                                const uint32_t *experts,
+                                                uint32_t n_experts,
+                                                uint32_t rows,
+                                                uint32_t n_tokens,
+                                                uint32_t rounds);
+int ds4_gpu_mtl4_m1r_d8m_routed_organ_canary(const char *m1r_path,
+                                             const char *d8m_path,
+                                             uint32_t layer,
+                                             const uint32_t *experts,
+                                             uint32_t n_experts,
+                                             uint32_t rows,
+                                             uint32_t rounds,
+                                             float swiglu_limit);
+int ds4_gpu_mtl4_m1r_d8m_routed_organ_batch_canary(const char *m1r_path,
+                                                   const char *d8m_path,
+                                                   uint32_t layer,
+                                                   const uint32_t *experts,
+                                                   uint32_t n_experts,
+                                                   uint32_t rows,
+                                                   uint32_t n_tokens,
+                                                   uint32_t rounds,
+                                                   float swiglu_limit);
+
+/* Direct M1R full routed-FFN organ canary: gate+up+SwiGLU then down sum.
+ * This is the closest current canary to the production decode organ. */
+int ds4_gpu_mtl4_m1r_routed_organ_canary(const char *m1r_path,
+                                          uint32_t layer,
+                                          const uint32_t *experts,
+                                          uint32_t n_experts,
+                                          uint32_t rounds,
+                                          float swiglu_limit);
+int ds4_gpu_mtl4_m1r_routed_organ_batch_canary(const char *m1r_path,
+                                               uint32_t layer,
+                                               const uint32_t *experts,
+                                               uint32_t n_experts,
+                                               uint32_t n_tokens,
+                                               uint32_t rounds,
+                                               float swiglu_limit);
+int ds4_gpu_mtl4_m1r_routed_organ_dispatch_cpu(const char *m1r_path,
+                                                uint32_t layer,
+                                                const int32_t *selected_experts,
+                                                const float *route_weights,
+                                                const float *input,
+                                                float *output,
+                                                uint32_t n_experts,
+                                                float swiglu_limit);
+int ds4_gpu_mtl4_m1r_routed_organ_dispatch_tensor(const char *m1r_path,
+                                                   uint32_t layer,
+                                                   ds4_gpu_tensor *selected_experts,
+                                                   ds4_gpu_tensor *route_weights,
+                                                   ds4_gpu_tensor *input,
+                                                   ds4_gpu_tensor *output,
+                                                   uint32_t n_experts,
+                                                   float swiglu_limit);
+int ds4_gpu_mtl4_m1r_routed_organ_dispatch_tensor_batch(const char *m1r_path,
+                                                        uint32_t layer,
+                                                        ds4_gpu_tensor *selected_experts,
+                                                        ds4_gpu_tensor *route_weights,
+                                                        ds4_gpu_tensor *input,
+                                                        ds4_gpu_tensor *output,
+                                                        uint32_t n_tokens,
+                                                        uint32_t n_experts,
+                                                        float swiglu_limit);
 
 /* silv 2026-05-28 — runtime fused decode-matmul dispatch primitive.
  *

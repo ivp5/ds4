@@ -164,6 +164,20 @@ static void json_ws(const char **p) {
     while (**p && isspace((unsigned char)**p)) (*p)++;
 }
 
+/* linecount campaign #523 rewrite-2: the json_ws/optional-comma/json_ws separator idiom (23 sites). */
+static void json_skip_comma(const char **p) {
+    json_ws(p);
+    if (**p == ',') (*p)++;
+    json_ws(p);
+}
+
+/* campaign #523 rewrite-3: parse-field-or-cleanup idiom (the fold I vetoed as 'cryptic'). */
+#define PARSE_STR_OR(var, lbl) char *var = NULL; if (!json_string(p, &var)) { free(key); goto lbl; }
+#define PARSE_NUM_OR(var, lbl) double var = 0.0; if (!json_number(&p, &var)) { free(key); goto lbl; }
+/* campaign #523 rewrite-4: the 85x cleanup-on-fail idiom (the >=200-line cut the veto hid). */
+#define CHECK_OR(cond, lbl) if (!(cond)) { free(key); goto lbl; }
+#define STR_FIELD(field, lbl) free(field); CHECK_OR(json_string(p, &field), lbl)
+
 static bool json_lit(const char **p, const char *lit) {
     size_t n = strlen(lit);
     if (strncmp(*p, lit, n) != 0) return false;
@@ -436,11 +450,7 @@ static bool json_content(const char **p, char **out) {
                 }
                 (*p)++;
                 if (!strcmp(key, "text")) {
-                    char *s = NULL;
-                    if (!json_string(p, &s)) {
-                        free(key);
-                        goto fail;
-                    }
+                    PARSE_STR_OR(s, fail);
                     buf_puts(&b, s);
                     free(s);
                 } else if (!json_skip_value(p)) {
@@ -448,18 +458,14 @@ static bool json_content(const char **p, char **out) {
                     goto fail;
                 }
                 free(key);
-                json_ws(p);
-                if (**p == ',') (*p)++;
-                json_ws(p);
+                json_skip_comma(p);
             }
             if (**p != '}') goto fail;
             (*p)++;
         } else if (!json_skip_value(p)) {
             goto fail;
         }
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != ']') goto fail;
     (*p)++;
@@ -840,9 +846,7 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
             return false;
         }
         free(key);
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != '}') return false;
     (*p)++;
@@ -874,9 +878,7 @@ static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
             return false;
         }
         free(key);
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != '}') return false;
     (*p)++;
@@ -942,9 +944,7 @@ static bool parse_stop(const char **p, stop_list *out) {
         } else if (!json_skip_value(p)) {
             return false;
         }
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != ']') return false;
     (*p)++;
@@ -1043,9 +1043,7 @@ static bool parse_stream_options(const char **p, bool *include_usage) {
             return false;
         }
         free(key);
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != '}') return false;
     (*p)++;
@@ -1067,19 +1065,12 @@ static bool parse_function_call(const char **p, tool_call *tc) {
         }
         (*p)++;
         if (!strcmp(key, "name")) {
-            free(tc->name);
-            if (!json_string(p, &tc->name)) {
-                free(key);
-                goto bad;
-            }
+            STR_FIELD(tc->name, bad);
         } else if (!strcmp(key, "arguments")) {
             free(tc->arguments);
             json_ws(p);
             if (**p == '"') {
-                if (!json_string(p, &tc->arguments)) {
-                    free(key);
-                    goto bad;
-                }
+                CHECK_OR(json_string(p, &tc->arguments), bad);
             } else if (!json_raw_value(p, &tc->arguments)) {
                 free(key);
                 goto bad;
@@ -1089,9 +1080,7 @@ static bool parse_function_call(const char **p, tool_call *tc) {
             goto bad;
         }
         free(key);
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != '}') goto bad;
     (*p)++;
@@ -1121,24 +1110,15 @@ static bool parse_tool_calls_value(const char **p, tool_calls *calls) {
             }
             (*p)++;
             if (!strcmp(key, "id")) {
-                free(tc.id);
-                if (!json_string(p, &tc.id)) {
-                    free(key);
-                    goto bad;
-                }
+                STR_FIELD(tc.id, bad);
             } else if (!strcmp(key, "function")) {
-                if (!parse_function_call(p, &tc)) {
-                    free(key);
-                    goto bad;
-                }
+                CHECK_OR(parse_function_call(p, &tc), bad);
             } else if (!json_skip_value(p)) {
                 free(key);
                 goto bad;
             }
             free(key);
-            json_ws(p);
-            if (**p == ',') (*p)++;
-            json_ws(p);
+            json_skip_comma(p);
         }
         if (**p != '}') goto bad;
         (*p)++;
@@ -1147,9 +1127,7 @@ static bool parse_tool_calls_value(const char **p, tool_calls *calls) {
             memset(&tc, 0, sizeof(tc));
         }
         tool_call_free(&tc);
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
         continue;
 bad:
         tool_call_free(&tc);
@@ -1221,22 +1199,13 @@ static char *responses_special_schema_from_tool(const char *raw) {
         p++;
         if (!strcmp(key, "type")) {
             free(type);
-            if (!json_string(&p, &type)) {
-                free(key);
-                goto done;
-            }
+            CHECK_OR(json_string(&p, &type), done);
         } else if (!strcmp(key, "description")) {
             free(description);
-            if (!json_string(&p, &description)) {
-                free(key);
-                goto done;
-            }
+            CHECK_OR(json_string(&p, &description), done);
         } else if (!strcmp(key, "parameters")) {
             free(parameters);
-            if (!json_raw_value(&p, &parameters)) {
-                free(key);
-                goto done;
-            }
+            CHECK_OR(json_raw_value(&p, &parameters), done);
         } else if (!json_skip_value(&p)) {
             free(key);
             goto done;
@@ -1291,28 +1260,16 @@ static char *responses_namespace_function_schema_from_tool(const char *raw,
         p++;
         if (!strcmp(key, "type")) {
             free(type);
-            if (!json_string(&p, &type)) {
-                free(key);
-                goto done;
-            }
+            CHECK_OR(json_string(&p, &type), done);
         } else if (!strcmp(key, "name")) {
             free(name);
-            if (!json_string(&p, &name)) {
-                free(key);
-                goto done;
-            }
+            CHECK_OR(json_string(&p, &name), done);
         } else if (!strcmp(key, "description")) {
             free(description);
-            if (!json_string(&p, &description)) {
-                free(key);
-                goto done;
-            }
+            CHECK_OR(json_string(&p, &description), done);
         } else if (!strcmp(key, "parameters") || !strcmp(key, "input_schema")) {
             free(parameters);
-            if (!json_raw_value(&p, &parameters)) {
-                free(key);
-                goto done;
-            }
+            CHECK_OR(json_raw_value(&p, &parameters), done);
         } else if (!json_skip_value(&p)) {
             free(key);
             goto done;
@@ -1422,16 +1379,10 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
         p++;
         if (!strcmp(key, "name")) {
             free(order.name);
-            if (!json_string(&p, &order.name)) {
-                free(key);
-                goto done;
-            }
+            CHECK_OR(json_string(&p, &order.name), done);
         } else if (!strcmp(key, "input_schema") || !strcmp(key, "parameters")) {
             char *schema = NULL;
-            if (!json_raw_value(&p, &schema)) {
-                free(key);
-                goto done;
-            }
+            CHECK_OR(json_raw_value(&p, &schema), done);
             parse_schema_properties(schema, &order);
             free(schema);
         } else if (!json_skip_value(&p)) {
@@ -1483,22 +1434,13 @@ static bool append_responses_namespace_tool_schemas(buf *schemas,
         p++;
         if (!strcmp(key, "type")) {
             free(type);
-            if (!json_string(&p, &type)) {
-                free(key);
-                goto done;
-            }
+            CHECK_OR(json_string(&p, &type), done);
         } else if (!strcmp(key, "name")) {
             free(name);
-            if (!json_string(&p, &name)) {
-                free(key);
-                goto done;
-            }
+            CHECK_OR(json_string(&p, &name), done);
         } else if (!strcmp(key, "tools")) {
             free(tools);
-            if (!json_raw_value(&p, &tools)) {
-                free(key);
-                goto done;
-            }
+            CHECK_OR(json_raw_value(&p, &tools), done);
         } else if (!json_skip_value(&p)) {
             free(key);
             goto done;
@@ -1580,9 +1522,7 @@ static bool parse_tools_value(const char **p, char **out, tool_schema_orders *or
         }
         free(function);
         free(raw);
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != ']') goto bad;
     (*p)++;
@@ -1614,45 +1554,26 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
             }
             (*p)++;
             if (!strcmp(key, "role")) {
-                free(msg.role);
-                if (!json_string(p, &msg.role)) {
-                    free(key);
-                    goto fail;
-                }
+                STR_FIELD(msg.role, fail);
             } else if (!strcmp(key, "content")) {
                 free(msg.content);
-                if (!json_content(p, &msg.content)) {
-                    free(key);
-                    goto fail;
-                }
+                CHECK_OR(json_content(p, &msg.content), fail);
             } else if (!strcmp(key, "reasoning_content")) {
                 free(msg.reasoning);
-                if (!json_content(p, &msg.reasoning)) {
-                    free(key);
-                    goto fail;
-                }
+                CHECK_OR(json_content(p, &msg.reasoning), fail);
             } else if (!strcmp(key, "tool_call_id")) {
-                char *id = NULL;
-                if (!json_string(p, &id)) {
-                    free(key);
-                    goto fail;
-                }
+                PARSE_STR_OR(id, fail);
                 chat_msg_add_tool_call_id(&msg, id);
                 free(id);
             } else if (!strcmp(key, "tool_calls")) {
                 tool_calls_free(&msg.calls);
-                if (!parse_tool_calls_value(p, &msg.calls)) {
-                    free(key);
-                    goto fail;
-                }
+                CHECK_OR(parse_tool_calls_value(p, &msg.calls), fail);
             } else if (!json_skip_value(p)) {
                 free(key);
                 goto fail;
             }
             free(key);
-            json_ws(p);
-            if (**p == ',') (*p)++;
-            json_ws(p);
+            json_skip_comma(p);
         }
         if (**p != '}') goto fail;
         (*p)++;
@@ -1660,9 +1581,7 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         if (!msg.content) msg.content = xstrdup("");
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
         continue;
 fail:
         chat_msg_free(&msg);
@@ -1708,55 +1627,29 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         }
         (*p)++;
         if (!strcmp(key, "type")) {
-            free(type);
-            if (!json_string(p, &type)) {
-                free(key);
-                goto bad;
-            }
+            STR_FIELD(type, bad);
         } else if (!strcmp(key, "text")) {
             free(text);
-            if (!json_content(p, &text)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_content(p, &text), bad);
         } else if (!strcmp(key, "thinking")) {
             free(thinking);
-            if (!json_content(p, &thinking)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_content(p, &thinking), bad);
         } else if (!strcmp(key, "id") || !strcmp(key, "tool_use_id")) {
-            free(id);
-            if (!json_string(p, &id)) {
-                free(key);
-                goto bad;
-            }
+            STR_FIELD(id, bad);
         } else if (!strcmp(key, "name")) {
-            free(name);
-            if (!json_string(p, &name)) {
-                free(key);
-                goto bad;
-            }
+            STR_FIELD(name, bad);
         } else if (!strcmp(key, "input")) {
             free(input);
-            if (!json_raw_value(p, &input)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_raw_value(p, &input), bad);
         } else if (!strcmp(key, "content")) {
             free(tool_result);
-            if (!json_content(p, &tool_result)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_content(p, &tool_result), bad);
         } else if (!json_skip_value(p)) {
             free(key);
             goto bad;
         }
         free(key);
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != '}') goto bad;
     (*p)++;
@@ -1842,9 +1735,7 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg) {
         } else if (!json_skip_value(p)) {
             return false;
         }
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != ']') return false;
     (*p)++;
@@ -1873,26 +1764,17 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
             }
             (*p)++;
             if (!strcmp(key, "role")) {
-                free(msg.role);
-                if (!json_string(p, &msg.role)) {
-                    free(key);
-                    goto fail;
-                }
+                STR_FIELD(msg.role, fail);
             } else if (!strcmp(key, "content")) {
                 free(msg.content);
                 msg.content = NULL;
-                if (!parse_anthropic_content(p, &msg)) {
-                    free(key);
-                    goto fail;
-                }
+                CHECK_OR(parse_anthropic_content(p, &msg), fail);
             } else if (!json_skip_value(p)) {
                 free(key);
                 goto fail;
             }
             free(key);
-            json_ws(p);
-            if (**p == ',') (*p)++;
-            json_ws(p);
+            json_skip_comma(p);
         }
         if (**p != '}') goto fail;
         (*p)++;
@@ -1900,9 +1782,7 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         if (!msg.content) msg.content = xstrdup("");
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
         continue;
 fail:
         chat_msg_free(&msg);
@@ -1949,9 +1829,7 @@ static bool parse_anthropic_system_object(const char **p, buf *out) {
             return false;
         }
         free(key);
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != '}') return false;
     (*p)++;
@@ -1991,9 +1869,7 @@ static bool parse_anthropic_system(const char **p, char **out) {
         } else if (!json_skip_value(p)) {
             goto bad;
         }
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != ']') goto bad;
     (*p)++;
@@ -2644,26 +2520,17 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         p++;
         if (!strcmp(key, "messages")) {
             chat_msgs_free(&msgs);
-            if (!parse_messages(&p, &msgs)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_messages(&p, &msgs), bad);
             got_messages = true;
         } else if (!strcmp(key, "tools")) {
             free(tool_schemas);
             tool_schemas = NULL;
-            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_tools_value(&p, &tool_schemas, &r->tool_orders), bad);
         } else if (!strcmp(key, "tool_choice")) {
             json_ws(&p);
             if (*p == '"') {
                 char *choice = NULL;
-                if (!json_string(&p, &choice)) {
-                    free(key);
-                    goto bad;
-                }
+                CHECK_OR(json_string(&p, &choice), bad);
                 tool_choice_none = !strcmp(choice, "none");
                 free(choice);
             } else if (!json_skip_value(&p)) {
@@ -2672,81 +2539,38 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
         } else if (!strcmp(key, "model")) {
             free(r->model);
-            if (!json_string(&p, &r->model)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_string(&p, &r->model), bad);
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_int(&p, &r->max_tokens), bad);
         } else if (!strcmp(key, "temperature")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
+            PARSE_NUM_OR(v, bad);
             r->temperature = (float)v;
         } else if (!strcmp(key, "top_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
+            PARSE_NUM_OR(v, bad);
             r->top_p = (float)v;
         } else if (!strcmp(key, "min_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
+            PARSE_NUM_OR(v, bad);
             r->min_p = (float)v;
         } else if (!strcmp(key, "top_k")) {
-            if (!json_int(&p, &r->top_k)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_int(&p, &r->top_k), bad);
         } else if (!strcmp(key, "seed")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
+            PARSE_NUM_OR(v, bad);
             r->seed = v > 0.0 ? (uint64_t)v : 0;
         } else if (!strcmp(key, "stream")) {
-            if (!json_bool(&p, &r->stream)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_bool(&p, &r->stream), bad);
         } else if (!strcmp(key, "stream_options")) {
-            if (!parse_stream_options(&p, &r->stream_include_usage)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_stream_options(&p, &r->stream_include_usage), bad);
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_thinking_control_value(&p, &thinking_enabled), bad);
             got_thinking = true;
         } else if (!strcmp(key, "reasoning_effort")) {
-            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_reasoning_effort_value(&p, &reasoning_effort), bad);
         } else if (!strcmp(key, "think")) {
-            if (!json_bool(&p, &thinking_enabled)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_bool(&p, &thinking_enabled), bad);
             got_thinking = true;
         } else if (!strcmp(key, "stop")) {
-            if (!parse_stop(&p, &r->stops)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_stop(&p, &r->stops), bad);
         } else if (!json_skip_value(&p)) {
             free(key);
             goto bad;
@@ -2817,24 +2641,15 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         p++;
         if (!strcmp(key, "messages")) {
             chat_msgs_free(&msgs);
-            if (!parse_anthropic_messages(&p, &msgs)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_anthropic_messages(&p, &msgs), bad);
             got_messages = true;
         } else if (!strcmp(key, "system")) {
             free(system);
-            if (!parse_anthropic_system(&p, &system)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_anthropic_system(&p, &system), bad);
         } else if (!strcmp(key, "tools")) {
             free(tool_schemas);
             tool_schemas = NULL;
-            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_tools_value(&p, &tool_schemas, &r->tool_orders), bad);
         } else if (!strcmp(key, "tool_choice")) {
             json_ws(&p);
             if (*p == '{') {
@@ -2842,10 +2657,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 json_ws(&p);
                 while (*p && *p != '}') {
                     char *ckey = NULL;
-                    if (!json_string(&p, &ckey)) {
-                        free(key);
-                        goto bad;
-                    }
+                    CHECK_OR(json_string(&p, &ckey), bad);
                     json_ws(&p);
                     if (*p != ':') {
                         free(ckey);
@@ -2883,61 +2695,29 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
         } else if (!strcmp(key, "model")) {
             free(r->model);
-            if (!json_string(&p, &r->model)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_string(&p, &r->model), bad);
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_int(&p, &r->max_tokens), bad);
         } else if (!strcmp(key, "temperature")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
+            PARSE_NUM_OR(v, bad);
             r->temperature = (float)v;
         } else if (!strcmp(key, "top_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
+            PARSE_NUM_OR(v, bad);
             r->top_p = (float)v;
         } else if (!strcmp(key, "top_k")) {
-            if (!json_int(&p, &r->top_k)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_int(&p, &r->top_k), bad);
         } else if (!strcmp(key, "stream")) {
-            if (!json_bool(&p, &r->stream)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_bool(&p, &r->stream), bad);
         } else if (!strcmp(key, "stop_sequences")) {
-            if (!parse_stop(&p, &r->stops)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_stop(&p, &r->stops), bad);
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_thinking_control_value(&p, &thinking_enabled), bad);
             got_thinking = true;
         } else if (!strcmp(key, "output_config")) {
-            if (!parse_output_config_effort(&p, &reasoning_effort)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_output_config_effort(&p, &reasoning_effort), bad);
         } else if (!strcmp(key, "reasoning_effort")) {
-            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_reasoning_effort_value(&p, &reasoning_effort), bad);
         } else if (!json_skip_value(&p)) {
             free(key);
             goto bad;
@@ -3071,9 +2851,7 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     goto fail;
                 }
                 free(key);
-                json_ws(p);
-                if (**p == ',') (*p)++;
-                json_ws(p);
+                json_skip_comma(p);
             }
             if (**p != '}') {
                 free(type);
@@ -3105,9 +2883,7 @@ static bool parse_responses_content_array(const char **p, char **out) {
              * element must be either a string or a typed text object. */
             goto fail;
         }
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != ']') goto fail;
     (*p)++;
@@ -3174,55 +2950,25 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
             }
             (*p)++;
             if (!strcmp(key, "type")) {
-                free(type);
-                if (!json_string(p, &type)) {
-                    free(key);
-                    goto item_fail;
-                }
+                STR_FIELD(type, item_fail);
             } else if (!strcmp(key, "role")) {
-                free(role);
-                if (!json_string(p, &role)) {
-                    free(key);
-                    goto item_fail;
-                }
+                STR_FIELD(role, item_fail);
             } else if (!strcmp(key, "content")) {
                 free(content);
-                if (!parse_responses_content_array(p, &content)) {
-                    free(key);
-                    goto item_fail;
-                }
+                CHECK_OR(parse_responses_content_array(p, &content), item_fail);
             } else if (!strcmp(key, "name")) {
-                free(name);
-                if (!json_string(p, &name)) {
-                    free(key);
-                    goto item_fail;
-                }
+                STR_FIELD(name, item_fail);
             } else if (!strcmp(key, "namespace")) {
-                free(namespace);
-                if (!json_string(p, &namespace)) {
-                    free(key);
-                    goto item_fail;
-                }
+                STR_FIELD(namespace, item_fail);
             } else if (!strcmp(key, "call_id")) {
-                free(call_id);
-                if (!json_string(p, &call_id)) {
-                    free(key);
-                    goto item_fail;
-                }
+                STR_FIELD(call_id, item_fail);
             } else if (!strcmp(key, "id")) {
-                free(item_id);
-                if (!json_string(p, &item_id)) {
-                    free(key);
-                    goto item_fail;
-                }
+                STR_FIELD(item_id, item_fail);
             } else if (!strcmp(key, "arguments")) {
                 free(arguments);
                 json_ws(p);
                 if (**p == '"') {
-                    if (!json_string(p, &arguments)) {
-                        free(key);
-                        goto item_fail;
-                    }
+                    CHECK_OR(json_string(p, &arguments), item_fail);
                 } else if (!json_raw_value(p, &arguments)) {
                     free(key);
                     goto item_fail;
@@ -3231,15 +2977,9 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 free(output);
                 json_ws(p);
                 if (**p == '[') {
-                    if (!parse_responses_content_array(p, &output)) {
-                        free(key);
-                        goto item_fail;
-                    }
+                    CHECK_OR(parse_responses_content_array(p, &output), item_fail);
                 } else if (**p == '"') {
-                    if (!json_string(p, &output)) {
-                        free(key);
-                        goto item_fail;
-                    }
+                    CHECK_OR(json_string(p, &output), item_fail);
                 } else if (!json_raw_value(p, &output)) {
                     free(key);
                     goto item_fail;
@@ -3248,62 +2988,41 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 free(input_str);
                 json_ws(p);
                 if (**p == '"') {
-                    if (!json_string(p, &input_str)) {
-                        free(key);
-                        goto item_fail;
-                    }
+                    CHECK_OR(json_string(p, &input_str), item_fail);
                 } else if (!json_raw_value(p, &input_str)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "summary")) {
                 free(summary);
-                if (!parse_responses_content_array(p, &summary)) {
-                    free(key);
-                    goto item_fail;
-                }
+                CHECK_OR(parse_responses_content_array(p, &summary), item_fail);
             } else if (!strcmp(key, "action")) {
                 free(action);
-                if (!json_raw_value(p, &action)) {
-                    free(key);
-                    goto item_fail;
-                }
+                CHECK_OR(json_raw_value(p, &action), item_fail);
             } else if (!strcmp(key, "result")) {
                 free(result);
                 json_ws(p);
                 if (**p == '"') {
-                    if (!json_string(p, &result)) {
-                        free(key);
-                        goto item_fail;
-                    }
+                    CHECK_OR(json_string(p, &result), item_fail);
                 } else if (!json_raw_value(p, &result)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "status")) {
-                free(status_str);
-                if (!json_string(p, &status_str)) {
-                    free(key);
-                    goto item_fail;
-                }
+                STR_FIELD(status_str, item_fail);
             } else if (!strcmp(key, "tools")) {
                 /* tool_search_output items carry their discovered tool list
                  * here instead of in `output` / `result`. Keep it separate
                  * from the human-visible result body so malformed tool lists
                  * never get mistaken for normal tool output. */
                 free(tools_json);
-                if (!json_raw_value(p, &tools_json)) {
-                    free(key);
-                    goto item_fail;
-                }
+                CHECK_OR(json_raw_value(p, &tools_json), item_fail);
             } else if (!json_skip_value(p)) {
                 free(key);
                 goto item_fail;
             }
             free(key);
-            json_ws(p);
-            if (**p == ',') (*p)++;
-            json_ws(p);
+            json_skip_comma(p);
             continue;
 item_fail:
             free(type);
@@ -3583,9 +3302,7 @@ item_fail:
         free(result);
         free(tools_json);
         free(status_str);
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != ']') goto fail;
     (*p)++;
@@ -3669,9 +3386,7 @@ static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
             return false;
         }
         free(key);
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
+        json_skip_comma(p);
     }
     if (**p != '}') return false;
     (*p)++;
@@ -3713,10 +3428,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
              * for parity with other Responses-API callers. */
             if (*p == '"') {
                 char *plain = NULL;
-                if (!json_string(&p, &plain)) {
-                    free(key);
-                    goto bad;
-                }
+                CHECK_OR(json_string(&p, &plain), bad);
                 chat_msg msg = {0};
                 msg.role = xstrdup("user");
                 msg.content = plain;
@@ -3740,18 +3452,12 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         } else if (!strcmp(key, "tools")) {
             free(tool_schemas);
             tool_schemas = NULL;
-            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_tools_value(&p, &tool_schemas, &r->tool_orders), bad);
         } else if (!strcmp(key, "tool_choice")) {
             json_ws(&p);
             if (*p == '"') {
                 char *choice = NULL;
-                if (!json_string(&p, &choice)) {
-                    free(key);
-                    goto bad;
-                }
+                CHECK_OR(json_string(&p, &choice), bad);
                 /* DS4 honours "none" (disable tools) and "auto" (model decides).
                  * "required" and explicit function targets need constrained
                  * decoding we don't implement — reject so clients see the
@@ -3785,35 +3491,18 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             }
         } else if (!strcmp(key, "model")) {
             free(r->model);
-            if (!json_string(&p, &r->model)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_string(&p, &r->model), bad);
             r->model_from_request = true;
         } else if (!strcmp(key, "max_output_tokens") || !strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_int(&p, &r->max_tokens), bad);
         } else if (!strcmp(key, "temperature")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
+            PARSE_NUM_OR(v, bad);
             r->temperature = (float)v;
         } else if (!strcmp(key, "top_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
+            PARSE_NUM_OR(v, bad);
             r->top_p = (float)v;
         } else if (!strcmp(key, "stream")) {
-            if (!json_bool(&p, &r->stream)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_bool(&p, &r->stream), bad);
         } else if (!strcmp(key, "reasoning")) {
             bool effort_seen = false;
             if (!parse_responses_reasoning(&p, &reasoning_effort,
@@ -3997,87 +3686,41 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         p++;
         if (!strcmp(key, "prompt")) {
             free(prompt);
-            if (!parse_prompt(&p, &prompt)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_prompt(&p, &prompt), bad);
         } else if (!strcmp(key, "model")) {
             free(r->model);
-            if (!json_string(&p, &r->model)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_string(&p, &r->model), bad);
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_int(&p, &r->max_tokens), bad);
         } else if (!strcmp(key, "temperature")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
+            PARSE_NUM_OR(v, bad);
             r->temperature = (float)v;
         } else if (!strcmp(key, "top_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
+            PARSE_NUM_OR(v, bad);
             r->top_p = (float)v;
         } else if (!strcmp(key, "min_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
+            PARSE_NUM_OR(v, bad);
             r->min_p = (float)v;
         } else if (!strcmp(key, "top_k")) {
-            if (!json_int(&p, &r->top_k)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_int(&p, &r->top_k), bad);
         } else if (!strcmp(key, "seed")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
+            PARSE_NUM_OR(v, bad);
             r->seed = v > 0.0 ? (uint64_t)v : 0;
         } else if (!strcmp(key, "stream")) {
-            if (!json_bool(&p, &r->stream)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_bool(&p, &r->stream), bad);
         } else if (!strcmp(key, "stream_options")) {
-            if (!parse_stream_options(&p, &r->stream_include_usage)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_stream_options(&p, &r->stream_include_usage), bad);
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_thinking_control_value(&p, &thinking_enabled), bad);
             got_thinking = true;
         } else if (!strcmp(key, "reasoning_effort")) {
-            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_reasoning_effort_value(&p, &reasoning_effort), bad);
         } else if (!strcmp(key, "think")) {
-            if (!json_bool(&p, &thinking_enabled)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(json_bool(&p, &thinking_enabled), bad);
             got_thinking = true;
         } else if (!strcmp(key, "stop")) {
-            if (!parse_stop(&p, &r->stops)) {
-                free(key);
-                goto bad;
-            }
+            CHECK_OR(parse_stop(&p, &r->stops), bad);
         } else if (!json_skip_value(&p)) {
             free(key);
             goto bad;
@@ -11774,6 +11417,10 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
 
+/* test-scaffold helpers (linecount campaign #523 rewrite-1): fold uniform socketpair setup/teardown. */
+#define TEST_SOCKPAIR(sv) int sv[2]; TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0); if (sv[0] < 0 || sv[1] < 0) return
+#define TEST_SOCKCLOSE(out, sv) do { free(out); close(sv[0]); close(sv[1]); } while (0)
+
 static void test_tool_schema_order_from_anthropic_schema(void) {
     tool_schema_orders orders = {0};
     tool_schema_orders_add_json(&orders,
@@ -12144,9 +11791,7 @@ static void test_cors_headers_are_opt_in(void) {
 }
 
 static void test_cors_preflight_response_is_no_content(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     TEST_ASSERT(http_response(sv[0], true, 204, NULL, ""));
     shutdown(sv[0], SHUT_WR);
@@ -12156,15 +11801,11 @@ static void test_cors_preflight_response_is_no_content(void) {
     TEST_ASSERT(strstr(out, "Content-Type:") == NULL);
     TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *") != NULL);
 
-    free(out);
-    close(sv[0]);
-    close(sv[1]);
+    TEST_SOCKCLOSE(out, sv);
 }
 
 static void test_cors_sse_headers(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     TEST_ASSERT(sse_headers(sv[0], true));
     shutdown(sv[0], SHUT_WR);
@@ -12173,15 +11814,11 @@ static void test_cors_sse_headers(void) {
     TEST_ASSERT(strstr(out, "Content-Type: text/event-stream") != NULL);
     TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *") != NULL);
 
-    free(out);
-    close(sv[0]);
-    close(sv[1]);
+    TEST_SOCKCLOSE(out, sv);
 }
 
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -12238,9 +11875,7 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
 }
 
 static void test_anthropic_tool_stream_sends_live_tool_use(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -12345,9 +11980,7 @@ static void test_anthropic_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "\"cache_read_input_tokens\":7") != NULL);
     TEST_ASSERT(strstr(out, "\"cache_creation_input_tokens\":3") != NULL);
 
-    free(out);
-    close(sv[0]);
-    close(sv[1]);
+    TEST_SOCKCLOSE(out, sv);
 
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) {
@@ -12366,16 +11999,12 @@ static void test_anthropic_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "\"cache_read_input_tokens\":7") != NULL);
     TEST_ASSERT(strstr(out, "\"cache_creation_input_tokens\":3") != NULL);
 
-    free(out);
-    close(sv[0]);
-    close(sv[1]);
+    TEST_SOCKCLOSE(out, sv);
     request_free(&r);
 }
 
 static void test_openai_tool_stream_sends_incremental_text(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -12431,9 +12060,7 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
 }
 
 static void test_openai_stream_usage_reports_cache_details(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -12487,9 +12114,7 @@ static void test_responses_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "\"output_tokens\":2") != NULL);
     TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
 
-    free(out);
-    close(sv[0]);
-    close(sv[1]);
+    TEST_SOCKCLOSE(out, sv);
 
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) {
@@ -12520,9 +12145,7 @@ static void test_responses_usage_reports_cache_details(void) {
 }
 
 static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -12574,9 +12197,7 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
 }
 
 static void test_openai_tool_stream_sends_partial_arguments(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -12654,9 +12275,7 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
 }
 
 static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -12695,9 +12314,7 @@ static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
 }
 
 static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -12731,9 +12348,7 @@ static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
 }
 
 static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -12775,9 +12390,7 @@ static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
 }
 
 static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -12830,9 +12443,7 @@ static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
 }
 
 static void test_openai_tool_stream_handles_multiple_calls(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -12884,9 +12495,7 @@ static void test_streaming_holds_partial_utf8(void) {
     TEST_ASSERT(utf8_stream_safe_len(partial, 0, strlen(partial), false) == 2);
     TEST_ASSERT(utf8_stream_safe_len(complete, 0, strlen(complete), false) == strlen(complete));
 
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -14423,9 +14032,7 @@ static void test_model_metadata_clamps_completion_to_context(void) {
 }
 
 static void test_client_socket_nonblocking_flag(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_SOCKPAIR(sv);
     set_client_socket_nonblocking(sv[0]);
     int flags = fcntl(sv[0], F_GETFL, 0);
     TEST_ASSERT(flags >= 0);

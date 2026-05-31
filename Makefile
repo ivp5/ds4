@@ -30,8 +30,13 @@ JOURNAL_OBJ :=
 JOURNAL_LIB :=
 endif
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal $(JOURNAL_LIB)
-CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_metal.o ds4_metal_vqb2_fp16.o ds4_expert_table.o ds4_inflight.o ds4_moe_route_log.o ds4_polar_reader.o ds4_vqb1_reader.o ds4_vqb2_reader.o ds4_vqb2_pack.o ds4_watersic_pack.o ds4_nonrouted_pack.o ds4_prefix_cache.o $(JOURNAL_OBJ)
-CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_inflight.o ds4_polar_reader.o ds4_vqb1_reader.o ds4_vqb2_reader.o ds4_vqb2_pack.o ds4_watersic_pack.o ds4_nonrouted_pack.o ds4_prefix_cache.o $(JOURNAL_OBJ)
+# VQB2/CDX are not active runtime pack paths anymore. Keep these linked only
+# while M1R still shares legacy helper/canary symbols; do not add new product
+# entrypoints against them.
+LEGACY_CODEC_OBJS = ds4_metal_vqb2_fp16.o ds4_vqb2_reader.o ds4_vqb2_pack.o ds4_cdx3_reader.o
+LEGACY_CODEC_CPU_OBJS = ds4_vqb2_reader.o ds4_vqb2_pack.o ds4_cdx3_reader.o
+CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_metal.o ds4_expert_table.o ds4_inflight.o ds4_moe_route_log.o ds4_polar_reader.o ds4_vqb1_reader.o $(LEGACY_CODEC_OBJS) ds4_watersic_pack.o ds4_ridgegptq_reader.o ds4_nonrouted_pack.o ds4_d8m_reader.o ds4_prefix_cache.o $(JOURNAL_OBJ)
+CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_inflight.o ds4_polar_reader.o ds4_vqb1_reader.o $(LEGACY_CODEC_CPU_OBJS) ds4_watersic_pack.o ds4_ridgegptq_reader.o ds4_nonrouted_pack.o ds4_d8m_reader.o ds4_prefix_cache.o $(JOURNAL_OBJ)
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -42,8 +47,9 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_cuda.o ds4_polar_reader.o ds4_vqb1_reader.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_polar_reader.o ds4_vqb1_reader.o
+LEGACY_CODEC_CPU_OBJS = ds4_cdx3_reader.o
+CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_cuda.o ds4_polar_reader.o ds4_vqb1_reader.o ds4_ridgegptq_reader.o ds4_d8m_reader.o $(LEGACY_CODEC_CPU_OBJS)
+CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_polar_reader.o ds4_vqb1_reader.o ds4_ridgegptq_reader.o ds4_d8m_reader.o $(LEGACY_CODEC_CPU_OBJS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
@@ -173,6 +179,15 @@ ds4.o: ds4.c ds4.h ds4_gpu.h ds4_neon_i8mm.h ds4_quant_blocks.h
 
 ds4_neon_i8mm.o: ds4_neon_i8mm.c ds4_neon_i8mm.h ds4_quant_blocks.h
 	$(CC) $(I8MM_BUILD_FLAGS) -c -o $@ ds4_neon_i8mm.c
+
+ds4_ridgegptq_reader.o: ds4_ridgegptq_reader.c ds4_ridgegptq_reader.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_ridgegptq_reader.c
+
+ds4_d8m_reader.o: ds4_d8m_reader.c ds4_d8m_reader.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_d8m_reader.c
+
+ds4_cdx3_reader.o: ds4_cdx3_reader.c ds4_cdx3_reader.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_cdx3_reader.c
 
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c

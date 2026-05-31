@@ -1,6 +1,7 @@
 /* ds4_vqb1_reader.c — VQ-2D codec file reader (VQB1 format). */
 
 #include "ds4_vqb1_reader.h"
+#include "ds4_pack_io.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -16,50 +17,11 @@ bool ds4_vqb1_open(const char *path, ds4_vqb1_file *out) {
     memset(out, 0, sizeof(*out));
     out->fd = -1;
 
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "ds4_vqb1: open(%s) failed: %s\n", path, strerror(errno));
-        return false;
-    }
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        fprintf(stderr, "ds4_vqb1: fstat(%s) failed: %s\n", path, strerror(errno));
-        close(fd);
-        return false;
-    }
-    if ((size_t)st.st_size < DS4_VQB1_HEADER_BYTES) {
-        fprintf(stderr, "ds4_vqb1: %s too small (%lld bytes)\n", path, (long long)st.st_size);
-        close(fd);
-        return false;
-    }
+    const uint8_t *p = ds4_pack_mmap_open(path, "ds4_vqb1", DS4_VQB1_MAGIC,
+                                          DS4_VQB1_HEADER_BYTES, &out->map, &out->map_size, &out->fd);
+    if (!p) return false;
 
-    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) {
-        fprintf(stderr, "ds4_vqb1: mmap(%s) failed: %s\n", path, strerror(errno));
-        close(fd);
-        return false;
-    }
-
-    const uint8_t *p = (const uint8_t *)map;
-    if (memcmp(p, DS4_VQB1_MAGIC, 4) != 0) {
-        fprintf(stderr, "ds4_vqb1: %s bad magic\n", path);
-        munmap(map, (size_t)st.st_size);
-        close(fd);
-        return false;
-    }
-
-    /* Header layout (little-endian uint32):
-     *   4-7:  version
-     *   8-11: n_experts
-     *  12-15: n_rows
-     *  16-19: n_pairs
-     *  20-23: layer
-     *  24-27: kind_id
-     *  28-31: k
-     */
-    out->fd = fd;
-    out->map = map;
-    out->map_size = (size_t)st.st_size;
+    /* Header (LE uint32): 4:version 8:n_experts 12:n_rows 16:n_pairs 20:layer 24:kind_id 28:k */
     memcpy(&out->version,   p + 4,  4);
     memcpy(&out->n_experts, p + 8,  4);
     memcpy(&out->n_rows,    p + 12, 4);
@@ -74,8 +36,7 @@ bool ds4_vqb1_open(const char *path, ds4_vqb1_file *out) {
     if (expected != out->map_size) {
         fprintf(stderr, "ds4_vqb1: %s size mismatch (have %zu, expected %zu)\n",
                 path, out->map_size, expected);
-        munmap(map, out->map_size);
-        close(fd);
+        ds4_pack_munmap_close(&out->map, &out->map_size, &out->fd);
         memset(out, 0, sizeof(*out));
         out->fd = -1;
         return false;
@@ -88,8 +49,7 @@ bool ds4_vqb1_open(const char *path, ds4_vqb1_file *out) {
 
 void ds4_vqb1_close(ds4_vqb1_file *f) {
     if (!f) return;
-    if (f->map && f->map != MAP_FAILED) munmap(f->map, f->map_size);
-    if (f->fd >= 0) close(f->fd);
+    ds4_pack_munmap_close(&f->map, &f->map_size, &f->fd);
     memset(f, 0, sizeof(*f));
     f->fd = -1;
 }

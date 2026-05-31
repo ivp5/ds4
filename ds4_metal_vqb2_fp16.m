@@ -25,6 +25,7 @@
 #ifdef __APPLE__
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <mach/mach_time.h>  /* silv 2026-05-28 H2247-audit R1: per-layer timing */
 #endif
 
 /* ==========================================================================
@@ -497,7 +498,9 @@ static int init_mtl4_arg_table(void) {
             for (NSUInteger i = 0; i < sizeof(allocs)/sizeof(allocs[0]); i++)
                 if (allocs[i]) [s_mtl4_residency addAllocation:allocs[i]];
             [s_mtl4_residency commit];
-            [s_mtl4_residency requestResidency];
+            /* silv 2026-05-30: gate residency on live availability (deployable path). */
+            { extern int ds4_residency_request_checked(id, const char *);
+              ds4_residency_request_checked(s_mtl4_residency, __func__); }
             [s_mtl4_queue addResidencySet:s_mtl4_residency];
         }
     }
@@ -873,11 +876,109 @@ int ds4_metal_vqb2_fp16_dispatch_mtl4(struct ds4_hot_expert_store *store,
 /* ==========================================================================
  * Top-level dispatcher — env DS4_VQB2_FP16_PATH selects backend once.
  * ========================================================================== */
-int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
-                                 uint32_t layer, uint32_t n_tokens,
-                                 const int32_t *selected_exps,
-                                 const float *expert_weights,
-                                 const void *input_fp32, void *output_fp32) {
+/* silv 2026-05-28 H2247-audit R1 — per-layer dispatch timing instrumentation.
+ *
+ * H2247 found L9 had a 800-1000× cliff. My static audit surfaced 5 NEW
+ * candidates: L21/L23/L27/L28 (cross-kind K-mix gate=K=16/up=K=16/down=K=4)
+ * and L22 (K=256 throughout + 4× pack-offset jump up→down). To confirm
+ * or refute, instrument the production dispatch entry with per-layer
+ * timing. Dump on engine_close via journal-shape stderr lines.
+ *
+ * Storage: 43 layers × {count, total_ns, max_ns} = ~32 bytes/layer + small.
+ * Cost per dispatch: one mach_absolute_time call before + after = ~50ns
+ * overhead, irrelevant vs typical 1-2ms dispatches.
+ *
+ * Read via env DS4_VQB2_LAYER_TIMING=1; default off (no overhead). */
+static uint64_t s_layer_timing_count[DS4_N_LAYER]    = {0};
+static uint64_t s_layer_timing_total_ns[DS4_N_LAYER] = {0};
+static uint64_t s_layer_timing_max_ns[DS4_N_LAYER]   = {0};
+static int      s_layer_timing_enabled               = -1;  /* lazy init */
+
+static int ds4_layer_timing_active(void) {
+    if (s_layer_timing_enabled < 0) {
+        const char *e = getenv("DS4_VQB2_LAYER_TIMING");
+        s_layer_timing_enabled = (e && e[0] == '1') ? 1 : 0;
+        if (s_layer_timing_enabled) {
+            fprintf(stderr, "ds4_vqb2_fp16: per-layer dispatch timing ENABLED "
+                    "(H2247-audit R1). Dump on engine_close via "
+                    "ds4_metal_vqb2_fp16_dump_layer_timing().\n");
+        }
+    }
+    return s_layer_timing_enabled;
+}
+
+/* Caller (typically engine_close) invokes this to print per-layer
+ * timing summary. Outlier hunting: compare each layer's mean against
+ * the corpus median; flag >2× median as a candidate cliff. */
+void ds4_metal_vqb2_fp16_dump_layer_timing(void) {
+    if (s_layer_timing_enabled <= 0) return;
+    static mach_timebase_info_data_t tb = {0, 0};
+    if (tb.numer == 0) mach_timebase_info(&tb);
+
+    /* First pass: collect means + global median */
+    double means_ms[DS4_N_LAYER];
+    double max_ms_arr[DS4_N_LAYER];
+    int    have_data[DS4_N_LAYER];
+    int    n_layers_seen = 0;
+    for (int L = 0; L < DS4_N_LAYER; L++) {
+        if (s_layer_timing_count[L] == 0) {
+            have_data[L] = 0; means_ms[L] = 0; max_ms_arr[L] = 0;
+            continue;
+        }
+        have_data[L] = 1;
+        const double avg_ns = (double)s_layer_timing_total_ns[L] /
+                              (double)s_layer_timing_count[L];
+        means_ms[L]   = avg_ns / 1e6;
+        max_ms_arr[L] = (double)s_layer_timing_max_ns[L] / 1e6;
+        n_layers_seen++;
+    }
+    if (n_layers_seen == 0) {
+        fprintf(stderr, "ds4_vqb2_fp16: per-layer timing — no data\n");
+        return;
+    }
+    /* Compute median over layers that have data */
+    double active[DS4_N_LAYER];
+    int n_active = 0;
+    for (int L = 0; L < DS4_N_LAYER; L++)
+        if (have_data[L]) active[n_active++] = means_ms[L];
+    /* Inline sort (tiny array) */
+    for (int i = 0; i < n_active; i++)
+        for (int j = i+1; j < n_active; j++)
+            if (active[j] < active[i]) { double t = active[i]; active[i] = active[j]; active[j] = t; }
+    const double median_ms = active[n_active / 2];
+
+    fprintf(stderr,
+            "\nds4_vqb2_fp16: ====== H2247-audit R1 per-layer dispatch timing ======\n"
+            "ds4_vqb2_fp16: median mean dispatch: %.3f ms (across %d active layers)\n"
+            "ds4_vqb2_fp16: %3s %8s %10s %10s %10s %s\n",
+            median_ms, n_active,
+            "L", "calls", "mean_ms", "max_ms", "ratio", "verdict");
+    for (int L = 0; L < DS4_N_LAYER; L++) {
+        if (!have_data[L]) continue;
+        const double ratio = means_ms[L] / median_ms;
+        const char *verdict = "";
+        if      (ratio > 10.0) verdict = "*** CLIFF (>10× median)";
+        else if (ratio >  5.0) verdict = "**  major outlier (>5×)";
+        else if (ratio >  2.0) verdict = "*   outlier (>2×)";
+        fprintf(stderr,
+                "ds4_vqb2_fp16: %3d %8llu %10.3f %10.3f %10.2fx %s\n",
+                L,
+                (unsigned long long)s_layer_timing_count[L],
+                means_ms[L], max_ms_arr[L], ratio, verdict);
+    }
+    fprintf(stderr, "ds4_vqb2_fp16: H2247-audit candidates (static): "
+                    "L21 L22 L23 L27 L28 — check the verdict column above\n");
+}
+
+/* silv 2026-05-28 H2247-audit R1: split implementation from public entry
+ * so we can wrap the impl with timing without instrumenting every return
+ * inside the multi-path switch. */
+static int ds4_metal_vqb2_fp16_dispatch_impl(struct ds4_hot_expert_store *store,
+                                              uint32_t layer, uint32_t n_tokens,
+                                              const int32_t *selected_exps,
+                                              const float *expert_weights,
+                                              const void *input_fp32,
+                                              void *output_fp32) {
     if (!s_path_resolved) {
         const char *e = getenv("DS4_VQB2_FP16_PATH");
         if (e && *e) {
@@ -943,6 +1044,18 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
             static int      s_fused_bind_ok        = 0;
             static uint64_t s_full_cov_attempts    = 0;
             static uint64_t s_partial_cov_attempts = 0;
+            static int      s_allow_polar_fallback_checked = 0;
+            static int      s_allow_polar_fallback         = 0;
+            if (!s_allow_polar_fallback_checked) {
+                const char *pf = getenv("DS4_VQB2_ALLOW_POLAR_FALLBACK");
+                s_allow_polar_fallback = (pf && *pf && *pf != '0') ? 1 : 0;
+                if (s_allow_polar_fallback) {
+                    fprintf(stderr,
+                            "ds4_vqb2_fp16: DS4_VQB2_ALLOW_POLAR_FALLBACK=1 — "
+                            "PATH_FUSED may fall through to polar-codec MTL4\n");
+                }
+                s_allow_polar_fallback_checked = 1;
+            }
             if (!s_fused_bind_attempted) {
                 s_fused_bind_attempted = 1;
                 const char *pack_path = getenv("DS4_VQB2_PACK_PATH");
@@ -1164,6 +1277,115 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
                                 fflush(stderr); \
                             } \
                         } while (0)
+                        /* silv 2026-05-29 #816 — chain-step max-abs/NaN probe.
+                         * DS4_VQB2_CHAIN_PROBE=1 dumps per-step magnitude for
+                         * (layer, token) pair selected by DS4_VQB2_CHAIN_PROBE_LAYER
+                         * (default 1) and DS4_VQB2_CHAIN_PROBE_TOKEN (default last).
+                         * The bug surfaces at L01 last position; this finds WHICH
+                         * step in the chain first emits NaN/Inf. */
+                        static int s_chain_probe_checked = 0;
+                        static int s_chain_probe_enabled = 0;
+                        static uint32_t s_chain_probe_layer = 1u;
+                        static int32_t s_chain_probe_token  = -1; /* -1 = last */
+                        if (!s_chain_probe_checked) {
+                            const char *e1 = getenv("DS4_VQB2_CHAIN_PROBE");
+                            s_chain_probe_enabled = (e1 && *e1 && *e1 != '0') ? 1 : 0;
+                            const char *e2 = getenv("DS4_VQB2_CHAIN_PROBE_LAYER");
+                            if (e2 && *e2) s_chain_probe_layer = (uint32_t)atoi(e2);
+                            const char *e3 = getenv("DS4_VQB2_CHAIN_PROBE_TOKEN");
+                            if (e3 && *e3) s_chain_probe_token  = (int32_t)atoi(e3);
+                            s_chain_probe_checked = 1;
+                            if (s_chain_probe_enabled) {
+                                fprintf(stderr,
+                                        "ds4_vqb2_fp16: DS4_VQB2_CHAIN_PROBE=1 layer=%u token=%d\n",
+                                        s_chain_probe_layer, s_chain_probe_token);
+                            }
+                        }
+                        /* Probes fire when (layer matches AND token matches). The
+                         * "last" semantic is recomputed each call since n_tokens
+                         * varies (prefill chunk vs decode). */
+                        #define DS4_CHAIN_PROBE_FP16(LABEL, BUF, N_HALVES) do { \
+                            if (s_chain_probe_enabled && layer == s_chain_probe_layer && \
+                                ((s_chain_probe_token < 0 && t == n_tokens - 1u) || \
+                                 (int32_t)t == s_chain_probe_token)) { \
+                                id<MTLBuffer> _b = (__bridge id<MTLBuffer>)(BUF); \
+                                const _Float16 *_p = (const _Float16 *)_b.contents; \
+                                uint32_t _nan = 0, _inf = 0, _zero = 0, _norm = 0; \
+                                float _max_abs = 0.0f, _min_val = 1e+30f, _max_val = -1e+30f; \
+                                const uint64_t _n = (uint64_t)(N_HALVES); \
+                                for (uint64_t i = 0; i < _n; i++) { \
+                                    const float v = (float)_p[i]; \
+                                    if (v != v)        { _nan++; continue; } \
+                                    if (v ==  INFINITY || v == -INFINITY) { _inf++; continue; } \
+                                    if (v == 0.0f)     { _zero++; continue; } \
+                                    _norm++; \
+                                    if (fabsf(v) > _max_abs) _max_abs = fabsf(v); \
+                                    if (v < _min_val) _min_val = v; \
+                                    if (v > _max_val) _max_val = v; \
+                                } \
+                                fprintf(stderr, \
+                                    "ds4_vqb2_fp16: CHAIN_PROBE L%u t=%u %-18s n=%llu nan=%u inf=%u zero=%u nonzero=%u  range=[%.4g, %.4g] max|.|=%.4g  [0..3]= %.4g %.4g %.4g %.4g\n", \
+                                    layer, t, (LABEL), (unsigned long long)_n, \
+                                    _nan, _inf, _zero, _norm, _min_val, _max_val, _max_abs, \
+                                    (float)_p[0], (float)_p[1], (float)_p[2], (float)_p[3]); \
+                                fflush(stderr); \
+                            } \
+                        } while (0)
+                        #define DS4_CHAIN_PROBE_FP32(LABEL, BUF, N_FLOATS) do { \
+                            if (s_chain_probe_enabled && layer == s_chain_probe_layer && \
+                                ((s_chain_probe_token < 0 && t == n_tokens - 1u) || \
+                                 (int32_t)t == s_chain_probe_token)) { \
+                                id<MTLBuffer> _b = (__bridge id<MTLBuffer>)(BUF); \
+                                const float *_p = (const float *)_b.contents; \
+                                uint32_t _nan = 0, _inf = 0, _zero = 0, _norm = 0; \
+                                float _max_abs = 0.0f, _min_val = 1e+30f, _max_val = -1e+30f; \
+                                const uint64_t _n = (uint64_t)(N_FLOATS); \
+                                for (uint64_t i = 0; i < _n; i++) { \
+                                    const float v = _p[i]; \
+                                    if (v != v)        { _nan++; continue; } \
+                                    if (v ==  INFINITY || v == -INFINITY) { _inf++; continue; } \
+                                    if (v == 0.0f)     { _zero++; continue; } \
+                                    _norm++; \
+                                    if (fabsf(v) > _max_abs) _max_abs = fabsf(v); \
+                                    if (v < _min_val) _min_val = v; \
+                                    if (v > _max_val) _max_val = v; \
+                                } \
+                                fprintf(stderr, \
+                                    "ds4_vqb2_fp16: CHAIN_PROBE L%u t=%u %-18s n=%llu nan=%u inf=%u zero=%u nonzero=%u  range=[%.4g, %.4g] max|.|=%.4g  [0..3]= %.4g %.4g %.4g %.4g\n", \
+                                    layer, t, (LABEL), (unsigned long long)_n, \
+                                    _nan, _inf, _zero, _norm, _min_val, _max_val, _max_abs, \
+                                    _p[0], _p[1], _p[2], _p[3]); \
+                                fflush(stderr); \
+                            } \
+                        } while (0)
+                        /* Also probe input_fp32 + expert weights — these come from
+                         * upstream, so dumping them shows the chain's input distribution. */
+                        #define DS4_CHAIN_PROBE_FP32_PTR(LABEL, PTR, N_FLOATS) do { \
+                            if (s_chain_probe_enabled && layer == s_chain_probe_layer && \
+                                ((s_chain_probe_token < 0 && t == n_tokens - 1u) || \
+                                 (int32_t)t == s_chain_probe_token)) { \
+                                const float *_p = (const float *)(PTR); \
+                                uint32_t _nan = 0, _inf = 0, _zero = 0, _norm = 0; \
+                                float _max_abs = 0.0f, _min_val = 1e+30f, _max_val = -1e+30f; \
+                                const uint64_t _n = (uint64_t)(N_FLOATS); \
+                                for (uint64_t i = 0; i < _n; i++) { \
+                                    const float v = _p[i]; \
+                                    if (v != v)        { _nan++; continue; } \
+                                    if (v ==  INFINITY || v == -INFINITY) { _inf++; continue; } \
+                                    if (v == 0.0f)     { _zero++; continue; } \
+                                    _norm++; \
+                                    if (fabsf(v) > _max_abs) _max_abs = fabsf(v); \
+                                    if (v < _min_val) _min_val = v; \
+                                    if (v > _max_val) _max_val = v; \
+                                } \
+                                fprintf(stderr, \
+                                    "ds4_vqb2_fp16: CHAIN_PROBE L%u t=%u %-18s n=%llu nan=%u inf=%u zero=%u nonzero=%u  range=[%.4g, %.4g] max|.|=%.4g  [0..3]= %.4g %.4g %.4g %.4g\n", \
+                                    layer, t, (LABEL), (unsigned long long)_n, \
+                                    _nan, _inf, _zero, _norm, _min_val, _max_val, _max_abs, \
+                                    _p[0], _p[1], _p[2], _p[3]); \
+                                fflush(stderr); \
+                            } \
+                        } while (0)
 
                         for (uint32_t t = 0; t < n_tokens && all_tokens_ok; t++) {
                             const int32_t *sel_t = selected_exps + (size_t)t * n_sel;
@@ -1177,14 +1399,29 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
 
                             /* Shape adapter — 4096 fp32 → MTLBuffer of fp16 in
                              * 2048 pairs × 2 = 8192 halves linear layout. */
+                            DS4_CHAIN_PROBE_FP32_PTR("input_fp32(in_t)", in_t, hidden);
+                            DS4_CHAIN_PROBE_FP32_PTR("expert_weights(w_t)", w_t, n_sel);
+                            if (s_chain_probe_enabled && layer == s_chain_probe_layer &&
+                                ((s_chain_probe_token < 0 && t == n_tokens - 1u) ||
+                                 (int32_t)t == s_chain_probe_token)) {
+                                fprintf(stderr,
+                                        "ds4_vqb2_fp16: CHAIN_PROBE L%u t=%u selected_exps[0..5]= %d %d %d %d %d %d  expert_weights[0..5]= %.6g %.6g %.6g %.6g %.6g %.6g\n",
+                                        layer, t,
+                                        sel_t[0], sel_t[1], sel_t[2], sel_t[3], sel_t[4], sel_t[5],
+                                        (double)w_t[0], (double)w_t[1], (double)w_t[2],
+                                        (double)w_t[3], (double)w_t[4], (double)w_t[5]);
+                                fflush(stderr);
+                            }
                             DS4_CHAIN_TRACE("x_adapter_pre");
                             void *x_buf = ds4_metal_vqb2_fused_x_adapter_fp32_to_fp16(in_t, hidden);
                             DS4_CHAIN_TRACE("x_adapter_post");
                             if (!x_buf) { all_tokens_ok = 0; failed_token = t; break; }
+                            DS4_CHAIN_PROBE_FP16("x_buf(post-adapter)", x_buf, hidden);
 
                             DS4_CHAIN_TRACE("rw_memcpy_pre");
                             memcpy(s_rw_buf.contents, w_t, n_sel * sizeof(float));
                             DS4_CHAIN_TRACE("rw_memcpy_post");
+                            DS4_CHAIN_PROBE_FP32("rw_buf(memcpy'd)", s_rw_buf, n_sel);
 
                             uint32_t g_n_rb = 0, g_n_rows = 0, g_n_pairs = 0;
                             uint32_t u_n_rb = 0, u_n_rows = 0, u_n_pairs = 0;
@@ -1194,12 +1431,56 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
                                                                           x_buf, gate_buf,
                                                                           &g_n_rb, &g_n_rows, &g_n_pairs);
                             DS4_CHAIN_TRACE("dispatch_kind_gate_post");
+                            DS4_CHAIN_PROBE_FP16("gate_buf(post-GATE)", gate_buf, (uint64_t)n_sel * g_n_rb * g_n_rows);
+                            /* silv 2026-05-29 — gate cross-check dump. DS4_VQB2_CHAIN_DUMP_DIR=path
+                             * writes full X (hidden f32), gate_buf (n_sel*g_n_rb*g_n_rows f32),
+                             * and shape/selected for the probed (layer,token). One-shot. Lets
+                             * Python recompute the code-space reference and confirm the engine
+                             * matmul is bit-correct (echo=codec) vs a residual numeric drift. */
+                            {
+                                static int s_chain_dumped = 0;
+                                const char *dd = getenv("DS4_VQB2_CHAIN_DUMP_DIR");
+                                if (!s_chain_dumped && dd && *dd && s_chain_probe_enabled &&
+                                    layer == s_chain_probe_layer &&
+                                    ((s_chain_probe_token < 0 && t == n_tokens - 1u) ||
+                                     (int32_t)t == s_chain_probe_token)) {
+                                    s_chain_dumped = 1;
+                                    char pth[1200];
+                                    id<MTLBuffer> _xb = (__bridge id<MTLBuffer>)x_buf;
+                                    const _Float16 *_xp = (const _Float16 *)_xb.contents;
+                                    float *xtmp = (float *)malloc((size_t)hidden * sizeof(float));
+                                    for (uint32_t i = 0; i < hidden; i++) xtmp[i] = (float)_xp[i];
+                                    snprintf(pth, sizeof(pth), "%s/x.bin", dd);
+                                    FILE *fx = fopen(pth, "wb"); if (fx) { fwrite(xtmp, 4, hidden, fx); fclose(fx); }
+                                    free(xtmp);
+                                    id<MTLBuffer> _gb = (__bridge id<MTLBuffer>)gate_buf;
+                                    const _Float16 *_gp = (const _Float16 *)_gb.contents;
+                                    const uint64_t gn = (uint64_t)n_sel * g_n_rb * g_n_rows;
+                                    float *gtmp = (float *)malloc((size_t)gn * sizeof(float));
+                                    for (uint64_t i = 0; i < gn; i++) gtmp[i] = (float)_gp[i];
+                                    snprintf(pth, sizeof(pth), "%s/gate.bin", dd);
+                                    FILE *fg = fopen(pth, "wb"); if (fg) { fwrite(gtmp, 4, (size_t)gn, fg); fclose(fg); }
+                                    free(gtmp);
+                                    snprintf(pth, sizeof(pth), "%s/shape.txt", dd);
+                                    FILE *fs = fopen(pth, "w");
+                                    if (fs) {
+                                        fprintf(fs, "layer=%u n_sel=%u g_n_rb=%u g_n_rows=%u hidden=%u\n",
+                                                layer, n_sel, g_n_rb, g_n_rows, hidden);
+                                        for (uint32_t s = 0; s < n_sel; s++)
+                                            fprintf(fs, "sel %u\n", (unsigned)sel_t[s]);
+                                        fclose(fs);
+                                    }
+                                    fprintf(stderr, "ds4_vqb2_fp16: CHAIN_DUMP wrote x/gate/shape to %s\n", dd);
+                                    fflush(stderr);
+                                }
+                            }
                             DS4_CHAIN_TRACE("dispatch_kind_up_pre");
                             int rcu = (rcg == 0) ?
                                 ds4_metal_vqb2_fused_dispatch_kind(layer, 1u, sel_u32, n_sel,
                                                                     x_buf, up_buf,
                                                                     &u_n_rb, &u_n_rows, &u_n_pairs) : -1;
                             DS4_CHAIN_TRACE("dispatch_kind_up_post");
+                            DS4_CHAIN_PROBE_FP16("up_buf(post-UP)", up_buf, (uint64_t)n_sel * u_n_rb * u_n_rows);
                             /* Codex H2186/H2187 fix: gate/up come from fused
                              * decode-matmul in row-block-major layout
                              * [n_rb][n_sel][n_rows]. The legacy 2D SwiGLU
@@ -1248,6 +1529,7 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
                                     gate_buf, up_buf, rw_void, mid_buf,
                                     g_n_rows, n_sel, g_n_rb, 0.0f) : 0;
                             DS4_CHAIN_TRACE("swiglu_rowblock_post");
+                            DS4_CHAIN_PROBE_FP16("mid_buf(post-SwiGLU)", mid_buf, (uint64_t)n_sel * g_n_rb * g_n_rows);
                             /* DOWN reads per-slot X with stride = n_rb * n_rows
                              * halves — the full slot-major intermediate width. */
                             const uint32_t intermediate_stride = g_n_rb * g_n_rows;
@@ -1257,6 +1539,7 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
                                                                             mid_buf, down_buf, intermediate_stride,
                                                                             &d_n_rb, &d_n_rows, &d_n_pairs) : -1;
                             DS4_CHAIN_TRACE("dispatch_kind_strided_down_post");
+                            DS4_CHAIN_PROBE_FP16("down_buf(post-DOWN)", down_buf, (uint64_t)n_sel * d_n_rb * d_n_rows);
                             DS4_CHAIN_TRACE("sum_step_pre");
                             /* sum_step writes into s_sum_out_buf (real MTLBuffer)
                              * to avoid run_canary's CPU-pointer-as-MTLBuffer cast
@@ -1270,6 +1553,7 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
                                     : ds4_metal_vqb2_fused_sum_step      (down_buf, sum_out_void, hidden))
                                 : 0;
                             DS4_CHAIN_TRACE("sum_step_post");
+                            DS4_CHAIN_PROBE_FP32("sum_out_buf(post-SUM)", s_sum_out_buf, hidden);
                             if (rcsum == 1) {
                                 memcpy(out_t, s_sum_out_buf.contents, (size_t)hidden * sizeof(float));
                             }
@@ -1294,7 +1578,7 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
                         if ((s_full_cov_attempts & 1023) == 1) {
                             fprintf(stderr,
                                     "ds4_vqb2_fp16: PATH_FUSED L%u chain failed at t=%u/%u "
-                                    "(rcg=%d rcu=%d rcs=%d rcd=%d rcsum=%d) — fallback\n",
+                                    "(rcg=%d rcu=%d rcs=%d rcd=%d rcsum=%d) — fail closed\n",
                                     layer, failed_token, n_tokens,
                                     last_rcg, last_rcu, last_rcs, last_rcd, last_rcsum);
                         }
@@ -1302,7 +1586,7 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
                     if ((s_full_cov_attempts & 1023) == 1) {
                         fprintf(stderr,
                                 "ds4_vqb2_fp16: PATH_FUSED L%u eligible "
-                                "(attempts=%llu, n_tokens=%u) — fallback to MTL4\n",
+                                "(attempts=%llu, n_tokens=%u) — fail closed unless explicit polar fallback\n",
                                 layer, (unsigned long long)s_full_cov_attempts, n_tokens);
                     }
                 } else {
@@ -1316,11 +1600,52 @@ int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
                     }
                 }
             }
+            if (!s_allow_polar_fallback) {
+                fprintf(stderr,
+                        "ds4_vqb2_fp16: PATH_FUSED unavailable or failed for L%u; "
+                        "refusing silent MTL4 polar-codec fallback on DS4 data "
+                        "(set DS4_VQB2_ALLOW_POLAR_FALLBACK=1 only for explicit diagnostics)\n",
+                        layer);
+                return -2;
+            }
             return ds4_metal_vqb2_fp16_dispatch_mtl4(store, layer, n_tokens, selected_exps, expert_weights, input_fp32, output_fp32);
         }
         case PATH_LEGACY:
         default:        return ds4_metal_vqb2_fp16_dispatch_legacy(store, layer, n_tokens, selected_exps, expert_weights, input_fp32, output_fp32);
     }
+}
+
+/* silv 2026-05-28 H2247-audit R1 — public dispatch entry with per-layer
+ * timing wrapper. When DS4_VQB2_LAYER_TIMING=1, wall-time each
+ * (layer, dispatch) call via mach_absolute_time and accumulate. Static
+ * cost when disabled: one int check + one branch, dominated by the
+ * dispatch_impl call itself. */
+int ds4_metal_vqb2_fp16_dispatch(struct ds4_hot_expert_store *store,
+                                 uint32_t layer, uint32_t n_tokens,
+                                 const int32_t *selected_exps,
+                                 const float *expert_weights,
+                                 const void *input_fp32, void *output_fp32) {
+    const int timing_on = ds4_layer_timing_active();
+    static mach_timebase_info_data_t s_tb = {0, 0};
+    uint64_t t0 = 0;
+    if (timing_on) {
+        if (s_tb.numer == 0) mach_timebase_info(&s_tb);
+        t0 = mach_absolute_time();
+    }
+    const int rc = ds4_metal_vqb2_fp16_dispatch_impl(
+        store, layer, n_tokens, selected_exps, expert_weights,
+        input_fp32, output_fp32);
+    if (timing_on && layer < DS4_N_LAYER) {
+        const uint64_t t1 = mach_absolute_time();
+        const uint64_t dt_ns = (uint64_t)((double)(t1 - t0) *
+                                          (double)s_tb.numer /
+                                          (double)s_tb.denom);
+        s_layer_timing_count[layer]++;
+        s_layer_timing_total_ns[layer] += dt_ns;
+        if (dt_ns > s_layer_timing_max_ns[layer])
+            s_layer_timing_max_ns[layer] = dt_ns;
+    }
+    return rc;
 }
 
 /* ==========================================================================
@@ -1346,7 +1671,7 @@ int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *store,
                                      struct ds4_gpu_tensor *weights,
                                      struct ds4_gpu_tensor *input,
                                      struct ds4_gpu_tensor *output) {
-    if (!store || !selected || !weights || !input || !output) return -1;
+    if (!selected || !weights || !input || !output) return -1;
     /* silv 2026-05-28: multi-token PATH_FUSED enabled (Tier 1). The inner
      * dispatcher loops over tokens when n_tokens > 1; previously this gate
      * rejected anything but n_tokens==1. */

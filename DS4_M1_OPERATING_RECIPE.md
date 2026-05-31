@@ -9,9 +9,19 @@ findings consolidated.
 
 ## STICKY HAZARD — pre-launch check (CRITICAL)
 
-**Two kernel panics on file: 2026-05-19, 2026-05-23. Both triggered by
-DS4 launches WITHOUT phase-split, attempting to wire 86.7 GiB IQ2_XXS
-into Metal on a 48 GiB cap.**
+**THREE kernel panics on file: 2026-05-19, 2026-05-23, 2026-05-30.** The
+first two: DS4 launches WITHOUT phase-split wiring 86.7 GiB IQ2_XXS into
+Metal on a 48 GiB cap. The **THIRD (2026-05-30)**: a legacy VQB2 hot-store
+path loaded an uncapped routed sidecar under concurrency (load avg 65,
+multiple workflow agents), so Metal residency blew the cap. VQB2/CDX pack
+paths are now quarantined as one-time artifacts; the active under-52 GiB path
+is metadata-only GGUF + exact non-routed pack + M1R fixed-plane routed pack.
+Two structural defenses remain current:
+- **PreToolUse hook** `~/.claude/hooks/ds4-m1-guard.sh` (registered in
+  settings.json) BLOCKS unsafe ds4 model-runs and reads inside executed `.sh`
+  wrappers too.
+- **RULE: NEVER run live ds4 on M1 from an autonomous workflow agent.**
+  Foreground/silv only, one job at a time.
 
 EVERY DS4 binary launch on M1 MUST contain one of:
 
@@ -23,6 +33,10 @@ EVERY DS4 binary launch on M1 MUST contain one of:
 
 If your binary version doesn't support these flags, pick a different
 binary. The default Metal path is a guaranteed panic on M1.
+
+Do not use historical VQB2/CDX directories as runtime inputs. If a run cannot
+be expressed as `--nonrouted-pack ... --m1r-pack ...` or a deliberate
+source/GGUF control, stop and re-check the pack lineage before launching.
 
 Late-warning log line (already past the point of no return):
 ```
@@ -39,8 +53,8 @@ If N > 48000, KILL within 90 seconds or expect reboot.
 │  ds4_pillars.c        — ICB/HotExpert/SpecDecode  (env-gated, scaffolded)│
 │  ds4_journal.c        — SQLite-WAL append-only    (JOURNAL=1 opt-in)│
 │  ds4_expert_table.c   — Path B runtime expert mask│
-│  ds4_polar_reader.c   — polar p32_m8 codec        │
-│  ds4_vqb1_reader.c    — VQ-2D K=256 codec         │
+│  ds4_polar_reader.c   — legacy codec reader       │
+│  ds4_vqb1_reader.c    — legacy codec reader       │
 │  ds4_moe_route_log.c  — per-event router trace (v3 schema)│
 ├──────────────────────────────────────────────────────────────┤
 │  ds4.c (~24K lines)   — main engine, MoE dispatch │
@@ -119,9 +133,10 @@ DS4_JOURNAL_DB=/tmp/ds4.db ./ds4-bench --prefill-metal-phases auto ...
 | KV-disk cold | 22.04 | 1.53 | 64.82s |
 | **KV-disk warm** | (skipped) | **4.51 t/s** | **6.87s** |
 
-**Deployment doctrine**:
-- **Retire MTP from M1 recipe** (net loss at all draft depths)
-- **Promote KV-disk-dir to default-on** for agentic workloads
+**Deployment doctrine update**:
+- Retire only the old **sequential-verifier** MTP path. MTP remains the target speed path when verifier work is block/parallel.
+- Promote KV-disk-dir to default-on for repeated-prefix agentic workloads.
+- Max-performance target: MTL4/compute + ICB/stable buffers + compressed routed-expert replay + block verifier + MTP/specdecode.
 
 ## Quantization landscape — M1 Max 64GB fit
 
@@ -207,7 +222,7 @@ A/B comparison: same prompt, same flags except ICB env vars.
 - IMPLICATION: use COMPUTE path for FROZEN organs (shared expert MLP,
   output head, attention output projection); skip ML packaging on M1.
 
-## Why MTP is retired on M1
+## Why old MTP was retired, and what replaces it
 
 Per shifts #292-#293:
 1. MTP spec-decode runs with avg 2.7 accept per call (after bench-path
@@ -217,9 +232,19 @@ Per shifts #292-#293:
 3. Net effect: MTP=2 → 1.62 t/s (vs no-MTP 1.83 t/s). MTP=4 → 1.04 t/s.
    MTP=8 → 0.75 t/s. Strict net loss, scaling worse with draft depth.
 
-Real spec-decode win would require **batched MoE verification** (read
-each expert once per batch), which DS4 doesn't currently implement.
-Task #418 was the entry point design memo for this; not yet built.
+Real spec-decode win requires **batched/block MoE verification**: read each
+expert/codebook once per verifier block, produce top-1 rows for acceptance,
+and read back only the committed continuation logits. That is now the owning
+abstraction. Codec containers are disposable; the runtime object should be
+whatever lets MTL4/compute + ICB replay compressed expert records without
+whole-model FP16 expansion.
+
+Immediate code direction:
+- Keep the non-strict microbatch verifier as the performance path.
+- Keep strict/exact decode2 only as a correctness oracle.
+- Remove per-token heap churn from speculative verify scratch.
+- Fuse routed expert decode, SwiGLU, down, and verifier top-1 work into stable
+  MTL buffers/ICB records before optimizing pack aesthetics.
 
 ## Why hot-expert pin doesn't work (shift #292)
 

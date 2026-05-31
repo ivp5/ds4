@@ -15,7 +15,7 @@
  *       "data_off": int, "data_bytes": int}, ...]
  *   [data_bytes] tensor data, 64-byte aligned per tensor
  *
- * dtype strings: "BF16", "F16", "F32", "I8", "F8_E4M3", "F8_E8M0"
+ * dtype strings: "BF16", "F16", "F32", "I8", "I32", "F8_E4M3", "F8_E8M0"
  */
 #ifndef DS4_NONROUTED_PACK_H
 #define DS4_NONROUTED_PACK_H
@@ -41,6 +41,7 @@ typedef enum ds4_nrpk_dtype {
     DS4_NRPK_DTYPE_I8       = 4,
     DS4_NRPK_DTYPE_F8_E4M3  = 5,  /* float8 e4m3fn */
     DS4_NRPK_DTYPE_F8_E8M0  = 6,  /* float8 e8m0fnu (scale exponent) */
+    DS4_NRPK_DTYPE_I32      = 7,
 } ds4_nrpk_dtype;
 
 typedef struct ds4_nrpk_header {

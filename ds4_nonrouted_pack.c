@@ -30,6 +30,7 @@ ds4_nrpk_dtype ds4_nrpk_dtype_from_string(const char *s) {
     if (!strcmp(s, "F16"))      return DS4_NRPK_DTYPE_F16;
     if (!strcmp(s, "BF16"))     return DS4_NRPK_DTYPE_BF16;
     if (!strcmp(s, "I8"))       return DS4_NRPK_DTYPE_I8;
+    if (!strcmp(s, "I32"))      return DS4_NRPK_DTYPE_I32;
     if (!strcmp(s, "F8_E4M3"))  return DS4_NRPK_DTYPE_F8_E4M3;
     if (!strcmp(s, "F8_E8M0"))  return DS4_NRPK_DTYPE_F8_E8M0;
     return DS4_NRPK_DTYPE_UNKNOWN;
@@ -41,6 +42,7 @@ const char *ds4_nrpk_dtype_name(ds4_nrpk_dtype d) {
         case DS4_NRPK_DTYPE_F16:     return "F16";
         case DS4_NRPK_DTYPE_BF16:    return "BF16";
         case DS4_NRPK_DTYPE_I8:      return "I8";
+        case DS4_NRPK_DTYPE_I32:     return "I32";
         case DS4_NRPK_DTYPE_F8_E4M3: return "F8_E4M3";
         case DS4_NRPK_DTYPE_F8_E8M0: return "F8_E8M0";
         default:                     return "UNK";
@@ -52,6 +54,7 @@ size_t ds4_nrpk_dtype_bytes(ds4_nrpk_dtype d) {
         case DS4_NRPK_DTYPE_F32: return 4;
         case DS4_NRPK_DTYPE_F16:
         case DS4_NRPK_DTYPE_BF16: return 2;
+        case DS4_NRPK_DTYPE_I32: return 4;
         case DS4_NRPK_DTYPE_I8:
         case DS4_NRPK_DTYPE_F8_E4M3:
         case DS4_NRPK_DTYPE_F8_E8M0: return 1;

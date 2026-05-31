@@ -53,7 +53,7 @@
 #include "ds4_moe_route_log.h"
 #include "ds4_polar_reader.h"
 #include "ds4_prefix_cache.h"
-#include "ds4_vqb2_pack.h"  /* silv 2026-05-28 task #764 — --vqb2-pack engine wiring */
+#include "ds4_vqb2_pack.h"  /* legacy hot-store coverage masks; not a runtime pack selector */
 #include "ds4_nonrouted_pack.h"  /* silv 2026-05-28 task #771 Phase 1 — --nonrouted-pack engine wiring */
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -76,6 +76,7 @@
 static inline void pe_router_trace_record_cpu(uint32_t il, uint32_t pos, const int *selected, const float *weights);
 /* Forward decl: layer-duplication remap. Defined near ds4_layer_should_skip. */
 static inline uint32_t ds4_layer_dup_remap(uint32_t il);
+#define DS4_M1_MAX_MODEL_RESIDENCY_BYTES UINT64_C(55834574848)
 #define DS4_ROPE_FREQ_BASE (10000.0f)
 #define DS4_ROPE_SCALE_FACTOR (16.0f)
 #define DS4_ROPE_YARN_BETA_FAST (32.0f)
@@ -7519,6 +7520,7 @@ static void layer_routed_moe_selected_one_prealloc(
  const float *x,
  const int32_t *selected_rows,
  const float *weight_rows,
+ uint32_t layer_index,
  float clamp,
  float *mid_all,
  block_q8_K *xq,
@@ -7557,8 +7559,8 @@ static void layer_routed_moe_selected_one_prealloc(
  ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
 
  if (is_q4) {
- /* GPU→CPU handoff path: no layer index. DS4_N_LAYER sentinel
-  * disables organ-skip via the bounds check in ds4_organ_should_skip. */
+ /* GPU→CPU handoff path: keep the real layer index so organ-skip and
+  * harm probes observe the same routed expert body as decode. */
  matvec_q4_k_experts_mid_prequant(mid_all, model,
  layer->ffn_gate_exps,
  layer->ffn_up_exps,
@@ -7567,12 +7569,10 @@ static void layer_routed_moe_selected_one_prealloc(
  weight_rows,
  DS4_N_EXPERT_USED,
  clamp,
- DS4_N_LAYER);
+ layer_index);
  } else {
- /* GPU→CPU batch handoff path: layer index is not available here.
-  * Pass DS4_N_LAYER as a sentinel — ds4_organ_should_skip's bounds
-  * check makes the skip a no-op on this path. The harm scorer
-  * runs through the single-token --cpu-moe path that has `il`. */
+ /* GPU→CPU handoff path: keep the real layer index so organ-skip and
+  * harm probes observe the same routed expert body as decode. */
  matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
  layer->ffn_gate_exps,
  layer->ffn_up_exps,
@@ -7581,7 +7581,7 @@ static void layer_routed_moe_selected_one_prealloc(
  weight_rows,
  DS4_N_EXPERT_USED,
  clamp,
- DS4_N_LAYER);
+ layer_index);
  }
 
  for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
@@ -7626,6 +7626,7 @@ static DS4_MAYBE_UNUSED void cpu_routed_moe_batch_handoff_prealloc(
  ffn_norm_rows,
  selected_rows,
  weight_rows,
+ il,
  clamp,
  mid,
  xq,
@@ -11949,20 +11950,19 @@ static bool metal_graph_matmul_plain_tensor(
  *   - Three independent dispatch backends (CPU-default, CPU-hot-FP16,
  *     Metal-hot-FP16, Metal-default) interleaved in branchy code
  *
- * The abstraction declares the sync invariants in a static table (O(1)
- * lookup). Each backend's "needs_cpu_sync" flag is checked uniformly in
- * apply(); the bug surface (an unsynced dispatch) cannot recur because
- * the sync barrier is data-driven, not branch-driven.
+ * The abstraction keeps the sync invariant in one owner: apply() decides
+ * whether to drain/restart the graph around a backend. The bug surface
+ * (an unsynced dispatch) cannot recur through branch-local shortcuts.
  *
  * Engineer roster cycle 1 perspectives baked in:
  *   - Carmack/Hotz: no special cases, one always-correct path
  *   - Linus: no premature optimization that silently breaks correctness
- *   - Pearl: sync invariant declared at the data level, not the call level
- *   - Knuth: table-driven dispatch over conditional cascade
+ *   - Pearl: sync invariant owned at the causal boundary
+ *   - Knuth: plan/apply dispatch over conditional cascade
  *   - DJB: backend metadata in a const table; no ad-hoc env probes per call
  *
  * Multi-cycle plan:
- *   Cycle 1 (this): introduce plan/apply API + sync-invariant table.
+ *   Cycle 1 (this): introduce plan/apply API + single sync owner.
  *   Cycle 2: replace the nested if/else call site with one apply() call.
  *   Cycle 3: backends that read GPU buffers (Metal-hot) gain MTLBuffer
  *            handle dispatch (task #784) so needs_cpu_sync drops to 0.
@@ -11972,25 +11972,9 @@ static bool metal_graph_matmul_plain_tensor(
 typedef enum {
  DS4_ROUTED_MOE_CPU_DEFAULT     = 0, /* CPU IQ2_XXS dequant + matmul */
  DS4_ROUTED_MOE_CPU_HOT_FP16    = 1, /* CPU via predequant FP16 hot-store */
- DS4_ROUTED_MOE_METAL_HOT_FP16  = 2, /* Metal via VQB2 hot-store dispatch_gpu */
- DS4_ROUTED_MOE_METAL_DEFAULT   = 3, /* Default Metal routed FFN (vqb2 pack direct) */
+ DS4_ROUTED_MOE_METAL_DEFAULT   = 2, /* Default Metal routed FFN */
  DS4_ROUTED_MOE_BACKEND_COUNT
 } ds4_routed_moe_backend;
-
-/* Sync-invariant table. Indexed by backend. Each row says how the
- * dispatcher MUST treat the GPU command buffer around the backend call. */
-typedef struct {
- uint8_t needs_cpu_sync;        /* end_commands() before + begin_commands() after */
- uint8_t reads_cpu_input_ptrs;  /* dereferences ds4_gpu_tensor_contents() */
- const char *name;
-} ds4_routed_moe_backend_props;
-
-static const ds4_routed_moe_backend_props DS4_ROUTED_MOE_PROPS[DS4_ROUTED_MOE_BACKEND_COUNT] = {
- [DS4_ROUTED_MOE_CPU_DEFAULT]    = { 1, 1, "cpu_default"    },
- [DS4_ROUTED_MOE_CPU_HOT_FP16]   = { 1, 1, "cpu_hot_fp16"   },
- [DS4_ROUTED_MOE_METAL_HOT_FP16] = { 1, 1, "metal_hot_fp16" }, /* Until task #784 lands */
- [DS4_ROUTED_MOE_METAL_DEFAULT]  = { 0, 0, "metal_default"  },
-};
 
 /* The plan is the FULL decision: which backend + which hot-store (NULL
  * for non-hot backends). Computed once per (layer, token); execution is
@@ -12003,22 +11987,14 @@ typedef struct {
 /* Env-var caches: read once per process, not per dispatch. DJB style. */
 static int  ds4_routed_moe_env_initialized = 0;
 static int  ds4_routed_moe_env_hot_fp16 = 0;
-static int  ds4_routed_moe_env_hot_metal = 0;
 
 static void ds4_routed_moe_env_init(void) {
  if (ds4_routed_moe_env_initialized) return;
- ds4_routed_moe_env_hot_fp16 = (getenv("DS4_HOT_FP16") != NULL ||
-                                  getenv("DS4_VQB2_FP16") != NULL) ? 1 : 0;
- ds4_routed_moe_env_hot_metal = (getenv("DS4_HOT_METAL_MOE") != NULL) ? 1 : 0;
+ ds4_routed_moe_env_hot_fp16 = (getenv("DS4_HOT_FP16") != NULL) ? 1 : 0;
  ds4_routed_moe_env_initialized = 1;
  if (ds4_routed_moe_env_hot_fp16) {
   fprintf(stderr,
    "ds4: DS4_HOT_FP16=1 — predequant FP16 hot-store dispatch engaged (CPU-MoE site)\n");
- }
- if (ds4_routed_moe_env_hot_metal) {
-  fprintf(stderr,
-   "ds4: DS4_HOT_METAL_MOE=1 — Metal-MoE FP16 hot-store hook engaged "
-   "(staging; honors sync invariant via routed_moe abstraction)\n");
  }
 }
 
@@ -12040,13 +12016,6 @@ static ds4_routed_moe_plan ds4_routed_moe_decide(
     p.backend = DS4_ROUTED_MOE_CPU_HOT_FP16;
     p.hot = hot;
    }
-  }
- } else if (ds4_routed_moe_env_hot_metal && sel_for_pinning_check) {
-  /* Metal-MoE branch with optional hot-store. */
-  ds4_hot_expert_store *hot = ds4_hot_store_get_active();
-  if (hot && ds4_hot_layer_all_pinned(hot, il, sel_for_pinning_check, DS4_N_EXPERT_USED)) {
-   p.backend = DS4_ROUTED_MOE_METAL_HOT_FP16;
-   p.hot = hot;
   }
  }
  return p;
@@ -12079,14 +12048,25 @@ static int ds4_routed_moe_apply_full(
  ds4_routed_moe_env_init();
 
  const bool is_cpu_moe_layer = (!force_metal_moe && g->cpu_moe_layer[il]);
- const bool has_path_fused_pack = getenv("DS4_VQB2_PACK_PATH") != NULL;
+ const bool has_m1r_pack = getenv("DS4_M1R_PACK_PATH") != NULL;
 
  /* If neither branch applies, return 0 — caller runs default Metal path. */
- if (!is_cpu_moe_layer && !ds4_routed_moe_env_hot_metal && !has_path_fused_pack) {
+ if (!is_cpu_moe_layer && !has_m1r_pack) {
   return 0;
  }
 
- /* CPU-MoE branch: scratch + sync first. */
+ if (has_m1r_pack) {
+  const char *m1r_path = getenv("DS4_M1R_PACK_PATH");
+  if (ds4_gpu_end_commands() == 0) return -1;
+  const int dr = ds4_gpu_mtl4_m1r_routed_organ_dispatch_tensor(
+   m1r_path, il,
+   g->router_selected, g->router_weights,
+   g->ffn_norm, g->routed_out,
+   DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP);
+  if (ds4_gpu_begin_commands() == 0) return -1;
+  return dr == 0 ? 1 : -1;
+ }
+
  if (is_cpu_moe_layer) {
   if (!metal_graph_ensure_cpu_moe_scratch(g, 1)) return -1;
  }
@@ -12103,22 +12083,6 @@ static int ds4_routed_moe_apply_full(
  if (!contents_ok) {
   ds4_gpu_begin_commands();
   return -1;
- }
-
- if (!is_cpu_moe_layer && !ds4_routed_moe_env_hot_metal && has_path_fused_pack) {
-  extern int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *,
-                                               uint32_t, uint32_t,
-                                               struct ds4_gpu_tensor *,
-                                               struct ds4_gpu_tensor *,
-                                               struct ds4_gpu_tensor *,
-                                               struct ds4_gpu_tensor *);
-  memset(out, 0, (size_t)DS4_N_EMBD * sizeof(float));
-  const int dr = ds4_metal_vqb2_fp16_dispatch_gpu(
-   NULL, il, 1u,
-   g->router_selected, g->router_weights,
-   g->ffn_norm, g->routed_out);
-  if (ds4_gpu_begin_commands() == 0) return -1;
-  return dr == 0 ? 1 : -1;
  }
 
  /* Decide the backend now that we have sel for pinning checks. */
@@ -12143,24 +12107,6 @@ static int ds4_routed_moe_apply_full(
    g->cpu_moe_mid, g->cpu_moe_xq,
    g->cpu_moe_midq, g->cpu_moe_pair_ids);
   dispatched = 1;
-  break;
- }
- case DS4_ROUTED_MOE_METAL_HOT_FP16: {
-  extern int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *);
-  extern int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *,
-                                               uint32_t, uint32_t,
-                                               struct ds4_gpu_tensor *,
-                                               struct ds4_gpu_tensor *,
-                                               struct ds4_gpu_tensor *,
-                                               struct ds4_gpu_tensor *);
-  if (ds4_metal_vqb2_fp16_bind_store(plan.hot) == 0) {
-   memset(out, 0, (size_t)DS4_N_EMBD * sizeof(float));
-   const int dr = ds4_metal_vqb2_fp16_dispatch_gpu(
-    plan.hot, il, 1u,
-    g->router_selected, g->router_weights,
-    g->ffn_norm, g->routed_out);
-   if (dr == 0) dispatched = 1;
-  }
   break;
  }
  case DS4_ROUTED_MOE_METAL_DEFAULT:
@@ -13687,10 +13633,9 @@ static bool metal_graph_encode_decode_layer(
  }
  /* silv 2026-05-28 engineer-roster cycle 2: routed-MoE dispatch collapsed
   * from a 165-line nested if/else into a single apply_full() call.
-  * apply_full() honors the sync invariant declared in DS4_ROUTED_MOE_PROPS
-  * uniformly across all backends — the task #764 sync-skip kludge cannot
-  * recur because the dispatch decision and the sync barrier are now
-  * data-driven, not branch-driven. */
+  * apply_full() owns the sync invariant uniformly across all backends —
+  * the task #764 sync-skip kludge cannot recur because the dispatch decision
+  * and the sync barrier are now in one function, not branch-local shortcuts. */
  if (ok) {
  const int dispatched = ds4_routed_moe_apply_full(g, model, layer, il, force_metal_moe);
  if (dispatched < 0) {
@@ -16630,21 +16575,78 @@ static bool metal_graph_encode_layer_ffn_batch(
  }
  DS4_METAL_PROFILE_FFN_STAGE("router");
 
-	 const bool has_path_fused_pack = getenv("DS4_VQB2_PACK_PATH") != NULL;
-	 if (ok && has_path_fused_pack && !g->cpu_moe_layer[il]) {
-	 extern int ds4_metal_vqb2_fp16_dispatch_gpu(struct ds4_hot_expert_store *,
-	                                              uint32_t, uint32_t,
-	                                              struct ds4_gpu_tensor *,
-	                                              struct ds4_gpu_tensor *,
-	                                              struct ds4_gpu_tensor *,
-	                                              struct ds4_gpu_tensor *);
+	 const char *m1r_path = getenv("DS4_M1R_PACK_PATH");
+	 const bool has_m1r_pack = m1r_path && m1r_path[0];
+	 if (ok && has_m1r_pack) {
 	 ok = (ds4_gpu_end_commands() != 0);
-	 if (ok) {
-	  const int dr = ds4_metal_vqb2_fp16_dispatch_gpu(
-	   NULL, il, (uint32_t)n_tokens,
+	 if (ok && n_tokens == 1) {
+	  const int dr = ds4_gpu_mtl4_m1r_routed_organ_dispatch_tensor(
+	   m1r_path, il,
 	   g->batch_router_selected, g->batch_router_weights,
-	   g->batch_ffn_norm, g->batch_routed_out);
+	   g->batch_ffn_norm, g->batch_routed_out,
+	   DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP);
 	  ok = (dr == 0);
+	 } else if (ok) {
+	  static int s_m1r_prefill_batch_notice = 0;
+	  static int s_m1r_prefill_fallback_notice = 0;
+	  const bool m1r_batch_enabled = getenv("DS4_M1R_BATCH_ENABLE") != NULL;
+	  int batch_dr = -1;
+	  if (m1r_batch_enabled) {
+	   if (!s_m1r_prefill_batch_notice) {
+	    s_m1r_prefill_batch_notice = 1;
+	    fprintf(stderr,
+	            "ds4: M1R prefill using true batched dispatch n_tokens=%u\n",
+	            n_tokens);
+	   }
+	   batch_dr = ds4_gpu_mtl4_m1r_routed_organ_dispatch_tensor_batch(
+	    m1r_path, il,
+	    g->batch_router_selected, g->batch_router_weights,
+	    g->batch_ffn_norm, g->batch_routed_out,
+	    (uint32_t)n_tokens, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP);
+	  }
+	  if (batch_dr != 0) {
+	   if (!s_m1r_prefill_fallback_notice) {
+	    s_m1r_prefill_fallback_notice = 1;
+	    fprintf(stderr,
+	            "ds4: M1R prefill falling back to token-loop bridge n_tokens=%u "
+	            "disabled=%d last_rc=%d\n",
+	            n_tokens, m1r_batch_enabled ? 0 : 1, batch_dr);
+	   }
+	  }
+	  ok = (batch_dr == 0);
+	  if (!ok) {
+	   fprintf(stderr,
+	           "ds4: M1R token-loop bridge diagnostic fallback engaged; batch path needs investigation\n");
+	   const uint64_t selected_stride = (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t);
+	   const uint64_t weights_stride = (uint64_t)DS4_N_EXPERT_USED * sizeof(float);
+	   const uint64_t hidden_stride = (uint64_t)DS4_N_EMBD * sizeof(float);
+	   bool fallback_ok = true;
+	   for (size_t ti = 0; fallback_ok && ti < n_tokens; ti++) {
+	    ds4_gpu_tensor *selected_view = ds4_gpu_tensor_view(
+	     g->batch_router_selected, (uint64_t)ti * selected_stride, selected_stride);
+	    ds4_gpu_tensor *weights_view = ds4_gpu_tensor_view(
+	     g->batch_router_weights, (uint64_t)ti * weights_stride, weights_stride);
+	    ds4_gpu_tensor *input_view = ds4_gpu_tensor_view(
+	     g->batch_ffn_norm, (uint64_t)ti * hidden_stride, hidden_stride);
+	    ds4_gpu_tensor *output_view = ds4_gpu_tensor_view(
+	     g->batch_routed_out, (uint64_t)ti * hidden_stride, hidden_stride);
+	    if (!selected_view || !weights_view || !input_view || !output_view) {
+	     fprintf(stderr, "ds4: M1R token-loop view allocation failed L%u token=%zu/%u\n",
+	             il, ti, n_tokens);
+	     fallback_ok = false;
+	    } else {
+	     const int dr = ds4_gpu_mtl4_m1r_routed_organ_dispatch_tensor(
+	      m1r_path, il, selected_view, weights_view, input_view, output_view,
+	      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP);
+	     fallback_ok = (dr == 0);
+	    }
+	    ds4_gpu_tensor_free(output_view);
+	    ds4_gpu_tensor_free(input_view);
+	    ds4_gpu_tensor_free(weights_view);
+	    ds4_gpu_tensor_free(selected_view);
+	   }
+	   ok = fallback_ok;
+	  }
 	 }
 	 if (ds4_gpu_begin_commands() == 0) ok = false;
 	 } else if (ok && g->cpu_moe_layer[il]) {
@@ -16750,7 +16752,7 @@ static bool metal_graph_encode_layer_ffn_batch(
  metal_graph_debug_dump_tensor("ffn_moe_out", g->batch_routed_out,
  (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
  }
- DS4_L1_PROBE("ffn_moe_out(VQB2 routed)", g->batch_routed_out, DS4_N_EMBD);
+ DS4_L1_PROBE("ffn_moe_out(routed)", g->batch_routed_out, DS4_N_EMBD);
  DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
  if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_shared_gate, model,
   layer->ffn_gate_shexp,
@@ -18702,12 +18704,8 @@ struct ds4_engine {
  * engine_activate_prefill_phase() since N <= DS4_N_LAYER and the
  * split is deterministic. */
  uint32_t prefill_metal_phases;
- /* silv 2026-05-28 task #764 — VQB2 pack handle (Architecture B).
-  * Owned by engine; opened in engine_open when opt->vqb2_pack_path
-  * is set; closed in engine_close. NULL when --vqb2-pack absent. */
- struct ds4_vqb2_pack *vqb2_pack;
  /* silv 2026-05-28 task #771 Phase 1 — Non-routed pack handle.
-  * Companion to vqb2_pack for non-routed tensors. Opened in engine_open
+  * Companion to m1r_pack_path for non-routed tensors. Opened in engine_open
   * when opt->nonrouted_pack_path is set; closed in engine_close.
   * NULL when --nonrouted-pack absent. Phase 1 ships the diagnostic;
   * Phase 2 wires the tensor-load lookup override. */
@@ -20403,6 +20401,9 @@ struct ds4_session {
  token_vec checkpoint;
  float *logits;
  float *mtp_logits;
+ float *mtp_verify_logits;
+ float *mtp_verify_logits0;
+ int *mtp_verify_tops;
  int mtp_draft_token;
  uint64_t mtp_probe_total;
  uint64_t mtp_probe_hit;
@@ -22049,6 +22050,11 @@ static bool ds4_env_mib_to_bytes(const char *env_name, uint64_t *out) {
 static uint64_t engine_compute_phase_max_routed_bytes(const ds4_engine *e,
  uint32_t phases);
 
+static bool engine_has_external_m1r_routed_pack(void) {
+ const char *p = getenv("DS4_M1R_PACK_PATH");
+ return p && p[0];
+}
+
 /* Resolve `--prefill-metal-phases auto` into a concrete N in [1, DS4_N_LAYER].
  *
  * Budget model:
@@ -22066,6 +22072,12 @@ static uint64_t engine_compute_phase_max_routed_bytes(const ds4_engine *e,
 static uint32_t engine_resolve_auto_phases(const ds4_engine *e) {
  const uint64_t total = engine_compute_phase_max_routed_bytes(e, 1);
  if (total == 0) {
+ if (engine_has_external_m1r_routed_pack()) {
+ fprintf(stderr,
+ "ds4: --prefill-metal-phases auto: routed experts supplied by external "
+ "M1R pack; no GGUF routed residency to phase, using N=1\n");
+ return 1;
+ }
  fprintf(stderr,
  "ds4: --prefill-metal-phases auto: routed expert bytes are zero, "
  "cannot auto-size; specify an explicit N\n");
@@ -22167,6 +22179,7 @@ static void ds4_phase_layer_range(uint32_t phases, uint32_t phase_idx,
 static uint64_t engine_compute_phase_max_routed_bytes(const ds4_engine *e,
  uint32_t phases) {
  if (phases == 0) return 0;
+ if (engine_has_external_m1r_routed_pack()) return 0;
  uint64_t max_bytes = 0;
  for (uint32_t p = 0; p < phases; p++) {
  uint32_t start = 0, end = 0;
@@ -22428,7 +22441,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
   * flags (--prefill-metal-phases, --cpu-moe, ...) prevent the kernel PANIC but NOT
   * unusability. A >RAM model under the residency gate SKIPS the wire and then
   * DEMAND-PAGES its >RAM working set during prefill -> the system THRASHES into
-  * unresponsiveness. Verified 2026-05-30: --prefill-metal-phases auto + --vqb2-pack,
+  * unresponsiveness. Verified 2026-05-30: --prefill-metal-phases auto + obsolete routed pack,
   * residency correctly SKIPPED (no panic, reached prefill L38/43), but the machine
   * became unusable ~20s in. "No panic" != "usable". So a model > 52 GiB does NOT run
   * usably on this 64 GB M1 Max by ANY residency strategy (wire->panic, page->thrash).
@@ -22559,6 +22572,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  vocab_load(&e->vocab, &e->model);
  config_validate_model(&e->model);
  weights_bind(&e->weights, &e->model);
+ if (opt->m1r_pack_path && opt->m1r_pack_path[0]) {
+  setenv("DS4_M1R_PACK_PATH", opt->m1r_pack_path, 1);
+ }
  if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
  ds4_engine_close(e);
  *out = NULL;
@@ -22937,20 +22953,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
   }
  }
 
- /* silv 2026-05-28 task #764 — VQB2 pack engine wire (Architecture B).
-  *
-  * When --vqb2-pack PATH is set, opt->vqb2_pack_path supplies the pack
-  * file. We:
-  *   (a) export DS4_VQB2_PACK_PATH so the PATH_FUSED dispatcher's lazy
-  *       bind in ds4_metal_vqb2_fp16.m finds the same pack;
-  *   (b) open the pack mmap + parse its index CSV;
-  *   (c) if DS4_VQB2_PACK_HOT_LAYERS="L1,L2,..." is set, allocate the
-  *       FP16 hot-store sized for those layers and pin them — this is
-  *       what the legacy/icb/mtl4 paths need to read from. Without
-  *       hot-store population, only PATH_FUSED is exercised.
-  *
-  * Index path convention: <pack_path>.index.csv next to the pack file.
-  * Pack handle is owned by the engine; closed in ds4_engine_close. */
  /* silv 2026-05-28 task #771 Phase 1 — non-routed pack open + name-mapping
   * coverage probe.
   *
@@ -23018,7 +23020,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
      if (t->name.len >= sizeof(gguf_name)) continue;
      memcpy(gguf_name, t->name.ptr, t->name.len);
      gguf_name[t->name.len] = '\0';
-     /* Skip routed-FFN expert tensors — they live in VQB2 pack, not nrpk. */
+     /* Skip routed-FFN expert tensors — they live in the routed pack, not nrpk. */
      if (strstr(gguf_name, "ffn_gate_exps") ||
          strstr(gguf_name, "ffn_up_exps") ||
          strstr(gguf_name, "ffn_down_exps")) {
@@ -23156,7 +23158,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
      if (t->name.len >= sizeof(gguf_name)) continue;
      memcpy(gguf_name, t->name.ptr, t->name.len);
      gguf_name[t->name.len] = '\0';
-     /* Skip routed-FFN tensors — handled by VQB2 pack, not nrpk. */
+     /* Skip routed-FFN tensors — handled by the routed pack, not nrpk. */
      if (strstr(gguf_name, "ffn_gate_exps") ||
          strstr(gguf_name, "ffn_up_exps") ||
          strstr(gguf_name, "ffn_down_exps")) {
@@ -23716,91 +23718,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
   }
  }
 
- if (opt->vqb2_pack_path && opt->vqb2_pack_path[0]) {
-  setenv("DS4_VQB2_PACK_PATH", opt->vqb2_pack_path, 0);
-  /* Normal PATH_FUSED execution reads the pack directly from Metal via
-   * DS4_VQB2_PACK_PATH. Do not also mmap/open the 37GB pack on the engine
-   * side unless a legacy hot-store pin explicitly needs the CPU handle. */
-  const char *hot_layers_env = getenv("DS4_VQB2_PACK_HOT_LAYERS");
-  if (!(hot_layers_env && hot_layers_env[0])) {
-   fprintf(stderr, "ds4: --vqb2-pack: exported DS4_VQB2_PACK_PATH=%s\n"
-                   "    CPU pack not opened; PATH_FUSED will lazy-bind the pack directly\n",
-           opt->vqb2_pack_path);
+ if (opt->m1r_pack_path && opt->m1r_pack_path[0]) {
+  setenv("DS4_M1R_PACK_PATH", opt->m1r_pack_path, 1);
+  if (access(opt->m1r_pack_path, R_OK) != 0) {
+   fprintf(stderr, "ds4: --m1r-pack: access failed path=%s error=%s\n",
+           opt->m1r_pack_path, strerror(errno));
   } else {
-   char index_path[1280];
-   snprintf(index_path, sizeof(index_path), "%s.index.csv", opt->vqb2_pack_path);
-   ds4_vqb2_pack *pack = (ds4_vqb2_pack *)calloc(1, sizeof(*pack));
-   if (!pack) {
-    fprintf(stderr, "ds4: --vqb2-pack: calloc(ds4_vqb2_pack) failed\n");
-   } else if (!ds4_vqb2_pack_open(opt->vqb2_pack_path, index_path, pack)) {
-    fprintf(stderr, "ds4: --vqb2-pack: open failed (pack=%s index=%s)\n",
-            opt->vqb2_pack_path, index_path);
-    free(pack);
-    pack = NULL;
-   } else {
-    fprintf(stderr, "ds4: --vqb2-pack: opened %s (%.2f GB, %u entries)\n",
-            opt->vqb2_pack_path, (double)pack->pack_size / 1e9,
-            (unsigned)pack->n_entries);
-    e->vqb2_pack = pack;
-
-    /* Optional: pin layers into the FP16 hot-store for legacy/icb/mtl4.
-     * Budget per layer (256 experts × 3 kinds × 3 row-blocks × ~17 MB
-     * FP16) ≈ 13 GB. Caller is responsible for not OOMing the system. */
-    int requested[DS4_N_LAYER];
-    int n_req = 0;
-    char lbuf[256];
-    strncpy(lbuf, hot_layers_env, sizeof(lbuf) - 1);
-    lbuf[sizeof(lbuf) - 1] = '\0';
-    char *tok = strtok(lbuf, ",");
-    while (tok && n_req < (int)DS4_N_LAYER) {
-     int L = atoi(tok);
-     if (L >= 0 && L < (int)DS4_N_LAYER) requested[n_req++] = L;
-     tok = strtok(NULL, ",");
-    }
-    if (n_req > 0) {
-     /* silv 2026-05-28: pack tiles store bit-packed VQB2 codes, not decoded
-      * FP16. Empirical: L22 with 16384 tiles = 0.72 GB heap. Budget 1.5 GB
-      * per layer leaves 100% safety margin. For all 43 layers: ~65 GB total
-      * (fits Metal cap with non-routed segments). The IQ2_XXS-source pin
-      * path (DS4_HOT_PIN_LAYERS) uses 14 GB/layer because it decodes to FP16. */
-     const uint64_t per_layer_budget = ((uint64_t)3ULL << 29); /* 1.5 GB */
-     const uint64_t budget = (uint64_t)n_req * per_layer_budget + ((uint64_t)1ULL << 30);
-     fprintf(stderr, "ds4: --vqb2-pack: DS4_VQB2_PACK_HOT_LAYERS=%s → budget=%.1f GB\n",
-             hot_layers_env, (double)budget / 1e9);
-     ds4_hot_expert_store *store = ds4_hot_expert_store_alloc(budget);
-     if (store) {
-      int n_pin_calls = 0;
-      int total_pinned = 0;
-      for (int i = 0; i < n_req; i++) {
-       int n = ds4_vqb2_pack_load_to_hot_store(store, pack, requested[i], -1);
-       if (n >= 0) {
-        n_pin_calls++;
-        total_pinned += n;
-        fprintf(stderr, "ds4: --vqb2-pack: L%d pinned %d tiles\n",
-                requested[i], n);
-       } else {
-        fprintf(stderr, "ds4: --vqb2-pack: L%d pack_load_to_hot_store FAILED\n",
-                requested[i]);
-        break;
-       }
-      }
-      if (n_pin_calls > 0) {
-       fprintf(stderr, "ds4: --vqb2-pack: hot-store: %d layers, %d total tiles, %.2f GB heap\n",
-               n_pin_calls, total_pinned, (double)ds4_hot_store_heap_bytes_get(store) / 1e9);
-       ds4_hot_store_set_active(store);
-       extern int ds4_metal_vqb2_fp16_bind_store(struct ds4_hot_expert_store *);
-       if (ds4_metal_vqb2_fp16_bind_store(store) != 0) {
-        fprintf(stderr, "ds4: --vqb2-pack: Metal bind failed (CPU dispatch still ok)\n");
-       }
-      } else {
-       ds4_hot_expert_store_free(store);
-      }
-     } else {
-      fprintf(stderr, "ds4: --vqb2-pack: hot-store alloc failed (budget %.1f GB)\n",
-              (double)budget / 1e9);
-     }
-    }
-   }
+   fprintf(stderr, "ds4: --m1r-pack: opened runtime-native routed pack=%s\n",
+           opt->m1r_pack_path);
   }
  }
 
@@ -23832,13 +23757,8 @@ const char *ds4_mpp_mode_name(ds4_mpp_mode m) {
  }
 }
 
-/* silv 2026-05-28 H2247-audit R1: per-layer dispatch timing dump. */
-extern void ds4_metal_vqb2_fp16_dump_layer_timing(void);
-
 void ds4_engine_close(ds4_engine *e) {
  if (!e) return;
- /* H2247-audit R1: dump per-layer dispatch timing if instrumented. */
- ds4_metal_vqb2_fp16_dump_layer_timing();
  /* silv 2026-05-28 #796 Increment 2c: dump storage-dispatch counters so we
   * can see when the heap-storage path actually fires vs. the mmap fallback.
   * Print only when at least one path was exercised — silent when neither
@@ -23865,23 +23785,6 @@ void ds4_engine_close(ds4_engine *e) {
   * downstream (kernel arithmetic). */
  fprintf(stderr, "ds4: storage-dispatch fp8 — heap=%llu (zero = via_tensor not called for FP8 attn weights)\n",
          (unsigned long long)s_n_storage_dispatch_fp8);
- /* silv 2026-05-28 — PATH_FUSED ICB-eligibility probe summary. Reports
-  * what fraction of PATH_FUSED calls would have HIT an 8-way per-layer
-  * sig cache. Sizes the upside of wiring PATH_FUSED through ICB
-  * capture+replay. */
- {
-  extern void ds4_metal_vqb2_fp16_pf_icb_eligibility(uint64_t *, uint64_t *);
-  uint64_t pf_h = 0, pf_m = 0;
-  ds4_metal_vqb2_fp16_pf_icb_eligibility(&pf_h, &pf_m);
-  if (pf_h > 0 || pf_m > 0) {
-   const uint64_t total = pf_h + pf_m;
-   fprintf(stderr,
-           "ds4: PATH_FUSED ICB-eligibility — hits=%llu misses=%llu total=%llu (%.1f%% would replay)\n",
-           (unsigned long long)pf_h, (unsigned long long)pf_m,
-           (unsigned long long)total,
-           total > 0 ? (100.0 * (double)pf_h / (double)total) : 0.0);
-  }
- }
  /* silv 2026-05-27 Phase 2: dump prefix cache stats if any activity, then free */
  if (e->prefix_cache.stat_lookups > 0 || e->prefix_cache.stat_stores > 0) {
    char statbuf[256];
@@ -23903,12 +23806,6 @@ void ds4_engine_close(ds4_engine *e) {
  ds4_release_instance_lock();
  free(e->directional_steering_dirs);
  free(e->directional_steering_file);
- /* silv 2026-05-28 task #764 — release VQB2 pack mmap if engine opened one */
- if (e->vqb2_pack) {
-  ds4_vqb2_pack_close(e->vqb2_pack);
-  free(e->vqb2_pack);
-  e->vqb2_pack = NULL;
- }
  /* silv 2026-05-28 task #771 — release non-routed pack mmap if opened */
  if (e->nonrouted_pack) {
   ds4_nrpk_close(e->nonrouted_pack);
@@ -23960,6 +23857,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
  s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
  if (e->mtp_ready) {
  s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
+ s->mtp_verify_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_verify_logits[0]));
+ s->mtp_verify_logits0 = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_verify_logits0[0]));
+ s->mtp_verify_tops = xmalloc(16u * sizeof(s->mtp_verify_tops[0]));
  s->mtp_draft_token = -1;
  }
  *out = s;
@@ -23981,6 +23881,9 @@ void ds4_session_free(ds4_session *s) {
  token_vec_free(&s->checkpoint);
  free(s->logits);
  free(s->mtp_logits);
+ free(s->mtp_verify_logits);
+ free(s->mtp_verify_logits0);
+ free(s->mtp_verify_tops);
  free(s);
 }
 
@@ -24659,7 +24562,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  mtp_last_margin = v0 - v1;
  }
  if (mtp_last_margin < mtp_margin_threshold) {
- float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+ float *row_logits = s->mtp_verify_logits;
  const int start = s->checkpoint.len;
  const double verify_t0 = mtp_timing ? now_sec() : 0.0;
  bool ok = metal_graph_eval_token_raw_swa(&s->graph,
@@ -24669,13 +24572,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  (uint32_t)start,
  row_logits);
  if (!ok) {
- free(row_logits);
  snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
  s->checkpoint_valid = false;
  return -1;
  }
  memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
- free(row_logits);
  token_vec_push(&s->checkpoint, drafts[0]);
  accepted[n_accept++] = drafts[0];
  s->checkpoint_valid = true;
@@ -24708,8 +24609,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  if (use_decode2_exact) {
  ds4_spec_frontier frontier;
  memset(&frontier, 0, sizeof(frontier));
- float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
- float *row0_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row0_logits[0]));
+ float *row_logits = s->mtp_verify_logits;
+ float *row0_logits = s->mtp_verify_logits0;
  const int start = s->checkpoint.len;
  int row0_top = -1;
  const double snapshot_t0 = mtp_timing ? now_sec() : 0.0;
@@ -24746,8 +24647,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  (now_sec() - mtp_t0) * 1000.0);
  }
  spec_frontier_free(&frontier);
- free(row0_logits);
- free(row_logits);
  return n_accept;
  }
 
@@ -24773,8 +24672,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  (replay_done - mtp_t0) * 1000.0);
  }
  spec_frontier_free(&frontier);
- free(row0_logits);
- free(row_logits);
  return n_accept;
  }
  if (have_frontier) {
@@ -24782,8 +24679,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  (void)spec_frontier_restore(&frontier, s);
  }
  spec_frontier_free(&frontier);
- free(row0_logits);
- free(row_logits);
  if (getenv("DS4_MTP_SPEC_LOG")) {
  fprintf(stderr, "ds4: mtp decode2 verifier failed, falling back to sequential\n");
  }
@@ -24793,8 +24688,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  {
  ds4_spec_frontier frontier;
  memset(&frontier, 0, sizeof(frontier));
- int *row_tops = xmalloc((size_t)draft_n * sizeof(row_tops[0]));
- float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+ int *row_tops = s->mtp_verify_tops;
+ float *row_logits = s->mtp_verify_logits;
  const int start = s->checkpoint.len;
  /*
  * The production MTP depth is two. Prefix-1 capture makes partial
@@ -24900,8 +24795,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  s->mtp_draft_valid = false;
  DS4_MTP_KEEP_ACCEPTED(replayed);
  spec_frontier_free(&frontier);
- free(row_logits);
- free(row_tops);
  return n_accept;
  }
  }
@@ -24931,8 +24824,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  (now_sec() - mtp_t0) * 1000.0);
  }
  spec_frontier_free(&frontier);
- free(row_logits);
- free(row_tops);
  return n_accept;
  }
  }
@@ -24962,8 +24853,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  (now_sec() - mtp_t0) * 1000.0);
  }
  spec_frontier_free(&frontier);
- free(row_logits);
- free(row_tops);
  return n_accept;
  }
  } else {
@@ -24997,8 +24886,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  (replay_done - mtp_t0) * 1000.0);
  }
  spec_frontier_free(&frontier);
- free(row_logits);
- free(row_tops);
  return n_accept;
  }
  }
@@ -25038,8 +24925,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  (replay_done - mtp_t0) * 1000.0);
  }
  spec_frontier_free(&frontier);
- free(row_logits);
- free(row_tops);
  return n_accept;
  }
  }
@@ -25055,13 +24940,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  s->checkpoint_valid = false;
  DS4_MTP_KEEP_ACCEPTED(0);
  spec_frontier_free(&frontier);
- free(row_logits);
- free(row_tops);
  return -1;
  }
  spec_frontier_free(&frontier);
- free(row_logits);
- free(row_tops);
  if (getenv("DS4_MTP_SPEC_LOG")) {
  fprintf(stderr, "ds4: mtp spec micro verifier failed, falling back to sequential\n");
  }

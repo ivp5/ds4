@@ -3,6 +3,7 @@
  * See ds4_watersic_pack.h for layout + design.
  */
 #include "ds4_watersic_pack.h"
+#include "ds4_pack_io.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -29,72 +30,44 @@ bool ds4_watersic_pack_open(const char *pack_path, ds4_watersic_pack *out) {
     out->fd = -1;
     strncpy(out->pack_path, pack_path, sizeof(out->pack_path) - 1);
 
-    int fd = open(pack_path, O_RDONLY);
-    if (fd < 0) {
-        ds4_ws_log("open(%s) failed: %s", pack_path, strerror(errno));
-        return false;
-    }
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        ds4_ws_log("fstat failed: %s", strerror(errno));
-        close(fd);
-        return false;
-    }
-    if ((size_t)st.st_size < sizeof(ds4_watersic_header)) {
-        ds4_ws_log("file too small: %lld bytes < %zu header bytes",
-                   (long long)st.st_size, sizeof(ds4_watersic_header));
-        close(fd);
-        return false;
-    }
-    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) {
-        ds4_ws_log("mmap failed: %s", strerror(errno));
-        close(fd);
-        return false;
-    }
+    const uint8_t *base = ds4_pack_mmap_open_flags(pack_path, "ds4_watersic", NULL,
+                                                   sizeof(ds4_watersic_header), MAP_SHARED,
+                                                   &out->map, &out->map_size, &out->fd);
+    if (!base) return false;
 
-    const ds4_watersic_header *hdr = (const ds4_watersic_header *)map;
+    const ds4_watersic_header *hdr = (const ds4_watersic_header *)base;
     if (hdr->magic != DS4_WATERSIC_MAGIC) {
         ds4_ws_log("bad magic 0x%08x (expected 0x%08x)",
                    hdr->magic, DS4_WATERSIC_MAGIC);
-        munmap(map, (size_t)st.st_size);
-        close(fd);
+        ds4_pack_munmap_close(&out->map, &out->map_size, &out->fd);
         return false;
     }
     if (hdr->version != DS4_WATERSIC_VERSION) {
         ds4_ws_log("unsupported version %u (this code supports %u)",
                    hdr->version, DS4_WATERSIC_VERSION);
-        munmap(map, (size_t)st.st_size);
-        close(fd);
+        ds4_pack_munmap_close(&out->map, &out->map_size, &out->fd);
         return false;
     }
     if (hdr->R != 2u && hdr->R != 4u && hdr->R != 8u) {
         ds4_ws_log("R=%u not supported (must be one of 2, 4, 8)", hdr->R);
-        munmap(map, (size_t)st.st_size);
-        close(fd);
+        ds4_pack_munmap_close(&out->map, &out->map_size, &out->fd);
         return false;
     }
     if (hdr->n_layers > DS4_WATERSIC_MAX_LAYERS ||
         hdr->n_kinds != DS4_WATERSIC_N_KINDS) {
         ds4_ws_log("bad dims: n_layers=%u n_kinds=%u",
                    hdr->n_layers, hdr->n_kinds);
-        munmap(map, (size_t)st.st_size);
-        close(fd);
+        ds4_pack_munmap_close(&out->map, &out->map_size, &out->fd);
         return false;
     }
-    if (hdr->total_pack_bytes != (uint64_t)st.st_size) {
+    if (hdr->total_pack_bytes != (uint64_t)out->map_size) {
         ds4_ws_log("size mismatch: header says %llu, file is %lld",
                    (unsigned long long)hdr->total_pack_bytes,
-                   (long long)st.st_size);
-        munmap(map, (size_t)st.st_size);
-        close(fd);
+                   (long long)out->map_size);
+        ds4_pack_munmap_close(&out->map, &out->map_size, &out->fd);
         return false;
     }
 
-    const uint8_t *base = (const uint8_t *)map;
-    out->fd          = fd;
-    out->map         = map;
-    out->map_size    = (size_t)st.st_size;
     out->hdr         = hdr;
     out->lk_table    = (const ds4_watersic_lk_header *)(base + hdr->lk_table_offset);
     out->alpha_arena = base + hdr->alpha_arena_offset;
@@ -105,8 +78,7 @@ bool ds4_watersic_pack_open(const char *pack_path, ds4_watersic_pack *out) {
     if ((uint64_t)hdr->lk_table_offset +
         (uint64_t)out->n_lk * sizeof(ds4_watersic_lk_header) > out->map_size) {
         ds4_ws_log("lk_table OOB");
-        munmap(map, out->map_size);
-        close(fd);
+        ds4_pack_munmap_close(&out->map, &out->map_size, &out->fd);
         memset(out, 0, sizeof(*out));
         out->fd = -1;
         return false;
@@ -116,8 +88,7 @@ bool ds4_watersic_pack_open(const char *pack_path, ds4_watersic_pack *out) {
     out->lookup = (int32_t *)malloc(out->n_lk * sizeof(int32_t));
     if (!out->lookup) {
         ds4_ws_log("lookup alloc failed");
-        munmap(map, out->map_size);
-        close(fd);
+        ds4_pack_munmap_close(&out->map, &out->map_size, &out->fd);
         memset(out, 0, sizeof(*out));
         out->fd = -1;
         return false;
@@ -129,8 +100,7 @@ bool ds4_watersic_pack_open(const char *pack_path, ds4_watersic_pack *out) {
             ds4_ws_log("lk entry %u has bad (layer=%u, kind=%u)",
                        i, e->layer, e->kind);
             free(out->lookup);
-            munmap(map, out->map_size);
-            close(fd);
+            ds4_pack_munmap_close(&out->map, &out->map_size, &out->fd);
             memset(out, 0, sizeof(*out));
             out->fd = -1;
             return false;
@@ -141,8 +111,7 @@ bool ds4_watersic_pack_open(const char *pack_path, ds4_watersic_pack *out) {
                        "first at %d, this at %u",
                        e->layer, e->kind, out->lookup[slot], i);
             free(out->lookup);
-            munmap(map, out->map_size);
-            close(fd);
+            ds4_pack_munmap_close(&out->map, &out->map_size, &out->fd);
             memset(out, 0, sizeof(*out));
             out->fd = -1;
             return false;
@@ -154,10 +123,7 @@ bool ds4_watersic_pack_open(const char *pack_path, ds4_watersic_pack *out) {
 
 void ds4_watersic_pack_close(ds4_watersic_pack *p) {
     if (!p) return;
-    if (p->map && p->map_size > 0) {
-        munmap(p->map, p->map_size);
-    }
-    if (p->fd >= 0) close(p->fd);
+    ds4_pack_munmap_close(&p->map, &p->map_size, &p->fd);
     free(p->lookup);
     memset(p, 0, sizeof(*p));
     p->fd = -1;

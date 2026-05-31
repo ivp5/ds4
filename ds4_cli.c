@@ -2,6 +2,7 @@
 #include "ds4_gpu.h"
 #include "ds4_polar_reader.h"
 #include "ds4_nonrouted_pack.h"
+#include "ds4_d8m_reader.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -142,6 +143,10 @@ static void usage(FILE *fp) {
         "      DS4_PREFILL_METAL_PHASES_HEADROOM_MIB (default 14336),\n"
         "      DS4_PREFILL_METAL_PHASES_MIN_TOKENS (default 0; set e.g. 1500\n"
         "      for single-shot chat to fall back to cpu-moe on short prompts).\n"
+        "  --nonrouted-pack FILE\n"
+        "      Open a DS4NRPK1 non-routed pack for attention/embed/output/router tensors.\n"
+        "  --m1r-pack FILE\n"
+        "      Open the M1R fixed-plane routed-FFN pack.\n"
         "  --power N\n"
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
@@ -1548,15 +1553,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--nonrouted-pack")) {
             c.engine.nonrouted_pack_path = need_arg(&i, argc, argv, arg);
             fprintf(stderr, "ds4: --nonrouted-pack %s\n", c.engine.nonrouted_pack_path);
-        } else if (!strcmp(arg, "--vqb2-pack")) {
-            /* silv 2026-05-28 task #764 — VQB2 pack as active routed-FFN source
-             * (Architecture B). Argument is the .vqb2pack file path; engine_open
-             * opens it + exports DS4_VQB2_PACK_PATH for the lazy fused-path
-             * discovery. When DS4_VQB2_PACK_HOT_LAYERS="L1,L2,..." is also set,
-             * those layers are pinned into the FP16 hot-store so the
-             * legacy/icb/mtl4 paths have data too. */
-            c.engine.vqb2_pack_path = need_arg(&i, argc, argv, arg);
-            fprintf(stderr, "ds4: --vqb2-pack %s\n", c.engine.vqb2_pack_path);
+        } else if (!strcmp(arg, "--m1r-pack")) {
+            c.engine.m1r_pack_path = need_arg(&i, argc, argv, arg);
+            fprintf(stderr, "ds4: --m1r-pack %s\n", c.engine.m1r_pack_path);
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {
@@ -1857,6 +1856,32 @@ int main(int argc, char **argv) {
         const uint32_t ne0 = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 256;
         const uint32_t ne1 = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
         return ds4_gpu_mtl4_topk_mask_canary(ne0, ne1) ? 0 : 1;
+    }
+    /* --icb-dense-canary [M [N]] : task #822. Bit-exact check that ICB record→replay of the
+     * dense Q8_0 matvec equals direct dispatch (only the dispatch mechanism differs). De-risks
+     * the production wiring of the ICB dense-path (the 50 t/s lever). Expect "BIT-EXACT PASS". */
+    if (argc >= 2 && !strcmp(argv[1], "--icb-dense-canary")) {
+        const uint32_t M = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4096;
+        const uint32_t N = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 4096;
+        return ds4_gpu_dense_matvec_icb_canary(M, N) ? 0 : 1;
+    }
+    /* --icb-dense-bench [M [N [n_gemv [n_iter]]]] : task #822. A/B the per-forward dispatch cost of
+     * the dense GEMV batch — DIRECT (re-encode each forward) vs ICB (cached replay). Tests the
+     * ledger's "dispatch-bound" diagnosis = the 50 t/s lever, with NO model load. n_gemv defaults to
+     * 258 (43 layers × 6 dense GEMVs); a speedup > 1 confirms ICB amortization is real before wiring. */
+    if (argc >= 2 && !strcmp(argv[1], "--icb-dense-bench")) {
+        const uint32_t M      = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4096;
+        const uint32_t N      = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 4096;
+        const uint32_t n_gemv = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 258;
+        const uint32_t n_iter = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 30;
+        return ds4_gpu_dense_matvec_icb_bench(M, N, n_gemv, n_iter) ? 0 : 1;
+    }
+    /* --mtl4-icb-execute-canary [n_floats [rounds]] : proves the MTL4 encoder can replay
+     * a classic MTLICB command when the MTL4 pipeline was compiled with ICB support. */
+    if (argc >= 2 && !strcmp(argv[1], "--mtl4-icb-execute-canary")) {
+        const uint32_t n_floats = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 65536u;
+        const uint32_t rounds   = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 200u;
+        return ds4_gpu_mtl4_icb_execute_canary(n_floats, rounds) ? 0 : 1;
     }
     /* --topk-mask-scatter-canary [n_topk [n_tokens [n_comp]]] : silv 2026-05-27
      * task #673. MTL4 port of kernel_dsv4_topk_mask_scatter
@@ -2501,114 +2526,6 @@ int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--routed-mm-dispatch-probe")) {
         return ds4_gpu_mtl4_routed_mm_dispatch_probe() ? 0 : 1;
     }
-    /* --vqb2-pack-probe <pack> <index_csv> : silv 2026-05-28
-     * Opens pack + index, verifies summary, materializes 5 views from across
-     * the pack range, decodes a sample pair, prints results. Smoke test for
-     * the pack-backed VQB2 view loader (codex H2116-H2125). */
-    if (argc >= 2 && !strcmp(argv[1], "--vqb2-pack-probe")) {
-        if (argc < 4) {
-            fprintf(stderr, "usage: --vqb2-pack-probe <pack> <index_csv>\n");
-            return 1;
-        }
-        extern int ds4_cli_vqb2_pack_probe(const char *pack, const char *index);
-        return ds4_cli_vqb2_pack_probe(argv[2], argv[3]);
-    }
-    /* --vqb2-pack-layer-tour <pack> <index_csv> <layer> : silv 2026-05-28
-     * H2125 layer-major iterator smoke test. Walks all 64 packets for the
-     * given layer in (kind, row_start) order, decodes one pair per packet.
-     * Expected: 16 gate + 16 up + 32 down = 64 packets, 64 successful decodes. */
-    if (argc >= 2 && !strcmp(argv[1], "--vqb2-pack-layer-tour")) {
-        if (argc < 5) {
-            fprintf(stderr, "usage: --vqb2-pack-layer-tour <pack> <index_csv> <layer>\n");
-            return 1;
-        }
-        extern int ds4_cli_vqb2_pack_layer_tour(const char *pack, const char *index, uint32_t layer);
-        return ds4_cli_vqb2_pack_layer_tour(argv[2], argv[3], (uint32_t)atoi(argv[4]));
-    }
-    /* --vqb2-decode-fp16-canary [N [K]] : silv 2026-05-28 GPU-side VQB2 decoder.
-     * Default N=4096, K=16. K∈{4,16,64,256}. Synthetic packet → GPU decode →
-     * compare against ground truth. Foundation for pack-direct dispatch. */
-    if (argc >= 2 && !strcmp(argv[1], "--vqb2-decode-fp16-canary")) {
-        const uint32_t n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4096;
-        const uint32_t k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
-        return ds4_gpu_mtl4_vqb2_decode_fp16_canary(n, k) ? 0 : 1;
-    }
-    /* --vqb2-decode-icb-bench [N_PACKETS [N_CODES [K [ROUNDS]]]] : silv 2026-05-28
-     * ICB Phase 8 bench: direct vs ICB record/replay timing. Defaults: 64 packets
-     * × 32768 codes (one DS4 layer's gate/up shape) × K=16 × 100 rounds. */
-    if (argc >= 2 && !strcmp(argv[1], "--vqb2-decode-icb-bench")) {
-        const uint32_t np = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nc = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32768;
-        const uint32_t k  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 16;
-        const uint32_t r  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 100;
-        return ds4_gpu_mtl4_vqb2_decode_icb_bench(np, nc, k, r) ? 0 : 1;
-    }
-    /* --vqb2-decode-fp16-selected-canary [N_SEL [N_TOTAL [ROWS [PAIRS [K]]]]] :
-     * silv 2026-05-28 — selected-expert decode for H2125 routed-MoE dispatch.
-     * Defaults: 6 selected / 256 total experts × 128 rows × 1024 pairs × K=16
-     * (matches the DS4 V4 routed-FFN per-token shape: 6 active of 256). */
-    if (argc >= 2 && !strcmp(argv[1], "--vqb2-decode-fp16-selected-canary")) {
-        const uint32_t nsel  = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 6;
-        const uint32_t ntot  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        const uint32_t rows  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128;
-        const uint32_t pairs = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 1024;
-        const uint32_t k     = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 16;
-        return ds4_gpu_mtl4_vqb2_decode_fp16_selected_canary(nsel, ntot, rows, pairs, k) ? 0 : 1;
-    }
-    /* --vqb2-stacked-bench [N_PKTS [N_SEL [N_TOTAL [ROWS [PAIRS [K [ROUNDS]]]]]]] :
-     * silv 2026-05-28 — isolates compute-reduction vs encoder-amortization
-     * axes for the routed-MoE primitive. Defaults match one DS4 V4 layer event:
-     * 64 packets × 6/256 experts × 128 rows × 1024 pairs × K=16 × 20 rounds. */
-    if (argc >= 2 && !strcmp(argv[1], "--vqb2-stacked-bench")) {
-        const uint32_t np    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
-        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128;
-        const uint32_t pairs = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1024;
-        const uint32_t k     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 16;
-        const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 20;
-        return ds4_gpu_mtl4_vqb2_decode_stacked_speedup_bench(np, nsel, ntot, rows, pairs, k, r) ? 0 : 1;
-    }
-    /* --vqb2-vectorized-bench [N_PKTS [N_SEL [N_TOTAL [ROWS [PAIRS [K [ROUNDS]]]]]]] :
-     * silv 2026-05-28 — vectorized decoder bench. Cross-checks bit-exact vs
-     * scalar baseline, reports speedup. Defaults: 64 × 6/256 × 128 × 1024 × K=16. */
-    if (argc >= 2 && !strcmp(argv[1], "--vqb2-vectorized-bench")) {
-        const uint32_t np    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
-        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128;
-        const uint32_t pairs = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1024;
-        const uint32_t k     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 16;
-        const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 20;
-        return ds4_gpu_mtl4_vqb2_decode_vectorized_bench(np, nsel, ntot, rows, pairs, k, r) ? 0 : 1;
-    }
-    /* --vqb2-noop-write-bench [N_PKTS [N_SEL [ROWS [PAIRS [ROUNDS]]]]] :
-     * silv 2026-05-28 — diagnostic baseline. Writes a constant half2, no
-     * codes load, no codebook lookup. Same dispatch shape as decoders. If
-     * this matches ~2.2 GB/s, the wall is write throughput, not decode. */
-    if (argc >= 2 && !strcmp(argv[1], "--vqb2-noop-write-bench")) {
-        const uint32_t np    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
-        const uint32_t rows  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128;
-        const uint32_t pairs = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 1024;
-        const uint32_t r     = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20;
-        return ds4_gpu_mtl4_vqb2_noop_write_bench(np, nsel, rows, pairs, r) ? 0 : 1;
-    }
-    /* --vqb2-decode-matmul-canary [N_PKTS [N_SEL [N_TOTAL [ROWS [PAIRS [K [ROUNDS]]]]]]] :
-     * silv 2026-05-28 — FUSED decode-matmul kernel. Cross-checks each output
-     * against CPU scalar reference + measures GFLOP/s. The architectural move
-     * that bypasses the 2.7 GB/s store wall. Defaults match one DS4 V4 layer
-     * event: 64 packets × 6/256 × 128 rows × 1024 pairs × K=16 × 20 rounds. */
-    if (argc >= 2 && !strcmp(argv[1], "--vqb2-decode-matmul-canary")) {
-        const uint32_t np    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
-        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128;
-        const uint32_t pairs = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1024;
-        const uint32_t k     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 16;
-        const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 20;
-        return ds4_gpu_mtl4_vqb2_decode_matmul_fp16_canary(np, nsel, ntot, rows, pairs, k, r) ? 0 : 1;
-    }
     /* --watersic-canary [N_PKTS [N_SEL [N_TOTAL [ROWS [COLS [R [ROUNDS]]]]]]] :
      * silv 2026-05-28 task #769 — WaterSIC scalar-quant decode-matmul kernel
      * (QMM-II arxiv 2605.13768 Algorithm 3). Cross-checks vs CPU scalar reference
@@ -2688,63 +2605,261 @@ int main(int argc, char **argv) {
         ds4_nrpk_close(&p);
         return 0;
     }
-    /* --vqb2-pack-fused-canary [N_ENT [N_SEL [N_TOTAL [ROWS [PAIRS [K [ROUNDS]]]]]]] :
-     * silv 2026-05-28 task #758 — Architecture B pack-driven layer dispatch.
-     * Allocates a synthetic pack with N_ENT entries back-to-back, wraps via
-     * newBufferWithBytesNoCopy, runs the per-layer batched dispatch primitive,
-     * cross-checks. Defaults: 64 entries (= one DS4 V4 layer event's worth
-     * of row_blocks: 16 gate + 16 up + 32 down) × 6/256 × 128×1024 × K=16. */
-    if (argc >= 2 && !strcmp(argv[1], "--vqb2-pack-fused-canary")) {
-        const uint32_t nent  = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
-        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128;
-        const uint32_t pairs = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1024;
-        const uint32_t k     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 16;
-        const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 20;
-        return ds4_gpu_mtl4_vqb2_pack_fused_canary(nent, nsel, ntot, rows, pairs, k, r) ? 0 : 1;
-    }
-    /* --vqb2-pack-icb-bench [N_ENT [N_SEL [N_TOTAL [ROWS [PAIRS [K [ROUNDS]]]]]]] :
-     * Head-to-head A/B: cached MTL4 dispatch vs classic-MTL ICB record-replay. */
-    if (argc >= 2 && !strcmp(argv[1], "--vqb2-pack-icb-bench")) {
-        const uint32_t nent  = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
-        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128;
-        const uint32_t pairs = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1024;
-        const uint32_t k     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 16;
-        const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 20;
-        return ds4_gpu_mtl4_vqb2_pack_icb_bench(nent, nsel, ntot, rows, pairs, k, r) ? 0 : 1;
-    }
-    /* --vqb2-fused-microbench PACK CSV [LAYER [KIND [ROUNDS]]] :
-     * Warm pack + time N dispatch_kind calls. Reports per-(layer, kind)
-     * ms + projected per-token ms + t/s ceiling for 43-layer × 3-kind. */
-    if (argc >= 2 && !strcmp(argv[1], "--vqb2-fused-microbench")) {
-        if (argc < 4) {
-            fprintf(stderr, "usage: --vqb2-fused-microbench PACK CSV [LAYER [KIND [ROUNDS]]]\n");
-            return 2;
+    if (argc >= 3 && !strcmp(argv[1], "--d8m-inspect")) {
+        ds4_d8m_file p;
+        if (!ds4_d8m_open(argv[2], &p)) {
+            fprintf(stderr, "ds4: --d8m-inspect failed to open %s\n", argv[2]);
+            return 1;
         }
-        const char *pack_path = argv[2];
-        const char *csv_path  = argv[3];
-        const uint32_t layer  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 22;
-        const uint32_t kind   = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 0;
-        const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20;
-        return ds4_metal_vqb2_fused_microbench(pack_path, csv_path, layer, kind, rounds) ? 0 : 1;
-    }
-    /* --vqb2-fused-bind-smoke PACK_PATH CSV_PATH [LAYER [KIND]] :
-     * Opens a real VQB2 pack, wraps as MTLBuffer, dispatches the fused
-     * decode-matmul for one (layer, kind), prints output sample. Validates
-     * the bind_pack + dispatcher hookup against the on-disk pack. */
-    if (argc >= 2 && !strcmp(argv[1], "--vqb2-fused-bind-smoke")) {
-        if (argc < 4) {
-            fprintf(stderr, "usage: --vqb2-fused-bind-smoke PACK_PATH CSV_PATH [LAYER [KIND]]\n");
-            return 2;
+        ds4_d8m_print_summary(&p);
+        for (uint32_t expert = 0; expert < 256u; expert++) {
+            ds4_d8m_record rec;
+            if (!ds4_d8m_get_record(&p, expert, &rec)) continue;
+            const uint32_t c0 = ds4_d8m_code_at(&p, &rec, 0);
+            const uint32_t c1 = ds4_d8m_code_at(&p, &rec, 1);
+            fprintf(stderr,
+                    "  expert=%3u K=%4u bits=%2u cb_off=%llu idx_off=%llu idx_bytes=%u first_codes=%u,%u\n",
+                    expert, rec.k, rec.bits,
+                    (unsigned long long)rec.codebook_offset,
+                    (unsigned long long)rec.index_offset,
+                    rec.index_bytes, c0, c1);
         }
-        const char *pack_path = argv[2];
-        const char *csv_path  = argv[3];
-        const uint32_t layer  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 22;
-        const uint32_t kind   = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 0;
-        return ds4_metal_vqb2_fused_bind_smoke(pack_path, csv_path, layer, kind) ? 0 : 1;
+        ds4_d8m_close(&p);
+        return 0;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--d8m-down-selected-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *d8m_path = argv[2];
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t n_experts = 3;
+        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8m-down-selected-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
+        const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
+        return ds4_gpu_mtl4_d8m_down_selected_canary(
+            d8m_path, experts, n_experts, rows, rounds) ? 0 : 1;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--d8m-down-selected-batch-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *d8m_path = argv[2];
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t n_experts = 3;
+        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8m-down-selected-batch-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
+        const uint32_t tokens = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 8u;
+        const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20u;
+        return ds4_gpu_mtl4_d8m_down_selected_batch_canary(
+            d8m_path, experts, n_experts, rows, tokens, rounds) ? 0 : 1;
+    }
+    /* --m1r-d8m-routed-organ-canary M1R_PACK D8M_PACK [LAYER [EXPERTS_CSV [ROWS [ROUNDS [CLAMP]]]]]
+     * Runs hybrid routed organ: M1R gate/up -> D8M down in one MTL4 command buffer. */
+    if (argc >= 4 && !strcmp(argv[1], "--m1r-d8m-routed-organ-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *m1r_path = argv[2];
+        const char *d8m_path = argv[3];
+        const uint32_t layer = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 42u;
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 1, 2, 3, 4, 5};
+        uint32_t n_experts = ds4_cli_selected_expert_cap;
+        if (argc >= 6 && argv[5] && argv[5][0] && strcmp(argv[5], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[5]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --m1r-d8m-routed-organ-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rows = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 128u;
+        const uint32_t rounds = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 20u;
+        const float clamp = (argc >= 9) ? strtof(argv[8], NULL) : 10.0f;
+        return ds4_gpu_mtl4_m1r_d8m_routed_organ_canary(
+            m1r_path, d8m_path, layer, experts, n_experts, rows, rounds, clamp) ? 0 : 1;
+    }
+    /* --m1r-d8m-routed-organ-batch-canary M1R_PACK D8M_PACK [LAYER [EXPERTS_CSV [ROWS [TOKENS [ROUNDS [CLAMP]]]]]]
+     * Runs token-batched hybrid routed organ: M1R gate/up -> D8M down in one MTL4 command buffer. */
+    if (argc >= 4 && !strcmp(argv[1], "--m1r-d8m-routed-organ-batch-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *m1r_path = argv[2];
+        const char *d8m_path = argv[3];
+        const uint32_t layer = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 42u;
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 1, 2, 3, 4, 5};
+        uint32_t n_experts = ds4_cli_selected_expert_cap;
+        if (argc >= 6 && argv[5] && argv[5][0] && strcmp(argv[5], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[5]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --m1r-d8m-routed-organ-batch-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rows = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 4096u;
+        const uint32_t n_tokens = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 8u;
+        const uint32_t rounds = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 5u;
+        const float clamp = (argc >= 10) ? strtof(argv[9], NULL) : 10.0f;
+        return ds4_gpu_mtl4_m1r_d8m_routed_organ_batch_canary(
+            m1r_path, d8m_path, layer, experts, n_experts, rows, n_tokens, rounds, clamp) ? 0 : 1;
+    }
+    /* --m1r-gateup-swiglu-selected-canary PACK [LAYER [EXPERTS_CSV [ROWS [ROUNDS [CLAMP]]]]]
+     * Runs selected experts directly from an M1R fixed-plane pack. */
+    if (argc >= 3 && !strcmp(argv[1], "--m1r-gateup-swiglu-selected-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *m1r_path = argv[2];
+        const uint32_t layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 25u;
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 1, 2, 3, 4, 5};
+        uint32_t n_experts = ds4_cli_selected_expert_cap;
+        if (argc >= 5 && argv[4] && argv[4][0] && strcmp(argv[4], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[4]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --m1r-gateup-swiglu-selected-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rows = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128u;
+        const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20u;
+        const float clamp = (argc >= 8) ? strtof(argv[7], NULL) : 10.0f;
+        return ds4_gpu_mtl4_m1r_gateup_swiglu_selected_canary(
+            m1r_path, layer, experts, n_experts, rows, rounds, clamp) ? 0 : 1;
+    }
+    /* --m1r-down-selected-canary PACK [LAYER [EXPERTS_CSV [ROWS [ROUNDS]]]]
+     * Runs selected experts through direct M1R down-projection sum. */
+    if (argc >= 3 && !strcmp(argv[1], "--m1r-down-selected-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *m1r_path = argv[2];
+        const uint32_t layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 25u;
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 1, 2, 3, 4, 5};
+        uint32_t n_experts = ds4_cli_selected_expert_cap;
+        if (argc >= 5 && argv[4] && argv[4][0] && strcmp(argv[4], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[4]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --m1r-down-selected-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rows = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128u;
+        const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20u;
+        return ds4_gpu_mtl4_m1r_down_selected_canary(
+            m1r_path, layer, experts, n_experts, rows, rounds) ? 0 : 1;
+    }
+    /* --m1r-routed-organ-canary PACK [LAYER [EXPERTS_CSV [ROUNDS [CLAMP]]]]
+     * Runs direct M1R gate+up+SwiGLU then down-sum in one command buffer. */
+    if (argc >= 3 && !strcmp(argv[1], "--m1r-routed-organ-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *m1r_path = argv[2];
+        const uint32_t layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 25u;
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 1, 2, 3, 4, 5};
+        uint32_t n_experts = ds4_cli_selected_expert_cap;
+        if (argc >= 5 && argv[4] && argv[4][0] && strcmp(argv[4], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[4]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --m1r-routed-organ-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
+        const float clamp = (argc >= 7) ? strtof(argv[6], NULL) : 10.0f;
+        return ds4_gpu_mtl4_m1r_routed_organ_canary(
+            m1r_path, layer, experts, n_experts, rounds, clamp) ? 0 : 1;
+    }
+    /* --m1r-routed-organ-batch-canary PACK [LAYER [EXPERTS_CSV [TOKENS [ROUNDS [CLAMP]]]]]
+     * Compares true token-batch dispatch against per-token tensor dispatch. */
+    if (argc >= 3 && !strcmp(argv[1], "--m1r-routed-organ-batch-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *m1r_path = argv[2];
+        const uint32_t layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 25u;
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 1, 2, 3, 4, 5};
+        uint32_t n_experts = ds4_cli_selected_expert_cap;
+        if (argc >= 5 && argv[4] && argv[4][0] && strcmp(argv[4], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[4]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --m1r-routed-organ-batch-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t n_tokens = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 8u;
+        const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 5u;
+        const float clamp = (argc >= 8) ? strtof(argv[7], NULL) : 10.0f;
+        return ds4_gpu_mtl4_m1r_routed_organ_batch_canary(
+            m1r_path, layer, experts, n_experts, n_tokens, rounds, clamp) ? 0 : 1;
     }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {

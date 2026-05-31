@@ -2,6 +2,7 @@
  * on-disk layout + invariants.  Phase A of task #563 (silv 2026-05-25). */
 
 #include "ds4_polar_reader.h"
+#include "ds4_pack_io.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -34,39 +35,11 @@ bool ds4_polar_open(const char *path, ds4_polar_file *out) {
     if (!path || !out) return false;
     memset(out, 0, sizeof(*out));
 
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "ds4_polar_open: open(%s) failed: %s\n",
-                path, strerror(errno));
-        return false;
-    }
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        fprintf(stderr, "ds4_polar_open: fstat failed: %s\n", strerror(errno));
-        close(fd);
-        return false;
-    }
-    if ((uint64_t)st.st_size < DS4_POLAR_HEADER_BYTES) {
-        fprintf(stderr, "ds4_polar_open: %s too small (%lld bytes)\n",
-                path, (long long)st.st_size);
-        close(fd);
-        return false;
-    }
-    void *mm = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (mm == MAP_FAILED) {
-        fprintf(stderr, "ds4_polar_open: mmap failed: %s\n", strerror(errno));
-        close(fd);
-        return false;
-    }
-    const uint8_t *base = (const uint8_t *)mm;
-    if (memcmp(base, DS4_POLAR_MAGIC, 4) != 0) {
-        fprintf(stderr,
-                "ds4_polar_open: bad magic in %s (got %02x %02x %02x %02x, want PLR2)\n",
-                path, base[0], base[1], base[2], base[3]);
-        munmap(mm, (size_t)st.st_size);
-        close(fd);
-        return false;
-    }
+    const uint8_t *base = ds4_pack_mmap_open_flags(path, "ds4_polar_open", DS4_POLAR_MAGIC,
+                                                   DS4_POLAR_HEADER_BYTES, MAP_PRIVATE,
+                                                   &out->mmap_base, &out->mmap_bytes, &out->fd);
+    if (!base) return false;
+
     uint32_t version  = le32(base + 4);
     uint32_t n_experts = le32(base + 8);
     uint32_t n_rows    = le32(base + 12);
@@ -82,29 +55,25 @@ bool ds4_polar_open(const char *path, ds4_polar_file *out) {
     if (version != DS4_POLAR_VERSION) {
         fprintf(stderr, "ds4_polar_open: %s version=%u, want %u\n",
                 path, version, DS4_POLAR_VERSION);
-        munmap(mm, (size_t)st.st_size);
-        close(fd);
+        ds4_pack_munmap_close(&out->mmap_base, &out->mmap_bytes, &out->fd);
         return false;
     }
     if (kind_id > DS4_POLAR_KIND_DOWN) {
         fprintf(stderr, "ds4_polar_open: %s kind_id=%u out of range\n",
                 path, kind_id);
-        munmap(mm, (size_t)st.st_size);
-        close(fd);
+        ds4_pack_munmap_close(&out->mmap_base, &out->mmap_bytes, &out->fd);
         return false;
     }
     if (phase_levels < 4 || phase_levels > 65536 || (phase_levels & (phase_levels - 1)) != 0) {
         fprintf(stderr, "ds4_polar_open: %s phase_levels=%u not a power of 2 in [4, 65536]\n",
                 path, phase_levels);
-        munmap(mm, (size_t)st.st_size);
-        close(fd);
+        ds4_pack_munmap_close(&out->mmap_base, &out->mmap_bytes, &out->fd);
         return false;
     }
     if (mag_levels < 1 || mag_levels > 256) {
         fprintf(stderr, "ds4_polar_open: %s mag_levels=%u out of range\n",
                 path, mag_levels);
-        munmap(mm, (size_t)st.st_size);
-        close(fd);
+        ds4_pack_munmap_close(&out->mmap_base, &out->mmap_bytes, &out->fd);
         return false;
     }
     const size_t per_expert_codes = (size_t)n_rows * (size_t)n_pairs;
@@ -113,18 +82,14 @@ bool ds4_polar_open(const char *path, ds4_polar_file *out) {
     const size_t phase_bytes = mag_bytes;
     const size_t levels_bytes = (size_t)n_experts * per_expert_levels * sizeof(float);
     const size_t want_total = DS4_POLAR_HEADER_BYTES + mag_bytes + phase_bytes + levels_bytes;
-    if ((uint64_t)st.st_size < want_total) {
+    if ((uint64_t)out->mmap_bytes < want_total) {
         fprintf(stderr,
                 "ds4_polar_open: %s truncated (size=%lld, want %zu)\n",
-                path, (long long)st.st_size, want_total);
-        munmap(mm, (size_t)st.st_size);
-        close(fd);
+                path, (long long)out->mmap_bytes, want_total);
+        ds4_pack_munmap_close(&out->mmap_base, &out->mmap_bytes, &out->fd);
         return false;
     }
 
-    out->mmap_base = mm;
-    out->mmap_bytes = (size_t)st.st_size;
-    out->fd = fd;
     out->version = version;
     out->n_experts = n_experts;
     out->n_rows = n_rows;
@@ -144,10 +109,7 @@ bool ds4_polar_open(const char *path, ds4_polar_file *out) {
 
 void ds4_polar_close(ds4_polar_file *p) {
     if (!p) return;
-    if (p->mmap_base && p->mmap_bytes) {
-        munmap(p->mmap_base, p->mmap_bytes);
-    }
-    if (p->fd >= 0) close(p->fd);
+    ds4_pack_munmap_close(&p->mmap_base, &p->mmap_bytes, &p->fd);
     memset(p, 0, sizeof(*p));
     p->fd = -1;
 }
