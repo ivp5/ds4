@@ -147,6 +147,8 @@ static void usage(FILE *fp) {
         "      Open a DS4NRPK1 non-routed pack for attention/embed/output/router tensors.\n"
         "  --m1r-pack FILE\n"
         "      Open the M1R fixed-plane routed-FFN pack.\n"
+        "  --d8m-down-template TEMPLATE\n"
+        "      Use per-layer D8M down packs with printf-style layer substitution.\n"
         "  --power N\n"
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
@@ -1556,6 +1558,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--m1r-pack")) {
             c.engine.m1r_pack_path = need_arg(&i, argc, argv, arg);
             fprintf(stderr, "ds4: --m1r-pack %s\n", c.engine.m1r_pack_path);
+        } else if (!strcmp(arg, "--d8m-down-template")) {
+            c.engine.d8m_down_pack_template = need_arg(&i, argc, argv, arg);
+            fprintf(stderr, "ds4: --d8m-down-template %s\n", c.engine.d8m_down_pack_template);
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {

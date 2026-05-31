@@ -107,6 +107,7 @@ typedef struct {
      * runtime-native successor to CDX3: section-indexed, fixed planes,
      * no framed/interleaved records in the hot path. */
     const char *m1r_pack_path;
+    const char *d8m_down_pack_template;
     /* silv 2026-05-28 task #771 Phase 1 — non-routed pack path. When set,
      * engine_open opens the DS4NRPK1 pack (attention/embed/output/router/MTP)
      * and exposes it as a runtime lookup source. Companion to m1r_pack_path

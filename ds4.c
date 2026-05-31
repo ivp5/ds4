@@ -12058,11 +12058,21 @@ static int ds4_routed_moe_apply_full(
  if (has_m1r_pack) {
   const char *m1r_path = getenv("DS4_M1R_PACK_PATH");
   if (ds4_gpu_end_commands() == 0) return -1;
-  const int dr = ds4_gpu_mtl4_m1r_routed_organ_dispatch_tensor(
-   m1r_path, il,
-   g->router_selected, g->router_weights,
-   g->ffn_norm, g->routed_out,
-   DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP);
+  const bool has_d8m_down =
+   getenv("DS4_D8M_DOWN_PACK_TEMPLATE") != NULL ||
+   getenv("DS4_D8M_DOWN_PACK_DIR") != NULL ||
+   getenv("DS4_D8M_DOWN_PACK_PATH") != NULL;
+  const int dr = has_d8m_down ?
+   ds4_gpu_mtl4_m1r_routed_organ_dispatch_tensor_batch(
+    m1r_path, il,
+    g->router_selected, g->router_weights,
+    g->ffn_norm, g->routed_out,
+    1u, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP) :
+   ds4_gpu_mtl4_m1r_routed_organ_dispatch_tensor(
+    m1r_path, il,
+    g->router_selected, g->router_weights,
+    g->ffn_norm, g->routed_out,
+    DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP);
   if (ds4_gpu_begin_commands() == 0) return -1;
   return dr == 0 ? 1 : -1;
  }
@@ -22575,6 +22585,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  if (opt->m1r_pack_path && opt->m1r_pack_path[0]) {
   setenv("DS4_M1R_PACK_PATH", opt->m1r_pack_path, 1);
  }
+ if (opt->d8m_down_pack_template && opt->d8m_down_pack_template[0] &&
+     strchr(opt->d8m_down_pack_template, '%')) {
+  setenv("DS4_D8M_DOWN_PACK_TEMPLATE", opt->d8m_down_pack_template, 1);
+ }
  if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
  ds4_engine_close(e);
  *out = NULL;
@@ -23725,7 +23739,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
            opt->m1r_pack_path, strerror(errno));
   } else {
    fprintf(stderr, "ds4: --m1r-pack: opened runtime-native routed pack=%s\n",
-           opt->m1r_pack_path);
+	          opt->m1r_pack_path);
+  }
+ }
+ if (opt->d8m_down_pack_template && opt->d8m_down_pack_template[0]) {
+  if (!strchr(opt->d8m_down_pack_template, '%')) {
+   fprintf(stderr,
+           "ds4: --d8m-down-template ignored: template must contain printf-style layer placeholder\n");
+  } else {
+   setenv("DS4_D8M_DOWN_PACK_TEMPLATE", opt->d8m_down_pack_template, 1);
+   fprintf(stderr, "ds4: --d8m-down-template: enabled per-layer down template=%s\n",
+           opt->d8m_down_pack_template);
   }
  }
 
