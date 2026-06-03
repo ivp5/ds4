@@ -49183,7 +49183,8 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     const uint64_t score_count = (uint64_t)n_tokens * n_experts * groups * max_k;
     const int half_score = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_HALF") > 0;
     const size_t score_bytes_per_value = half_score ? sizeof(uint16_t) : sizeof(float);
-    const int native_code_mode = !half_score && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_NATIVE_CODES") > 0;
+    const int native_code_env = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_NATIVE_CODES");
+    const int native_code_mode = !half_score && (native_code_env >= 0 ? native_code_env > 0 : n_tokens <= 4u);
     const uint32_t default_gather_tile_rows = (n_tokens <= 1u) ? 1u : ((n_tokens <= 4u) ? 16u : 8u);
     uint32_t gather_tile_rows = ds4_gpu_env_u32("DS4_D8F_METAL_LUT_GATHER_TILE_ROWS", default_gather_tile_rows);
     if (half_score) gather_tile_rows = 1u;
