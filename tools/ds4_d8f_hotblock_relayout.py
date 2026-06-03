@@ -32,6 +32,8 @@ from ds4_sparse_projection_splice import (
     EXPERTS,
     FUSED_RECORD,
     FUSED_RECORD_BYTES,
+    GATEUP_OVERLAY_SENTINEL,
+    GATEUP_ROW_BLOCKS,
     HEADER_BYTES,
     PROJECTIONS,
     SIDECAR_RECORD,
@@ -46,6 +48,9 @@ from ds4_sparse_projection_splice import (
 )
 
 GATEUP_OVERLAY_PREFIX = "gateup_overlay_"
+GATEUP_ROWS_PER_BLOCK = 128
+GATEUP_IN_DIM = 4096
+GATEUP_INDEX_GUARD_BYTES = 4
 
 
 def parse_int_set(text: str, *, limit: int, name: str) -> list[int]:
@@ -225,8 +230,26 @@ def runtime_hot_spans(info: dict[str, Any],
                       records: list[tuple[Any, ...]],
                       experts: list[int]) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
+    overlays = info.get("gateup_overlays", {})
     for expert in experts:
-        for projection_id in range(len(PROJECTIONS)):
+        for projection_id in (0, 1):
+            needs_base = False
+            if overlays:
+                for row_block in range(GATEUP_ROW_BLOCKS):
+                    overlay = overlays.get((projection_id, expert, row_block))
+                    if overlay:
+                        start, end, _ = payload_span(overlay)
+                        if end > start:
+                            spans.append((start, end))
+                    else:
+                        needs_base = True
+            else:
+                needs_base = True
+            if needs_base:
+                start, end, _ = payload_span(records[projection_id * EXPERTS + expert])
+                if end > start:
+                    spans.append((start, end))
+        for projection_id in (2,):
             start, end, _ = payload_span(records[projection_id * EXPERTS + expert])
             if end > start:
                 spans.append((start, end))
@@ -250,6 +273,157 @@ def runtime_hot_summary(info: dict[str, Any],
                         records: list[tuple[Any, ...]],
                         experts: list[int]) -> dict[str, Any]:
     return span_summary(runtime_hot_spans(info, records, experts))
+
+
+def gateup_rowblock_hot_summaries(info: dict[str, Any],
+                                  records: list[tuple[Any, ...]],
+                                  experts: list[int]) -> list[dict[str, Any]]:
+    overlays = info.get("gateup_overlays", {})
+    summaries: list[dict[str, Any]] = []
+    for row_block in range(GATEUP_ROW_BLOCKS):
+        spans: list[tuple[int, int]] = []
+        for expert in experts:
+            for projection_id in (0, 1):
+                overlay = overlays.get((projection_id, expert, row_block))
+                if overlay:
+                    start, end, _ = payload_span(overlay)
+                    if end > start:
+                        spans.append((start, end))
+                    continue
+                record = records[projection_id * EXPERTS + expert]
+                projection, _, _, bits, block, _, codebook_offset, index_offset, _, codebook_bytes, index_bytes, _, _ = [int(x) for x in record]
+                if projection != projection_id or not bits or not block or not index_bytes:
+                    continue
+                if codebook_bytes:
+                    spans.append((codebook_offset, codebook_offset + codebook_bytes))
+                row_index_bytes = ((GATEUP_IN_DIM // block) * bits + 7) // 8
+                segment_bytes = GATEUP_ROWS_PER_BLOCK * row_index_bytes
+                guarded_segment_bytes = segment_bytes + GATEUP_INDEX_GUARD_BYTES
+                segment_offset = index_offset + row_block * segment_bytes
+                if segment_offset + guarded_segment_bytes <= index_offset + index_bytes:
+                    spans.append((segment_offset, segment_offset + guarded_segment_bytes))
+        item = span_summary(spans)
+        item["row_block"] = row_block
+        summaries.append(item)
+    return summaries
+
+
+def compact_window_stats(items: list[dict[str, Any]]) -> dict[str, Any]:
+    windows = [int(item["window_bytes"]) for item in items]
+    payloads = [int(item["payload_bytes"]) for item in items]
+    densities = [float(item["density"]) for item in items if int(item["window_bytes"]) > 0]
+    if not windows:
+        return {"min": 0, "mean": 0.0, "max": 0, "payload_mean": 0.0, "density_mean": 0.0}
+    return {
+        "min": min(windows),
+        "mean": sum(windows) / len(windows),
+        "max": max(windows),
+        "payload_mean": sum(payloads) / len(payloads),
+        "density_mean": (sum(densities) / len(densities)) if densities else 0.0,
+    }
+
+
+def copy_gateup_overlay_record(source_path: Path,
+                               source_record: tuple[Any, ...],
+                               row_block: int,
+                               handle,
+                               hasher) -> tuple[int, ...]:
+    projection, expert, k, bits, block, _, codebook_offset, index_offset, _, codebook_bytes, index_bytes, _, _ = [int(x) for x in source_record]
+    if projection not in (0, 1) or k == 0 or block != 8 or row_block < 0 or row_block >= GATEUP_ROW_BLOCKS:
+        raise RuntimeError(f"invalid gate/up overlay source p={projection} e={expert} k={k} block={block} row_block={row_block}")
+    row_index_bytes = ((GATEUP_IN_DIM // block) * bits + 7) // 8
+    segment_bytes = GATEUP_ROWS_PER_BLOCK * row_index_bytes
+    guarded_segment_bytes = segment_bytes + GATEUP_INDEX_GUARD_BYTES
+    segment_offset = index_offset + row_block * segment_bytes
+    if segment_offset + guarded_segment_bytes > index_offset + index_bytes:
+        raise RuntimeError(f"gate/up overlay source too short p={projection} e={expert} row_block={row_block}")
+    codebook = read_payload(source_path, codebook_offset, codebook_bytes)
+    index = read_payload(source_path, segment_offset, guarded_segment_bytes)
+    new_codebook_offset = append_aligned(handle, codebook)
+    new_index_offset = append_aligned(handle, index)
+    hasher.update(codebook)
+    hasher.update(index)
+    return (
+        projection,
+        expert,
+        k,
+        bits,
+        block,
+        row_block,
+        new_codebook_offset,
+        new_index_offset,
+        0,
+        codebook_bytes,
+        guarded_segment_bytes,
+        0,
+        0,
+    )
+
+
+def begin_gateup_overlay(handle, hot_experts: list[int]) -> dict[str, Any]:
+    slot_offset = handle.tell()
+    padding = (-slot_offset) % 16
+    if padding:
+        handle.write(b"\0" * padding)
+        slot_offset += padding
+    slot_entries = 2 * EXPERTS * GATEUP_ROW_BLOCKS
+    slot_table = bytearray()
+    for _ in range(slot_entries):
+        slot_table += GATEUP_OVERLAY_SENTINEL.to_bytes(4, "little")
+    handle.write(slot_table)
+    record_offset = handle.tell()
+    padding = (-record_offset) % 16
+    if padding:
+        handle.write(b"\0" * padding)
+        record_offset += padding
+    record_count = 2 * len(hot_experts) * GATEUP_ROW_BLOCKS
+    record_table = bytearray(record_count * FUSED_RECORD_BYTES)
+    handle.write(record_table)
+    return {
+        "slot_offset": slot_offset,
+        "record_offset": record_offset,
+        "slot_entries": slot_entries,
+        "slot_table": slot_table,
+        "record_table": record_table,
+        "records": 0,
+    }
+
+
+def add_gateup_overlay_record(state: dict[str, Any],
+                              source_path: Path,
+                              source_record: tuple[Any, ...],
+                              row_block: int,
+                              handle,
+                              hasher) -> None:
+    record = copy_gateup_overlay_record(source_path, source_record, row_block, handle, hasher)
+    projection, expert = int(record[0]), int(record[1])
+    slot = int(state["records"])
+    slot_index = (projection * EXPERTS + expert) * GATEUP_ROW_BLOCKS + row_block
+    state["slot_table"][slot_index * 4:(slot_index + 1) * 4] = slot.to_bytes(4, "little")
+    state["record_table"][slot * FUSED_RECORD_BYTES:(slot + 1) * FUSED_RECORD_BYTES] = FUSED_RECORD.pack(*record)
+    state["records"] = slot + 1
+
+
+def finish_gateup_overlay(state: dict[str, Any] | None, handle) -> dict[str, Any]:
+    if not state:
+        return {}
+    here = handle.tell()
+    handle.seek(int(state["slot_offset"]))
+    handle.write(state["slot_table"])
+    handle.seek(int(state["record_offset"]))
+    handle.write(state["record_table"])
+    handle.seek(here)
+    return {
+        "gateup_overlay_slot_table_offset": int(state["slot_offset"]),
+        "gateup_overlay_record_offset": int(state["record_offset"]),
+        "gateup_overlay_slot_entries": int(state["slot_entries"]),
+        "gateup_overlay_record_bytes": FUSED_RECORD_BYTES,
+        "gateup_overlay_records": int(state["records"]),
+        "gateup_overlay_sentinel": GATEUP_OVERLAY_SENTINEL,
+        "gateup_overlay_layout": "hot_expert_rowblock_major_gate_up",
+        "gateup_overlay_rows_per_block": GATEUP_ROWS_PER_BLOCK,
+        "gateup_overlay_index_guard_bytes": GATEUP_INDEX_GUARD_BYTES,
+    }
 
 
 def begin_hotblock_sidecars(source_path: Path,
@@ -365,7 +539,8 @@ def relayout_layer(source_pack: Path,
                    layer: int,
                    hot_experts: list[int],
                    execute: bool,
-                   status_every: int) -> dict[str, Any]:
+                   status_every: int,
+                   gateup_rowblock_overlays: bool) -> dict[str, Any]:
     source_path = d8f_path(source_pack, layer)
     info = read_d8f(source_path)
     report: dict[str, Any] = {
@@ -383,6 +558,7 @@ def relayout_layer(source_pack: Path,
     old_window = window_span(old_records, hot_experts)
     old_expert_spans = {str(expert): expert_span(old_records, expert)[2] for expert in hot_experts}
     old_runtime = runtime_hot_summary(info, old_records, hot_experts)
+    old_gateup_rowblocks = gateup_rowblock_hot_summaries(info, old_records, hot_experts)
     report.update({
         "ready": True,
         "source_bytes": info["bytes"],
@@ -392,6 +568,7 @@ def relayout_layer(source_pack: Path,
         "source_runtime_hot_payload_bytes": old_runtime["payload_bytes"],
         "source_runtime_hot_density": old_runtime["density"],
         "source_runtime_hot_span_count": old_runtime["span_count"],
+        "source_gateup_rowblock_hot_window_bytes": compact_window_stats(old_gateup_rowblocks),
     })
     if not execute:
         return report
@@ -409,8 +586,10 @@ def relayout_layer(source_pack: Path,
         "d8f_hotblock_source": str(source_path),
         "d8f_hotblock_hot_experts": hot_experts,
         "d8f_hotblock_payload_order": "hot_expert_major_gate_up_down_then_remaining_expert_major",
+        "d8f_hotblock_gateup_rowblock_overlays": bool(gateup_rowblock_overlays),
     })
     payload_hashers = {projection: hashlib.sha256() for projection in PROJECTIONS}
+    overlay_hashers = {projection: hashlib.sha256() for projection in PROJECTIONS[:2]}
     new_records: list[tuple[Any, ...] | None] = [None] * (len(PROJECTIONS) * EXPERTS)
     temp_path = out_path.with_suffix(out_path.suffix + ".tmp")
 
@@ -419,22 +598,70 @@ def relayout_layer(source_pack: Path,
         handle.write(b"\0" * (len(PROJECTIONS) * EXPERTS * FUSED_RECORD_BYTES))
         expert_order = ordered_experts(hot_experts)
         sidecar_state = begin_hotblock_sidecars(source_path, info["sidecars"], hot_experts, handle)
-        for expert_index, expert in enumerate(expert_order, 1):
-            for projection_id, projection in enumerate(PROJECTIONS):
-                old_record = old_records[projection_id * EXPERTS + expert]
-                new_records[projection_id * EXPERTS + expert] = copy_record(
-                    source_path, old_record, handle, payload_hashers[projection]
+        overlay_state = begin_gateup_overlay(handle, hot_experts) if gateup_rowblock_overlays else None
+        if overlay_state:
+            for row_block in range(GATEUP_ROW_BLOCKS):
+                for expert in hot_experts:
+                    for projection_id, projection in enumerate(PROJECTIONS[:2]):
+                        old_record = old_records[projection_id * EXPERTS + expert]
+                        add_gateup_overlay_record(
+                            overlay_state, source_path, old_record, row_block, handle,
+                            overlay_hashers[projection],
+                        )
+                if status_every:
+                    print(json.dumps({
+                        "phase": "hotblock_gateup_overlay_progress",
+                        "layer": layer,
+                        "row_block_done": row_block + 1,
+                        "row_blocks_total": GATEUP_ROW_BLOCKS,
+                        "out_bytes": handle.tell(),
+                    }, sort_keys=True), flush=True)
+            for expert in hot_experts:
+                old_record = old_records[2 * EXPERTS + expert]
+                new_records[2 * EXPERTS + expert] = copy_record(
+                    source_path, old_record, handle, payload_hashers[PROJECTIONS[2]]
                 )
-            if status_every and (expert_index % status_every == 0 or expert_index == len(expert_order)):
-                print(json.dumps({
-                    "phase": "hotblock_copy_progress",
-                    "layer": layer,
-                    "experts_done": expert_index,
-                    "experts_total": len(expert_order),
-                    "out_bytes": handle.tell(),
-                }, sort_keys=True), flush=True)
+            hot_set = set(hot_experts)
+            cold_experts = hot_experts + [expert for expert in range(EXPERTS) if expert not in hot_set]
+            for expert_index, expert in enumerate(cold_experts, 1):
+                projection_ids = (0, 1) if expert in hot_set else (0, 1, 2)
+                for projection_id in projection_ids:
+                    old_record = old_records[projection_id * EXPERTS + expert]
+                    new_records[projection_id * EXPERTS + expert] = copy_record(
+                        source_path, old_record, handle, payload_hashers[PROJECTIONS[projection_id]]
+                    )
+                if status_every and (expert_index % status_every == 0 or expert_index == len(cold_experts)):
+                    print(json.dumps({
+                        "phase": "hotblock_copy_progress",
+                        "layer": layer,
+                        "experts_done": expert_index,
+                        "experts_total": len(cold_experts),
+                        "out_bytes": handle.tell(),
+                    }, sort_keys=True), flush=True)
+        else:
+            for expert_index, expert in enumerate(expert_order, 1):
+                for projection_id, projection in enumerate(PROJECTIONS):
+                    old_record = old_records[projection_id * EXPERTS + expert]
+                    new_records[projection_id * EXPERTS + expert] = copy_record(
+                        source_path, old_record, handle, payload_hashers[projection]
+                    )
+                if status_every and (expert_index % status_every == 0 or expert_index == len(expert_order)):
+                    print(json.dumps({
+                        "phase": "hotblock_copy_progress",
+                        "layer": layer,
+                        "experts_done": expert_index,
+                        "experts_total": len(expert_order),
+                        "out_bytes": handle.tell(),
+                    }, sort_keys=True), flush=True)
+        overlay_header = finish_gateup_overlay(overlay_state, handle)
         sidecar_header = finish_hotblock_sidecars(sidecar_state, handle)
+        header.update(overlay_header)
         header.update(sidecar_header)
+        if overlay_state:
+            header["gateup_overlay_payload_sha256"] = {
+                projection: overlay_hashers[projection].hexdigest()
+                for projection in PROJECTIONS[:2]
+            }
         header["payload_sha256"] = {projection: payload_hashers[projection].hexdigest() for projection in PROJECTIONS}
         handle.seek(HEADER_BYTES)
         for record in new_records:
@@ -451,6 +678,9 @@ def relayout_layer(source_pack: Path,
     new_window = window_span(new_records_t, hot_experts)
     new_expert_spans = {str(expert): expert_span(new_records_t, expert)[2] for expert in hot_experts}
     new_runtime = runtime_hot_summary(new_info, new_records_t, hot_experts)
+    new_gateup_rowblocks = gateup_rowblock_hot_summaries(new_info, new_records_t, hot_experts)
+    old_gateup_stats = compact_window_stats(old_gateup_rowblocks)
+    new_gateup_stats = compact_window_stats(new_gateup_rowblocks)
     report.update({
         "materialized": True,
         "output_bytes": out_path.stat().st_size,
@@ -462,6 +692,8 @@ def relayout_layer(source_pack: Path,
         "output_runtime_hot_density": new_runtime["density"],
         "output_runtime_hot_span_count": new_runtime["span_count"],
         "runtime_hot_window_reduction": (old_runtime["window_bytes"] / new_runtime["window_bytes"]) if new_runtime["window_bytes"] else None,
+        "output_gateup_rowblock_hot_window_bytes": new_gateup_stats,
+        "gateup_rowblock_hot_window_reduction": (old_gateup_stats["mean"] / new_gateup_stats["mean"]) if new_gateup_stats["mean"] else None,
     })
     return report
 
@@ -478,6 +710,8 @@ def main() -> int:
     parser.add_argument("--route-top", type=int, default=6)
     parser.add_argument("--route-stages", default="all", help="all, or comma list such as prefill,decode")
     parser.add_argument("--route-score", choices=["mass", "abs_mass", "count"], default="mass")
+    parser.add_argument("--gateup-rowblock-overlays", action="store_true",
+                        help="materialize hot gate/up experts as 128-row overlay records for deeper locality")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--status-every", type=int, default=32)
@@ -518,8 +752,12 @@ def main() -> int:
             "layer": layer,
             "hot_experts": hot_experts,
             "execute": args.execute,
+            "gateup_rowblock_overlays": args.gateup_rowblock_overlays,
         }, sort_keys=True), flush=True)
-        report = relayout_layer(args.pack, args.out_dir, layer, hot_experts, args.execute, args.status_every)
+        report = relayout_layer(
+            args.pack, args.out_dir, layer, hot_experts, args.execute,
+            args.status_every, args.gateup_rowblock_overlays,
+        )
         reports.append(report)
         print(json.dumps({
             "phase": "hotblock_layer_done",
@@ -532,6 +770,7 @@ def main() -> int:
             "source_runtime_hot_window_bytes": report.get("source_runtime_hot_window_bytes"),
             "output_runtime_hot_window_bytes": report.get("output_runtime_hot_window_bytes"),
             "runtime_hot_window_reduction": report.get("runtime_hot_window_reduction"),
+            "gateup_rowblock_hot_window_reduction": report.get("gateup_rowblock_hot_window_reduction"),
             "reason": report.get("reason"),
         }, sort_keys=True), flush=True)
 
@@ -550,6 +789,7 @@ def main() -> int:
         "pack_out_dir": None if args.pack_out_dir is None else str(args.pack_out_dir),
         "layers": layers,
         "common_hot_experts": common_hot,
+        "gateup_rowblock_overlays": args.gateup_rowblock_overlays,
         "route_trace_csv": None if args.route_trace_csv is None else str(args.route_trace_csv),
         "route_top": args.route_top,
         "route_stages": args.route_stages,

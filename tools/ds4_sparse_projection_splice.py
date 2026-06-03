@@ -16,6 +16,8 @@ FUSED_MAGIC = b"DS4D8F1\0"
 HEADER_BYTES = 4096
 EXPERTS = 256
 PROJECTIONS = ("gate", "up", "down")
+GATEUP_ROW_BLOCKS = 16
+GATEUP_OVERLAY_SENTINEL = 0xFFFFFFFF
 PROJECTION_ID = {name: index for index, name in enumerate(PROJECTIONS)}
 FUSED_RECORD_BYTES = 64
 FUSED_RECORD = struct.Struct("<IIIIIIQQQIIII")
@@ -94,6 +96,43 @@ def read_d8f(path: Path) -> dict[str, Any]:
                 result.update({"valid": False, "reason": "truncated_record_table", "bytes": size})
                 return result
             records.append(FUSED_RECORD.unpack(raw))
+        gateup_overlays: dict[tuple[int, int, int], tuple[Any, ...]] = {}
+        overlay_slot_offset = int(header.get("gateup_overlay_slot_table_offset", 0) or 0)
+        if overlay_slot_offset:
+            overlay_record_offset = int(header.get("gateup_overlay_record_offset", 0) or 0)
+            overlay_slot_entries = int(header.get("gateup_overlay_slot_entries", 2 * EXPERTS * GATEUP_ROW_BLOCKS) or 0)
+            overlay_record_bytes = int(header.get("gateup_overlay_record_bytes", FUSED_RECORD_BYTES) or FUSED_RECORD_BYTES)
+            overlay_records = int(header.get("gateup_overlay_records", 0) or 0)
+            overlay_sentinel = int(header.get("gateup_overlay_sentinel", GATEUP_OVERLAY_SENTINEL) or GATEUP_OVERLAY_SENTINEL)
+            if (overlay_slot_entries != 2 * EXPERTS * GATEUP_ROW_BLOCKS or
+                    overlay_record_bytes != FUSED_RECORD_BYTES or
+                    overlay_sentinel != GATEUP_OVERLAY_SENTINEL or
+                    not overlay_record_offset or
+                    overlay_slot_offset + overlay_slot_entries * 4 > size or
+                    overlay_record_offset + overlay_records * FUSED_RECORD_BYTES > size):
+                result.update({"valid": False, "reason": "unsupported_gateup_overlay_shape", "bytes": size})
+                return result
+            handle.seek(overlay_slot_offset)
+            slot_table = handle.read(overlay_slot_entries * 4)
+            handle.seek(overlay_record_offset)
+            overlay_table = handle.read(overlay_records * FUSED_RECORD_BYTES)
+            if len(slot_table) != overlay_slot_entries * 4 or len(overlay_table) != overlay_records * FUSED_RECORD_BYTES:
+                result.update({"valid": False, "reason": "truncated_gateup_overlay", "bytes": size})
+                return result
+            for slot_index in range(overlay_slot_entries):
+                slot = struct.unpack_from("<I", slot_table, slot_index * 4)[0]
+                if slot == overlay_sentinel:
+                    continue
+                if slot >= overlay_records:
+                    result.update({"valid": False, "reason": "gateup_overlay_slot_out_of_range", "bytes": size})
+                    return result
+                projection = slot_index // (EXPERTS * GATEUP_ROW_BLOCKS)
+                within_projection = slot_index % (EXPERTS * GATEUP_ROW_BLOCKS)
+                expert = within_projection // GATEUP_ROW_BLOCKS
+                row_block = within_projection % GATEUP_ROW_BLOCKS
+                gateup_overlays[(projection, expert, row_block)] = FUSED_RECORD.unpack_from(
+                    overlay_table, slot * FUSED_RECORD_BYTES
+                )
         sidecars: dict[int, tuple[Any, ...]] = {}
         sidecar_offset = int(header.get("sidecar_table_offset", 0) or 0)
         sidecar_records = int(header.get("sidecar_records", 0) or 0)
@@ -116,6 +155,7 @@ def read_d8f(path: Path) -> dict[str, Any]:
         "bytes": size,
         "header": header,
         "records": records,
+        "gateup_overlays": gateup_overlays,
         "sidecars": sidecars,
     })
     return result
