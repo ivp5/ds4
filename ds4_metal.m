@@ -1584,6 +1584,37 @@ static uint32_t ds4_gpu_env_u32(const char *name, uint32_t default_val) {
     return (uint32_t)v;
 }
 
+static int ds4_gpu_d8f_runtime_native_down_enabled_for_layer(uint32_t layer,
+                                                             uint32_t token_count) {
+    if (ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_DISABLE") > 0) return 0;
+    static int parsed = 0;
+    static int has_allow = 0;
+    static int has_disable = 0;
+    static uint64_t allow_mask = 0ull;
+    static uint64_t disable_mask = 0ull;
+    if (!parsed) {
+        const char *allow_csv = getenv("DS4_D8F_RUNTIME_NATIVE_DOWN_LAYERS");
+        const char *disable_csv = getenv("DS4_D8F_RUNTIME_NATIVE_DOWN_DISABLE_LAYERS");
+        has_allow = (allow_csv && allow_csv[0]) ? 1 : 0;
+        has_disable = (disable_csv && disable_csv[0]) ? 1 : 0;
+        allow_mask = has_allow ? ds4_gpu_d8f_layer_mask_from_csv(allow_csv) : 0ull;
+        disable_mask = has_disable ? ds4_gpu_d8f_layer_mask_from_csv(disable_csv) : 0ull;
+        parsed = 1;
+    }
+    if (layer >= 64u) return 0;
+    if (has_allow && ((allow_mask >> layer) & 1ull) == 0ull) return 0;
+    if (has_disable && ((disable_mask >> layer) & 1ull)) return 0;
+    const uint32_t min_tokens =
+        ds4_gpu_env_u32("DS4_D8F_RUNTIME_NATIVE_DOWN_MIN_TOKENS", 1u);
+    const uint32_t max_tokens =
+        ds4_gpu_env_u32("DS4_D8F_RUNTIME_NATIVE_DOWN_MAX_TOKENS", UINT32_MAX);
+    if (token_count < min_tokens || token_count > max_tokens) return 0;
+    const int explicit_native = ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN");
+    if (explicit_native == 0) return 0;
+    if (explicit_native > 0) return 1;
+    return has_allow;
+}
+
 /*
  * Retained Metal4 defaults live here instead of behind user-visible options.
  * The public runtime has one automatic accelerated path plus the global
@@ -52171,7 +52202,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
         const int down_native_recbuf =
             !down_tile32_recbuf &&
             !half_mid && recbuf_enabled && !preweight_mid && down_tile16 &&
-            ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN") > 0 &&
+            ds4_gpu_d8f_runtime_native_down_enabled_for_layer(layer, n_tokens) &&
             ds4_d8f_down_native_code_sidecar_count(&g_d8f_runtime_file) > 0u &&
             g_d8f_runtime_rec_buf &&
             g_d8f_runtime_texbuf &&
