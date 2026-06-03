@@ -20,6 +20,9 @@ def parse_metrics(line):
         "slots",
         "max_k",
         "rounds",
+        "pack2d",
+        "pack2d_width",
+        "pack2d_height",
     ):
         if key in metrics:
             metrics[key] = int(metrics[key])
@@ -30,16 +33,25 @@ def parse_metrics(line):
         "tex_linear2d",
         "tex_buffer",
         "tex_sample",
+        "tex_pack2d_read",
+        "tex_pack2d_sample",
         "speedup_2d",
         "speedup_tb",
         "speedup_sample",
+        "speedup_pack2d_read",
+        "speedup_pack2d_sample",
         "max_abs_buffer",
         "max_abs_texture",
         "max_abs_texture_buffer",
         "max_abs_texture_sample",
+        "max_abs_pack2d_read",
+        "max_abs_pack2d_sample",
         "max_abs_buf_tex",
         "max_abs_buf_tb",
         "max_abs_buf_sample",
+        "max_abs_buf_pack2d_read",
+        "max_abs_buf_pack2d_sample",
+        "pack2d_view",
     ):
         if key in metrics:
             metrics[key] = float(metrics[key].removesuffix("MiB").removesuffix("ms").removesuffix("x"))
@@ -80,6 +92,8 @@ def main():
                     (metrics.get("tex_linear2d", 1e30), "linear2d"),
                     (metrics.get("tex_buffer", 1e30), "texture_buffer"),
                     (metrics.get("tex_sample", 1e30), "sample_nearest"),
+                    (metrics.get("tex_pack2d_read", 1e30), "pack2d_read"),
+                    (metrics.get("tex_pack2d_sample", 1e30), "pack2d_sample"),
                 )
             )[1]
         )
@@ -87,6 +101,8 @@ def main():
             metrics.get("tex_linear2d", 1e30),
             metrics.get("tex_buffer", 1e30),
             metrics.get("tex_sample", 1e30),
+            metrics.get("tex_pack2d_read", 1e30),
+            metrics.get("tex_pack2d_sample", 1e30),
         )
         metrics["best_texture_speedup"] = metrics["buffer"] / metrics["best_texture_ms"]
         results.append(metrics)
@@ -108,19 +124,26 @@ def main():
         fieldnames = [
             "layer",
             "max_k",
+            "pack2d",
             "buffer",
             "tex_linear2d",
             "tex_buffer",
             "tex_sample",
+            "tex_pack2d_read",
+            "tex_pack2d_sample",
             "speedup_2d",
             "speedup_tb",
             "speedup_sample",
+            "speedup_pack2d_read",
+            "speedup_pack2d_sample",
             "best_texture_path",
             "best_texture_speedup",
             "max_abs_buffer",
             "max_abs_texture",
             "max_abs_texture_buffer",
             "max_abs_texture_sample",
+            "max_abs_pack2d_read",
+            "max_abs_pack2d_sample",
         ]
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()

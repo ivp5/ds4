@@ -918,6 +918,32 @@ inline float d8f_dot8_codebook_texbuf(texture_buffer<half, access::read> codeboo
          float(hi.z) * m6 + float(hi.w) * m7;
 }
 
+inline uint2 d8f_pack2d_coord(uint texel) {
+  constexpr uint width = 16384u;
+  const uint y = texel / width;
+  return uint2(texel - y * width, y);
+}
+
+inline float d8f_dot8_codebook_pack2d(texture2d<half, access::read> codebook_tex,
+                                      ulong codebook_offset,
+                                      uint code,
+                                      float m0,
+                                      float m1,
+                                      float m2,
+                                      float m3,
+                                      float m4,
+                                      float m5,
+                                      float m6,
+                                      float m7) {
+  const uint base = uint((codebook_offset >> 3) + ulong(code) * 2ul);
+  const half4 lo = codebook_tex.read(d8f_pack2d_coord(base));
+  const half4 hi = codebook_tex.read(d8f_pack2d_coord(base + 1u));
+  return float(lo.x) * m0 + float(lo.y) * m1 +
+         float(lo.z) * m2 + float(lo.w) * m3 +
+         float(hi.x) * m4 + float(hi.y) * m5 +
+         float(hi.z) * m6 + float(hi.w) * m7;
+}
+
 inline ulong d8f_down_lut_sidecar_a_offset(D8FDownLutSidecarLite sidecar) {
   return ulong(sidecar.a_offset_lo) | (ulong(sidecar.a_offset_hi) << 32);
 }
@@ -2397,6 +2423,128 @@ kernel void d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes(
         if (code >= rec.k) continue;
         acc[rr] += rw * d8f_dot8_codebook_texbuf(codebook_tex, rec.codebook_offset, code,
                                                   m0, m1, m2, m3, m4, m5, m6, m7);
+      }
+    }
+    if (side_rank1) {
+      side_dot = simd_sum(side_dot);
+      if (tiisg == 0u) partial[sgitg] = side_dot;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (tid == 0u) {
+        float dot_total = 0.0f;
+        for (uint sg = 0u; sg < 8u; sg++) dot_total += partial[sg];
+        for (uint rr = 0u; rr < 16u; rr++) {
+          const uint row = row_base + rr;
+          if (row < args.rows) acc[rr] += rw * float(side_a[row]) * dot_total;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+  for (uint rr = 0u; rr < 16u; rr++) {
+    acc[rr] = simd_sum(acc[rr]);
+    if (tiisg == 0u) partial[rr * 8u + sgitg] = acc[rr];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    for (uint rr = 0u; rr < 16u; rr++) {
+      const uint row = row_base + rr;
+      if (row < args.rows) {
+        float total = 0.0f;
+        for (uint sg = 0u; sg < 8u; sg++) total += partial[rr * 8u + sg];
+        out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] = total;
+      }
+    }
+  }
+}
+
+kernel void d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_pack2d(
+  device const uchar *pack               [[buffer(0)]],
+  device const float *mid                [[buffer(1)]],
+  device const uint  *selected           [[buffer(2)]],
+  device float       *out                [[buffer(3)]],
+  constant D8FDownBatchArgs &args        [[buffer(4)]],
+  device const float *route_weights      [[buffer(5)]],
+  device const D8FRecordLite *recs       [[buffer(6)]],
+  device const float *sidecar_dot        [[buffer(7)]],
+  texture2d<half, access::read> codebook_tex [[texture(0)]],
+  threadgroup float *partial             [[threadgroup(0)]],
+  uint tid [[thread_index_in_threadgroup]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]],
+  uint2 pos [[threadgroup_position_in_grid]]) {
+  (void)sidecar_dot;
+  const uint row_base = pos.x << 4;
+  const uint token = pos.y;
+  if (token >= args.n_tokens) return;
+  const uint blocks_per_row = args.in_dim >> 3;
+  device const float *token_mid = mid + ulong(token) * ulong(args.mid_token_stride);
+  device const float *token_weights = route_weights + ulong(token) * ulong(args.route_token_stride);
+  float acc[16];
+  for (uint rr = 0u; rr < 16u; rr++) acc[rr] = 0.0f;
+  for (uint slot = 0u; slot < args.n_selected; slot++) {
+    const float rw = token_weights[slot];
+    if (rw == 0.0f) continue;
+    const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];
+    const D8FRecordLite rec = recs[8192u + expert];
+    device const uchar *side_rec = d8f_down_sidecar_record(pack, args, expert);
+    const uint side_rank = side_rec ? d8f_u32(side_rec + 4) : 0u;
+    const uint side_in_dim = side_rec ? d8f_u32(side_rec + 8) : 0u;
+    const uint side_out_dim = side_rec ? d8f_u32(side_rec + 12) : 0u;
+    const ulong side_u_off = side_rec ? d8f_u64(side_rec + 16) : 0ul;
+    const ulong side_a_off = side_rec ? d8f_u64(side_rec + 24) : 0ul;
+    const bool side_rank1 = side_rank == 1u && side_in_dim == args.in_dim &&
+                            side_out_dim == args.rows && side_u_off != 0ul &&
+                            side_a_off != 0ul;
+    device const half *side_u = side_rank1 ? (const device half *)(pack + side_u_off) : nullptr;
+    device const half *side_a = side_rank1 ? (const device half *)(pack + side_a_off) : nullptr;
+    const bool native_codes =
+        rec.native_code_offset != 0ul &&
+        rec.native_code_bytes >= args.rows * blocks_per_row * (uint)sizeof(ushort);
+    device const ushort *native = native_codes ? (const device ushort *)(pack + rec.native_code_offset) : nullptr;
+    const device float *slot_mid = token_mid + ulong(slot) * ulong(args.mid_slot_stride);
+    float side_dot = 0.0f;
+    for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {
+      const uint x_base = block_col << 3;
+      const float m0 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 0u);
+      const float m1 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 1u);
+      const float m2 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 2u);
+      const float m3 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 3u);
+      const float m4 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 4u);
+      const float m5 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 5u);
+      const float m6 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 6u);
+      const float m7 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 7u);
+      if (side_rank1) {
+        side_dot += float(side_u[x_base + 0u]) * m0 + float(side_u[x_base + 1u]) * m1 +
+                    float(side_u[x_base + 2u]) * m2 + float(side_u[x_base + 3u]) * m3 +
+                    float(side_u[x_base + 4u]) * m4 + float(side_u[x_base + 5u]) * m5 +
+                    float(side_u[x_base + 6u]) * m6 + float(side_u[x_base + 7u]) * m7;
+      }
+      for (uint rr = 0u; rr < 16u; rr++) {
+        const uint row = row_base + rr;
+        if (row >= args.rows) continue;
+        uint code = 0u;
+        if (native_codes) {
+          code = uint(native[ulong(row) * ulong(blocks_per_row) + ulong(block_col)]);
+        } else {
+          const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);
+          const ulong bit_off = block_index * ulong(rec.bits);
+          const ulong byte_off = bit_off >> 3;
+          const uint shift = uint(bit_off & 7ul);
+          device const uchar *ix = pack + rec.index_offset + byte_off;
+          const uint w = uint(ix[0]) | (uint(ix[1]) << 8u) | (uint(ix[2]) << 16u) | (uint(ix[3]) << 24u);
+          code = (w >> shift) & rec.mask;
+        }
+        if (code >= rec.k) continue;
+        if (native_codes) {
+          acc[rr] += rw * d8f_dot8_codebook_pack2d(codebook_tex, rec.codebook_offset, code,
+                                                     m0, m1, m2, m3, m4, m5, m6, m7);
+        } else {
+          const device half *cb = (const device half *)(pack + rec.codebook_offset + ulong(code) * 16ul);
+          acc[rr] += rw * (float(cb[0]) * m0 + float(cb[1]) * m1 +
+                           float(cb[2]) * m2 + float(cb[3]) * m3 +
+                           float(cb[4]) * m4 + float(cb[5]) * m5 +
+                           float(cb[6]) * m6 + float(cb[7]) * m7);
+        }
       }
     }
     if (side_rank1) {
