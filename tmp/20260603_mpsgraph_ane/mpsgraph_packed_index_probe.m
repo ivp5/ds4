@@ -118,6 +118,14 @@ static const char *descriptor_mode_name(uint32_t mode) {
         case 2u: return "level1";
         case 3u: return "fastmath";
         case 4u: return "runtime_type_infer";
+        case 5u: return "private_shape_cache";
+        case 6u: return "private_device_placement";
+        case 7u: return "private_ane_flags";
+        case 8u: return "private_prefer1";
+        case 9u: return "private_prefer2";
+        case 10u: return "private_allowed3";
+        case 11u: return "private_ane_device";
+        case 12u: return "private_compile_resources";
         default: return "default";
     }
 }
@@ -128,7 +136,50 @@ static uint32_t parse_descriptor_mode(const char *mode) {
     if (strcmp(mode, "level1") == 0) return 2u;
     if (strcmp(mode, "fastmath") == 0) return 3u;
     if (strcmp(mode, "runtime_type_infer") == 0) return 4u;
+    if (strcmp(mode, "private_shape_cache") == 0) return 5u;
+    if (strcmp(mode, "private_device_placement") == 0) return 6u;
+    if (strcmp(mode, "private_ane_flags") == 0) return 7u;
+    if (strcmp(mode, "private_prefer1") == 0) return 8u;
+    if (strcmp(mode, "private_prefer2") == 0) return 9u;
+    if (strcmp(mode, "private_allowed3") == 0) return 10u;
+    if (strcmp(mode, "private_ane_device") == 0) return 11u;
+    if (strcmp(mode, "private_compile_resources") == 0) return 12u;
     return UINT32_MAX;
+}
+
+static bool set_private_value(id object, NSString *key, id value) {
+    @try {
+        [object setValue:value forKey:key];
+        return true;
+    } @catch (NSException *exception) {
+        fprintf(stderr, "[private_skip] key=%s reason=%s\n", key.UTF8String, exception.reason.UTF8String);
+        return false;
+    }
+}
+
+static void call_private_void(id object, NSString *selector_name) {
+    SEL selector = NSSelectorFromString(selector_name);
+    if (![object respondsToSelector:selector]) {
+        fprintf(stderr, "[private_skip] selector=%s missing\n", selector_name.UTF8String);
+        return;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    [object performSelector:selector];
+#pragma clang diagnostic pop
+}
+
+static MPSGraphDevice *private_ane_device(void) {
+    SEL selector = NSSelectorFromString(@"ANEDevice");
+    Class cls = [MPSGraphDevice class];
+    if (![cls respondsToSelector:selector]) {
+        fprintf(stderr, "[private_skip] MPSGraphDevice ANEDevice missing\n");
+        return nil;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    return [cls performSelector:selector];
+#pragma clang diagnostic pop
 }
 
 static MPSGraphCompilationDescriptor *make_compilation_descriptor(uint32_t mode) {
@@ -138,6 +189,29 @@ static MPSGraphCompilationDescriptor *make_compilation_descriptor(uint32_t mode)
     descriptor.optimizationLevel = mode == 1u ? MPSGraphOptimizationLevel0 : MPSGraphOptimizationLevel1;
     if (mode == 3u) descriptor.reducedPrecisionFastMath = MPSGraphReducedPrecisionFastMathAllowFP16Intermediates;
     if (mode == 4u) [descriptor disableTypeInference];
+    if (mode == 5u) {
+        set_private_value(descriptor, @"enableShapeShifterCache", @YES);
+        set_private_value(descriptor, @"shapeShifterCacheThreads", @4u);
+    } else if (mode == 6u) {
+        call_private_void(descriptor, @"enableDevicePlacement");
+    } else if (mode == 7u) {
+        set_private_value(descriptor, @"enableANEFWToFWSignal", @YES);
+        set_private_value(descriptor, @"enableANELateLatch", @YES);
+        set_private_value(descriptor, @"enableANECHWRankPromotion", @YES);
+    } else if (mode == 8u) {
+        call_private_void(descriptor, @"enableDevicePlacement");
+        set_private_value(descriptor, @"preferredDevice", @1u);
+        set_private_value(descriptor, @"allowedComputeDevices", @3u);
+    } else if (mode == 9u) {
+        call_private_void(descriptor, @"enableDevicePlacement");
+        set_private_value(descriptor, @"preferredDevice", @2u);
+        set_private_value(descriptor, @"allowedComputeDevices", @7u);
+    } else if (mode == 10u) {
+        call_private_void(descriptor, @"enableDevicePlacement");
+        set_private_value(descriptor, @"allowedComputeDevices", @3u);
+    } else if (mode == 12u) {
+        set_private_value(descriptor, @"enableCompileResourcesForPackage", @YES);
+    }
     return descriptor;
 }
 
@@ -179,7 +253,8 @@ static MPSGraphExecutable *build_executable(bool packed_path,
     MPSGraphShapedType *x_type = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(kInputDim)]
                                                                    dataType:MPSDataTypeFloat16];
     MPSGraphCompilationDescriptor *descriptor = make_compilation_descriptor(descriptor_mode);
-    MPSGraphExecutable *executable = [graph compileWithDevice:nil
+    MPSGraphDevice *compile_device = descriptor_mode == 11u ? private_ane_device() : nil;
+    MPSGraphExecutable *executable = [graph compileWithDevice:compile_device
                                                         feeds:@{x : x_type}
                                                 targetTensors:@[out]
                                              targetOperations:nil
@@ -193,6 +268,29 @@ static MPSGraphExecutable *build_executable(bool packed_path,
     *x_tensor_out = x;
     *out_tensor_out = out;
     return executable;
+}
+
+static const char *private_exec_mode(void) {
+    const char *mode = getenv("MPSGRAPH_PRIVATE_EXEC_MODE");
+    return mode && mode[0] ? mode : "default";
+}
+
+static void configure_execution_descriptor(MPSGraphExecutableExecutionDescriptor *descriptor) {
+    const char *mode = private_exec_mode();
+    if (strcmp(mode, "disable_sync_results") == 0) {
+        set_private_value(descriptor, @"disableSynchronizeResults", @YES);
+    } else if (strcmp(mode, "disable_ane_cache") == 0) {
+        set_private_value(descriptor, @"disableANECaching", @YES);
+    } else if (strcmp(mode, "disable_ane_fallback") == 0) {
+        set_private_value(descriptor, @"disableANEFallback", @YES);
+    } else if (strcmp(mode, "ane_sync") == 0) {
+        set_private_value(descriptor, @"encodeANESync", @YES);
+    } else if (strcmp(mode, "ane_disable_shared_events") == 0) {
+        set_private_value(descriptor, @"encodeANEDisableSharedEvents", @YES);
+    } else if (strcmp(mode, "ane_strict_no_cache") == 0) {
+        set_private_value(descriptor, @"disableANECaching", @YES);
+        set_private_value(descriptor, @"disableANEFallback", @YES);
+    }
 }
 
 static double time_executable(MPSGraphExecutable *executable,
@@ -221,6 +319,7 @@ static double time_executable_async_wait(MPSGraphExecutable *executable,
     NSArray *outputs = @[out_data];
     MPSGraphExecutableExecutionDescriptor *descriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
     descriptor.waitUntilCompleted = YES;
+    configure_execution_descriptor(descriptor);
     for (uint32_t warmup = 0; warmup < 3u; ++warmup) {
         [executable runAsyncWithMTLCommandQueue:queue inputsArray:inputs resultsArray:outputs executionDescriptor:descriptor];
     }
@@ -242,6 +341,7 @@ static double time_executable_async_event_batch(MPSGraphExecutable *executable,
     NSArray *outputs = @[out_data];
     for (uint32_t warmup = 0; warmup < 3u; ++warmup) {
         MPSGraphExecutableExecutionDescriptor *descriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
+        configure_execution_descriptor(descriptor);
         [descriptor signalEvent:event atExecutionEvent:MPSGraphExecutionStageCompleted value:warmup + 1u];
         [executable runAsyncWithMTLCommandQueue:queue inputsArray:inputs resultsArray:outputs executionDescriptor:descriptor];
         if (![event waitUntilSignaledValue:warmup + 1u timeoutMS:60000u]) return -1.0;
@@ -250,6 +350,7 @@ static double time_executable_async_event_batch(MPSGraphExecutable *executable,
     double start = now_seconds();
     for (uint32_t round = 0; round < rounds; ++round) {
         MPSGraphExecutableExecutionDescriptor *descriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
+        configure_execution_descriptor(descriptor);
         [descriptor signalEvent:event atExecutionEvent:MPSGraphExecutionStageCompleted value:round + 1u];
         [executable runAsyncWithMTLCommandQueue:queue inputsArray:inputs resultsArray:outputs executionDescriptor:descriptor];
     }
@@ -266,7 +367,7 @@ int main(int argc, const char **argv) {
         if (rows == 0u || rows > 8192u) rows = 4096u;
         if (rounds == 0u) rounds = 20u;
         if ((bits != 4u && bits != 12u) || descriptor_mode == UINT32_MAX) {
-            fprintf(stderr, "usage: %s [rows] [rounds] [bits=4|12] [default|level0|level1|fastmath|runtime_type_infer]\n", argv[0]);
+            fprintf(stderr, "usage: %s [rows] [rounds] [bits=4|12] [default|level0|level1|fastmath|runtime_type_infer|private_shape_cache|private_device_placement|private_ane_flags|private_prefer1|private_prefer2|private_allowed3|private_ane_device|private_compile_resources]\n", argv[0]);
             return 2;
         }
         const uint32_t code_count = 1u << bits;
@@ -364,8 +465,8 @@ int main(int argc, const char **argv) {
         double expanded_index_mb = (double)((size_t)kGroups * rows * sizeof(int32_t)) / 1.0e6;
         double packed_index_mb = (double)((size_t)kGroups * packed_bytes * sizeof(uint8_t)) / 1.0e6;
         fprintf(stderr,
-                "mpsgraph_packed_index_probe: rows=%u rounds=%u bits=%u descriptor=%s groups=%u k=%u expanded_compile_ms=%.3f packed_compile_ms=%.3f expanded_us=%.3f packed_us=%.3f expanded_async_wait_us=%.3f packed_async_wait_us=%.3f expanded_async_batch_us=%.3f packed_async_batch_us=%.3f speedup=%.3f expanded_index_MB=%.3f packed_index_MB=%.3f index_shrink=%.3f bad=%u max_abs=%.6g rms=%.6g sample_exp=%.6g sample_pack=%.6g\n",
-                rows, rounds, bits, descriptor_mode_name(descriptor_mode), kGroups, code_count,
+                "mpsgraph_packed_index_probe: rows=%u rounds=%u bits=%u descriptor=%s exec_private=%s groups=%u k=%u expanded_compile_ms=%.3f packed_compile_ms=%.3f expanded_us=%.3f packed_us=%.3f expanded_async_wait_us=%.3f packed_async_wait_us=%.3f expanded_async_batch_us=%.3f packed_async_batch_us=%.3f speedup=%.3f expanded_index_MB=%.3f packed_index_MB=%.3f index_shrink=%.3f bad=%u max_abs=%.6g rms=%.6g sample_exp=%.6g sample_pack=%.6g\n",
+                rows, rounds, bits, descriptor_mode_name(descriptor_mode), private_exec_mode(), kGroups, code_count,
                 expanded_compile_ms, packed_compile_ms,
                 expanded_us, packed_us,
                 expanded_async_wait_us, packed_async_wait_us,

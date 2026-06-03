@@ -53,6 +53,21 @@ static MLMultiArray *make_zero_input(NSArray<NSNumber *> *shape) {
     return array;
 }
 
+static NSString *env_string(const char *name, NSString *fallback) {
+    const char *value = getenv(name);
+    return value && value[0] ? [NSString stringWithUTF8String:value] : fallback;
+}
+
+static bool set_private_value(id object, NSString *key, id value) {
+    @try {
+        [object setValue:value forKey:key];
+        return true;
+    } @catch (NSException *exception) {
+        NSLog(@"[private_skip] key=%@ reason=%@", key, exception.reason);
+        return false;
+    }
+}
+
 static MLModelConfiguration *make_configuration(void) {
     MLModelConfiguration *config = [[MLModelConfiguration alloc] init];
     config.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
@@ -60,7 +75,46 @@ static MLModelConfiguration *make_configuration(void) {
     hints.reshapeFrequency = MLReshapeFrequencyHintInfrequent;
     hints.specializationStrategy = MLSpecializationStrategyFastPrediction;
     config.optimizationHints = hints;
+    NSString *mode = env_string("COREML_PRIVATE_CONFIG_MODE", @"default");
+    if ([mode isEqualToString:@"e5_engine1"]) {
+        set_private_value(config, @"experimentalMLE5EngineUsage", @1);
+    } else if ([mode isEqualToString:@"e5_engine2"]) {
+        set_private_value(config, @"experimentalMLE5EngineUsage", @2);
+    } else if ([mode isEqualToString:@"e5_mask1"]) {
+        set_private_value(config, @"e5rtComputeDeviceTypeMask", @1u);
+    } else if ([mode isEqualToString:@"e5_mask3"]) {
+        set_private_value(config, @"e5rtComputeDeviceTypeMask", @3u);
+    } else if ([mode isEqualToString:@"e5_mask7"]) {
+        set_private_value(config, @"e5rtComputeDeviceTypeMask", @7u);
+    } else if ([mode isEqualToString:@"mpsgraph_specialization"]) {
+        set_private_value(config, @"specializationUsesMPSGraphExecutable", @YES);
+    } else if ([mode isEqualToString:@"float16_gpu_accum"]) {
+        set_private_value(config, @"allowFloat16AccumulationOnGPU", @YES);
+        set_private_value(config, @"allowLowPrecisionAccumulationOnGPU", @YES);
+    } else if ([mode isEqualToString:@"background_gpu"]) {
+        set_private_value(config, @"allowBackgroundGPUCompute", @YES);
+        set_private_value(config, @"allowBackgroundGPUComputeSetting", @YES);
+    } else if ([mode isEqualToString:@"instrumented"]) {
+        set_private_value(config, @"allowsInstrumentation", @YES);
+    }
     return config;
+}
+
+static MLPredictionOptions *make_prediction_options(void) {
+    MLPredictionOptions *options = [[MLPredictionOptions alloc] init];
+    NSString *mode = env_string("COREML_PRIVATE_PREDICT_MODE", @"default");
+    if ([mode isEqualToString:@"ane_qos_user"]) {
+        set_private_value(options, @"aneQoS", @(QOS_CLASS_USER_INITIATED));
+    } else if ([mode isEqualToString:@"ane_qos_utility"]) {
+        set_private_value(options, @"aneQoS", @(QOS_CLASS_UTILITY));
+    } else if ([mode isEqualToString:@"ane_priority_high"]) {
+        set_private_value(options, @"aneExecutionPriority", @"high");
+    } else if ([mode isEqualToString:@"ane_priority_low"]) {
+        set_private_value(options, @"aneExecutionPriority", @"low");
+    } else if ([mode isEqualToString:@"ane_priority_realtime"]) {
+        set_private_value(options, @"aneExecutionPriority", @"realtime");
+    }
+    return options;
 }
 
 static MLComputePlan *load_compute_plan(NSURL *compiled_url, MLModelConfiguration *config) {
@@ -138,7 +192,13 @@ int main(int argc, const char **argv) {
         }
         NSMutableArray<MLModel *> *models = [NSMutableArray array];
         double base_footprint = footprint_mib();
-        NSLog(@"[start] packages=%d footprint_mib=%.2f", argc - 1, base_footprint);
+        NSString *config_mode = env_string("COREML_PRIVATE_CONFIG_MODE", @"default");
+        NSString *predict_mode = env_string("COREML_PRIVATE_PREDICT_MODE", @"default");
+        const char *rounds_env = getenv("COREML_PREDICT_ROUNDS");
+        uint32_t predict_rounds = rounds_env && rounds_env[0] ? (uint32_t)strtoul(rounds_env, NULL, 10) : 1u;
+        if (predict_rounds == 0u) predict_rounds = 1u;
+        NSLog(@"[start] packages=%d config_private=%@ predict_private=%@ predict_rounds=%u footprint_mib=%.2f",
+              argc - 1, config_mode, predict_mode, predict_rounds, base_footprint);
         for (int index = 1; index < argc; ++index) {
             @autoreleasepool {
                 NSString *path = [NSString stringWithUTF8String:argv[index]];
@@ -162,21 +222,35 @@ int main(int argc, const char **argv) {
                     [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{input_name : [MLFeatureValue featureValueWithMultiArray:input]}
                                                                       error:&error];
                 if (!provider) die(@"feature provider failed", error);
+                MLPredictionOptions *options = make_prediction_options();
                 double predict_start = now_seconds();
-                id<MLFeatureProvider> prediction = [model predictionFromFeatures:provider error:&error];
+                id<MLFeatureProvider> prediction = [model predictionFromFeatures:provider options:options error:&error];
                 if (!prediction) die([NSString stringWithFormat:@"predict failed %@", path], error);
                 MLMultiArray *output = [prediction featureValueForName:output_name].multiArrayValue;
                 volatile uint16_t first = output ? ((uint16_t *)output.dataPointer)[0] : 0u;
                 (void)first;
                 double predict_done = now_seconds();
+                double steady_start = now_seconds();
+                for (uint32_t round = 0; round < predict_rounds; ++round) {
+                    prediction = [model predictionFromFeatures:provider options:options error:&error];
+                    if (!prediction) die([NSString stringWithFormat:@"steady predict failed %@", path], error);
+                    output = [prediction featureValueForName:output_name].multiArrayValue;
+                    first = output ? ((uint16_t *)output.dataPointer)[0] : 0u;
+                    (void)first;
+                }
+                double steady_predict_ms = (now_seconds() - steady_start) * 1.0e3 / (double)predict_rounds;
                 [models addObject:model];
                 double current_footprint = footprint_mib();
-                NSLog(@"[model] index=%d path=%@ compile_ms=%.3f load_ms=%.3f predict_ms=%.3f resident_models=%lu footprint_mib=%.2f delta_mib=%.2f",
+                NSLog(@"[model] index=%d path=%@ config_private=%@ predict_private=%@ predict_rounds=%u compile_ms=%.3f load_ms=%.3f predict_ms=%.3f steady_predict_ms=%.3f resident_models=%lu footprint_mib=%.2f delta_mib=%.2f",
                       index - 1,
                       path,
+                      config_mode,
+                      predict_mode,
+                      predict_rounds,
                       (compile_done - compile_start) * 1e3,
                       (load_done - load_start) * 1e3,
                       (predict_done - predict_start) * 1e3,
+                      steady_predict_ms,
                       (unsigned long)models.count,
                       current_footprint,
                       current_footprint - base_footprint);

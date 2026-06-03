@@ -54,3 +54,9 @@ The clean runtime architecture is a small set of cold-owned organs:
 - CoreML is the public ANE surface. `MLComputePlan` is now the placement verifier; `MLModelConfiguration.optimizationHints` is the specialization lever.
 - The highest-probability overlap structure is: CoreML ANE shared branch with output backing, MPSGraph routed branch enqueued through async/shared-event batches, then a GPU merge. This avoids CPU readback and exploits queue headroom.
 - Packed Metal remains the memory-floor candidate for routed D8F because it preserves packed indices and can own mixed `k/bits` metadata directly.
+
+## Private API Boundary
+
+- Undocumented MPSGraph/CoreML knobs are now probes, not defaults. They can falsify placement assumptions, but private enum values and string priorities are unsafe to infer.
+- `e5rtComputeDeviceTypeMask` is useful to force CPU fallback and prove ANE placement; the measured target remains default CoreML ANE placement with public optimization hints.
+- MPSGraph private ANE selectors are present but did not beat async/shared-event batching. Keep MPSGraph's role as GPU scheduling/fencing until a private mode passes real H3355 canaries repeatedly.

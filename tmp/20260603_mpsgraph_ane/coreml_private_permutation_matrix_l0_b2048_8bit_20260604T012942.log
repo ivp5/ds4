@@ -1,0 +1,166 @@
+[matrix] config permutations
+
+[case] config_private=default predict_private=default
+2026-06-04 01:29:42.710 coreml_shared_cache_probe[8145:12613180] [start] packages=1 config_private=default predict_private=default footprint_mib=1.55
+2026-06-04 01:29:45.304 coreml_shared_cache_probe[8145:12613180] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:29:47.718 coreml_shared_cache_probe[8145:12613180] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=default predict_private=default compile_ms=47.841 load_ms=2392.150 predict_ms=19.981 resident_models=1 footprint_mib=81.75 delta_mib=80.20
+2026-06-04 01:29:47.718 coreml_shared_cache_probe[8145:12613180] [done] resident_models=1 final_footprint_mib=81.75 total_delta_mib=80.20
+[exit] config_private=default code=0
+
+[case] config_private=e5_engine1 predict_private=default
+2026-06-04 01:29:47.728 coreml_shared_cache_probe[8146:12613239] [start] packages=1 config_private=e5_engine1 predict_private=default footprint_mib=1.55
+2026-06-04 01:29:50.976 coreml_shared_cache_probe[8146:12613239] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:29:51.392 coreml_shared_cache_probe[8146:12613239] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=e5_engine1 predict_private=default compile_ms=42.180 load_ms=378.053 predict_ms=37.612 resident_models=1 footprint_mib=218.14 delta_mib=216.59
+2026-06-04 01:29:51.392 coreml_shared_cache_probe[8146:12613239] [done] resident_models=1 final_footprint_mib=218.16 total_delta_mib=216.61
+[exit] config_private=e5_engine1 code=0
+
+[case] config_private=e5_engine2 predict_private=default
+2026-06-04 01:29:51.403 coreml_shared_cache_probe[8149:12613282] [start] packages=1 config_private=e5_engine2 predict_private=default footprint_mib=1.55
+2026-06-04 01:29:53.966 coreml_shared_cache_probe[8149:12613282] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:29:56.407 coreml_shared_cache_probe[8149:12613282] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=e5_engine2 predict_private=default compile_ms=40.583 load_ms=2421.438 predict_ms=17.564 resident_models=1 footprint_mib=81.61 delta_mib=80.06
+2026-06-04 01:29:56.407 coreml_shared_cache_probe[8149:12613282] [done] resident_models=1 final_footprint_mib=81.61 total_delta_mib=80.06
+[exit] config_private=e5_engine2 code=0
+
+[case] config_private=e5_mask1 predict_private=default
+2026-06-04 01:29:56.417 coreml_shared_cache_probe[8152:12613344] [start] packages=1 config_private=e5_mask1 predict_private=default footprint_mib=1.55
+2026-06-04 01:29:56.686 coreml_shared_cache_probe[8152:12613344] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=0 gpu_preferred=0 cpu_preferred=9 other_preferred=0 ane_supported=0 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:29:56.827 coreml_shared_cache_probe[8152:12613344] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=e5_mask1 predict_private=default compile_ms=42.130 load_ms=102.236 predict_ms=38.813 resident_models=1 footprint_mib=89.52 delta_mib=87.97
+2026-06-04 01:29:56.827 coreml_shared_cache_probe[8152:12613344] [done] resident_models=1 final_footprint_mib=89.55 total_delta_mib=88.00
+[exit] config_private=e5_mask1 code=0
+
+[case] config_private=e5_mask3 predict_private=default
+2026-06-04 01:29:56.837 coreml_shared_cache_probe[8153:12613358] [start] packages=1 config_private=e5_mask3 predict_private=default footprint_mib=1.55
+2026-06-04 01:29:57.091 coreml_shared_cache_probe[8153:12613358] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=0 gpu_preferred=0 cpu_preferred=9 other_preferred=0 ane_supported=0 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:29:57.230 coreml_shared_cache_probe[8153:12613358] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=e5_mask3 predict_private=default compile_ms=43.608 load_ms=100.709 predict_ms=38.923 resident_models=1 footprint_mib=89.66 delta_mib=88.11
+2026-06-04 01:29:57.231 coreml_shared_cache_probe[8153:12613358] [done] resident_models=1 final_footprint_mib=89.69 total_delta_mib=88.14
+[exit] config_private=e5_mask3 code=0
+
+[case] config_private=e5_mask7 predict_private=default
+2026-06-04 01:29:57.240 coreml_shared_cache_probe[8154:12613367] [start] packages=1 config_private=e5_mask7 predict_private=default footprint_mib=1.55
+2026-06-04 01:29:59.778 coreml_shared_cache_probe[8154:12613367] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:30:02.188 coreml_shared_cache_probe[8154:12613367] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=e5_mask7 predict_private=default compile_ms=42.759 load_ms=2390.467 predict_ms=18.268 resident_models=1 footprint_mib=81.83 delta_mib=80.28
+2026-06-04 01:30:02.189 coreml_shared_cache_probe[8154:12613367] [done] resident_models=1 final_footprint_mib=81.83 total_delta_mib=80.28
+[exit] config_private=e5_mask7 code=0
+
+[case] config_private=mpsgraph_specialization predict_private=default
+2026-06-04 01:30:02.199 coreml_shared_cache_probe[8156:12613408] [start] packages=1 config_private=mpsgraph_specialization predict_private=default footprint_mib=1.55
+2026-06-04 01:30:04.756 coreml_shared_cache_probe[8156:12613408] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:30:07.192 coreml_shared_cache_probe[8156:12613408] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=mpsgraph_specialization predict_private=default compile_ms=42.775 load_ms=2416.181 predict_ms=18.556 resident_models=1 footprint_mib=81.73 delta_mib=80.19
+2026-06-04 01:30:07.192 coreml_shared_cache_probe[8156:12613408] [done] resident_models=1 final_footprint_mib=81.73 total_delta_mib=80.19
+[exit] config_private=mpsgraph_specialization code=0
+
+[case] config_private=float16_gpu_accum predict_private=default
+2026-06-04 01:30:07.203 coreml_shared_cache_probe[8161:12613466] [start] packages=1 config_private=float16_gpu_accum predict_private=default footprint_mib=1.55
+2026-06-04 01:30:09.753 coreml_shared_cache_probe[8161:12613466] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:30:12.175 coreml_shared_cache_probe[8161:12613466] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=float16_gpu_accum predict_private=default compile_ms=42.061 load_ms=2402.003 predict_ms=18.510 resident_models=1 footprint_mib=81.86 delta_mib=80.31
+2026-06-04 01:30:12.175 coreml_shared_cache_probe[8161:12613466] [done] resident_models=1 final_footprint_mib=81.86 total_delta_mib=80.31
+[exit] config_private=float16_gpu_accum code=0
+
+[case] config_private=background_gpu predict_private=default
+2026-06-04 01:30:12.186 coreml_shared_cache_probe[8163:12613511] [start] packages=1 config_private=background_gpu predict_private=default footprint_mib=1.55
+2026-06-04 01:30:14.728 coreml_shared_cache_probe[8163:12613511] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:30:17.150 coreml_shared_cache_probe[8163:12613511] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=background_gpu predict_private=default compile_ms=42.940 load_ms=2399.587 predict_ms=21.650 resident_models=1 footprint_mib=81.77 delta_mib=80.22
+2026-06-04 01:30:17.150 coreml_shared_cache_probe[8163:12613511] [done] resident_models=1 final_footprint_mib=81.77 total_delta_mib=80.22
+[exit] config_private=background_gpu code=0
+
+[case] config_private=instrumented predict_private=default
+2026-06-04 01:30:17.160 coreml_shared_cache_probe[8165:12613585] [start] packages=1 config_private=instrumented predict_private=default footprint_mib=1.55
+2026-06-04 01:30:19.704 coreml_shared_cache_probe[8165:12613585] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:30:22.130 coreml_shared_cache_probe[8165:12613585] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=instrumented predict_private=default compile_ms=41.616 load_ms=2407.840 predict_ms=17.430 resident_models=1 footprint_mib=81.80 delta_mib=80.25
+2026-06-04 01:30:22.131 coreml_shared_cache_probe[8165:12613585] [done] resident_models=1 final_footprint_mib=81.80 total_delta_mib=80.25
+[exit] config_private=instrumented code=0
+
+[matrix] prediction permutations
+
+[case] config_private=default predict_private=default
+2026-06-04 01:30:22.140 coreml_shared_cache_probe[8183:12613650] [start] packages=1 config_private=default predict_private=default footprint_mib=1.55
+2026-06-04 01:30:24.684 coreml_shared_cache_probe[8183:12613650] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:30:27.105 coreml_shared_cache_probe[8183:12613650] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=default predict_private=default compile_ms=41.340 load_ms=2401.050 predict_ms=18.153 resident_models=1 footprint_mib=81.72 delta_mib=80.17
+2026-06-04 01:30:27.105 coreml_shared_cache_probe[8183:12613650] [done] resident_models=1 final_footprint_mib=81.72 total_delta_mib=80.17
+[exit] predict_private=default code=0
+
+[case] config_private=default predict_private=ane_qos_user
+2026-06-04 01:30:27.116 coreml_shared_cache_probe[8210:12613760] [start] packages=1 config_private=default predict_private=ane_qos_user footprint_mib=1.55
+2026-06-04 01:30:29.734 coreml_shared_cache_probe[8210:12613760] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:30:32.197 coreml_shared_cache_probe[8210:12613760] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=default predict_private=ane_qos_user compile_ms=42.862 load_ms=2439.302 predict_ms=22.365 resident_models=1 footprint_mib=81.86 delta_mib=80.31
+2026-06-04 01:30:32.197 coreml_shared_cache_probe[8210:12613760] [done] resident_models=1 final_footprint_mib=81.86 total_delta_mib=80.31
+[exit] predict_private=ane_qos_user code=0
+
+[case] config_private=default predict_private=ane_qos_utility
+2026-06-04 01:30:32.207 coreml_shared_cache_probe[8213:12613804] [start] packages=1 config_private=default predict_private=ane_qos_utility footprint_mib=1.55
+2026-06-04 01:30:34.798 coreml_shared_cache_probe[8213:12613804] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:30:37.257 coreml_shared_cache_probe[8213:12613804] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=default predict_private=ane_qos_utility compile_ms=40.368 load_ms=2440.536 predict_ms=17.459 resident_models=1 footprint_mib=81.75 delta_mib=80.20
+2026-06-04 01:30:37.257 coreml_shared_cache_probe[8213:12613804] [done] resident_models=1 final_footprint_mib=81.75 total_delta_mib=80.20
+[exit] predict_private=ane_qos_utility code=0
+
+[case] config_private=default predict_private=ane_priority_high
+2026-06-04 01:30:37.268 coreml_shared_cache_probe[8217:12613861] [start] packages=1 config_private=default predict_private=ane_priority_high footprint_mib=1.55
+2026-06-04 01:30:39.852 coreml_shared_cache_probe[8217:12613861] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason: 'Unrecognized ANE execution priority high'
+*** First throw call stack:
+(
+	0   CoreFoundation                      0x000000018cf191c0 __exceptionPreprocess + 176
+	1   libobjc.A.dylib                     0x000000018c9a291c objc_exception_throw + 88
+	2   CoreFoundation                      0x000000018cf190b0 +[NSException exceptionWithName:reason:userInfo:] + 0
+	3   CoreML                              0x0000000198297670 -[MLE5ExecutionStream _setANEExecutionPriorityWithOptions:] + 288
+	4   CoreML                              0x0000000198298a3c -[MLE5ExecutionStream _prepareForInputFeatures:options:error:] + 264
+	5   CoreML                              0x0000000198298424 -[MLE5ExecutionStream executeForInputFeatures:options:error:] + 72
+	6   CoreML                              0x00000001982461dc -[MLE5Engine _predictionFromFeatures:stream:options:error:] + 84
+	7   CoreML                              0x0000000198246480 -[MLE5Engine _predictionFromFeatures:options:error:] + 232
+	8   CoreML                              0x0000000198246f4c -[MLE5Engine _predictionFromFeatures:usingState:options:error:] + 464
+	9   CoreML                              0x00000001982470e8 -[MLE5Engine predictionFromFeatures:options:error:] + 104
+	10  CoreML                              0x000000019821bbf0 -[MLDelegateModel _predictionFromFeatures:usingState:options:error:] + 772
+	11  CoreML                              0x000000019821bf70 -[MLDelegateModel predictionFromFeatures:options:error:] + 132
+	12  coreml_shared_cache_probe           0x0000000102a358d8 main + 4000
+	13  dyld                                0x000000018ca2fe00 start + 6992
+)
+libc++abi: terminating due to uncaught exception of type NSException
+[exit] predict_private=ane_priority_high code=134
+
+[case] config_private=default predict_private=ane_priority_low
+2026-06-04 01:30:42.293 coreml_shared_cache_probe[8218:12613913] [start] packages=1 config_private=default predict_private=ane_priority_low footprint_mib=1.55
+2026-06-04 01:30:44.874 coreml_shared_cache_probe[8218:12613913] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason: 'Unrecognized ANE execution priority low'
+*** First throw call stack:
+(
+	0   CoreFoundation                      0x000000018cf191c0 __exceptionPreprocess + 176
+	1   libobjc.A.dylib                     0x000000018c9a291c objc_exception_throw + 88
+	2   CoreFoundation                      0x000000018cf190b0 +[NSException exceptionWithName:reason:userInfo:] + 0
+	3   CoreML                              0x0000000198297670 -[MLE5ExecutionStream _setANEExecutionPriorityWithOptions:] + 288
+	4   CoreML                              0x0000000198298a3c -[MLE5ExecutionStream _prepareForInputFeatures:options:error:] + 264
+	5   CoreML                              0x0000000198298424 -[MLE5ExecutionStream executeForInputFeatures:options:error:] + 72
+	6   CoreML                              0x00000001982461dc -[MLE5Engine _predictionFromFeatures:stream:options:error:] + 84
+	7   CoreML                              0x0000000198246480 -[MLE5Engine _predictionFromFeatures:options:error:] + 232
+	8   CoreML                              0x0000000198246f4c -[MLE5Engine _predictionFromFeatures:usingState:options:error:] + 464
+	9   CoreML                              0x00000001982470e8 -[MLE5Engine predictionFromFeatures:options:error:] + 104
+	10  CoreML                              0x000000019821bbf0 -[MLDelegateModel _predictionFromFeatures:usingState:options:error:] + 772
+	11  CoreML                              0x000000019821bf70 -[MLDelegateModel predictionFromFeatures:options:error:] + 132
+	12  coreml_shared_cache_probe           0x000000010016d8d8 main + 4000
+	13  dyld                                0x000000018ca2fe00 start + 6992
+)
+libc++abi: terminating due to uncaught exception of type NSException
+[exit] predict_private=ane_priority_low code=134
+
+[case] config_private=default predict_private=ane_priority_realtime
+2026-06-04 01:30:47.322 coreml_shared_cache_probe[8220:12613966] [start] packages=1 config_private=default predict_private=ane_priority_realtime footprint_mib=1.55
+2026-06-04 01:30:49.930 coreml_shared_cache_probe[8220:12613966] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason: 'Unrecognized ANE execution priority realtime'
+*** First throw call stack:
+(
+	0   CoreFoundation                      0x000000018cf191c0 __exceptionPreprocess + 176
+	1   libobjc.A.dylib                     0x000000018c9a291c objc_exception_throw + 88
+	2   CoreFoundation                      0x000000018cf190b0 +[NSException exceptionWithName:reason:userInfo:] + 0
+	3   CoreML                              0x0000000198297670 -[MLE5ExecutionStream _setANEExecutionPriorityWithOptions:] + 288
+	4   CoreML                              0x0000000198298a3c -[MLE5ExecutionStream _prepareForInputFeatures:options:error:] + 264
+	5   CoreML                              0x0000000198298424 -[MLE5ExecutionStream executeForInputFeatures:options:error:] + 72
+	6   CoreML                              0x00000001982461dc -[MLE5Engine _predictionFromFeatures:stream:options:error:] + 84
+	7   CoreML                              0x0000000198246480 -[MLE5Engine _predictionFromFeatures:options:error:] + 232
+	8   CoreML                              0x0000000198246f4c -[MLE5Engine _predictionFromFeatures:usingState:options:error:] + 464
+	9   CoreML                              0x00000001982470e8 -[MLE5Engine predictionFromFeatures:options:error:] + 104
+	10  CoreML                              0x000000019821bbf0 -[MLDelegateModel _predictionFromFeatures:usingState:options:error:] + 772
+	11  CoreML                              0x000000019821bf70 -[MLDelegateModel predictionFromFeatures:options:error:] + 132
+	12  coreml_shared_cache_probe           0x0000000100bf18d8 main + 4000
+	13  dyld                                0x000000018ca2fe00 start + 6992
+)
+libc++abi: terminating due to uncaught exception of type NSException
+[exit] predict_private=ane_priority_realtime code=134

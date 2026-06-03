@@ -76,3 +76,11 @@ Append-only transaction log. Scope: IVP5 DS4 MPSGraph/ANE runtime architecture, 
 - Real H3355 selected-six async batching is also useful: down r50 `1609.519 -> 1081.396 us/op`, gate/up r50 `1719.212 -> 1242.824 us/op`, all `bad=0`.
 - CoreML `MLComputePlan` confirms actual ANE placement for shared packages: L0 b2048 8-bit reports `ane_preferred=9/21` ops and `ane_supported=9/21`, with operators `const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1`.
 - Architecture update: stop treating ANE and MPSGraph as one opaque offload. CoreML owns ANE placement; MPSGraph owns GPU graph execution and queue/fence shape. The overlap organ should use CoreML output backings plus MPSGraph async-batch/event fences, then merge on GPU.
+
+## 2026-06-04T01:34 JST — private API falsification pass
+
+- Added runtime discovery for MPSGraph/CoreML private selectors and tested a guarded matrix of MPSGraph private compile/execution modes and CoreML private config/prediction modes.
+- MPSGraph `ANEDevice` and ANE descriptor flags are present and callable but did not produce a stable speed win; `private_prefer2` is harmful and shows private enum guessing is unsafe.
+- CoreML `e5rtComputeDeviceTypeMask` is valuable as a placement falsifier: masks `1` and `3` force CPU placement and slow steady prediction to `~26.8 ms` versus default ANE `~12-14 ms` while loading much faster. That is a diagnostic, not the runtime target.
+- Invalid `aneExecutionPriority` strings crash; keep priority strings out of runtime paths unless valid values are discovered and exception-contained.
+- Architecture update: private APIs do not replace the current public-ish overlap plan. Use them only to verify placement, cache, and fallback hypotheses.

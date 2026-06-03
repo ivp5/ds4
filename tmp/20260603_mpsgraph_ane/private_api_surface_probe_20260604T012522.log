@@ -1,0 +1,817 @@
+[class] name=MPSGraph superclass=MPSGraphObject
+[property] class=MPSGraph name=tensorNameDict attrs=T@"NSMutableDictionary",&,V_tensorNameDict
+[property] class=MPSGraph name=compilerOptions attrs=TQ,V_compilerOptions
+[property] class=MPSGraph name=placeholderTensors attrs=T@"NSArray",R,N
+[method] class=MPSGraph kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MPSGraph kind=instance selector=.cxx_construct types=@16@0:8
+[method] class=MPSGraph kind=instance selector=tileTensor:withMultiplier:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=absoluteWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=acosWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=acoshWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=additionWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=argSortWithTensor:axis:descending:name: types=@44@0:8@16q24B32@36
+[method] class=MPSGraph kind=instance selector=asinWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=asinhWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=atanWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=atanhWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=bandPartWithTensor:numLower:numUpper:name: types=@48@0:8@16q24q32@40
+[method] class=MPSGraph kind=instance selector=castTensor:toType:name: types=@36@0:8@16I24@28
+[method] class=MPSGraph kind=instance selector=ceilWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=clampWithTensor:minValueTensor:maxValueTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=concatTensors:dimension:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=convolution2DWithSourceTensor:weightsTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=cosWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=coshWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=cumulativeProductWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=cumulativeSumWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=depthwiseConvolution3DWithSourceTensor:weightsTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=divisionWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=equalWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=exponentBase2WithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=exponentWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=floorWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=gatherNDWithUpdatesTensor:indicesTensor:batchDimensions:name: types=@48@0:8@16@24Q32@40
+[method] class=MPSGraph kind=instance selector=gatherWithUpdatesTensor:indicesTensor:axis:batchDimensions:name: types=@56@0:8@16@24q32Q40@48
+[method] class=MPSGraph kind=instance selector=greaterThanOrEqualToWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=greaterThanWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=lessThanOrEqualToWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=lessThanWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=logarithmWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=logicalANDWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=logicalORWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=logicalXORWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=matrixMultiplicationWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=maximumWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=meanOfTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=minimumWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=moduloWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=multiplicationWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=negativeWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=notEqualWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=notWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=padTensor:withPaddingMode:leftPadding:rightPadding:constantValue:name: types=@64@0:8@16q24@32@40d48@56
+[method] class=MPSGraph kind=instance selector=powerWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=randomTensorWithShape:descriptor:seed:name: types=@48@0:8@16@24Q32@40
+[method] class=MPSGraph kind=instance selector=reciprocalWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=reductionAndWithTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=reductionArgMaximumWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=reductionArgMinimumWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=reductionMaximumWithTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=reductionMinimumWithTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=reductionOrWithTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=reductionProductWithTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=reductionSumWithTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=resizeNearestWithTensor:sizeTensor:nearestRoundingMode:centerResult:alignCorners:name: types=@56@0:8@16@24Q32B40B44@48
+[method] class=MPSGraph kind=instance selector=resizeTensor:size:mode:centerResult:alignCorners:layout:name: types=@64@0:8@16@24Q32B40B44Q48@56
+[method] class=MPSGraph kind=instance selector=reverseSquareRootWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=reverseTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=roundWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=scatterAlongAxis:withDataTensor:updatesTensor:indicesTensor:mode:name: types=@64@0:8q16@24@32@40q48@56
+[method] class=MPSGraph kind=instance selector=selectWithPredicateTensor:truePredicateTensor:falsePredicateTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=signWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=sinWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=sinhWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=sliceTensor:starts:ends:strides:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=softMaxWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=splitTensor:numSplits:axis:name: types=@48@0:8@16Q24q32@40
+[method] class=MPSGraph kind=instance selector=splitTensor:splitSizes:axis:name: types=@48@0:8@16@24q32@40
+[method] class=MPSGraph kind=instance selector=squareRootWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=squareWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=subtractionWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=tanWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=tanhWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=topKWithSourceTensor:axis:k:name: types=@48@0:8@16q24Q32@40
+[method] class=MPSGraph kind=instance selector=transposeTensor:dimension:withDimension:name: types=@48@0:8@16Q24Q32@40
+[method] class=MPSGraph kind=instance selector=transposeTensor:permutation:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=compilerOptions types=Q16@0:8
+[method] class=MPSGraph kind=instance selector=setCompilerOptions: types=v24@0:8Q16
+[method] class=MPSGraph kind=instance selector=convolution2DDataGradientWithIncomingGradientTensor:weightsTensor:outputShape:forwardConvolutionDescriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=convolution2DWeightsGradientWithIncomingGradientTensor:sourceTensor:outputShape:forwardConvolutionDescriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=convolutionTranspose2DDataGradientWithIncomingGradientTensor:weightsTensor:outputShape:forwardConvolutionDescriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=convolutionTranspose2DWeightsGradientWithIncomingGradientTensor:sourceTensor:outputShape:forwardConvolutionDescriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=convolutionTranspose2DWithSourceTensor:weightsTensor:outputShape:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=depthwiseConvolution2DDataGradientWithIncomingGradientTensor:weightsTensor:outputShape:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=depthwiseConvolution2DWeightsGradientWithIncomingGradientTensor:sourceTensor:outputShape:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=depthwiseConvolution2DWithSourceTensor:weightsTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=reLUWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=sigmoidWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=compileWithDevice:feeds:targetTensors:targetOperations:compilationDescriptor: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=convolutionTranspose2DWithSourceTensor:weightsTensor:outputShapeTensor:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=depthToSpace2DTensor:widthAxisTensor:heightAxisTensor:depthAxisTensor:blockSize:usePixelShuffleOrder:name: types=@68@0:8@16@24@32@40Q48B56@60
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:scaleTensor:zeroPointTensor:dataType:axis:name: types=@60@0:8@16@24@32I40q44@52
+[method] class=MPSGraph kind=instance selector=maxPooling4DWithSourceTensor:descriptor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=normalizationWithTensor:meanTensor:varianceTensor:gammaTensor:betaTensor:epsilon:name: types=@68@0:8@16@24@32@40@48f56@60
+[method] class=MPSGraph kind=instance selector=quantizeTensor:scaleTensor:zeroPointTensor:dataType:axis:name: types=@60@0:8@16@24@32I40q44@52
+[method] class=MPSGraph kind=instance selector=reshapeTensor:withShape:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=resizeBilinearWithTensor:sizeTensor:centerResult:alignCorners:name: types=@48@0:8@16@24B32B36@40
+[method] class=MPSGraph kind=instance selector=runAsyncWithMTLCommandQueue:feeds:targetOperations:resultsDictionary:executionDescriptor: types=v56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=shapeOfTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=sliceTensor:dimension:start:length:name: types=@56@0:8@16Q24q32q40@48
+[method] class=MPSGraph kind=instance selector=sliceTensor:starts:ends:strides:startMask:endMask:squeezeMask:name: types=@68@0:8@16@24@32@40I48I52I56@60
+[method] class=MPSGraph kind=instance selector=spaceToDepth2DTensor:widthAxisTensor:heightAxisTensor:depthAxisTensor:blockSize:usePixelShuffleOrder:name: types=@68@0:8@16@24@32@40Q48B56@60
+[method] class=MPSGraph kind=instance selector=transposeTensor:permute:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=GRUGradientsWithSourceTensor:recurrentWeight:sourceGradient:zState:outputFwd:inputWeight:bias:initState:descriptor:name: types=@96@0:8@16@24@32@40@48@56@64@72@80@88
+[method] class=MPSGraph kind=instance selector=GRUWithSourceTensor:recurrentWeight:inputWeight:bias:descriptor:name: types=@64@0:8@16@24@32@40@48@56
+[method] class=MPSGraph kind=instance selector=GRUWithSourceTensor:recurrentWeight:inputWeight:bias:initState:mask:secondaryBias:descriptor:name: types=@88@0:8@16@24@32@40@48@56@64@72@80
+[method] class=MPSGraph kind=instance selector=HermiteanToRealFFTWithTensor:axes:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=L2NormPooling4DGradientWithGradientTensor:sourceTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=LSTMGradientsWithSourceTensor:recurrentWeight:sourceGradient:zState:cellOutputFwd:descriptor:name: types=@72@0:8@16@24@32@40@48@56@64
+[method] class=MPSGraph kind=instance selector=LSTMGradientsWithSourceTensor:recurrentWeight:sourceGradient:zState:cellOutputFwd:inputWeight:bias:initState:initCell:mask:descriptor:name: types=@112@0:8@16@24@32@40@48@56@64@72@80@88@96@104
+[method] class=MPSGraph kind=instance selector=LSTMWithSourceTensor:recurrentWeight:initState:initCell:descriptor:name: types=@64@0:8@16@24@32@40@48@56
+[method] class=MPSGraph kind=instance selector=LSTMWithSourceTensor:recurrentWeight:inputWeight:bias:initState:initCell:mask:peephole:descriptor:name: types=@96@0:8@16@24@32@40@48@56@64@72@80@88
+[method] class=MPSGraph kind=instance selector=convolutionTranspose2DDataGradientWithIncomingGradientTensor:weightsTensor:outputShapeTensor:forwardConvolutionDescriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=decompositionLUWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=logarithmBase10WithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=quantizedGatherWithUpdatesTensor:indicesTensor:scaleTensor:zeroPointTensor:minTensor:dequantDataType:axis:batchDimensions:name: types=@84@0:8@16@24@32@40@48I56Q60Q68@76
+[method] class=MPSGraph kind=instance selector=sortWithTensor:axisTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=GRUGradientsWithSourceTensor:recurrentWeight:sourceGradient:zState:outputFwd:inputWeight:bias:descriptor:name: types=@88@0:8@16@24@32@40@48@56@64@72@80
+[method] class=MPSGraph kind=instance selector=GRUGradientsWithSourceTensor:recurrentWeight:sourceGradient:zState:outputFwd:stateGradient:inputWeight:bias:initState:mask:secondaryBias:descriptor:name: types=@120@0:8@16@24@32@40@48@56@64@72@80@88@96@104@112
+[method] class=MPSGraph kind=instance selector=GRUWithSourceTensor:recurrentWeight:inputWeight:bias:initState:descriptor:name: types=@72@0:8@16@24@32@40@48@56@64
+[method] class=MPSGraph kind=instance selector=HammingDistanceWithPrimaryTensor:secondaryTensor:resultDataType:name: types=@44@0:8@16@24I32@36
+[method] class=MPSGraph kind=instance selector=HermiteanToRealFFTWithTensor:axesTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=L2NormPooling4DWithSourceTensor:descriptor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=LSTMGradientsWithSourceTensor:recurrentWeight:sourceGradient:zState:cellOutputFwd:inputWeight:bias:initState:initCell:descriptor:name: types=@104@0:8@16@24@32@40@48@56@64@72@80@88@96
+[method] class=MPSGraph kind=instance selector=LSTMGradientsWithSourceTensor:recurrentWeight:sourceGradient:zState:cellOutputFwd:stateGradient:cellGradient:inputWeight:bias:initState:initCell:mask:peephole:descriptor:name: types=@136@0:8@16@24@32@40@48@56@64@72@80@88@96@104@112@120@128
+[method] class=MPSGraph kind=instance selector=LSTMWithSourceTensor:recurrentWeight:inputWeight:bias:initState:initCell:descriptor:name: types=@80@0:8@16@24@32@40@48@56@64@72
+[method] class=MPSGraph kind=instance selector=broadcastGradientArgsForPrimaryTensor:withSecondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=leakyReLUWithTensor:alpha:name: types=@40@0:8@16d24@32
+[method] class=MPSGraph kind=instance selector=absoluteErrorWithPrimaryTensor:secondaryTensor:reductionType:name: types=@48@0:8@16@24Q32@40
+[method] class=MPSGraph kind=instance selector=absoluteSquareWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=adamAssignWithInputVariableTensor:momentumVariableTensor:velocityVariableTensor:maximumVelocityVariableTensor:updates:name: types=@64@0:8@16@24@32@40@48@56
+[method] class=MPSGraph kind=instance selector=adamUpdateWithCurrentLearningRateTensor:beta1Tensor:beta2Tensor:epsilonTensor:valuesTensor:momentumTensor:velocityTensor:maximumVelocityTensor:gradientTensor:name: types=@96@0:8@16@24@32@40@48@56@64@72@80@88
+[method] class=MPSGraph kind=instance selector=adamUpdateWithLearningRateTensor:beta1Tensor:beta2Tensor:epsilonTensor:beta1PowerTensor:beta2PowerTensor:valuesTensor:momentumTensor:velocityTensor:maximumVelocityTensor:gradientTensor:name: types=@112@0:8@16@24@32@40@48@56@64@72@80@88@96@104
+[method] class=MPSGraph kind=instance selector=adamUpdateWithLearningRateTensor:beta1Tensor:beta2Tensor:epsilonTensor:iterationTensor:valuesTensor:momentumTensor:velocityTensor:gradientTensor:name: types=@96@0:8@16@24@32@40@48@56@64@72@80@88
+[method] class=MPSGraph kind=instance selector=adamWithCurrentLearningRateTensor:beta1Tensor:beta2Tensor:epsilonTensor:valuesTensor:momentumTensor:velocityTensor:maximumVelocityTensor:gradientTensor:name: types=@96@0:8@16@24@32@40@48@56@64@72@80@88
+[method] class=MPSGraph kind=instance selector=adamWithLearningRateTensor:beta1Tensor:beta2Tensor:epsilonTensor:beta1PowerTensor:beta2PowerTensor:valuesTensor:momentumTensor:velocityTensor:maximumVelocityTensor:gradientTensor:name: types=@112@0:8@16@24@32@40@48@56@64@72@80@88@96@104
+[method] class=MPSGraph kind=instance selector=applyAdamWithCurrentLearningRateTensor:beta1Tensor:beta2Tensor:epsilonTensor:variable:momentumVariable:velocityVariable:maximumVelocityVariable:gradientTensor:name: types=@96@0:8@16@24@32@40@48@56@64@72@80@88
+[method] class=MPSGraph kind=instance selector=applyAdamWithLearningRateTensor:beta1Tensor:beta2Tensor:epsilonTensor:beta1PowerTensor:beta2PowerTensor:variable:momentumVariable:velocityVariable:gradientTensor:name: types=@104@0:8@16@24@32@40@48@56@64@72@80@88@96
+[method] class=MPSGraph kind=instance selector=applyAdamWithLearningRateTensor:beta1Tensor:beta2Tensor:epsilonTensor:iterationTensor:variable:momentumVariable:velocityVariable:gradientTensor:name: types=@96@0:8@16@24@32@40@48@56@64@72@80@88
+[method] class=MPSGraph kind=instance selector=applyStochasticGradientDescentWithLearningRateTensor:variable:gradientTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=argSortWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=argSortWithTensor:axisTensor:descending:name: types=@44@0:8@16@24B32@36
+[method] class=MPSGraph kind=instance selector=argSortWithTensor:axisTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=assignVariable:withValueOfTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=atan2WithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=avgPooling2DGradientWithGradientTensor:sourceTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=avgPooling2DLayerWithTensor:kernelSizes:strides:paddingStyle:dataLayout:name: types=@64@0:8@16@24@32Q40Q48@56
+[method] class=MPSGraph kind=instance selector=avgPooling2DWithSourceTensor:descriptor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=avgPooling4DGradientWithGradientTensor:sourceTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=avgPooling4DWithSourceTensor:descriptor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=bandPartWithTensor:numLowerTensor:numUpperTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=batchNormalizationLayerWithTensor:batchNormalizationGammaInitializer:batchNormalizationBetaInitializer:batchNormalizationMeanInitializer:batchNormalizationVarianceInitializer:batchNormalizationEpsilon:dataLayout:name: types=@80@0:8@16@24@32@40@48d56Q64@72
+[method] class=MPSGraph kind=instance selector=batchToSpaceTensor:spatialAxes:batchAxis:blockDimensions:usePixelShuffleOrder:name: types=@60@0:8@16@24q32@40B48@52
+[method] class=MPSGraph kind=instance selector=batchToSpaceTensor:spatialAxesTensor:batchAxisTensor:blockDimensionsTensor:usePixelShuffleOrder:name: types=@60@0:8@16@24@32@40B48@52
+[method] class=MPSGraph kind=instance selector=biasAddWithTensor:biases:dataLayout:name: types=@48@0:8@16@24Q32@40
+[method] class=MPSGraph kind=instance selector=bitwiseANDWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=bitwiseLeftShiftWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=bitwiseNOTWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=bitwiseORWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=bitwisePopulationCountWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=bitwiseRightShiftWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=bitwiseXORWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=bottomKWithGradientTensor:source:axis:k:name: types=@56@0:8@16@24q32Q40@48
+[method] class=MPSGraph kind=instance selector=bottomKWithGradientTensor:source:axisTensor:kTensor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=bottomKWithSourceTensor:axis:k:name: types=@48@0:8@16q24Q32@40
+[method] class=MPSGraph kind=instance selector=bottomKWithSourceTensor:axisTensor:kTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=broadcastShapesOfTensors:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=broadcastTensor:toShape:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=broadcastTensor:toShapeTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=bufferToTensorWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=bufferToTensorWithTensor:shape:type:interleave:isTensorBufferOp:isChannelAndInterleaveSame:name: types=@60@0:8@16@24I32@36B44B48@52
+[method] class=MPSGraph kind=instance selector=callSymbolName:inputTensors:outputTypes:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=callWithInputTensors:outputTypes:symbolName:inliningOption:name: types=@56@0:8@16@24@32Q40@48
+[method] class=MPSGraph kind=instance selector=callWithInputTensors:outputTypes:symbolName:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=castBooleansOfInputsTensors: types=@24@0:8@16
+[method] class=MPSGraph kind=instance selector=colToImWithSourceTensor:outputShape:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=compileWithDevice:feeds:targetTensors:targetOperations: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=complexTensorWithRealTensor:imaginaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=concatTensor:withTensor:dimension:name: types=@48@0:8@16@24q32@40
+[method] class=MPSGraph kind=instance selector=concatTensors:dimension:interleave:name: types=@44@0:8@16q24B32@36
+[method] class=MPSGraph kind=instance selector=conjugateWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=convolution2DDataGradientWithIncomingGradientTensor:weightsTensor:outputShapeTensor:forwardConvolutionDescriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=convolution2DLayerWithTensor:kernelSizes:outputChannelCount:strides:activationType:weightsInitializer:biasesInitializer:batchNormalizationGammaInitializer:batchNormalizationBetaInitializer:batchNormalizationMeanInitializer:batchNormalizationVarianceInitializer:batchNormalizationEpsilon:paddingStyle:dataLayout:weightsLayout:name: types=@140@0:8@16@24Q32@40I48@52@60@68@76@84@92d100Q108Q116Q124@132
+[method] class=MPSGraph kind=instance selector=convolution2DLayerWithTensor:kernelSizes:outputChannelCount:strides:activationType:weightsInitializer:biasesInitializer:paddingStyle:dataLayout:weightsLayout:name: types=@100@0:8@16@24Q32@40I48@52@60Q68Q76Q84@92
+[method] class=MPSGraph kind=instance selector=convolution2DLayerWithTensor:kernelSizes:outputChannelCount:strides:dilationRates:groups:activationType:weightsInitializer:biasesInitializer:batchNormalizationGammaInitializer:batchNormalizationBetaInitializer:batchNormalizationMeanInitializer:batchNormalizationVarianceInitializer:batchNormalizationEpsilon:paddingStyle:dataLayout:weightsLayout:name: types=@156@0:8@16@24Q32@40@48Q56I64@68@76@84@92@100@108d116Q124Q132Q140@148
+[method] class=MPSGraph kind=instance selector=convolution2DWeightsGradientWithIncomingGradientTensor:sourceTensor:outputShapeTensor:forwardConvolutionDescriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=convolution2DWithDefaultBatchNormalizationLayerWithTensor:kernelSizes:outputChannelCount:strides:activationType:weightsInitializer:biasesInitializer:paddingStyle:dataLayout:weightsLayout:name: types=@100@0:8@16@24Q32@40I48@52@60Q68Q76Q84@92
+[method] class=MPSGraph kind=instance selector=convolution3DDataGradientWithIncomingGradientTensor:weightsTensor:outputShape:forwardConvolutionDescriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=convolution3DDataGradientWithIncomingGradientTensor:weightsTensor:outputShapeTensor:forwardConvolutionDescriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=convolution3DWeightsGradientWithIncomingGradientTensor:sourceTensor:outputShape:forwardConvolutionDescriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=convolution3DWeightsGradientWithIncomingGradientTensor:sourceTensor:outputShapeTensor:forwardConvolutionDescriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=convolution3DWithSourceTensor:weightsTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=convolutionTranspose2DWeightsGradientWithIncomingGradientTensor:sourceTensor:outputShapeTensor:forwardConvolutionDescriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=coordinateAlongAxis:withShapeTensor:name: types=@40@0:8q16@24@32
+[method] class=MPSGraph kind=instance selector=coordinateAlongAxisTensor:withShape:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=coordinateAlongAxisTensor:withShapeTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=costVolumeWithRefTensor:inputTensor:coordinatesTensor:windowSizes:layout:normalizeCoordinates:relativeCoordinates:coordinateIs1DInWidth:similarityType:name: types=@84@0:8@16@24@32@40Q48B56B60B64Q68@76
+[method] class=MPSGraph kind=instance selector=cropResizeWithImagesTensor:boxesTensor:boxIndicesTensor:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=cropTensor:dimension:amount_before:amount_after:name: types=@56@0:8@16Q24Q32Q40@48
+[method] class=MPSGraph kind=instance selector=cumulativeMaximumReturnIndicesWithTensor:axis:exclusive:reverse:name: types=@48@0:8@16q24B32B36@40
+[method] class=MPSGraph kind=instance selector=cumulativeMaximumWithTensor:axis:exclusive:reverse:name: types=@48@0:8@16q24B32B36@40
+[method] class=MPSGraph kind=instance selector=cumulativeMaximumWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=cumulativeMaximumWithTensor:axisTensor:exclusive:reverse:name: types=@48@0:8@16@24B32B36@40
+[method] class=MPSGraph kind=instance selector=cumulativeMaximumWithTensor:axisTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=cumulativeMinimumReturnIndicesWithTensor:axis:exclusive:reverse:name: types=@48@0:8@16q24B32B36@40
+[method] class=MPSGraph kind=instance selector=cumulativeMinimumWithTensor:axis:exclusive:reverse:name: types=@48@0:8@16q24B32B36@40
+[method] class=MPSGraph kind=instance selector=cumulativeMinimumWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=cumulativeMinimumWithTensor:axisTensor:exclusive:reverse:name: types=@48@0:8@16@24B32B36@40
+[method] class=MPSGraph kind=instance selector=cumulativeMinimumWithTensor:axisTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=cumulativeProductWithTensor:axis:exclusive:reverse:name: types=@48@0:8@16q24B32B36@40
+[method] class=MPSGraph kind=instance selector=cumulativeProductWithTensor:axisTensor:exclusive:reverse:name: types=@48@0:8@16@24B32B36@40
+[method] class=MPSGraph kind=instance selector=cumulativeProductWithTensor:axisTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=cumulativeSumWithTensor:axis:exclusive:reverse:name: types=@48@0:8@16q24B32B36@40
+[method] class=MPSGraph kind=instance selector=cumulativeSumWithTensor:axisTensor:exclusive:reverse:name: types=@48@0:8@16@24B32B36@40
+[method] class=MPSGraph kind=instance selector=cumulativeSumWithTensor:axisTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=currentLearningRateWithLearningRateTensor:beta1Tensor:beta2Tensor:beta1PowerTensor:beta2PowerTensor:name: types=@64@0:8@16@24@32@40@48@56
+[method] class=MPSGraph kind=instance selector=decompositionWithTensor:descriptor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=deinterleaveTensor:interleaveFactor:name: types=@40@0:8@16Q24@32
+[method] class=MPSGraph kind=instance selector=depthToSpace2DTensor:widthAxis:heightAxis:depthAxis:blockSize:usePixelShuffleOrder:name: types=@68@0:8@16Q24Q32Q40Q48B56@60
+[method] class=MPSGraph kind=instance selector=depthwiseConvolution2DDataGradientWithIncomingGradientTensor:weightsTensor:outputShapeTensor:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=depthwiseConvolution2DWeightsGradientWithIncomingGradientTensor:sourceTensor:outputShapeTensor:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=depthwiseConvolution3DDataGradientWithIncomingGradientTensor:weightsTensor:outputShape:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=depthwiseConvolution3DDataGradientWithIncomingGradientTensor:weightsTensor:outputShapeTensor:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=depthwiseConvolution3DWeightsGradientWithIncomingGradientTensor:sourceTensor:outputShape:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=depthwiseConvolution3DWeightsGradientWithIncomingGradientTensor:sourceTensor:outputShapeTensor:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:LUTTensor:axis:name: types=@48@0:8@16@24q32@40
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:LUTTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:lutTableTensor:axis:name: types=@48@0:8@16@24q32@40
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:lutTableTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:scale:zeroPoint:dataType:name: types=@52@0:8@16d24d32I40@44
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:scale:zeroPoint:dtype:name: types=@52@0:8@16d24d32I40@44
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:scaleTensor:dataType:name: types=@44@0:8@16@24I32@36
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:scaleTensor:zeroPoint:dataType:axis:name: types=@60@0:8@16@24d32I40q44@52
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:scaleTensor:zeroPoint:dtype:axis:name: types=@56@0:8@16@24d32I40i44@48
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:scaleTensor:zeroPointTensor:dataType:name: types=@52@0:8@16@24@32I40@44
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:scaleTensor:zeroPointTensor:dtype:axis:name: types=@56@0:8@16@24@32I40i44@48
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:scaleTensor:zeroPointTensor:minTensor:dataType:axis:name: types=@68@0:8@16@24@32@40I48q52@60
+[method] class=MPSGraph kind=instance selector=dequantizeTensor:scaleTensor:zeroPointTensor:minTensor:dataType:name: types=@60@0:8@16@24@32@40I48@52
+[method] class=MPSGraph kind=instance selector=dimensionSizeOfTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=dimensionSizeOfTensor:axesTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=divisionNoNaNWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=dropoutTensor:rate:name: types=@40@0:8@16d24@32
+[method] class=MPSGraph kind=instance selector=dropoutTensor:rateTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=eluGradientWithIncomingGradient:sourceTensor:alpha:name: types=@48@0:8@16@24d32@40
+[method] class=MPSGraph kind=instance selector=eluWithTensor:alpha:name: types=@40@0:8@16d24@32
+[method] class=MPSGraph kind=instance selector=encodeToCommandBuffer:feeds:targetTensors:targetOperations:executionDescriptor: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=erfWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=expandDimsOfTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=expandDimsOfTensor:axesTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=expandDimsOfTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=expandTensor:dimension:name: types=@40@0:8@16Q24@32
+[method] class=MPSGraph kind=instance selector=expandTensor:dimensionTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=exponentBase10WithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=fastFourierTransformWithTensor:axes:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=fastFourierTransformWithTensor:axesTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=fixCastIntTensor:toSignedness:name: types=@36@0:8@16B24@28
+[method] class=MPSGraph kind=instance selector=fixSignednessOfInputsTensors: types=@24@0:8@16
+[method] class=MPSGraph kind=instance selector=flatten2DTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=flatten2DTensor:axisTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=floorModuloWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=forLoopWithLowerBound:upperBound:step:initialBodyArguments:body:name: types=@64@0:8@16@24@32@40@?48@56
+[method] class=MPSGraph kind=instance selector=fullyConnectedLayerWithTensor:outputChannelCount:activationType:weightsInitializer:biasesInitializer:name: types=@60@0:8@16Q24I32@36@44@52
+[method] class=MPSGraph kind=instance selector=gatherAlongAxis:withUpdatesTensor:indicesTensor:name: types=@48@0:8q16@24@32@40
+[method] class=MPSGraph kind=instance selector=gatherAlongAxisTensor:withUpdatesTensor:indicesTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=gatherAlongAxisWithUpdatesTensor:indicesTensor:axis:name: types=@48@0:8@16@24q32@40
+[method] class=MPSGraph kind=instance selector=getCoordinateValueWithShapeTensor:axisTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=getExecutableCacheSize types=Q16@0:8
+[method] class=MPSGraph kind=instance selector=getExecutableForDevice:feeds:targetTensors:targetOperations:resultsDictionary:executionDescriptor: types=@64@0:8@16@24@32@40@48@56
+[method] class=MPSGraph kind=instance selector=gradientForPrimaryTensor:withSecondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=gradientForPrimaryTensor:withTensors:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=identityWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=ifWithPredicateTensor:thenBlock:elseBlock:name: types=@48@0:8@16@?24@?32@40
+[method] class=MPSGraph kind=instance selector=imToColWithSourceTensor:descriptor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=imaginaryPartOfTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=interleaveTensor:interleaveFactor:name: types=@40@0:8@16Q24@32
+[method] class=MPSGraph kind=instance selector=inverseOfTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=isFiniteWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=isInfiniteWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=isNaNWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=kernelPredictorWithSourceTensor:weightsTensor:layout:kernelShape:dilationRates:name: types=@64@0:8@16@24Q32@40@48@56
+[method] class=MPSGraph kind=instance selector=kernelPredictorWithSourceTensor:weightsTensor:layout:kernelShape:name: types=@56@0:8@16@24Q32@40@48
+[method] class=MPSGraph kind=instance selector=leakyReLUGradientWithIncomingGradient:sourceTensor:alphaTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=leakyReLUWithTensor:alphaTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=localConvolutionDataGradientWithIncomingGradientTensor:weightTensor:dataLayout:kernelShape:dilationRateInX:dilationRateInY:name: types=@72@0:8@16@24Q32@40Q48Q56@64
+[method] class=MPSGraph kind=instance selector=localConvolutionWeightGradientWithIncomingGradientTensor:sourceTensor:dataLayout:kernelShape:dilationRateInX:dilationRateInY:name: types=@72@0:8@16@24Q32@40Q48Q56@64
+[method] class=MPSGraph kind=instance selector=localConvolutionWithSourceTensor:weightTensor:dataLayout:kernelShape:dilationRateInX:dilationRateInY:name: types=@72@0:8@16@24Q32@40Q48Q56@64
+[method] class=MPSGraph kind=instance selector=logarithmBase2WithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=logicalNANDWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=logicalNORWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=logicalXNORWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=lossReductionWithTensor:reductionType:axis:name: types=@48@0:8@16Q24^q32@40
+[method] class=MPSGraph kind=instance selector=mathOpsWithTensors:mathOpType:name: types=@40@0:8@16Q24@32
+[method] class=MPSGraph kind=instance selector=matrixMultiplicationPrimaryGradientWithIncomingGradientTensor:primaryTensor:secondaryTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=matrixMultiplicationSecondaryGradientWithIncomingGradientTensor:primaryTensor:secondaryTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=maxPooling2DGradientWithGradientTensor:indicesTensor:outputShape:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=maxPooling2DGradientWithGradientTensor:indicesTensor:outputShapeTensor:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=maxPooling2DGradientWithGradientTensor:sourceTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=maxPooling2DLayerWithTensor:kernelSizes:strides:paddingStyle:dataLayout:name: types=@64@0:8@16@24@32Q40Q48@56
+[method] class=MPSGraph kind=instance selector=maxPooling2DReturnIndicesWithSourceTensor:descriptor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=maxPooling2DWithSourceTensor:descriptor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=maxPooling4DGradientWithGradientTensor:indicesTensor:outputShape:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=maxPooling4DGradientWithGradientTensor:indicesTensor:outputShapeTensor:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=maxPooling4DGradientWithGradientTensor:sourceTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=maxPooling4DReturnIndicesWithSourceTensor:descriptor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=maximumWithNaNPropagationWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=minimumWithNaNPropagationWithPrimaryTensor:secondaryTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=momentumUpdateWithBetaTensor:momentumTensor:gradientTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=nonMaximumSuppressionWithBoxesTensor:scoresTensor:IOUThreshold:scoreThreshold:perClassSuppression:coordinateMode:name: types=@60@0:8@16@24f32f36B40Q44@52
+[method] class=MPSGraph kind=instance selector=nonMaximumSuppressionWithBoxesTensor:scoresTensor:classIndicesTensor:IOUThreshold:scoreThreshold:perClassSuppression:coordinateMode:name: types=@68@0:8@16@24@32f40f44B48Q52@60
+[method] class=MPSGraph kind=instance selector=nonZeroIndicesOfTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=normalizationBetaGradientWithIncomingGradientTensor:sourceTensor:reductionAxes:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=normalizationGammaGradientWithIncomingGradientTensor:sourceTensor:meanTensor:varianceTensor:reductionAxes:epsilon:name: types=@68@0:8@16@24@32@40@48f56@60
+[method] class=MPSGraph kind=instance selector=normalizationGradientWithIncomingGradientTensor:sourceTensor:meanTensor:varianceTensor:gammaTensor:gammaGradientTensor:betaGradientTensor:reductionAxes:epsilon:name: types=@92@0:8@16@24@32@40@48@56@64@72f80@84
+[method] class=MPSGraph kind=instance selector=oneHotWithIndicesTensor:depth:axis:dataType:name: types=@52@0:8@16Q24Q32I40@44
+[method] class=MPSGraph kind=instance selector=oneHotWithIndicesTensor:depth:axis:dataType:onValue:offValue:name: types=@68@0:8@16Q24Q32I40d44d52@60
+[method] class=MPSGraph kind=instance selector=oneHotWithIndicesTensor:depth:axis:name: types=@48@0:8@16Q24Q32@40
+[method] class=MPSGraph kind=instance selector=oneHotWithIndicesTensor:depth:dataType:name: types=@44@0:8@16Q24I32@36
+[method] class=MPSGraph kind=instance selector=oneHotWithIndicesTensor:depth:dataType:onValue:offValue:name: types=@60@0:8@16Q24I32d36d44@52
+[method] class=MPSGraph kind=instance selector=oneHotWithIndicesTensor:depth:name: types=@40@0:8@16Q24@32
+[method] class=MPSGraph kind=instance selector=padGradientWithIncomingGradientTensor:inputTensor:paddingMode:paddingTensor:constantValuesTensor:name: types=@64@0:8@16@24q32@40@48@56
+[method] class=MPSGraph kind=instance selector=padGradientWithIncomingGradientTensor:sourceTensor:paddingMode:leftPadding:rightPadding:name: types=@64@0:8@16@24q32@40@48@56
+[method] class=MPSGraph kind=instance selector=padGradientWithIncomingGradientTensor:sourceTensor:paddingMode:paddingTensor:name: types=@56@0:8@16@24q32@40@48
+[method] class=MPSGraph kind=instance selector=padTensor:paddingMode:paddingTensor:constantValuesTensor:name: types=@56@0:8@16q24@32@40@48
+[method] class=MPSGraph kind=instance selector=paddingTensorWithLeftPadding:rightPadding: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=placeholderTensors types=@16@0:8
+[method] class=MPSGraph kind=instance selector=planarTensorWithComplexTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=progressRandomStateTensor:forShape:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=progressRandomStateTensor:forShapeTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=prunedGradientTensorWithDescriptor:inputTensor:gradientTensor:shape:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=prunedTensorWithDescriptor:tensor:shape:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=quantizeTensor:scale:zeroPoint:dataType:name: types=@52@0:8@16d24d32I40@44
+[method] class=MPSGraph kind=instance selector=quantizeTensor:scale:zeroPoint:dtype:name: types=@52@0:8@16d24d32I40@44
+[method] class=MPSGraph kind=instance selector=quantizeTensor:scaleTensor:zeroPoint:dataType:axis:name: types=@60@0:8@16@24d32I40q44@52
+[method] class=MPSGraph kind=instance selector=quantizeTensor:scaleTensor:zeroPoint:dtype:axis:name: types=@56@0:8@16@24d32I40i44@48
+[method] class=MPSGraph kind=instance selector=quantizeTensor:scaleTensor:zeroPointTensor:dtype:axis:name: types=@56@0:8@16@24@32I40i44@48
+[method] class=MPSGraph kind=instance selector=randomPhiloxStateTensorWithCounterLow:counterHigh:key:name: types=@48@0:8Q16Q24Q32@40
+[method] class=MPSGraph kind=instance selector=randomPhiloxStateTensorWithSeed:name: types=@32@0:8Q16@24
+[method] class=MPSGraph kind=instance selector=randomTensorWithShape:descriptor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=randomTensorWithShape:descriptor:stateTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=randomTensorWithShapeTensor:descriptor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=randomTensorWithShapeTensor:descriptor:seed:name: types=@48@0:8@16@24Q32@40
+[method] class=MPSGraph kind=instance selector=randomTensorWithShapeTensor:descriptor:stateTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=randomUniformTensorWithShape:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=randomUniformTensorWithShape:seed:name: types=@40@0:8@16Q24@32
+[method] class=MPSGraph kind=instance selector=randomUniformTensorWithShape:stateTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=randomUniformTensorWithShapeTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=randomUniformTensorWithShapeTensor:seed:name: types=@40@0:8@16Q24@32
+[method] class=MPSGraph kind=instance selector=randomUniformTensorWithShapeTensor:stateTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=rankOfTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=reLUGradientWithIncomingGradient:sourceTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=realPartOfTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=realToHermiteanFFTWithTensor:axes:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=realToHermiteanFFTWithTensor:axesTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=reciprocalSquareRootWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=reductionAndWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=reductionMaximumPropagateNaNWithTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=reductionMaximumPropagateNaNWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=reductionMaximumWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=reductionMinimumPropagateNaNWithTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=reductionMinimumPropagateNaNWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=reductionMinimumWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=reductionOrWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=reductionProductWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=reductionSumWithTensor:axesTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=reductionSumWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=reinterpretCastTensor:toType:name: types=@36@0:8@16I24@28
+[method] class=MPSGraph kind=instance selector=reshapeTensor:withShapeTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=resizeBilinearWithGradientTensor:input:centerResult:alignCorners:layout:name: types=@56@0:8@16@24B32B36Q40@48
+[method] class=MPSGraph kind=instance selector=resizeBilinearWithGradientTensor:input:scaleOffsetTensor:layout:name: types=@56@0:8@16@24@32Q40@48
+[method] class=MPSGraph kind=instance selector=resizeBilinearWithGradientTensor:input:scaleTensor:offsetTensor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=resizeBilinearWithTensor:sizeTensor:centerResult:alignCorners:layout:name: types=@56@0:8@16@24B32B36Q40@48
+[method] class=MPSGraph kind=instance selector=resizeBilinearWithTensor:sizeTensor:scaleOffsetTensor:layout:name: types=@56@0:8@16@24@32Q40@48
+[method] class=MPSGraph kind=instance selector=resizeBilinearWithTensor:sizeTensor:scaleTensor:offsetTensor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=resizeNearestWithGradientTensor:input:nearestRoundingMode:centerResult:alignCorners:layout:name: types=@64@0:8@16@24Q32B40B44Q48@56
+[method] class=MPSGraph kind=instance selector=resizeNearestWithGradientTensor:input:scaleOffsetTensor:nearestRoundingMode:layout:name: types=@64@0:8@16@24@32Q40Q48@56
+[method] class=MPSGraph kind=instance selector=resizeNearestWithGradientTensor:input:scaleTensor:offsetTensor:nearestRoundingMode:name: types=@64@0:8@16@24@32@40Q48@56
+[method] class=MPSGraph kind=instance selector=resizeNearestWithTensor:sizeTensor:nearestRoundingMode:centerResult:alignCorners:layout:name: types=@64@0:8@16@24Q32B40B44Q48@56
+[method] class=MPSGraph kind=instance selector=resizeNearestWithTensor:sizeTensor:scaleOffsetTensor:nearestRoundingMode:layout:name: types=@64@0:8@16@24@32Q40Q48@56
+[method] class=MPSGraph kind=instance selector=resizeNearestWithTensor:sizeTensor:scaleTensor:offsetTensor:nearestRoundingMode:name: types=@64@0:8@16@24@32@40Q48@56
+[method] class=MPSGraph kind=instance selector=resizeTensor:sizeTensor:mode:centerResult:alignCorners:layout:name: types=@64@0:8@16@24Q32B40B44Q48@56
+[method] class=MPSGraph kind=instance selector=resizeTensor:sizeTensor:mode:centerResult:alignCorners:name: types=@56@0:8@16@24Q32B40B44@48
+[method] class=MPSGraph kind=instance selector=resizeTensor:sizeTensor:mode:nearestRoundingMode:centerResult:alignCorners:layout:name: types=@72@0:8@16@24Q32Q40B48B52Q56@64
+[method] class=MPSGraph kind=instance selector=resizeTensor:sizeTensor:mode:nearestRoundingMode:centerResult:alignCorners:name: types=@64@0:8@16@24Q32Q40B48B52@56
+[method] class=MPSGraph kind=instance selector=resizeTensor:sizeTensor:scaleOffsetTensor:mode:layout:name: types=@64@0:8@16@24@32Q40Q48@56
+[method] class=MPSGraph kind=instance selector=resizeTensor:sizeTensor:scaleOffsetTensor:mode:nearestRoundingMode:layout:name: types=@72@0:8@16@24@32Q40Q48Q56@64
+[method] class=MPSGraph kind=instance selector=resizeTensor:sizeTensor:scaleTensor:offsetTensor:mode:name: types=@64@0:8@16@24@32@40Q48@56
+[method] class=MPSGraph kind=instance selector=resizeTensor:sizeTensor:scaleTensor:offsetTensor:mode:nearestRoundingMode:name: types=@72@0:8@16@24@32@40Q48Q56@64
+[method] class=MPSGraph kind=instance selector=resizeWithGradientTensor:input:mode:centerResult:alignCorners:layout:name: types=@64@0:8@16@24Q32B40B44Q48@56
+[method] class=MPSGraph kind=instance selector=resizeWithGradientTensor:input:mode:nearestRoundingMode:centerResult:alignCorners:layout:name: types=@72@0:8@16@24Q32Q40B48B52Q56@64
+[method] class=MPSGraph kind=instance selector=resizeWithGradientTensor:input:scaleOffsetTensor:mode:layout:name: types=@64@0:8@16@24@32Q40Q48@56
+[method] class=MPSGraph kind=instance selector=resizeWithGradientTensor:input:scaleOffsetTensor:mode:nearestRoundingMode:layout:name: types=@72@0:8@16@24@32Q40Q48Q56@64
+[method] class=MPSGraph kind=instance selector=resizeWithGradientTensor:input:scaleTensor:offsetTensor:mode:name: types=@64@0:8@16@24@32@40Q48@56
+[method] class=MPSGraph kind=instance selector=resizeWithGradientTensor:input:scaleTensor:offsetTensor:mode:nearestRoundingMode:name: types=@72@0:8@16@24@32@40Q48Q56@64
+[method] class=MPSGraph kind=instance selector=reverseTensor:axesTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=reverseTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=rintWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=runAsyncWithDevice:feeds:targetOperations:resultsDictionary:executionDescriptor: types=v56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=runAsyncWithDevice:feeds:targetTensors:targetOperations:executionDescriptor: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=runAsyncWithFeeds:targetTensors:targetOperations:executionDescriptor: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=runAsyncWithMTLCommandQueue:feeds:targetTensors:targetOperations:executionDescriptor: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=runInternalWithMPSCommandBuffer:feeds:targetTensors:targetOperations:resultsDictionary:executionDescriptor:mpsGraphOwnedCommandBuffer: types=@68@0:8@16@24@32@40@48@56B64
+[method] class=MPSGraph kind=instance selector=runInternalWithMPSGraphDevice:feeds:targetTensors:targetOperations:resultsDictionary:executionDescriptor: types=@64@0:8@16@24@32@40@48@56
+[method] class=MPSGraph kind=instance selector=runInternalWithMTLCommandQueue:feeds:targetTensors:targetOperations:resultsDictionary:executionDescriptor: types=@64@0:8@16@24@32@40@48@56
+[method] class=MPSGraph kind=instance selector=runWithDevice:feeds:targetOperations:resultsDictionary:executionDescriptor: types=v56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=runWithDevice:feeds:targetTensors:targetOperations:executionDescriptor: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=runWithFeeds:targetTensors:targetOperations: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=runWithMTLCommandQueue:feeds:targetOperations:resultsDictionary: types=v48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=runWithMTLCommandQueue:feeds:targetTensors:targetOperations: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=sampleGridDataGradientWithIncomingGradientTensor:coordinateTensor:outputShape:normalizeCoordinates:relativeCoordinates:paddingMode:samplingMode:name: types=@72@0:8@16@24@32B40B44q48Q56@64
+[method] class=MPSGraph kind=instance selector=sampleGridDataGradientWithIncomingGradientTensor:coordinateTensor:outputShapeTensor:normalizeCoordinates:relativeCoordinates:paddingMode:samplingMode:name: types=@72@0:8@16@24@32B40B44q48Q56@64
+[method] class=MPSGraph kind=instance selector=sampleGridWithSourceTensor:coordinateTensor:layout:normalizeCoordinates:relativeCoordinates:alignCorners:paddingMode:nearestRoundingMode:constantValue:name: types=@84@0:8@16@24Q32B40B44B48q52Q60d68@76
+[method] class=MPSGraph kind=instance selector=sampleGridWithSourceTensor:coordinateTensor:layout:normalizeCoordinates:relativeCoordinates:alignCorners:paddingMode:samplingMode:constantValue:name: types=@84@0:8@16@24Q32B40B44B48q52Q60d68@76
+[method] class=MPSGraph kind=instance selector=sampleGridWithSourceTensor:coordinateTensor:layout:normalizeCoordinates:relativeCoordinates:alignCorners:paddingMode:samplingMode:nearestRoundingMode:constantValue:name: types=@92@0:8@16@24Q32B40B44B48q52Q60Q68d76@84
+[method] class=MPSGraph kind=instance selector=sampleGridWithSourceTensor:coordinateTensor:normalizeCoordinates:relativeCoordinates:paddingMode:samplingMode:constantValue:name: types=@72@0:8@16@24B32B36q40Q48d56@64
+[method] class=MPSGraph kind=instance selector=scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:maskTensor:scale:name: types=@60@0:8@16@24@32@40f48@52
+[method] class=MPSGraph kind=instance selector=scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:scale:name: types=@52@0:8@16@24@32f40@44
+[method] class=MPSGraph kind=instance selector=scatterAlongAxis:withUpdatesTensor:indicesTensor:shape:mode:name: types=@64@0:8q16@24@32@40q48@56
+[method] class=MPSGraph kind=instance selector=scatterAlongAxisTensor:withDataTensor:updatesTensor:indicesTensor:mode:name: types=@64@0:8@16@24@32@40q48@56
+[method] class=MPSGraph kind=instance selector=scatterAlongAxisTensor:withUpdatesTensor:indicesTensor:shape:mode:name: types=@64@0:8@16@24@32@40q48@56
+[method] class=MPSGraph kind=instance selector=scatterAlongAxisWithDataTensor:updatesTensor:indicesTensor:axis:mode:name: types=@64@0:8@16@24@32q40q48@56
+[method] class=MPSGraph kind=instance selector=scatterAlongAxisWithDataTensor:updatesTensor:indicesTensor:axis:name: types=@56@0:8@16@24@32q40@48
+[method] class=MPSGraph kind=instance selector=scatterAlongAxisWithUpdatesTensor:indicesTensor:shape:axis:mode:name: types=@64@0:8@16@24@32q40q48@56
+[method] class=MPSGraph kind=instance selector=scatterAlongAxisWithUpdatesTensor:indicesTensor:shape:axis:name: types=@56@0:8@16@24@32q40@48
+[method] class=MPSGraph kind=instance selector=scatterNDWithDataTensor:updatesTensor:indicesTensor:batchDimensions:mode:name: types=@64@0:8@16@24@32Q40q48@56
+[method] class=MPSGraph kind=instance selector=scatterNDWithUpdatesTensor:indicesTensor:shape:batchDimensions:mode:name: types=@64@0:8@16@24@32Q40q48@56
+[method] class=MPSGraph kind=instance selector=scatterNDWithUpdatesTensor:indicesTensor:shape:batchDimensions:name: types=@56@0:8@16@24@32Q40@48
+[method] class=MPSGraph kind=instance selector=scatterWithDataTensor:updatesTensor:indicesTensor:axis:mode:name: types=@64@0:8@16@24@32q40q48@56
+[method] class=MPSGraph kind=instance selector=scatterWithDataTensor:updatesTensor:indicesTensor:axis:name: types=@56@0:8@16@24@32q40@48
+[method] class=MPSGraph kind=instance selector=scatterWithUpdatesTensor:indicesTensor:shape:axis:mode:name: types=@64@0:8@16@24@32q40q48@56
+[method] class=MPSGraph kind=instance selector=scatterWithUpdatesTensor:indicesTensor:shape:axis:name: types=@56@0:8@16@24@32q40@48
+[method] class=MPSGraph kind=instance selector=setTensorNameDict: types=v24@0:8@16
+[method] class=MPSGraph kind=instance selector=sigmoidGradientWithIncomingGradient:sourceTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=signbitWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=singleGateRNNGradientsWithSourceTensor:recurrentWeight:sourceGradient:zState:initState:descriptor:name: types=@72@0:8@16@24@32@40@48@56@64
+[method] class=MPSGraph kind=instance selector=singleGateRNNGradientsWithSourceTensor:recurrentWeight:sourceGradient:zState:inputWeight:bias:initState:descriptor:name: types=@88@0:8@16@24@32@40@48@56@64@72@80
+[method] class=MPSGraph kind=instance selector=singleGateRNNGradientsWithSourceTensor:recurrentWeight:sourceGradient:zState:inputWeight:bias:initState:mask:descriptor:name: types=@96@0:8@16@24@32@40@48@56@64@72@80@88
+[method] class=MPSGraph kind=instance selector=singleGateRNNGradientsWithSourceTensor:recurrentWeight:sourceGradient:zState:stateGradient:inputWeight:bias:initState:mask:descriptor:name: types=@104@0:8@16@24@32@40@48@56@64@72@80@88@96
+[method] class=MPSGraph kind=instance selector=singleGateRNNWithSourceTensor:recurrentWeight:initState:descriptor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=singleGateRNNWithSourceTensor:recurrentWeight:inputWeight:bias:initState:descriptor:name: types=@72@0:8@16@24@32@40@48@56@64
+[method] class=MPSGraph kind=instance selector=singleGateRNNWithSourceTensor:recurrentWeight:inputWeight:bias:initState:mask:descriptor:name: types=@80@0:8@16@24@32@40@48@56@64@72
+[method] class=MPSGraph kind=instance selector=sizeOfTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=sliceGradientTensor:fwdInShapeTensor:startTensor:endTensor:strideTensor:startMask:endMask:squeezeMask:name: types=@76@0:8@16@24@32@40@48I56I60I64@68
+[method] class=MPSGraph kind=instance selector=sliceGradientTensor:fwdInShapeTensor:startTensor:sizeTensor:squeezeMask:name: types=@60@0:8@16@24@32@40I48@52
+[method] class=MPSGraph kind=instance selector=sliceGradientTensor:fwdInShapeTensor:starts:ends:strides:name: types=@64@0:8@16@24@32@40@48@56
+[method] class=MPSGraph kind=instance selector=sliceGradientTensor:fwdInShapeTensor:starts:ends:strides:startMask:endMask:squeezeMask:name: types=@76@0:8@16@24@32@40@48I56I60I64@68
+[method] class=MPSGraph kind=instance selector=sliceTensor:startTensor:endTensor:strideTensor:startMask:endMask:squeezeMask:name: types=@68@0:8@16@24@32@40I48I52I56@60
+[method] class=MPSGraph kind=instance selector=sliceTensor:startTensor:sizeTensor:squeezeMask:name: types=@52@0:8@16@24@32I40@44
+[method] class=MPSGraph kind=instance selector=sliceUpdateDataTensor:updateTensor:starts:ends:strides:name: types=@64@0:8@16@24@32@40@48@56
+[method] class=MPSGraph kind=instance selector=sliceUpdateDataTensor:updateTensor:starts:ends:strides:startMask:endMask:squeezeMask:name: types=@76@0:8@16@24@32@40@48I56I60I64@68
+[method] class=MPSGraph kind=instance selector=sliceUpdateDataTensor:updateTensor:startsTensor:endsTensor:stridesTensor:name: types=@64@0:8@16@24@32@40@48@56
+[method] class=MPSGraph kind=instance selector=sliceUpdateDataTensor:updateTensor:startsTensor:endsTensor:stridesTensor:startMask:endMask:squeezeMask:name: types=@76@0:8@16@24@32@40@48I56I60I64@68
+[method] class=MPSGraph kind=instance selector=softMaxCrossEntropyGradientWithIncomingGradientTensor:sourceTensor:labelsTensor:axis:reductionType:name: types=@64@0:8@16@24@32q40Q48@56
+[method] class=MPSGraph kind=instance selector=softMaxCrossEntropyWithSourceTensor:labelsTensor:axis:reductionType:name: types=@56@0:8@16@24q32Q40@48
+[method] class=MPSGraph kind=instance selector=softMaxGradientWithIncomingGradient:sourceTensor:axis:name: types=@48@0:8@16@24q32@40
+[method] class=MPSGraph kind=instance selector=solveLUWithDecompositionTensor:rhsTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=solveWithDecompositionTensor:rhsTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=sortWithTensor:axis:descending:name: types=@44@0:8@16q24B32@36
+[method] class=MPSGraph kind=instance selector=sortWithTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=sortWithTensor:axisTensor:descending:name: types=@44@0:8@16@24B32@36
+[method] class=MPSGraph kind=instance selector=spaceToBatchTensor:spatialAxes:batchAxis:blockDimensions:usePixelShuffleOrder:name: types=@60@0:8@16@24q32@40B48@52
+[method] class=MPSGraph kind=instance selector=spaceToBatchTensor:spatialAxesTensor:batchAxisTensor:blockDimensionsTensor:usePixelShuffleOrder:name: types=@60@0:8@16@24@32@40B48@52
+[method] class=MPSGraph kind=instance selector=spaceToDepth2DTensor:widthAxis:heightAxis:depthAxis:blockSize:usePixelShuffleOrder:name: types=@68@0:8@16Q24Q32Q40Q48B56@60
+[method] class=MPSGraph kind=instance selector=sparseTensorWithDescriptor:tensors:shape:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=sparseTensorWithType:tensors:shape:dataType:name: types=@52@0:8Q16@24@32I40@44
+[method] class=MPSGraph kind=instance selector=splitTensor:splitSizesTensor:axis:name: types=@48@0:8@16@24q32@40
+[method] class=MPSGraph kind=instance selector=squaredErrorWithPrimaryTensor:secondaryTensor:reductionType:name: types=@48@0:8@16@24Q32@40
+[method] class=MPSGraph kind=instance selector=squeezeTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=squeezeTensor:axesTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=squeezeTensor:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=squeezeTensor:dimension:name: types=@40@0:8@16Q24@32
+[method] class=MPSGraph kind=instance selector=squeezeTensor:dimensionTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=squeezeTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=stackTensors:axis:name: types=@40@0:8@16q24@32
+[method] class=MPSGraph kind=instance selector=stencilWithSourceTensor:weightsTensor:descriptor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=stencilWithSourceTensor:weightsTensor:offsets:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=stochasticGradientDescentWithLearningRateTensor:valuesTensor:gradientTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=tensorNameDict types=@16@0:8
+[method] class=MPSGraph kind=instance selector=tensorToBufferWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=tensorToBufferWithTensor:shape:type:interleave:isTensorBufferOp:isChannelAndInterleaveSame:name: types=@60@0:8@16@24I32@36B44B48@52
+[method] class=MPSGraph kind=instance selector=tileGradientWithIncomingGradientTensor:sourceTensor:multiplierTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=tileGradientWithIncomingGradientTensor:sourceTensor:withMultiplier:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=tileTensor:multiplierTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=tileTensorWithMultiplier: types=@24@0:8@16
+[method] class=MPSGraph kind=instance selector=topKWithGradientTensor:source:axis:k:name: types=@56@0:8@16@24q32Q40@48
+[method] class=MPSGraph kind=instance selector=topKWithGradientTensor:source:axisTensor:kTensor:name: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraph kind=instance selector=topKWithGradientTensor:source:k:name: types=@48@0:8@16@24Q32@40
+[method] class=MPSGraph kind=instance selector=topKWithGradientTensor:source:kTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=topKWithSourceTensor:axisTensor:kTensor:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=topKWithSourceTensor:k:name: types=@40@0:8@16Q24@32
+[method] class=MPSGraph kind=instance selector=topKWithSourceTensor:kTensor:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=truncateWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=varFromTensorWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=variableFromTensorWithTensor:name: types=@32@0:8@16@24
+[method] class=MPSGraph kind=instance selector=varianceOfTensor:axes:name: types=@40@0:8@16@24@32
+[method] class=MPSGraph kind=instance selector=varianceOfTensor:meanTensor:axes:name: types=@48@0:8@16@24@32@40
+[method] class=MPSGraph kind=instance selector=velocityUpdateWithBetaTensor:velocityTensor:gradientTensor:name: types=@48@0:8@16@24@32@40
+[class] name=MPSGraphCompilationDescriptor superclass=MPSGraphObject
+[property] class=MPSGraphCompilationDescriptor name=enableShapeShifterCache attrs=TB,N
+[property] class=MPSGraphCompilationDescriptor name=shapeShifterCacheThreads attrs=TQ,N
+[property] class=MPSGraphCompilationDescriptor name=compilerOptions attrs=TQ,V_compilerOptions
+[property] class=MPSGraphCompilationDescriptor name=aneCompilerSpatialSplitting attrs=TQ,V_aneCompilerSpatialSplitting
+[property] class=MPSGraphCompilationDescriptor name=enableANEFWToFWSignal attrs=TB,V_enableANEFWToFWSignal
+[property] class=MPSGraphCompilationDescriptor name=enableANELateLatch attrs=TB,V_enableANELateLatch
+[property] class=MPSGraphCompilationDescriptor name=enableANECHWRankPromotion attrs=TB,V_enableANECHWRankPromotion
+[property] class=MPSGraphCompilationDescriptor name=printANEPlacementAnalysis attrs=TB,V_printANEPlacementAnalysis
+[property] class=MPSGraphCompilationDescriptor name=preferredDevice attrs=TQ,N,V_preferredDevice
+[property] class=MPSGraphCompilationDescriptor name=allowedComputeDevices attrs=TQ,N,V_allowedComputeDevices
+[property] class=MPSGraphCompilationDescriptor name=enableANECValidationWorkflow attrs=TB,N,V_enableANECValidationWorkflow
+[property] class=MPSGraphCompilationDescriptor name=enableCompileResourcesForPackage attrs=TB,N,V_enableCompileResourcesForPackage
+[property] class=MPSGraphCompilationDescriptor name=dispatchQueue attrs=T@"NSObject<OS_dispatch_queue>",&,V_dispatchQueue
+[property] class=MPSGraphCompilationDescriptor name=reducedPrecisionFastMath attrs=TQ,V_reducedPrecisionFastMath
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=dispatchQueue types=@16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=preferredDevice types=Q16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setDispatchQueue: types=v24@0:8@16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=compilerOptions types=Q16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setCompilerOptions: types=v24@0:8Q16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setAllowedComputeDevices: types=v24@0:8Q16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setEnableANECValidationWorkflow: types=v20@0:8B16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setPreferredDevice: types=v24@0:8Q16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setReducedPrecisionFastMath: types=v24@0:8Q16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setAneCompilerSpatialSplitting: types=v24@0:8Q16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setEnableANEFWToFWSignal: types=v20@0:8B16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setEnableANELateLatch: types=v20@0:8B16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=allowedComputeDevices types=Q16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=aneCompilerSpatialSplitting types=Q16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=enableANECHWRankPromotion types=B16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=enableANECValidationWorkflow types=B16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=enableANEFWToFWSignal types=B16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=enableANELateLatch types=B16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=enableCompileResourcesForPackage types=B16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=enableDevicePlacement types=v16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=enableShapeShifterCache types=B16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=getNamedAttrArray:deviceDescriptor: types={vector<mlir::NamedAttribute, std::allocator<mlir::NamedAttribute>>=^{NamedAttribute}^{NamedAttribute}{?=^{NamedAttribute}}}32@0:8^v16@24
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=printANEPlacementAnalysis types=B16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=reducedPrecisionFastMath types=Q16@0:8
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setEnableANECHWRankPromotion: types=v20@0:8B16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setEnableCompileResourcesForPackage: types=v20@0:8B16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setEnableShapeShifterCache: types=v20@0:8B16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setPrintANEPlacementAnalysis: types=v20@0:8B16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=setShapeShifterCacheThreads: types=v24@0:8Q16
+[method] class=MPSGraphCompilationDescriptor kind=instance selector=shapeShifterCacheThreads types=Q16@0:8
+[class] name=MPSGraphExecutionDescriptor superclass=MPSGraphObject
+[property] class=MPSGraphExecutionDescriptor name=simulateANECompileFailure attrs=TB,V_simulateANECompileFailure
+[property] class=MPSGraphExecutionDescriptor name=simulateANELoadModelFailure attrs=TB,V_simulateANELoadModelFailure
+[property] class=MPSGraphExecutionDescriptor name=disableSynchronizeResults attrs=TB,V_disableSynchronizeResults
+[property] class=MPSGraphExecutionDescriptor name=disableANECaching attrs=TB,V_disableANECaching
+[property] class=MPSGraphExecutionDescriptor name=disableANEFallback attrs=TB,V_disableANEFallback
+[property] class=MPSGraphExecutionDescriptor name=scheduledHandler attrs=T@?,C,V_scheduledHandler
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=waitForEvent:value: types=v32@0:8@16Q24
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=signalEvent:atExecutionEvent:value: types=v40@0:8@16Q24Q32
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=setScheduledHandler: types=v24@0:8@?16
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=scheduledHandler types=@?16@0:8
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=waitForANEPrePowerUpEvent:value: types=v32@0:8@16Q24
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=setSimulateANELoadModelFailure: types=v20@0:8B16
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=disableANECaching types=B16@0:8
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=disableANEFallback types=B16@0:8
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=disableSynchronizeResults types=B16@0:8
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=setDisableANECaching: types=v20@0:8B16
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=setDisableANEFallback: types=v20@0:8B16
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=setDisableSynchronizeResults: types=v20@0:8B16
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=setSimulateANECompileFailure: types=v20@0:8B16
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=simulateANECompileFailure types=B16@0:8
+[method] class=MPSGraphExecutionDescriptor kind=instance selector=simulateANELoadModelFailure types=B16@0:8
+[class] name=MPSGraphExecutable superclass=MPSGraphObject
+[property] class=MPSGraphExecutable name=feedTensors attrs=T@"NSArray",R,V_feedTensorArray
+[property] class=MPSGraphExecutable name=targetTensors attrs=T@"NSArray",R,V_targetTensorArray
+[method] class=MPSGraphExecutable kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MPSGraphExecutable kind=instance selector=.cxx_construct types=@16@0:8
+[method] class=MPSGraphExecutable kind=instance selector=getOutputTypesWithDevice:entryPoint:compilationDescriptor: types=@40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=newExecutableWithDevice:inputsArray:intermediateOperations:executionDescriptor: types=@48@0:8@16@24@32@40
+[method] class=MPSGraphExecutable kind=instance selector=runAsyncWithMTLCommandQueue:inputsArray:resultsArray:executionDescriptor: types=@48@0:8@16@24@32@40
+[method] class=MPSGraphExecutable kind=instance selector=runWithDevice:inputsArray:resultsArray:executionDescriptor: types=@48@0:8@16@24@32@40
+[method] class=MPSGraphExecutable kind=instance selector=specializeWithDevice:entryPoints:compilationDescriptor: types=v40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=specializeWithDevice:entryPoints:compilationDescriptor:error: types=v48@0:8@16@24@32^@40
+[method] class=MPSGraphExecutable kind=instance selector=applyEntryPointToSymbolAndFileNameMap:device:compilationDescriptor: types=v40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=getOutputTypesWithDevice:inputTypes:compilationDescriptor: types=@40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=runWithMTLCommandQueue:inputsArray:resultsArray: types=@40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=unloadEntryPointToSymbolAndFileNameMap:device:compilationDescriptor: types=v40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=feedTensors types=@16@0:8
+[method] class=MPSGraphExecutable kind=instance selector=targetTensors types=@16@0:8
+[method] class=MPSGraphExecutable kind=instance selector=getOptimizedNoDeviceModulesSize types=Q16@0:8
+[method] class=MPSGraphExecutable kind=instance selector=runInternalWithDevice:commandBuffer:feedsDictionary:resultsDictionary:executableExecutionDescriptor:mpsGraphOwnedCommandBuffer: types=@60@0:8@16@24@32@40@48B56
+[method] class=MPSGraphExecutable kind=instance selector=allocateTensorDataTargetsForDevice:shapedEntryPoint: types=@32@0:8@16@24
+[method] class=MPSGraphExecutable kind=instance selector=aneRegionOpsHashSet: types=v24@0:8^v16
+[method] class=MPSGraphExecutable kind=instance selector=applyOptimizationPassesWithDevice:module:compilationID:compilationDescriptor:perEntryPointFuncOpMLIRName: types=v56@0:8@16{ModuleOp=^{Operation}}24Q32@40r^v48
+[method] class=MPSGraphExecutable kind=instance selector=bytecodeDictionaryFromCacheEntries: types=@72@0:8{SmallVector<MPSGraphExecutableCacheValue, 1U>=^vII[40c]}16
+[method] class=MPSGraphExecutable kind=instance selector=checkSpecializationValidForSingleEntry types=B16@0:8
+[method] class=MPSGraphExecutable kind=instance selector=cloneForFeeds:targetTensors:targetOperations:compilationDescriptor: types={OwningOpRef<mlir::ModuleOp>={ModuleOp=^{Operation}}}48@0:8@16@24@32@40
+[method] class=MPSGraphExecutable kind=instance selector=convertShapeRangesToMLIR:feedTensors:context: types={Attribute=^{AttributeStorage}}40@0:8@16@24^v32
+[method] class=MPSGraphExecutable kind=instance selector=dumpArrayOfTensorData:basePath:separator:invocationCount: types=v48@0:8@16@24@32Q40
+[method] class=MPSGraphExecutable kind=instance selector=dumpCompiledProducts types=v16@0:8
+[method] class=MPSGraphExecutable kind=instance selector=emitViewerSPIWithDevice:inputShapes:compilationDescriptor: types=@40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=getAttributesFromDescriptors:context:deviceDescriptor: types={vector<mlir::NamedAttribute, std::allocator<mlir::NamedAttribute>>=^{NamedAttribute}^{NamedAttribute}{?=^{NamedAttribute}}}40@0:8@16^v24@32
+[method] class=MPSGraphExecutable kind=instance selector=getDeviceCacheKeyForEntryPoint:device:compilationDescriptor: types={MPSGraphModuleKey={SmallVector<long long, 6U>=^vII[48c]}@@@@}40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=getDeviceCacheKeyForTransformedEntryPoint:device:compilationDescriptor: types={MPSGraphModuleKey={SmallVector<long long, 6U>=^vII[48c]}@@@@}40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=getDeviceCacheKeyForTransformedEntryPointImpl:deviceDescriptor:compilationDescriptor: types={MPSGraphModuleKey={SmallVector<long long, 6U>=^vII[48c]}@@@@}40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=getNewRuntimeForDevice:specializedModule:shapedEntryPoints:compilationDescriptor: types=^v48@0:8@16^v24@32@40
+[method] class=MPSGraphExecutable kind=instance selector=getNoDeviceCacheKeyForTransformedEntryPoint:compilationDescriptor: types={MPSGraphModuleKey={SmallVector<long long, 6U>=^vII[48c]}@@@@}32@0:8@16@24
+[method] class=MPSGraphExecutable kind=instance selector=getOptimizedModuleCacheSize types=Q16@0:8
+[method] class=MPSGraphExecutable kind=instance selector=getOptimizedNoDeviceModuleCacheSize types=Q16@0:8
+[method] class=MPSGraphExecutable kind=instance selector=getOutputTypesWithDevice:shapedEntryPoint:compilationDescriptor: types=@40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=getReadDataFromFileCache types=^v16@0:8
+[method] class=MPSGraphExecutable kind=instance selector=getRuntimeSpecializationAndEntryFunction:shapedEntryPoint:perEntryPointToSymbolAndFileNameMap:cacheSpecializedModuleLookups:entryFuncOp:runtime: types=^v60@0:8@16@24@32B40^v44^^{BaseRuntime}52
+[method] class=MPSGraphExecutable kind=instance selector=getTargetShapesForDevice:inputsArray: types=@32@0:8@16@24
+[method] class=MPSGraphExecutable kind=instance selector=getTensorDataArraysWithDevice:feedsDictionary:resultsDictionary:inputsArray:resultsArray:executableExecutionDescriptor: types=@64@0:8@16@24@32@40@48@56
+[method] class=MPSGraphExecutable kind=instance selector=getTotalANEJITCompilations types=Q16@0:8
+[method] class=MPSGraphExecutable kind=instance selector=initWithGraph:device:feeds:targetTensors:targetOperations:executableDescriptor: types=@64@0:8@16@24@32@40@48@56
+[method] class=MPSGraphExecutable kind=instance selector=initWithSpecializedMLIRModule:device:shapedEntryPoint:compilationDescriptor:executableDescriptor: types=@56@0:8{ModuleOp=^{Operation}}16@24@32@40@48
+[method] class=MPSGraphExecutable kind=instance selector=isExecutableForFeeds:targetTensors:targetOperations:compilationDescriptor: types=B48@0:8@16@24@32@40
+[method] class=MPSGraphExecutable kind=instance selector=optimizedBytecodeForAllExistingSpecializations types=@16@0:8
+[method] class=MPSGraphExecutable kind=instance selector=runAsyncWithCommandQueue:inputsArray:resultsArray:executionDescriptor: types=@48@0:8@16@24@32@40
+[method] class=MPSGraphExecutable kind=instance selector=runAsyncWithDevice:inputsArray:resultsArray:executionDescriptor: types=@48@0:8@16@24@32@40
+[method] class=MPSGraphExecutable kind=instance selector=runInternalWithDevice:commandBuffer:feeds:results:executableExecutionDescriptor:mpsGraphOwnedCommandBuffer: types=@60@0:8@16@24@32@40@48B56
+[method] class=MPSGraphExecutable kind=instance selector=runWithDevice:inputsArray:intermediateOperations:resultsArray:executionDescriptor: types=@56@0:8@16@24@32@40@48
+[method] class=MPSGraphExecutable kind=instance selector=runWithMTLCommandQueue:inputsArray:resultsArray:executionDescriptor: types=@48@0:8@16@24@32@40
+[method] class=MPSGraphExecutable kind=instance selector=sendANEStreamingSessionSignal:sessionDescriptor:report: types=B40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=specializeForMultipleInputTypesWithDevice:multipleInputTypes:compilationDescriptor: types=v40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=specializeWithDevice:inputShapes:compilationDescriptor: types=v40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=specializeWithDevice:inputTypes:compilationDescriptor: types=v40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=specializeWithDevice:shapedEntryPoint:compilationDescriptor: types={MPSGraphExecutableCacheValue=^{MPSGraphExecutableSpecializedModule}^{BaseModuleRef}{basic_string<char, std::char_traits<char>, std::allocator<char>>={?=(__rep={__short=[23c]b7b1}{__long=*Qb63b1})}}}40@0:8@16@24@32
+[method] class=MPSGraphExecutable kind=instance selector=specializeWithDevice:shapedEntryPoints:compilationDescriptor:error: types=v48@0:8@16@24@32^@40
+[method] class=MPSGraphExecutable kind=instance selector=specializedModuleWithDevice:shapedEntryPoints:compilationDescriptor:error: types={SmallVector<MPSGraphExecutableCacheValue, 1U>=^vII[40c]}48@0:8@16@24@32^@40
+[method] class=MPSGraphExecutable kind=class selector=prepareExecDescriptorAndRuntimeSpecialization:device:executableExecutionDescriptor: types=v40@0:8@16@24@32
+[class] name=MPSGraphExecutableExecutionDescriptor superclass=MPSGraphObject
+[property] class=MPSGraphExecutableExecutionDescriptor name=scheduledGraphHandler attrs=T@?,C,V_scheduledGraphHandler
+[property] class=MPSGraphExecutableExecutionDescriptor name=simulateANECompileFailure attrs=TB,V_simulateANECompileFailure
+[property] class=MPSGraphExecutableExecutionDescriptor name=simulateANELoadModelFailure attrs=TB,V_simulateANELoadModelFailure
+[property] class=MPSGraphExecutableExecutionDescriptor name=disableSynchronizeResults attrs=TB,V_disableSynchronizeResults
+[property] class=MPSGraphExecutableExecutionDescriptor name=disableANECaching attrs=TB,V_disableANECaching
+[property] class=MPSGraphExecutableExecutionDescriptor name=disableANEFallback attrs=TB,V_disableANEFallback
+[property] class=MPSGraphExecutableExecutionDescriptor name=encodeANESync attrs=TB,V_encodeANESync
+[property] class=MPSGraphExecutableExecutionDescriptor name=encodeANEDisableSharedEvents attrs=TB,V_encodeANEDisableSharedEvents
+[property] class=MPSGraphExecutableExecutionDescriptor name=scheduledHandler attrs=T@?,C,V_scheduledHandler
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=waitForEvent:value: types=v32@0:8@16Q24
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=signalEvent:atExecutionEvent:value: types=v40@0:8@16Q24Q32
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=setScheduledHandler: types=v24@0:8@?16
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=scheduledHandler types=@?16@0:8
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=waitForANEPrePowerUpEvent:value: types=v32@0:8@16Q24
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=setSimulateANELoadModelFailure: types=v20@0:8B16
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=disableANECaching types=B16@0:8
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=disableANEFallback types=B16@0:8
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=disableSynchronizeResults types=B16@0:8
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=encodeANEDisableSharedEvents types=B16@0:8
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=encodeANESync types=B16@0:8
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=scheduledGraphHandler types=@?16@0:8
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=setDisableANECaching: types=v20@0:8B16
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=setDisableANEFallback: types=v20@0:8B16
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=setDisableSynchronizeResults: types=v20@0:8B16
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=setEncodeANEDisableSharedEvents: types=v20@0:8B16
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=setEncodeANESync: types=v20@0:8B16
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=setScheduledGraphHandler: types=v24@0:8@?16
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=setSimulateANECompileFailure: types=v20@0:8B16
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=simulateANECompileFailure types=B16@0:8
+[method] class=MPSGraphExecutableExecutionDescriptor kind=instance selector=simulateANELoadModelFailure types=B16@0:8
+[class] name=MPSGraphDevice superclass=MPSGraphObject
+[property] class=MPSGraphDevice name=metalDeviceName attrs=T@"NSString",R,N,V_metalDeviceName
+[property] class=MPSGraphDevice name=deviceDescriptor attrs=T@"MPSGraphDeviceDescriptor",R,N,V_deviceDescriptor
+[property] class=MPSGraphDevice name=metalDevice attrs=T@"<MTLDevice>",R,N,V_metalDevice
+[method] class=MPSGraphDevice kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MPSGraphDevice kind=instance selector=metalDevice types=@16@0:8
+[method] class=MPSGraphDevice kind=instance selector=deviceDescriptor types=@16@0:8
+[method] class=MPSGraphDevice kind=instance selector=initWithDeviceDescriptor: types=@24@0:8@16
+[method] class=MPSGraphDevice kind=instance selector=initWithDeviceType:metalDevice: types=@28@0:8I16@20
+[method] class=MPSGraphDevice kind=instance selector=metalDeviceName types=@16@0:8
+[method] class=MPSGraphDevice kind=class selector=deviceWithMTLDevice: types=@24@0:8@16
+[method] class=MPSGraphDevice kind=class selector=CPUDevice types=@16@0:8
+[method] class=MPSGraphDevice kind=class selector=ANEDevice types=@16@0:8
+[class] name=MPSGraphTensorData superclass=MPSGraphObject
+[property] class=MPSGraphTensorData name=tensorDataType attrs=Tq,R,N,V_tensorDataType
+[property] class=MPSGraphTensorData name=device attrs=T@"MPSGraphDevice",R,N,V_device
+[method] class=MPSGraphTensorData kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MPSGraphTensorData kind=instance selector=device types=@16@0:8
+[method] class=MPSGraphTensorData kind=instance selector=initWithDevice:IOSurface:rowBytesAlignment:shape:dataType: types=@52@0:8@16^{__IOSurface=}24Q32@40I48
+[method] class=MPSGraphTensorData kind=instance selector=initWithDevice:data:shape:dataType: types=@44@0:8@16@24@32I40
+[method] class=MPSGraphTensorData kind=instance selector=tensorDataType types=q16@0:8
+[method] class=MPSGraphTensorData kind=instance selector=checkTensorData:nativeUlps:absoluteErr: types=@32@0:8r^f16f24f28
+[method] class=MPSGraphTensorData kind=instance selector=checkTensorData:nativeUlps:absoluteErr:PSNR: types=@36@0:8r^f16f24f28f32
+[method] class=MPSGraphTensorData kind=instance selector=checkWithReferenceTensorData:nativeUlps:absoluteError:PSNR: types=@36@0:8@16f24f28f32
+[method] class=MPSGraphTensorData kind=instance selector=initEmptyWithShape:dataType:device: types=@36@0:8@16I24@28
+[method] class=MPSGraphTensorData kind=instance selector=initWithDevice:rowBytesAlignment:shape:dataType: types=@44@0:8@16Q24@32I40
+[method] class=MPSGraphTensorData kind=instance selector=initWithMPSNDArray:device: types=@32@0:8@16@24
+[method] class=MPSGraphTensorData kind=instance selector=initWithMTLTensor: types=@24@0:8@16
+[class] name=MLModel superclass=NSObject
+[property] class=MLModel name=predictionEvent attrs=T@"MLPredictionEvent",&,N,V_predictionEvent
+[property] class=MLModel name=neuralNetwork attrs=T@"<MLNeuralNetwork>",R,N
+[property] class=MLModel name=recordsPredictionEvent attrs=TB,R,N
+[method] class=MLModel kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MLModel kind=instance selector=executionSchedule types=@16@0:8
+[method] class=MLModel kind=instance selector=recordsPredictionEvent types=B16@0:8
+[method] class=MLModel kind=instance selector=predictionEvent types=@16@0:8
+[method] class=MLModel kind=instance selector=initInterfaceAndMetadataWithCompiledArchive:error: types=@32@0:8^v16^@24
+[method] class=MLModel kind=instance selector=internalEngine types=@16@0:8
+[method] class=MLModel kind=instance selector=neuralNetwork types=@16@0:8
+[method] class=MLModel kind=instance selector=setPredictionEvent: types=v24@0:8@16
+[method] class=MLModel kind=class selector=_compileModelAtURL:options:error: types=@40@0:8@16@24^@32
+[method] class=MLModel kind=class selector=availableComputeDevices types=@16@0:8
+[method] class=MLModel kind=class selector=compileModelAtURL:completionHandler: types=v32@0:8@16@?24
+[method] class=MLModel kind=class selector=compileModelAtURL:error: types=@32@0:8@16^@24
+[method] class=MLModel kind=class selector=compileModelWithoutAutoreleaseAtURL:options:error: types=@40@0:8@16@24^@32
+[class] name=MLModelConfiguration superclass=NSObject
+[property] class=MLModelConfiguration name=experimentalMLE5EngineUsage attrs=Tq,N
+[property] class=MLModelConfiguration name=usePrecompiledE5Bundle attrs=TB,N
+[property] class=MLModelConfiguration name=e5rtComputeDeviceTypeMask attrs=TQ,N
+[property] class=MLModelConfiguration name=e5rtCustomANECompilerOptions attrs=T@"NSString",C,N
+[property] class=MLModelConfiguration name=specializationUsesMPSGraphExecutable attrs=TB,N
+[property] class=MLModelConfiguration name=experimentalMLProgramEncryptedCacheUsage attrs=Tq,N
+[property] class=MLModelConfiguration name=allowBackgroundGPUComputeSetting attrs=TB,V_allowBackgroundGPUComputeSetting
+[property] class=MLModelConfiguration name=allowFloat16AccumulationOnGPU attrs=TB,N
+[property] class=MLModelConfiguration name=allowLowPrecisionAccumulationOnGPU attrs=TB,V_allowLowPrecisionAccumulationOnGPU
+[property] class=MLModelConfiguration name=allowBackgroundGPUCompute attrs=TB,N
+[property] class=MLModelConfiguration name=preferredMTLDevice attrs=T@"<MTLDevice>",&,N
+[property] class=MLModelConfiguration name=preferredMetalDevice attrs=T@"<MTLDevice>",&,N,V_preferredMetalDevice
+[property] class=MLModelConfiguration name=allowsInstrumentation attrs=TB,N,V_allowsInstrumentation
+[method] class=MLModelConfiguration kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MLModelConfiguration kind=instance selector=setExperimentalMLE5EngineUsage: types=v24@0:8q16
+[method] class=MLModelConfiguration kind=instance selector=allowBackgroundGPUCompute types=B16@0:8
+[method] class=MLModelConfiguration kind=instance selector=allowBackgroundGPUComputeSetting types=B16@0:8
+[method] class=MLModelConfiguration kind=instance selector=allowFloat16AccumulationOnGPU types=B16@0:8
+[method] class=MLModelConfiguration kind=instance selector=allowLowPrecisionAccumulationOnGPU types=B16@0:8
+[method] class=MLModelConfiguration kind=instance selector=allowsInstrumentation types=B16@0:8
+[method] class=MLModelConfiguration kind=instance selector=e5rtComputeDeviceTypeMask types=Q16@0:8
+[method] class=MLModelConfiguration kind=instance selector=e5rtCustomANECompilerOptions types=@16@0:8
+[method] class=MLModelConfiguration kind=instance selector=experimentalMLE5EngineUsage types=q16@0:8
+[method] class=MLModelConfiguration kind=instance selector=experimentalMLE5EngineUsageToString: types=@24@0:8q16
+[method] class=MLModelConfiguration kind=instance selector=experimentalMLProgramEncryptedCacheUsage types=q16@0:8
+[method] class=MLModelConfiguration kind=instance selector=experimentalMLProgramEncryptedCacheUsageToString: types=@24@0:8q16
+[method] class=MLModelConfiguration kind=instance selector=neuralEngineCompilerOptions types=@16@0:8
+[method] class=MLModelConfiguration kind=instance selector=preferredMTLDevice types=@16@0:8
+[method] class=MLModelConfiguration kind=instance selector=preferredMetalDevice types=@16@0:8
+[method] class=MLModelConfiguration kind=instance selector=setAllowBackgroundGPUCompute: types=v20@0:8B16
+[method] class=MLModelConfiguration kind=instance selector=setAllowBackgroundGPUComputeSetting: types=v20@0:8B16
+[method] class=MLModelConfiguration kind=instance selector=setAllowFloat16AccumulationOnGPU: types=v20@0:8B16
+[method] class=MLModelConfiguration kind=instance selector=setAllowLowPrecisionAccumulationOnGPU: types=v20@0:8B16
+[method] class=MLModelConfiguration kind=instance selector=setAllowsInstrumentation: types=v20@0:8B16
+[method] class=MLModelConfiguration kind=instance selector=setE5rtComputeDeviceTypeMask: types=v24@0:8Q16
+[method] class=MLModelConfiguration kind=instance selector=setE5rtCustomANECompilerOptions: types=v24@0:8@16
+[method] class=MLModelConfiguration kind=instance selector=setExperimentalMLProgramEncryptedCacheUsage: types=v24@0:8q16
+[method] class=MLModelConfiguration kind=instance selector=setPreferredMTLDevice: types=v24@0:8@16
+[method] class=MLModelConfiguration kind=instance selector=setPreferredMetalDevice: types=v24@0:8@16
+[method] class=MLModelConfiguration kind=instance selector=setSpecializationUsesMPSGraphExecutable: types=v20@0:8B16
+[method] class=MLModelConfiguration kind=instance selector=setUsePrecompiledE5Bundle: types=v20@0:8B16
+[method] class=MLModelConfiguration kind=instance selector=specializationUsesMPSGraphExecutable types=B16@0:8
+[method] class=MLModelConfiguration kind=instance selector=usePrecompiledE5Bundle types=B16@0:8
+[method] class=MLModelConfiguration kind=instance selector=usesCompileTimeMPSGraphTypeInferenceForModelVersion: types=B24@0:8@16
+[class] name=MLOptimizationHints superclass=NSObject
+[property] class=MLOptimizationHints name=specializationStrategy attrs=Tq,N,V_specializationStrategy
+[method] class=MLOptimizationHints kind=instance selector=specializationStrategyToString: types=@24@0:8q16
+[method] class=MLOptimizationHints kind=instance selector=setSpecializationStrategy: types=v24@0:8q16
+[method] class=MLOptimizationHints kind=instance selector=specializationStrategy types=q16@0:8
+[class] name=MLPredictionOptions superclass=NSObject
+[property] class=MLPredictionOptions name=automaticOutputBackingMode attrs=T@"NSDictionary",C,N,V_automaticOutputBackingMode
+[property] class=MLPredictionOptions name=waitSyncPoints attrs=T@"NSArray",C,N,V_waitSyncPoints
+[property] class=MLPredictionOptions name=completionSyncPoint attrs=T@"MLPredictionSyncPoint",&,N,V_completionSyncPoint
+[property] class=MLPredictionOptions name=aneQoS attrs=TI,N,V_aneQoS
+[property] class=MLPredictionOptions name=aneExecutionPriority attrs=T@"NSString",N,V_aneExecutionPriority
+[property] class=MLPredictionOptions name=outputBackings attrs=T@"NSDictionary",C,N,V_outputBackings
+[method] class=MLPredictionOptions kind=instance selector=aneQoS types=I16@0:8
+[method] class=MLPredictionOptions kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MLPredictionOptions kind=instance selector=setAutomaticOutputBackingMode: types=v24@0:8@16
+[method] class=MLPredictionOptions kind=instance selector=automaticOutputBackingMode types=@16@0:8
+[method] class=MLPredictionOptions kind=instance selector=outputBackings types=@16@0:8
+[method] class=MLPredictionOptions kind=instance selector=setAneExecutionPriority: types=v24@0:8@16
+[method] class=MLPredictionOptions kind=instance selector=setWaitSyncPoints: types=v24@0:8@16
+[method] class=MLPredictionOptions kind=instance selector=waitSyncPoints types=@16@0:8
+[method] class=MLPredictionOptions kind=instance selector=setCompletionSyncPoint: types=v24@0:8@16
+[method] class=MLPredictionOptions kind=instance selector=setOutputBackings: types=v24@0:8@16
+[method] class=MLPredictionOptions kind=instance selector=aneExecutionPriority types=@16@0:8
+[method] class=MLPredictionOptions kind=instance selector=_validateDirectBindingExpectations:directlyBoundFeatureNames:unexpectedDirectBindings:unexpectedCopyBindings: types=B48@0:8@16@24^@32^@40
+[method] class=MLPredictionOptions kind=instance selector=completionSyncPoint types=@16@0:8
+[class] name=MLComputePlan superclass=NSObject
+[property] class=MLComputePlan name=computeDevicesBySupportedComputeUnits attrs=T@"NSDictionary",R,C,N,V_computeDevicesBySupportedComputeUnits
+[property] class=MLComputePlan name=executionScheduleByModelStructurePath attrs=T@"NSDictionary",R,C,N,V_executionScheduleByModelStructurePath
+[method] class=MLComputePlan kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MLComputePlan kind=instance selector=computeDeviceUsageForMLProgramOperation: types=@24@0:8@16
+[method] class=MLComputePlan kind=instance selector=computeDeviceUsageForNeuralNetworkLayer: types=@24@0:8@16
+[method] class=MLComputePlan kind=instance selector=computeDevicesBySupportedComputeUnits types=@16@0:8
+[method] class=MLComputePlan kind=instance selector=executionScheduleByModelStructurePath types=@16@0:8
+[method] class=MLComputePlan kind=instance selector=initWithModelStructure:modelDescription:modelAssetStorageType:executionSchedule:configuration: types=@56@0:8@16@24q32@40@48
+[method] class=MLComputePlan kind=class selector=computePlanOfModelStructure:modelAsset:configuration:error: types=@48@0:8@16@24@32^@40
+[class] name=MLComputePlanDeviceUsage superclass=NSObject
+[property] class=MLComputePlanDeviceUsage name=deviceSupportInfoArray attrs=T@"NSArray",R,C,N,V_deviceSupportInfoArray
+[property] class=MLComputePlanDeviceUsage name=supportedComputeDevices attrs=T@"NSArray",R,C,N,V_supportedComputeDevices
+[property] class=MLComputePlanDeviceUsage name=preferredComputeDevice attrs=T@"<MLComputeDeviceProtocol>",R,N,V_preferredComputeDevice
+[method] class=MLComputePlanDeviceUsage kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MLComputePlanDeviceUsage kind=instance selector=deviceSupportInfoArray types=@16@0:8
+[method] class=MLComputePlanDeviceUsage kind=instance selector=initWithSupportedComputeDevices:preferredComputeDevice:deviceSupportInfoArray: types=@40@0:8@16@24@32
+[method] class=MLComputePlanDeviceUsage kind=instance selector=preferredComputeDevice types=@16@0:8
+[method] class=MLComputePlanDeviceUsage kind=instance selector=supportInfoForComputeDevice: types=@24@0:8@16
+[method] class=MLComputePlanDeviceUsage kind=instance selector=supportedComputeDevices types=@16@0:8
+[class] name=MLComputePlanCost superclass=NSObject
+[class] name=MLNeuralEngineComputeDevice superclass=NSObject
+[method] class=MLNeuralEngineComputeDevice kind=class selector=physicalDevice types=@16@0:8
+[class] name=MLGPUComputeDevice superclass=NSObject
+[property] class=MLGPUComputeDevice name=metalDevice attrs=T@"<MTLDevice>",R,N,V_metalDevice
+[method] class=MLGPUComputeDevice kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MLGPUComputeDevice kind=instance selector=initWithMetalDevice: types=@24@0:8@16
+[method] class=MLGPUComputeDevice kind=instance selector=metalDevice types=@16@0:8
+[method] class=MLGPUComputeDevice kind=class selector=deviceWithMetalDevice: types=@24@0:8@16
+[class] name=MLCPUComputeDevice superclass=NSObject
+[method] class=MLCPUComputeDevice kind=class selector=physicalDevice types=@16@0:8
+[class] name=MLState superclass=NSObject
+[property] class=MLState name=backings attrs=T@"NSDictionary",R,C,N,V_backings
+[method] class=MLState kind=instance selector=.cxx_destruct types=v16@0:8
+[method] class=MLState kind=instance selector=backings types=@16@0:8
+[method] class=MLState kind=instance selector=initWithBackings: types=@24@0:8@16

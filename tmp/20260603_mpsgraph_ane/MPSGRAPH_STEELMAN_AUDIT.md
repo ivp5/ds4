@@ -60,3 +60,11 @@ Do not promote generic MPSGraph gather or packed-index MPSGraph decode as the fi
 - Real canary: H3355 L26 selected-six MPSGraph r50 improved down `1609.519 -> 1081.396 us/op` and gate/up `1719.212 -> 1242.824 us/op`, both `bad=0`, using `DS4_MPSGRAPH_ASYNC_BATCH=1`.
 - CoreML plan canary: `MLComputePlan` on `shared_l0_b2048_8bit` reports `ane_preferred=9`, `ane_supported=9`, `unknown_usage=12`, proving the ANE path is live for the compiled shared package rather than inferred from timing alone.
 - Steelman conclusion: MPSGraph's deepest useful lever for this project is not in-graph packed decode; it is scheduling/fence control. Use it to batch/overlap GPU graph work while CoreML handles ANE shared-prefill/high-B work.
+
+## 2026-06-04T01:34 JST — private API permutation audit
+
+- Runtime selector discovery found real private ANE-facing MPSGraph selectors: `MPSGraphDevice.ANEDevice`, `MPSGraphCompilationDescriptor.enableDevicePlacement`, `preferredDevice`, `allowedComputeDevices`, `enableANEFWToFWSignal`, `enableANELateLatch`, `enableANECHWRankPromotion`, and execution flags such as `disableANECaching`, `disableANEFallback`, `encodeANESync`, and `encodeANEDisableSharedEvents`.
+- Guarded synthetic 12-bit VQ-D8 tests showed these are callable but not a clear win. `private_ane_device` compiled and ran, but did not outperform default async batching; `private_prefer2` changed numerics slightly and was much slower, so the private device enum values are not safe to infer casually.
+- CoreML private config is more informative than MPSGraph private placement. `e5rtComputeDeviceTypeMask=1/3` forced CPU placement (`ane_preferred=0`, `cpu_preferred=9`) and proved the ANE package speed comes from actual ANE placement, not merely model shape or cache artifacts.
+- Private `aneExecutionPriority` is dangerous: naive string values `high`, `low`, and `realtime` throw uncaught `NSInvalidArgumentException`. Keep it out unless valid tokens are discovered from a primary source or runtime-verified with exception containment.
+- Steelman conclusion: undocumented APIs are useful as falsification instruments, not current production levers. The best tested path remains CoreML public ANE placement + MPSGraph async/shared-event GPU scheduling + packed Metal for memory-floor routed D8F.

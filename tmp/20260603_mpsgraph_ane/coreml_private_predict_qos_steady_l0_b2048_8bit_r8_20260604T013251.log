@@ -1,0 +1,21 @@
+
+[case] config_private=default predict_private=default rounds=8
+2026-06-04 01:32:51.991 coreml_shared_cache_probe[8435:12615386] [start] packages=1 config_private=default predict_private=default predict_rounds=8 footprint_mib=1.53
+2026-06-04 01:32:54.705 coreml_shared_cache_probe[8435:12615386] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:32:57.515 coreml_shared_cache_probe[8435:12615386] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=default predict_private=default predict_rounds=8 compile_ms=44.569 load_ms=2677.685 predict_ms=19.499 steady_predict_ms=13.886 resident_models=1 footprint_mib=209.97 delta_mib=208.44
+2026-06-04 01:32:57.515 coreml_shared_cache_probe[8435:12615386] [done] resident_models=1 final_footprint_mib=209.97 total_delta_mib=208.44
+[exit] predict_private=default code=0
+
+[case] config_private=default predict_private=ane_qos_user rounds=8
+2026-06-04 01:32:57.534 coreml_shared_cache_probe[8436:12615426] [start] packages=1 config_private=default predict_private=ane_qos_user predict_rounds=8 footprint_mib=1.52
+2026-06-04 01:33:00.108 coreml_shared_cache_probe[8436:12615426] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:33:02.707 coreml_shared_cache_probe[8436:12615426] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=default predict_private=ane_qos_user predict_rounds=8 compile_ms=43.021 load_ms=2463.759 predict_ms=20.007 steady_predict_ms=14.273 resident_models=1 footprint_mib=209.80 delta_mib=208.28
+2026-06-04 01:33:02.707 coreml_shared_cache_probe[8436:12615426] [done] resident_models=1 final_footprint_mib=209.80 total_delta_mib=208.28
+[exit] predict_private=ane_qos_user code=0
+
+[case] config_private=default predict_private=ane_qos_utility rounds=8
+2026-06-04 01:33:02.726 coreml_shared_cache_probe[8437:12615457] [start] packages=1 config_private=default predict_private=ane_qos_utility predict_rounds=8 footprint_mib=1.52
+2026-06-04 01:33:05.316 coreml_shared_cache_probe[8437:12615457] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:33:07.896 coreml_shared_cache_probe[8437:12615457] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage config_private=default predict_private=ane_qos_utility predict_rounds=8 compile_ms=41.962 load_ms=2446.285 predict_ms=19.333 steady_predict_ms=14.101 resident_models=1 footprint_mib=209.78 delta_mib=208.27
+2026-06-04 01:33:07.896 coreml_shared_cache_probe[8437:12615457] [done] resident_models=1 final_footprint_mib=209.78 total_delta_mib=208.27
+[exit] predict_private=ane_qos_utility code=0

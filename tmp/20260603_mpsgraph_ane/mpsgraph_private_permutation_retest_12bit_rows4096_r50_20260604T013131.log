@@ -1,0 +1,40 @@
+
+[case] descriptor=default exec_private=default
+mpsgraph_packed_index_probe: rows=4096 rounds=50 bits=12 descriptor=default exec_private=default groups=256 k=4096 expanded_compile_ms=5.539 packed_compile_ms=2.411 expanded_us=657.184 packed_us=748.103 expanded_async_wait_us=477.207 packed_async_wait_us=755.236 expanded_async_batch_us=175.272 packed_async_batch_us=920.118 speedup=0.878 expanded_index_MB=4.194 packed_index_MB=1.573 index_shrink=2.666 bad=0 max_abs=0 rms=0 sample_exp=0.924805 sample_pack=0.924805
+[exit] descriptor=default code=0
+
+[case] descriptor=private_device_placement exec_private=default
+mpsgraph_packed_index_probe: rows=4096 rounds=50 bits=12 descriptor=private_device_placement exec_private=default groups=256 k=4096 expanded_compile_ms=6.757 packed_compile_ms=3.593 expanded_us=711.973 packed_us=1366.037 expanded_async_wait_us=677.276 packed_async_wait_us=1356.437 expanded_async_batch_us=338.270 packed_async_batch_us=758.737 speedup=0.521 expanded_index_MB=4.194 packed_index_MB=1.573 index_shrink=2.666 bad=0 max_abs=0 rms=0 sample_exp=0.924805 sample_pack=0.924805
+[exit] descriptor=private_device_placement code=0
+
+[case] descriptor=private_prefer1 exec_private=default
+mpsgraph_packed_index_probe: rows=4096 rounds=50 bits=12 descriptor=private_prefer1 exec_private=default groups=256 k=4096 expanded_compile_ms=6.838 packed_compile_ms=3.646 expanded_us=734.265 packed_us=1467.566 expanded_async_wait_us=708.726 packed_async_wait_us=1350.582 expanded_async_batch_us=347.832 packed_async_batch_us=746.547 speedup=0.500 expanded_index_MB=4.194 packed_index_MB=1.573 index_shrink=2.666 bad=0 max_abs=0 rms=0 sample_exp=0.924805 sample_pack=0.924805
+[exit] descriptor=private_prefer1 code=0
+
+[case] descriptor=private_prefer2 exec_private=default
+mpsgraph_packed_index_probe: rows=4096 rounds=50 bits=12 descriptor=private_prefer2 exec_private=default groups=256 k=4096 expanded_compile_ms=6.249 packed_compile_ms=3.451 expanded_us=1576.581 packed_us=2360.758 expanded_async_wait_us=1768.317 packed_async_wait_us=2328.220 expanded_async_batch_us=1427.327 packed_async_batch_us=2290.452 speedup=0.668 expanded_index_MB=4.194 packed_index_MB=1.573 index_shrink=2.666 bad=0 max_abs=0 rms=0 sample_exp=0.924316 sample_pack=0.924316
+[exit] descriptor=private_prefer2 code=0
+
+[case] descriptor=private_ane_device exec_private=default
+mpsgraph_packed_index_probe: rows=4096 rounds=50 bits=12 descriptor=private_ane_device exec_private=default groups=256 k=4096 expanded_compile_ms=7.311 packed_compile_ms=3.936 expanded_us=701.073 packed_us=1406.932 expanded_async_wait_us=677.052 packed_async_wait_us=1362.422 expanded_async_batch_us=401.009 packed_async_batch_us=698.528 speedup=0.498 expanded_index_MB=4.194 packed_index_MB=1.573 index_shrink=2.666 bad=0 max_abs=0 rms=0 sample_exp=0.924805 sample_pack=0.924805
+[exit] descriptor=private_ane_device code=0
+
+[case] descriptor=private_compile_resources exec_private=default
+mpsgraph_packed_index_probe: rows=4096 rounds=50 bits=12 descriptor=private_compile_resources exec_private=default groups=256 k=4096 expanded_compile_ms=6.224 packed_compile_ms=3.534 expanded_us=558.476 packed_us=1109.582 expanded_async_wait_us=669.748 packed_async_wait_us=1408.793 expanded_async_batch_us=383.477 packed_async_batch_us=744.764 speedup=0.503 expanded_index_MB=4.194 packed_index_MB=1.573 index_shrink=2.666 bad=0 max_abs=0 rms=0 sample_exp=0.924805 sample_pack=0.924805
+[exit] descriptor=private_compile_resources code=0
+
+[case] descriptor=default exec_private=default
+mpsgraph_packed_index_probe: rows=4096 rounds=50 bits=12 descriptor=default exec_private=default groups=256 k=4096 expanded_compile_ms=4.797 packed_compile_ms=2.666 expanded_us=687.977 packed_us=1393.260 expanded_async_wait_us=658.131 packed_async_wait_us=1370.888 expanded_async_batch_us=395.887 packed_async_batch_us=921.013 speedup=0.494 expanded_index_MB=4.194 packed_index_MB=1.573 index_shrink=2.666 bad=0 max_abs=0 rms=0 sample_exp=0.924805 sample_pack=0.924805
+[exit] exec_private=default code=0
+
+[case] descriptor=default exec_private=ane_disable_shared_events
+mpsgraph_packed_index_probe: rows=4096 rounds=50 bits=12 descriptor=default exec_private=ane_disable_shared_events groups=256 k=4096 expanded_compile_ms=5.970 packed_compile_ms=2.329 expanded_us=706.716 packed_us=1347.036 expanded_async_wait_us=679.156 packed_async_wait_us=1381.112 expanded_async_batch_us=431.066 packed_async_batch_us=741.028 speedup=0.525 expanded_index_MB=4.194 packed_index_MB=1.573 index_shrink=2.666 bad=0 max_abs=0 rms=0 sample_exp=0.924805 sample_pack=0.924805
+[exit] exec_private=ane_disable_shared_events code=0
+
+[case] descriptor=default exec_private=disable_ane_cache
+mpsgraph_packed_index_probe: rows=4096 rounds=50 bits=12 descriptor=default exec_private=disable_ane_cache groups=256 k=4096 expanded_compile_ms=5.300 packed_compile_ms=2.469 expanded_us=580.002 packed_us=1172.488 expanded_async_wait_us=667.509 packed_async_wait_us=1373.498 expanded_async_batch_us=378.263 packed_async_batch_us=718.508 speedup=0.495 expanded_index_MB=4.194 packed_index_MB=1.573 index_shrink=2.666 bad=0 max_abs=0 rms=0 sample_exp=0.924805 sample_pack=0.924805
+[exit] exec_private=disable_ane_cache code=0
+
+[case] descriptor=default exec_private=disable_sync_results
+mpsgraph_packed_index_probe: rows=4096 rounds=50 bits=12 descriptor=default exec_private=disable_sync_results groups=256 k=4096 expanded_compile_ms=5.339 packed_compile_ms=2.473 expanded_us=661.379 packed_us=1363.371 expanded_async_wait_us=677.653 packed_async_wait_us=1494.343 expanded_async_batch_us=407.319 packed_async_batch_us=701.865 speedup=0.485 expanded_index_MB=4.194 packed_index_MB=1.573 index_shrink=2.666 bad=0 max_abs=0 rms=0 sample_exp=0.924805 sample_pack=0.924805
+[exit] exec_private=disable_sync_results code=0
