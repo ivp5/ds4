@@ -1,0 +1,17 @@
+[load] layer=42 prefix=layers.42.ffn.shared_experts t=1780501029873
+[load] gate_t=(4096, 2048) t=1780501029941
+[load] down_t=(2048, 4096) t=1780501030008
+[load] up_t=(4096, 2048) t=1780501030075
+[convert] start output=tmp/20260603_mpsgraph_ane/shared_l42_b2048_8bit_20260604T003627.mlpackage batch=2048 bits=8 opset=iOS26 deployment=macOS26 t=1780501030077
+Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]
+Running MIL default pipeline:   0%|          | 0/95 [00:00<?, ? passes/s]Running MIL default pipeline:  59%|█████▉    | 56/95 [00:00<00:00, 544.90 passes/s]Running MIL default pipeline: 100%|██████████| 95/95 [00:00<00:00, 616.38 passes/s]
+Running MIL backend_mlprogram pipeline:   0%|          | 0/12 [00:00<?, ? passes/s]Running MIL backend_mlprogram pipeline: 100%|██████████| 12/12 [00:00<00:00, 5376.16 passes/s]
+[convert] done t=1780501033361
+[palettize] start bits=8 t=1780501033361
+Running compression pass palettize_weights:   0%|          | 0/3 [00:00<?, ? ops/s]Running compression pass palettize_weights:  33%|███▎      | 1/3 [00:00<00:01,  1.36 ops/s]Running compression pass palettize_weights:  67%|██████▋   | 2/3 [00:01<00:00,  1.43 ops/s]Running compression pass palettize_weights: 100%|██████████| 3/3 [00:02<00:00,  1.42 ops/s]Running compression pass palettize_weights: 100%|██████████| 3/3 [00:02<00:00,  1.41 ops/s]
+Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]
+Running MIL default pipeline:   0%|          | 0/92 [00:00<?, ? passes/s]Running MIL default pipeline:  92%|█████████▏| 85/92 [00:00<00:00, 665.59 passes/s]Running MIL default pipeline: 100%|██████████| 92/92 [00:00<00:00, 696.23 passes/s]
+Running MIL backend_mlprogram pipeline:   0%|          | 0/12 [00:00<?, ? passes/s]Running MIL backend_mlprogram pipeline: 100%|██████████| 12/12 [00:00<00:00, 335.44 passes/s]
+[palettize] done t=1780501038210
+[spec] inputs=['x'] outputs=['shared_out']
+[save] done path=tmp/20260603_mpsgraph_ane/shared_l42_b2048_8bit_20260604T003627.mlpackage t=1780501038216

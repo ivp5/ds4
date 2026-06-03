@@ -241,3 +241,11 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - L26 shared 8-bit fidelity passed the cheap gates. Ones row: `max_abs=0.012057`, `rms=0.00294488`, `ref_rms=0.374573`. Real L26 hidden row 9: `max_abs=0.0113556`, `rms=0.00146171`, `ref_rms=0.0795328`.
 - Layer-matched L26 shared + L26 routed D8F overlap remains viable on the real hidden row. Same/no-evict p50: ANE `13.775 ms`, D8F `5.455 ms`, merge `0.561 ms`, concurrent+merge `14.463 ms`, overlap+merge speedup `1.368x`.
 - Cache warmup still does not promote: D8F-after-ANE was `7.429 ms` versus D8F-only `5.455 ms`. The runtime path should be explicit overlap and merge, not relying on hidden cache warming.
+
+## 2026-06-04T00:45 JST — multi-layer shared CoreML cache footprint and MPSGraph steelman boundary
+
+- Added `tmp/20260603_mpsgraph_ane/coreml_shared_cache_probe.m` to compile, load, predict, retain, and measure resident footprint for multiple shared-expert CoreML packages in one process.
+- Tightened the probe invariants: it now requires exactly one input/output feature and computes MLMultiArray element count over arbitrary rank instead of assuming rank-2 shape.
+- Six resident B=2048 8-bit shared models for layers `0,8,16,26,32,42` measured `240.38 MiB` total process footprint delta after prediction. Linear all-layer estimate for 43 layers is about `1.7 GiB`, which is plausible inside the 52GB architecture budget.
+- Model load latency is not plausible on the hot path: each package load measured about `2.4 s`. The runtime sidecar therefore needs explicit cold precompile/preload or a bounded layer-window model cache.
+- MPSGraph steelman status: standard expanded-index gather is not the memory-floor solution, but MPSGraph is not exhausted until packed-index decode/fusion, executable-cache footprint, down-only graph cache, queue/fence policy, and layout/shape sweeps are tested.

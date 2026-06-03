@@ -31,6 +31,7 @@
 - Real-hidden same/separate × CPU-evict matrix still supports overlap, not warmup: overlap+merge p50 speedups were `1.489x` same/no-evict, `1.464x` separate/no-evict, `1.225x` same/256MiB, and `1.140x` separate/256MiB. D8F-after-ANE was slower than D8F-only in both no-evict modes.
 - Metal eviction control now exists in the real-hidden canary. A 256MiB Metal write sweep costs about `2.1 ms` versus CPU eviction's `14.3 ms`, and overlap+merge still survives (`1.275x` same, `1.187x` separate). Same-buffer D8F-after-ANE was slightly faster than D8F-only under Metal eviction, but separate-buffer was slower; the mechanism is still allocation/scheduler/topology-sensitive, not a general warm-cache guarantee.
 - Layer-matched L26 shared CoreML is no longer a gap. L26 B=2048 8-bit shared export passed ones fidelity (`rms=0.00294488`, `ref_rms=0.374573`) and real-hidden row 9 fidelity (`rms=0.00146171`, `ref_rms=0.0795328`). Pairing L26 shared ANE with L26 routed D8F on the same real hidden row gave `1.368x` p50 overlap+merge speedup, while again rejecting a warm-cache promotion (`7.429 ms` D8F-after-ANE versus `5.455 ms` D8F-only).
+- Multi-layer shared CoreML cache is plausible but must be cold-path only. Six resident B=2048 8-bit shared models for layers `0,8,16,26,32,42` reached `240.38 MiB` total footprint delta; extrapolating linearly gives roughly `1.7 GiB` for all 43 shared layers. Load time is the real wall: each model load costs about `2.4 s`, so production needs precompile/preload or an explicit layer-window cache, never lazy hot-path loading.
 
 ## Highest-Potential Experiments
 
@@ -58,6 +59,7 @@
 22. Shared-expert package sweep: export 8-bit shared CoreML for a small layer set and measure compile/cache/memory behavior. Single-layer L26 is proven; production needs model-cache policy across many layers.
 23. Real-router weighted timing: rerun actual router top-k weights under a longer low-load schedule after metal eviction support. Short six-trial runs support overlap, but do not yet establish p90/p99 stability.
 24. Runtime sidecar scaffold: add an opt-in layer-local prefill organ that owns CoreML model cache, D8F graph cache, hidden-state backing, concurrent launch, and merge. Keep it default-off until route-weighted canary and real hidden-state fidelity checks pass.
+25. Packed-index MPSGraph steelman: test whether packed D8F codes can be decoded inside MPSGraph without materializing expanded `int32` indices. If it cannot, generic MPSGraph gather is bounded away from the memory floor and production should move to a custom Metal packed-index kernel for the routed leg.
 
 ## Production Direction
 
@@ -68,3 +70,4 @@
 - The near-term runtime architecture should be same-layer parallelism: GPU computes routed D8F, ANE computes 8-bit shared expert from the same hidden-state allocation, GPU merges shared+routed outputs from CoreML output backing, then the normal layer dependency continues. Cache correctness matters at the input and merge buffers; violating that turns theoretical bandwidth into extra serialization.
 - After the exact routed canary, prioritize overlap integration over cache folklore: cache warmth helped synthetic dense, but exact D8F routed mainly benefits from concurrent ANE/GPU execution. The next go/no-go is merge/fence cost, then route-weighted exact graph caching.
 - After route-weighted exactness, real-router weighted timing, real hidden-state input, Metal eviction controls, and layer-matched shared-expert export, the speed path is now an opt-in runtime integration problem rather than a speculative cache experiment. The remaining go/no-go is whether model-cache policy across many shared-expert CoreML packages fits the memory budget and preserves p90/p99 overlap.
+- The shared CoreML model-cache footprint likely fits the 52GB target if packages are retained cold and no duplicate decoded copies leak. The architecture must explicitly separate cold preloading/compilation from hot token work; otherwise a 2.4s per-layer lazy load destroys any per-op memory-floor progress.
