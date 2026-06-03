@@ -125,3 +125,11 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
   - selected six experts `165,0,1,2,3,4`: `bad=0`, `us/op=2302.492`, `logical_MB/op=33.858`.
 - Same selected-six classic baseline: `33.426 ms / 5 rounds = 6685.2 us/op`; MPSGraph selected LUT is ~2.9x faster for full down projection. This is the first real-codec evidence that the LUT loophole beats the current classic down organ on M1 full-row shape.
 - Small-row caveat: at 128 rows, classic remains faster because MPSGraph dispatch/constant gather overhead dominates. The production target should therefore fuse full selected experts/layers or otherwise amortize graph dispatch; do not adopt the one-expert/partial-row form as a runtime endpoint.
+
+## 2026-06-03T23:10 JST — MPSGraph D8F gate/up canary and memory-floor boundary
+
+- Extended the real-D8F MPSGraph LUT canary from down to gate+up with on-graph clamp, sigmoid/SwiGLU, and selected-expert concatenation. The shared LUT builder now supports both 2048-input down and 4096-input gate/up projections.
+- Corrected MPSGraph index handling to preserve D8F sentinel semantics: invalid codes map to an added zero codebook column, so MPSGraph gather and the CPU reference both skip sentinel blocks instead of indexing out of range.
+- Validation after correction: `make ds4` passed; selected-six down full-row fp16 passed with `bad=0`, `us/op=2448.067`, `logical_MB/op=33.861`; selected-six gate/up fp16 passed with `bad=0`, `us/op=2534.725`, `logical_MB/op=72.741`; prior single-expert fp32 gate/up exactness was `bad=0`, `max_abs=1.49012e-07`.
+- Performance boundary: MPSGraph down remains a real win versus classic selected-six down (`2448 us/op` now, prior classic `6685 us/op`). Gate/up is exact but not conclusively ahead of the current classic selected-six gate/up (`2535 us/op` after sentinel correction versus prior classic `2710 us/op`, within noisy/local-run range and still burdened by expanded int32 indices plus two projections).
+- Runtime implication: MPSGraph standard gather does not reach the packed-index memory floor. The immediate production candidate is selected/full-row down graph caching; gate/up needs either packed-index/custom gather removal, ANE/CoreML palettized table execution, or overlap with another engine before it is a defensible hot-path replacement.

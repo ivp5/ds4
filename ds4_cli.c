@@ -2749,6 +2749,40 @@ int main(int argc, char **argv) {
         return 1;
 #endif
     }
+    /* --d8f-mpsgraph-lut-gateup-canary <d8f> [EXPERTS_CSV [rows [rounds [mode [clamp]]]]]
+     * Real D8F gate+up LUT decomposition plus on-graph clamp+SwiGLU. */
+    if (argc >= 3 && !strcmp(argv[1], "--d8f-mpsgraph-lut-gateup-canary")) {
+#if defined(__APPLE__)
+        const char *path = argv[2];
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        uint32_t experts[ds4_cli_selected_expert_cap] = {165u, 0u, 1u, 2u, 3u, 4u};
+        uint32_t n_experts = 1u;
+        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
+            n_experts = 0u;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0u) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-mpsgraph-lut-gateup-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
+        const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
+        const uint32_t mode = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 0u;
+        const float clamp = (argc >= 8) ? strtof(argv[7], NULL) : 10.0f;
+        return ds4_gpu_mpsgraph_d8f_gateup_lut_selected_canary(path, experts, n_experts, rows, rounds, mode, clamp) ? 0 : 1;
+#else
+        fprintf(stderr, "ds4: --d8f-mpsgraph-lut-gateup-canary requires Apple MPSGraph\n");
+        return 1;
+#endif
+    }
     /* --mul-mm-f16-canary [M [N [K]]] : #732 dense FP16 matmul */
     if (argc >= 2 && !strcmp(argv[1], "--mul-mm-f16-canary")) {
         const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
