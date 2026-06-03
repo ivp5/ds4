@@ -1432,6 +1432,64 @@ kernel void d8f_down_lut_gather_codes_selected_batch_tile32(
   }
 }
 
+kernel void d8f_down_lut_gather_codes_selected_batch_tile24(
+  device const ushort *codes        [[buffer(0)]],
+  device const float  *score        [[buffer(1)]],
+  device float        *out          [[buffer(2)]],
+  constant D8FDownLutArgs &args     [[buffer(3)]],
+  device const D8FDownLutSidecarLite *sidecars [[buffer(4)]],
+  device const float *sidecar_dot    [[buffer(5)]],
+  device const uchar *pack           [[buffer(6)]],
+  threadgroup float *partial        [[threadgroup(0)]],
+  uint tid [[thread_index_in_threadgroup]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]],
+  uint2 pos [[threadgroup_position_in_grid]]) {
+  const uint row_base = pos.x * 24u;
+  const uint token = pos.y;
+  if (token >= args.n_tokens) return;
+  const uint groups = args.in_dim >> 3;
+  float acc[24];
+  for (uint rr = 0u; rr < 24u; rr++) acc[rr] = 0.0f;
+  for (uint slot = 0u; slot < args.n_selected; slot++) {
+    for (uint group = tid; group < groups; group += 256u) {
+      const ulong score_base =
+          ulong(token) * ulong(args.score_token_stride) +
+          ulong(slot) * ulong(args.score_slot_stride) +
+          ulong(group) * ulong(args.score_group_stride);
+      for (uint rr = 0u; rr < 24u; rr++) {
+        const uint row = row_base + rr;
+        if (row >= args.rows) continue;
+        const uint code = uint(codes[(ulong(slot) * ulong(args.rows) + ulong(row)) * ulong(groups) + ulong(group)]);
+        if (code < args.max_k) acc[rr] += score[score_base + ulong(code)];
+      }
+    }
+    if (tid == 0u) {
+      for (uint rr = 0u; rr < 24u; rr++) {
+        const uint row = row_base + rr;
+        if (row < args.rows) {
+          acc[rr] += d8f_down_lut_rank1_delta(pack, sidecars, sidecar_dot, args, token, slot, row);
+        }
+      }
+    }
+  }
+  for (uint rr = 0u; rr < 24u; rr++) {
+    acc[rr] = simd_sum(acc[rr]);
+    if (tiisg == 0u) partial[rr * 8u + sgitg] = acc[rr];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    for (uint rr = 0u; rr < 24u; rr++) {
+      const uint row = row_base + rr;
+      if (row < args.rows) {
+        float total = 0.0f;
+        for (uint sg = 0u; sg < 8u; sg++) total += partial[rr * 8u + sg];
+        out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] = total;
+      }
+    }
+  }
+}
+
 kernel void d8f_down_lut_scoreh_selected_batch(
   device const uchar *pack          [[buffer(0)]],
   device const float *mid           [[buffer(1)]],
