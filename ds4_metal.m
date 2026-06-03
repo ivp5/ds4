@@ -48949,6 +48949,8 @@ int ds4_gpu_mtl4_d8f_down_selected_canary(const char *d8f_path,
 
 static id<MTLComputePipelineState> g_d8f_down_lut_score_selected_batch_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gather_selected_batch_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_lut_gather_selected_batch_tile8_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_lut_gather_selected_batch_tile16_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_scoreh_selected_batch_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gatherh_selected_batch_pipeline;
 static int g_d8f_down_lut_classic_init_attempted;
@@ -48969,9 +48971,11 @@ static int ds4_d8f_down_lut_classic_pipeline_init(void) {
     }
     id<MTLFunction> score_fn = [lib newFunctionWithName:@"d8f_down_lut_score_selected_batch"];
     id<MTLFunction> gather_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_selected_batch"];
+    id<MTLFunction> gather_tile8_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_selected_batch_tile8"];
+    id<MTLFunction> gather_tile16_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_selected_batch_tile16"];
     id<MTLFunction> scoreh_fn = [lib newFunctionWithName:@"d8f_down_lut_scoreh_selected_batch"];
     id<MTLFunction> gatherh_fn = [lib newFunctionWithName:@"d8f_down_lut_gatherh_selected_batch"];
-    if (!score_fn || !gather_fn || !scoreh_fn || !gatherh_fn) {
+    if (!score_fn || !gather_fn || !gather_tile8_fn || !gather_tile16_fn || !scoreh_fn || !gatherh_fn) {
         fprintf(stderr, "ds4_d8f: down LUT Metal function lookup failed\n");
         return 0;
     }
@@ -48986,6 +48990,20 @@ static int ds4_d8f_down_lut_classic_pipeline_init(void) {
         [g_device newComputePipelineStateWithFunction:gather_fn error:&err];
     if (!g_d8f_down_lut_gather_selected_batch_pipeline) {
         fprintf(stderr, "ds4_d8f: down LUT gather pipeline failed: %s\n",
+                err.localizedDescription.UTF8String);
+        return 0;
+    }
+    g_d8f_down_lut_gather_selected_batch_tile8_pipeline =
+        [g_device newComputePipelineStateWithFunction:gather_tile8_fn error:&err];
+    if (!g_d8f_down_lut_gather_selected_batch_tile8_pipeline) {
+        fprintf(stderr, "ds4_d8f: down LUT gather tile8 pipeline failed: %s\n",
+                err.localizedDescription.UTF8String);
+        return 0;
+    }
+    g_d8f_down_lut_gather_selected_batch_tile16_pipeline =
+        [g_device newComputePipelineStateWithFunction:gather_tile16_fn error:&err];
+    if (!g_d8f_down_lut_gather_selected_batch_tile16_pipeline) {
+        fprintf(stderr, "ds4_d8f: down LUT gather tile16 pipeline failed: %s\n",
                 err.localizedDescription.UTF8String);
         return 0;
     }
@@ -49134,6 +49152,12 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     const uint64_t score_count = (uint64_t)n_tokens * n_experts * groups * max_k;
     const int half_score = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_HALF") > 0;
     const size_t score_bytes_per_value = half_score ? sizeof(uint16_t) : sizeof(float);
+    const uint32_t default_gather_tile_rows = (n_tokens <= 1u) ? 1u : ((n_tokens <= 4u) ? 16u : 8u);
+    uint32_t gather_tile_rows = ds4_gpu_env_u32("DS4_D8F_METAL_LUT_GATHER_TILE_ROWS", default_gather_tile_rows);
+    if (half_score) gather_tile_rows = 1u;
+    else if (gather_tile_rows >= 16u) gather_tile_rows = 16u;
+    else if (gather_tile_rows >= 8u) gather_tile_rows = 8u;
+    else gather_tile_rows = 1u;
     int ok = 0, mismatch = 0, gpu_zero = 0, gpu_sentinel = 0;
     double max_abs = 0.0, max_rel = 0.0, timed_ms = 0.0;
     double sum_abs = 0.0, sum_sq_abs = 0.0;
@@ -49192,17 +49216,29 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                 [enc setBuffer:recBuf offset:0 atIndex:5];
                 [enc dispatchThreads:MTLSizeMake(max_k, groups, n_tokens * n_experts)
                     threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-                [enc setComputePipelineState:half_score
+                id<MTLComputePipelineState> gather_pipeline = half_score
                     ? g_d8f_down_lut_gatherh_selected_batch_pipeline
-                    : g_d8f_down_lut_gather_selected_batch_pipeline];
+                    : g_d8f_down_lut_gather_selected_batch_pipeline;
+                NSUInteger gather_partial_bytes = 8u * sizeof(float);
+                uint32_t gather_grid_rows = rows;
+                if (!half_score && gather_tile_rows == 16u) {
+                    gather_pipeline = g_d8f_down_lut_gather_selected_batch_tile16_pipeline;
+                    gather_partial_bytes = 16u * 8u * sizeof(float);
+                    gather_grid_rows = (rows + 15u) >> 4;
+                } else if (!half_score && gather_tile_rows == 8u) {
+                    gather_pipeline = g_d8f_down_lut_gather_selected_batch_tile8_pipeline;
+                    gather_partial_bytes = 8u * 8u * sizeof(float);
+                    gather_grid_rows = (rows + 7u) >> 3;
+                }
+                [enc setComputePipelineState:gather_pipeline];
                 [enc setBuffer:packBuf offset:0 atIndex:0];
                 [enc setBuffer:selBuf offset:0 atIndex:1];
                 [enc setBuffer:scoreBuf offset:0 atIndex:2];
                 [enc setBuffer:outBuf offset:0 atIndex:3];
                 [enc setBuffer:argsBuf offset:0 atIndex:4];
                 [enc setBuffer:recBuf offset:0 atIndex:5];
-                [enc setThreadgroupMemoryLength:8u * sizeof(float) atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(rows, n_tokens, 1)
+                [enc setThreadgroupMemoryLength:gather_partial_bytes atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(gather_grid_rows, n_tokens, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
                 [cb commit];
@@ -49267,9 +49303,9 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         }
     }
     fprintf(stderr,
-            "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s score=%.2f MiB pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
+            "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s gather_tile=%u score=%.2f MiB pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
             n_experts, rows, n_tokens, rounds, max_k,
-            half_score ? "f16" : "f32",
+            half_score ? "f16" : "f32", gather_tile_rows,
             (double)(score_count * score_bytes_per_value) / 1048576.0,
             (double)file.size / 1048576.0, timed_ms,
             timed_ms / (double)rounds,

@@ -955,6 +955,120 @@ kernel void d8f_down_lut_gather_selected_batch(
   }
 }
 
+kernel void d8f_down_lut_gather_selected_batch_tile8(
+  device const uchar *pack          [[buffer(0)]],
+  device const uint  *selected      [[buffer(1)]],
+  device const float *score         [[buffer(2)]],
+  device float       *out           [[buffer(3)]],
+  constant D8FDownLutArgs &args     [[buffer(4)]],
+  device const D8FRecordLite *recs  [[buffer(5)]],
+  threadgroup float *partial        [[threadgroup(0)]],
+  uint tid [[thread_index_in_threadgroup]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]],
+  uint2 pos [[threadgroup_position_in_grid]]) {
+  const uint row_base = pos.x << 3;
+  const uint token = pos.y;
+  if (token >= args.n_tokens) return;
+  const uint groups = args.in_dim >> 3;
+  float acc[8];
+  for (uint rr = 0u; rr < 8u; rr++) acc[rr] = 0.0f;
+  for (uint slot = 0u; slot < args.n_selected; slot++) {
+    const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];
+    const D8FRecordLite rec = recs[8192u + expert];
+    for (uint group = tid; group < groups; group += 256u) {
+      const ulong score_base =
+          ulong(token) * ulong(args.score_token_stride) +
+          ulong(slot) * ulong(args.score_slot_stride) +
+          ulong(group) * ulong(args.score_group_stride);
+      for (uint rr = 0u; rr < 8u; rr++) {
+        const uint row = row_base + rr;
+        if (row >= args.rows) continue;
+        const ulong block_index = ulong(row) * ulong(groups) + ulong(group);
+        const ulong bit_off = block_index * ulong(rec.bits);
+        const ulong byte_off = bit_off >> 3;
+        const uint shift = uint(bit_off & 7ul);
+        device const uchar *ix = pack + rec.index_offset + byte_off;
+        const uint word = uint(ix[0]) | (uint(ix[1]) << 8u) | (uint(ix[2]) << 16u) | (uint(ix[3]) << 24u);
+        const uint code = (word >> shift) & rec.mask;
+        acc[rr] += score[score_base + ulong(code)];
+      }
+    }
+  }
+  for (uint rr = 0u; rr < 8u; rr++) {
+    acc[rr] = simd_sum(acc[rr]);
+    if (tiisg == 0u) partial[rr * 8u + sgitg] = acc[rr];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    for (uint rr = 0u; rr < 8u; rr++) {
+      const uint row = row_base + rr;
+      if (row < args.rows) {
+        float total = 0.0f;
+        for (uint sg = 0u; sg < 8u; sg++) total += partial[rr * 8u + sg];
+        out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] = total;
+      }
+    }
+  }
+}
+
+kernel void d8f_down_lut_gather_selected_batch_tile16(
+  device const uchar *pack          [[buffer(0)]],
+  device const uint  *selected      [[buffer(1)]],
+  device const float *score         [[buffer(2)]],
+  device float       *out           [[buffer(3)]],
+  constant D8FDownLutArgs &args     [[buffer(4)]],
+  device const D8FRecordLite *recs  [[buffer(5)]],
+  threadgroup float *partial        [[threadgroup(0)]],
+  uint tid [[thread_index_in_threadgroup]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]],
+  uint2 pos [[threadgroup_position_in_grid]]) {
+  const uint row_base = pos.x << 4;
+  const uint token = pos.y;
+  if (token >= args.n_tokens) return;
+  const uint groups = args.in_dim >> 3;
+  float acc[16];
+  for (uint rr = 0u; rr < 16u; rr++) acc[rr] = 0.0f;
+  for (uint slot = 0u; slot < args.n_selected; slot++) {
+    const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];
+    const D8FRecordLite rec = recs[8192u + expert];
+    for (uint group = tid; group < groups; group += 256u) {
+      const ulong score_base =
+          ulong(token) * ulong(args.score_token_stride) +
+          ulong(slot) * ulong(args.score_slot_stride) +
+          ulong(group) * ulong(args.score_group_stride);
+      for (uint rr = 0u; rr < 16u; rr++) {
+        const uint row = row_base + rr;
+        if (row >= args.rows) continue;
+        const ulong block_index = ulong(row) * ulong(groups) + ulong(group);
+        const ulong bit_off = block_index * ulong(rec.bits);
+        const ulong byte_off = bit_off >> 3;
+        const uint shift = uint(bit_off & 7ul);
+        device const uchar *ix = pack + rec.index_offset + byte_off;
+        const uint word = uint(ix[0]) | (uint(ix[1]) << 8u) | (uint(ix[2]) << 16u) | (uint(ix[3]) << 24u);
+        const uint code = (word >> shift) & rec.mask;
+        acc[rr] += score[score_base + ulong(code)];
+      }
+    }
+  }
+  for (uint rr = 0u; rr < 16u; rr++) {
+    acc[rr] = simd_sum(acc[rr]);
+    if (tiisg == 0u) partial[rr * 8u + sgitg] = acc[rr];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    for (uint rr = 0u; rr < 16u; rr++) {
+      const uint row = row_base + rr;
+      if (row < args.rows) {
+        float total = 0.0f;
+        for (uint sg = 0u; sg < 8u; sg++) total += partial[rr * 8u + sg];
+        out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] = total;
+      }
+    }
+  }
+}
+
 kernel void d8f_down_lut_scoreh_selected_batch(
   device const uchar *pack          [[buffer(0)]],
   device const float *mid           [[buffer(1)]],
