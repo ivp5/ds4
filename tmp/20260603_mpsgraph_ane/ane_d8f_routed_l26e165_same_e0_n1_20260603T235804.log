@@ -1,0 +1,26 @@
+2026-06-03 23:58:04.994 ane_d8f_routed_counterbalanced_canary[95892:12531105] [coreml] compile_start path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage
+2026-06-03 23:58:07.497 ane_d8f_routed_counterbalanced_canary[95892:12531105] [shape] coreml_input=x (
+    2048,
+    4096
+) coreml_output=shared_out (
+    2048,
+    4096
+) d8f=/Users/silv/cl/tlp/montyneg/ds4/DeepSeek-V4-Flash_H3355_H3353_L26E165_gate_clean_D8F_800kctx_AIME_active_20260603/ds4_L26_gate_up_down_VQD8_noE8_rank1.d8f experts=165 nsel=1 trials=4 evict_mib=0 mode=same seed=24601
+2026-06-03 23:58:07.555 ane_d8f_routed_counterbalanced_canary[95892:12531105] [mpsgraph] compile_start nsel=1
+2026-06-03 23:58:07.693 ane_d8f_routed_counterbalanced_canary[95892:12531105] [validate] bad=0 max_abs=6.15008e-05 max_rel=6.15008e-05 rms=1.45568e-05 sample_ref=0.00682174 sample_got=0.00682068
+2026-06-03 23:58:07.756 ane_d8f_routed_counterbalanced_canary[95892:12531105] [warmup] output_backing_used=yes
+2026-06-03 23:58:07.844 ane_d8f_routed_counterbalanced_canary[95892:12531105] [trial] index=0 order=d8f_only,d8f_evicted,d8f_after_ane,serial_ane_d8f,concurrent,ane_only,ane_after_d8f,d8f_after_ane_evicted
+2026-06-03 23:58:07.931 ane_d8f_routed_counterbalanced_canary[95892:12531105] [trial] index=1 order=ane_only,d8f_evicted,d8f_after_ane,d8f_after_ane_evicted,ane_after_d8f,serial_ane_d8f,concurrent,d8f_only
+2026-06-03 23:58:08.019 ane_d8f_routed_counterbalanced_canary[95892:12531105] [trial] index=2 order=d8f_after_ane,ane_after_d8f,serial_ane_d8f,concurrent,d8f_only,ane_only,d8f_after_ane_evicted,d8f_evicted
+2026-06-03 23:58:08.109 ane_d8f_routed_counterbalanced_canary[95892:12531105] [trial] index=3 order=d8f_after_ane_evicted,serial_ane_d8f,d8f_evicted,d8f_after_ane,ane_only,ane_after_d8f,d8f_only,concurrent
+2026-06-03 23:58:08.109 ane_d8f_routed_counterbalanced_canary[95892:12531105] [summary] mode=same evict_mib=0 nsel=1 case=ane_only n=4 min_ms=11.949 p50_ms=12.886 p90_ms=12.970 max_ms=12.970 mean_ms=12.587
+2026-06-03 23:58:08.109 ane_d8f_routed_counterbalanced_canary[95892:12531105] [summary] mode=same evict_mib=0 nsel=1 case=d8f_only n=4 min_ms=1.952 p50_ms=2.028 p90_ms=2.756 max_ms=2.756 mean_ms=2.183
+2026-06-03 23:58:08.109 ane_d8f_routed_counterbalanced_canary[95892:12531105] [summary] mode=same evict_mib=0 nsel=1 case=d8f_evicted n=4 min_ms=1.589 p50_ms=1.611 p90_ms=1.890 max_ms=1.890 mean_ms=1.673
+2026-06-03 23:58:08.109 ane_d8f_routed_counterbalanced_canary[95892:12531105] [summary] mode=same evict_mib=0 nsel=1 case=d8f_after_ane n=4 min_ms=1.934 p50_ms=2.060 p90_ms=2.421 max_ms=2.421 mean_ms=2.092
+2026-06-03 23:58:08.109 ane_d8f_routed_counterbalanced_canary[95892:12531105] [summary] mode=same evict_mib=0 nsel=1 case=d8f_after_ane_evicted n=4 min_ms=2.035 p50_ms=2.090 p90_ms=2.093 max_ms=2.093 mean_ms=2.070
+2026-06-03 23:58:08.109 ane_d8f_routed_counterbalanced_canary[95892:12531105] [summary] mode=same evict_mib=0 nsel=1 case=ane_after_d8f n=4 min_ms=12.586 p50_ms=13.001 p90_ms=13.451 max_ms=13.451 mean_ms=12.949
+2026-06-03 23:58:08.109 ane_d8f_routed_counterbalanced_canary[95892:12531105] [summary] mode=same evict_mib=0 nsel=1 case=serial_ane_d8f n=4 min_ms=14.022 p50_ms=14.673 p90_ms=15.021 max_ms=15.021 mean_ms=14.449
+2026-06-03 23:58:08.109 ane_d8f_routed_counterbalanced_canary[95892:12531105] [summary] mode=same evict_mib=0 nsel=1 case=concurrent n=4 min_ms=12.613 p50_ms=12.719 p90_ms=12.924 max_ms=12.924 mean_ms=12.743
+2026-06-03 23:58:08.109 ane_d8f_routed_counterbalanced_canary[95892:12531105] [derived] mode=same evict_mib=0 nsel=1 ane_plus_d8f_p50_ms=14.913 serial_measured_p50_ms=14.673 concurrent_p50_ms=12.719 overlap_speedup_p50=1.172
+2026-06-03 23:58:08.109 ane_d8f_routed_counterbalanced_canary[95892:12531105] [cache_effect] mode=same evict_mib=0 nsel=1 d8f_only_p50_ms=2.028 d8f_evicted_p50_ms=1.611 d8f_after_ane_p50_ms=2.060 d8f_after_ane_evicted_p50_ms=2.090 evict_p50_ms=0.000
+2026-06-03 23:58:08.109 ane_d8f_routed_counterbalanced_canary[95892:12531105] [samples] ane0=0xa118 d8f0=0x1efc

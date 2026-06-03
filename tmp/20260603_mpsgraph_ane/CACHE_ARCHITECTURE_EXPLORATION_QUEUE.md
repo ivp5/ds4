@@ -20,6 +20,9 @@
 - 4-bit CoreML palettization is not fidelity-safe on the current shared-expert canary (`rms=0.0841229`, `ref_rms=0.427915`), while 8-bit is plausible (`rms=0.0050416`, `ref_rms=0.427915`). Cache/overlap work should therefore measure 8-bit shared experts first, not force 4-bit through an AIME gate.
 - `ane_mpsgraph_counterbalanced_canary.m` tests the virtual-bandwidth hypothesis directly with randomized per-trial case order and `same` versus `separate` input allocations. Real H3355 layer-0 B=2048 8-bit, no eviction: same-buffer ANE→MPS p50 was faster than same-buffer MPS-only (`17.840 ms` vs `23.452 ms`), while separate-buffer ANE→MPS was slower than separate-buffer MPS-only (`19.674 ms` vs `15.075 ms`). This is the first direct evidence that the useful effect is shared allocation/cache/page/scheduler state, not generic ANE warmup.
 - Counterbalanced overlap p50 speedups stayed positive across same/separate and 0/256MiB eviction (`1.495x` to `1.882x`), but eviction controls remain noisy under current load. Treat the signal as high-potential, not yet production-proof.
+- `ane_d8f_routed_counterbalanced_canary.m` replaces synthetic MPSGraph dense with exact real D8F gate/up/SwiGLU/down LUT graph work. Exactness passed for L26/E165 (`bad=0`, `rms=1.45568e-05`) and selected six experts `165,0,1,2,3,4` (`bad=0`, `rms=3.30178e-05`).
+- Real six-expert D8F did not inherit the synthetic same-buffer ANE→MPS warmup. Same/no-evict D8F-only p50 was `7.270 ms`, D8F-after-ANE was `7.760 ms`; separate/no-evict D8F-only was `6.914 ms`, D8F-after-ANE was `7.273 ms`. The robust production win is parallel overlap, not proven D8F cache warmup.
+- Real six-expert ANE shared + exact D8F routed overlap remains valuable: same/no-evict p50 speedup `1.383x`; same/256MiB `1.613x`; separate/no-evict `1.600x`; separate/256MiB `1.355x`. This is the best current evidence for same-layer ANE/GPU prefill overlap.
 
 ## Highest-Potential Experiments
 
@@ -41,6 +44,8 @@
 16. Trivial-CoreML page warm: compare real shared-expert ANE against a cheap CoreML identity/read model that touches the same input with minimal math. If both help MPSGraph, page/TLB/SLC warmth is enough; if only real ANE helps, scheduler or weight-stream side effects matter.
 17. Microbatch interleave: test `B=256,512,1024,2048` shared-expert ANE while GPU runs routed D8F for the same layer. Same-layer shared and routed branches are dependency-parallel; cross-layer pipelining is not valid until the merge/residual is complete.
 18. Command-queue/fence policy: test one shared Metal command queue versus separate queues plus explicit events/fences around input readiness and output merge. The target is overlap without accidental serialization or cache-destructive waits.
+19. Merge survival canary: allocate CoreML shared output backing as a GPU-visible buffer/IOSurface, run exact D8F routed graph concurrently, then launch a Metal add/merge into the FFN output. Measure serial versus overlapped+merge; if merge erases the overlap, the architecture is not ready.
+20. Route-weighted exact graph: extend the D8F routed MPSGraph canary to multiply selected expert outputs by router weights before summing. Current graph uses unit expert weights; performance shape is valid, but runtime integration needs route-weighted output.
 
 ## Production Direction
 
@@ -49,3 +54,4 @@
 - Keep MPSGraph for exact D8F down/gateup canaries and graph-cache exploration. Treat MPSGraph + ANE overlap as a scheduling/cache optimization, not as a replacement for reaching the packed-index memory floor.
 - Treat the user’s “virtual bandwidth” hypothesis as plausible but unproven: the likely win is cache/SLC/TLB/DRAM-controller residency plus free parallel compute, not ANE magically warming GPU private cache. Promotion requires counterbalanced evidence and eviction controls.
 - The near-term runtime architecture should be same-layer parallelism: GPU computes routed D8F, ANE computes 8-bit shared expert from the same hidden-state allocation, GPU merges shared+routed outputs from CoreML output backing, then the normal layer dependency continues. Cache correctness matters at the input and merge buffers; violating that turns theoretical bandwidth into extra serialization.
+- After the exact routed canary, prioritize overlap integration over cache folklore: cache warmth helped synthetic dense, but exact D8F routed mainly benefits from concurrent ANE/GPU execution. The next go/no-go is merge/fence cost, then route-weighted exact graph caching.

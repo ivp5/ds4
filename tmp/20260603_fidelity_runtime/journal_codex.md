@@ -179,3 +179,14 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - That pattern supports the user's virtual-bandwidth hypothesis in the narrow form: ANE work can leave shared allocation/cache/page/scheduler state that makes the immediately following MPSGraph pass cheaper. It is not a private-cache warmup story because the effect disappears or reverses when the MPS input is a separate allocation.
 - Overlap remains useful even when cache behavior is noisy: p50 overlap speedups were `1.882x` same/no-evict, `1.566x` same/256MiB-evict, `1.608x` separate/no-evict, and `1.495x` separate/256MiB-evict.
 - The eviction results are not yet promotion-grade. Separate-buffer 256MiB eviction behaved coherently (`mps_after_ane` `16.944 ms` → `mps_after_ane_evicted` `22.850 ms`), but same-buffer 256MiB had order/load noise (`17.294 ms` → `14.847 ms`). Next evidence must run more trials under lower load, include Metal eviction, and pair ANE shared with real MPSGraph D8F down/gateup instead of synthetic dense.
+
+## 2026-06-04T00:00 JST — ANE shared + exact D8F routed MPSGraph canary
+
+- Added `tmp/20260603_mpsgraph_ane/ane_d8f_routed_counterbalanced_canary.m`, which composes real D8F gate, up, SwiGLU, and down LUTs into one MPSGraph executable and schedules it against the real 8-bit CoreML/ANE shared-expert model.
+- The harness is same-layer shaped: CoreML/ANE consumes the B=2048 hidden-state buffer for the shared expert while MPSGraph consumes the first row of either the same hidden-state `MTLBuffer` or a separate equal buffer for exact routed D8F. This is the production dependency boundary: shared and routed branches can run in parallel before merge.
+- Exactness passed. L26/E165 single-expert routed graph had `bad=0`, `rms=1.45568e-05`; selected six experts `165,0,1,2,3,4` had `bad=0`, `rms=3.30178e-05`.
+- Single-expert routed D8F is too small for major overlap: same/no-evict p50 D8F `2.028 ms`, ANE `12.886 ms`, concurrent `12.719 ms`, overlap speedup `1.172x`.
+- Six-expert routed D8F is the useful prefill scale. Same/no-evict p50: ANE `12.269 ms`, D8F `7.270 ms`, serial measured `21.422 ms`, concurrent `14.133 ms`, speedup `1.383x`.
+- Six-expert separate/no-evict p50: ANE `14.749 ms`, D8F `6.914 ms`, serial `19.865 ms`, concurrent `13.535 ms`, speedup `1.600x`. Same/256MiB p50 speedup was `1.613x`; separate/256MiB was `1.355x`.
+- The synthetic-dense cache warmup result does not transfer cleanly to exact D8F routed. For six experts, same/no-evict D8F-only `7.270 ms` versus D8F-after-ANE `7.760 ms`; separate/no-evict `6.914 ms` versus `7.273 ms`. Treat ANE+D8F as a parallel-overlap win first, not a proven D8F cache warmup.
+- Next runtime move: build an opt-in layer-local scheduler that launches ANE shared expert and GPU/MPSGraph routed D8F from the same hidden-state buffer, then measures GPU merge from CoreML output backing. The merge/fence cost now decides whether the overlap survives integration.

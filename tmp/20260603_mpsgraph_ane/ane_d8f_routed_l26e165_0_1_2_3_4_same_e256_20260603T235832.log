@@ -1,0 +1,28 @@
+2026-06-03 23:58:40.546 ane_d8f_routed_counterbalanced_canary[95986:12531586] [coreml] compile_start path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage
+2026-06-03 23:58:43.010 ane_d8f_routed_counterbalanced_canary[95986:12531586] [shape] coreml_input=x (
+    2048,
+    4096
+) coreml_output=shared_out (
+    2048,
+    4096
+) d8f=/Users/silv/cl/tlp/montyneg/ds4/DeepSeek-V4-Flash_H3355_H3353_L26E165_gate_clean_D8F_800kctx_AIME_active_20260603/ds4_L26_gate_up_down_VQD8_noE8_rank1.d8f experts=165,0,1,2,3,4 nsel=6 trials=6 evict_mib=256 mode=same seed=26003
+2026-06-03 23:58:43.325 ane_d8f_routed_counterbalanced_canary[95986:12531586] [mpsgraph] compile_start nsel=6
+2026-06-03 23:58:43.492 ane_d8f_routed_counterbalanced_canary[95986:12531586] [validate] bad=0 max_abs=0.000117674 max_rel=0.000117674 rms=3.30178e-05 sample_ref=-0.00536694 sample_got=-0.00536346
+2026-06-03 23:58:43.567 ane_d8f_routed_counterbalanced_canary[95986:12531586] [warmup] output_backing_used=yes
+2026-06-03 23:58:43.743 ane_d8f_routed_counterbalanced_canary[95986:12531586] [trial] index=0 order=d8f_after_ane,ane_only,concurrent,ane_after_d8f,d8f_after_ane_evicted,d8f_evicted,d8f_only,serial_ane_d8f
+2026-06-03 23:58:43.901 ane_d8f_routed_counterbalanced_canary[95986:12531586] [trial] index=1 order=d8f_evicted,serial_ane_d8f,ane_only,concurrent,ane_after_d8f,d8f_only,d8f_after_ane_evicted,d8f_after_ane
+2026-06-03 23:58:44.060 ane_d8f_routed_counterbalanced_canary[95986:12531586] [trial] index=2 order=d8f_only,d8f_after_ane,ane_after_d8f,ane_only,d8f_evicted,concurrent,serial_ane_d8f,d8f_after_ane_evicted
+2026-06-03 23:58:44.224 ane_d8f_routed_counterbalanced_canary[95986:12531586] [trial] index=3 order=d8f_after_ane_evicted,d8f_after_ane,serial_ane_d8f,concurrent,d8f_evicted,ane_after_d8f,ane_only,d8f_only
+2026-06-03 23:58:44.380 ane_d8f_routed_counterbalanced_canary[95986:12531586] [trial] index=4 order=d8f_only,serial_ane_d8f,d8f_after_ane_evicted,ane_after_d8f,d8f_after_ane,concurrent,ane_only,d8f_evicted
+2026-06-03 23:58:44.561 ane_d8f_routed_counterbalanced_canary[95986:12531586] [trial] index=5 order=d8f_after_ane_evicted,ane_after_d8f,serial_ane_d8f,d8f_after_ane,d8f_evicted,d8f_only,ane_only,concurrent
+2026-06-03 23:58:44.561 ane_d8f_routed_counterbalanced_canary[95986:12531586] [summary] mode=same evict_mib=256 nsel=6 case=ane_only n=6 min_ms=12.071 p50_ms=14.428 p90_ms=22.602 max_ms=22.602 mean_ms=14.748
+2026-06-03 23:58:44.561 ane_d8f_routed_counterbalanced_canary[95986:12531586] [summary] mode=same evict_mib=256 nsel=6 case=d8f_only n=6 min_ms=4.392 p50_ms=6.686 p90_ms=6.923 max_ms=6.923 mean_ms=6.067
+2026-06-03 23:58:44.561 ane_d8f_routed_counterbalanced_canary[95986:12531586] [summary] mode=same evict_mib=256 nsel=6 case=d8f_evicted n=6 min_ms=4.776 p50_ms=7.378 p90_ms=7.473 max_ms=7.473 mean_ms=6.170
+2026-06-03 23:58:44.561 ane_d8f_routed_counterbalanced_canary[95986:12531586] [summary] mode=same evict_mib=256 nsel=6 case=d8f_after_ane n=6 min_ms=4.301 p50_ms=7.207 p90_ms=7.341 max_ms=7.341 mean_ms=5.903
+2026-06-03 23:58:44.561 ane_d8f_routed_counterbalanced_canary[95986:12531586] [summary] mode=same evict_mib=256 nsel=6 case=d8f_after_ane_evicted n=6 min_ms=4.950 p50_ms=6.106 p90_ms=7.514 max_ms=7.514 mean_ms=6.002
+2026-06-03 23:58:44.561 ane_d8f_routed_counterbalanced_canary[95986:12531586] [summary] mode=same evict_mib=256 nsel=6 case=ane_after_d8f n=6 min_ms=13.140 p50_ms=22.081 p90_ms=23.398 max_ms=23.398 mean_ms=18.606
+2026-06-03 23:58:44.561 ane_d8f_routed_counterbalanced_canary[95986:12531586] [summary] mode=same evict_mib=256 nsel=6 case=serial_ane_d8f n=6 min_ms=16.019 p50_ms=25.865 p90_ms=29.835 max_ms=29.835 mean_ms=23.814
+2026-06-03 23:58:44.561 ane_d8f_routed_counterbalanced_canary[95986:12531586] [summary] mode=same evict_mib=256 nsel=6 case=concurrent n=6 min_ms=12.031 p50_ms=13.091 p90_ms=21.951 max_ms=21.951 mean_ms=14.239
+2026-06-03 23:58:44.561 ane_d8f_routed_counterbalanced_canary[95986:12531586] [derived] mode=same evict_mib=256 nsel=6 ane_plus_d8f_p50_ms=21.114 serial_measured_p50_ms=25.865 concurrent_p50_ms=13.091 overlap_speedup_p50=1.613
+2026-06-03 23:58:44.561 ane_d8f_routed_counterbalanced_canary[95986:12531586] [cache_effect] mode=same evict_mib=256 nsel=6 d8f_only_p50_ms=6.686 d8f_evicted_p50_ms=7.378 d8f_after_ane_p50_ms=7.207 d8f_after_ane_evicted_p50_ms=6.106 evict_p50_ms=14.183
+2026-06-03 23:58:44.561 ane_d8f_routed_counterbalanced_canary[95986:12531586] [samples] ane0=0xa118 d8f0=0x9d7e
