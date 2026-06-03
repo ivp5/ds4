@@ -1,0 +1,14 @@
+[config] output=tmp/20260603_mpsgraph_ane/prefill_b256_d4096_n2048_20260603T232600.mlpackage batch=256 input_dim=4096 output_dim=2048 bits=4 opset=iOS26 deployment=macOS26
+[convert] start t=1780496760923
+Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]
+Running MIL default pipeline:   0%|          | 0/95 [00:00<?, ? passes/s]Running MIL default pipeline: 100%|██████████| 95/95 [00:00<00:00, 1785.65 passes/s]
+Running MIL backend_mlprogram pipeline:   0%|          | 0/12 [00:00<?, ? passes/s]Running MIL backend_mlprogram pipeline: 100%|██████████| 12/12 [00:00<00:00, 18020.64 passes/s]
+[convert] done t=1780496762103
+[palettize] start t=1780496762104
+Running compression pass palettize_weights:   0%|          | 0/1 [00:00<?, ? ops/s]Running compression pass palettize_weights: 100%|██████████| 1/1 [00:01<00:00,  1.02s/ ops]Running compression pass palettize_weights: 100%|██████████| 1/1 [00:01<00:00,  1.02s/ ops]
+Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]
+Running MIL default pipeline:   0%|          | 0/92 [00:00<?, ? passes/s]Running MIL default pipeline: 100%|██████████| 92/92 [00:00<00:00, 2307.72 passes/s]
+Running MIL backend_mlprogram pipeline:   0%|          | 0/12 [00:00<?, ? passes/s]Running MIL backend_mlprogram pipeline: 100%|██████████| 12/12 [00:00<00:00, 1167.27 passes/s]
+[palettize] done t=1780496763909
+[spec] inputs=['x'] outputs=['y']
+[save] done path=tmp/20260603_mpsgraph_ane/prefill_b256_d4096_n2048_20260603T232600.mlpackage t=1780496763912
