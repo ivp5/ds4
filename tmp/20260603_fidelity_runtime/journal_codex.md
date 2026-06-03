@@ -198,3 +198,10 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - Overlap survives merge. Same-buffer/no-evict p50: ANE `13.459 ms`, D8F `7.922 ms`, merge `0.418 ms`, serial+merge `20.317 ms`, concurrent-then-merge `17.511 ms`, overlap+merge speedup `1.245x`.
 - Separate-buffer/no-evict p50: ANE `16.672 ms`, D8F `4.570 ms`, merge `0.608 ms`, serial+merge `20.896 ms`, concurrent-then-merge `17.455 ms`, overlap+merge speedup `1.252x`.
 - Current production implication: same-layer ANE shared + GPU/MPSGraph routed + GPU merge is mechanically viable and does not collapse on the first merge. Next falsifiers are route weights, real batch/microbatch scheduling, and moving from a canary executable into an opt-in layer-local runtime organ.
+
+## 2026-06-04T00:05 JST — route-weighted exact D8F graph
+
+- Extended `ane_d8f_routed_counterbalanced_canary.m` with optional route-weight CSV support. The MPSGraph now multiplies each selected expert's down output by its route weight before summing, matching MoE semantics instead of the prior unit-weight performance shape.
+- Weighted exactness passed for selected six experts `165,0,1,2,3,4` with weights `0.35,0.2,0.15,0.1,0.1,0.1`: `bad=0`, `max_abs=3.03481e-05`, `rms=7.04666e-06`.
+- Weighted D8F-only p50 was `6.790 ms`; merge p50 was `0.295 ms`. The four-trial overlap timing had an outlier and is not promotion-grade: concurrent p50 `22.103 ms`, concurrent-then-merge p50 `25.594 ms`, overlap+merge speedup only `1.008x`.
+- Current implication: the exact graph now has the required route-weight semantics. The next useful performance measurement is a longer low-load weighted run or direct runtime integration with real router weights, not another unit-weight canary.

@@ -24,6 +24,7 @@
 - Real six-expert D8F did not inherit the synthetic same-buffer ANE→MPS warmup. Same/no-evict D8F-only p50 was `7.270 ms`, D8F-after-ANE was `7.760 ms`; separate/no-evict D8F-only was `6.914 ms`, D8F-after-ANE was `7.273 ms`. The robust production win is parallel overlap, not proven D8F cache warmup.
 - Real six-expert ANE shared + exact D8F routed overlap remains valuable: same/no-evict p50 speedup `1.383x`; same/256MiB `1.613x`; separate/no-evict `1.600x`; separate/256MiB `1.355x`. This is the best current evidence for same-layer ANE/GPU prefill overlap.
 - Merge survival passed in the canary. A Metal half-add from CoreML shared output backing plus exact D8F routed output costs only `0.418-0.608 ms` p50, and overlap+merge still gives `1.245-1.252x` p50 speedup for selected six experts. Merge/fence cost does not immediately erase the ANE/GPU overlap.
+- Route-weight semantics are now in the exact D8F graph canary. Weighted selected-six L26/E165 with weights `0.35,0.2,0.15,0.1,0.1,0.1` passed exactness (`bad=0`, `rms=7.04666e-06`). The short weighted timing run was noisy, so use it as a semantics gate, not a speed claim.
 
 ## Highest-Potential Experiments
 
@@ -46,7 +47,7 @@
 17. Microbatch interleave: test `B=256,512,1024,2048` shared-expert ANE while GPU runs routed D8F for the same layer. Same-layer shared and routed branches are dependency-parallel; cross-layer pipelining is not valid until the merge/residual is complete.
 18. Command-queue/fence policy: test one shared Metal command queue versus separate queues plus explicit events/fences around input readiness and output merge. The target is overlap without accidental serialization or cache-destructive waits.
 19. Merge survival canary: allocate CoreML shared output backing as a GPU-visible buffer/IOSurface, run exact D8F routed graph concurrently, then launch a Metal add/merge into the FFN output. Measure serial versus overlapped+merge; if merge erases the overlap, the architecture is not ready.
-20. Route-weighted exact graph: extend the D8F routed MPSGraph canary to multiply selected expert outputs by router weights before summing. Current graph uses unit expert weights; performance shape is valid, but runtime integration needs route-weighted output.
+20. Real-router weighted timing: feed actual router top-k weights from a runtime trace into the route-weighted MPSGraph canary and rerun a longer low-load schedule. Synthetic normalized weights prove graph semantics, not production timing.
 21. Runtime sidecar scaffold: add an opt-in layer-local prefill organ that owns CoreML model cache, D8F graph cache, hidden-state backing, concurrent launch, and merge. Keep it default-off until route-weighted canary and real hidden-state fidelity checks pass.
 
 ## Production Direction
@@ -57,4 +58,4 @@
 - Treat the user’s “virtual bandwidth” hypothesis as plausible but unproven: the likely win is cache/SLC/TLB/DRAM-controller residency plus free parallel compute, not ANE magically warming GPU private cache. Promotion requires counterbalanced evidence and eviction controls.
 - The near-term runtime architecture should be same-layer parallelism: GPU computes routed D8F, ANE computes 8-bit shared expert from the same hidden-state allocation, GPU merges shared+routed outputs from CoreML output backing, then the normal layer dependency continues. Cache correctness matters at the input and merge buffers; violating that turns theoretical bandwidth into extra serialization.
 - After the exact routed canary, prioritize overlap integration over cache folklore: cache warmth helped synthetic dense, but exact D8F routed mainly benefits from concurrent ANE/GPU execution. The next go/no-go is merge/fence cost, then route-weighted exact graph caching.
-- After merge survival, the next go/no-go shifts to route-weighted exact graph and real hidden-state fidelity. If those pass, the speed path becomes an opt-in runtime integration problem rather than a speculative cache experiment.
+- After route-weighted exactness, the next go/no-go shifts to real hidden-state fidelity and real-router weighted timing. If those pass, the speed path becomes an opt-in runtime integration problem rather than a speculative cache experiment.

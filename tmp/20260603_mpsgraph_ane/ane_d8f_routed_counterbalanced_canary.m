@@ -299,6 +299,34 @@ static uint32_t parse_experts(const char *csv, uint32_t *experts, uint32_t max_e
     return count;
 }
 
+static bool parse_weights(const char *csv, float *weights, uint32_t n_weights) {
+    if (!weights || n_weights == 0u) return false;
+    for (uint32_t index = 0; index < n_weights; ++index) weights[index] = 1.0f;
+    if (!csv || strcmp(csv, "-") == 0 || strcmp(csv, "unit") == 0) return true;
+    char local[192];
+    strlcpy(local, csv, sizeof(local));
+    uint32_t count = 0;
+    char *save = NULL;
+    for (char *token = strtok_r(local, ",", &save); token; token = strtok_r(NULL, ",", &save)) {
+        if (count >= n_weights) return false;
+        char *end = NULL;
+        float value = strtof(token, &end);
+        if (end == token || *end != '\0' || !isfinite(value)) return false;
+        weights[count++] = value;
+    }
+    return count == n_weights;
+}
+
+static void weights_csv(char *out, size_t out_bytes, const float *weights, uint32_t n_weights) {
+    if (!out || out_bytes == 0u) return;
+    out[0] = '\0';
+    for (uint32_t index = 0; index < n_weights; ++index) {
+        char item[32];
+        snprintf(item, sizeof(item), "%s%.6g", index ? "," : "", weights[index]);
+        strlcat(out, item, out_bytes);
+    }
+}
+
 static void free_slots(D8FSlot *slots, uint32_t n_experts) {
     for (uint32_t slot = 0; slot < n_experts; ++slot) {
         free(slots[slot].gate_cb_f16);
@@ -367,7 +395,7 @@ static double p50_for_case(NSDictionary<NSString *, NSMutableArray<NSNumber *> *
 int main(int argc, const char **argv) {
     @autoreleasepool {
         if (argc < 4) {
-            fprintf(stderr, "usage: %s SHARED.mlpackage LAYER.d8f EXPERTS_CSV [trials] [evict_mib] [same|separate] [seed]\n", argv[0]);
+            fprintf(stderr, "usage: %s SHARED.mlpackage LAYER.d8f EXPERTS_CSV [trials] [evict_mib] [same|separate] [seed] [ROUTE_WEIGHTS_CSV]\n", argv[0]);
             return 2;
         }
         NSString *model_path = [NSString stringWithUTF8String:argv[1]];
@@ -375,10 +403,14 @@ int main(int argc, const char **argv) {
         uint32_t experts[kMaxExperts] = {0};
         uint32_t n_experts = parse_experts(argv[3], experts, kMaxExperts);
         if (n_experts == 0u) die(@"bad experts CSV", nil);
+        float route_weights[kMaxExperts] = {0};
         uint32_t trials = argc >= 5 ? (uint32_t)strtoul(argv[4], NULL, 10) : 8u;
         uint32_t evict_mib = argc >= 6 ? (uint32_t)strtoul(argv[5], NULL, 10) : 0u;
         NSString *input_mode = argc >= 7 ? [NSString stringWithUTF8String:argv[6]] : @"same";
         uint32_t random_state = argc >= 8 ? (uint32_t)strtoul(argv[7], NULL, 10) : 0x44384631u;
+        if (!parse_weights(argc >= 9 ? argv[8] : NULL, route_weights, n_experts)) die(@"bad route weights CSV", nil);
+        char route_weights_text[192];
+        weights_csv(route_weights_text, sizeof(route_weights_text), route_weights, n_experts);
         BOOL separate_input = [input_mode isEqualToString:@"separate"];
         if (![input_mode isEqualToString:@"same"] && !separate_input) die(@"input mode must be same or separate", nil);
 
@@ -396,8 +428,8 @@ int main(int argc, const char **argv) {
         uint32_t model_input_dim = input_shape[1].unsignedIntValue;
         uint32_t model_output_dim = output_shape[1].unsignedIntValue;
         if (model_input_dim != kHiddenDim || model_output_dim != kOutDim) die(@"CoreML shared model shape is not DS4 hidden->hidden", nil);
-        NSLog(@"[shape] coreml_input=%@ %@ coreml_output=%@ %@ d8f=%s experts=%s nsel=%u trials=%u evict_mib=%u mode=%@ seed=%u",
-              input_name, input_shape, output_name, output_shape, d8f_path, argv[3], n_experts, trials, evict_mib, input_mode, random_state);
+        NSLog(@"[shape] coreml_input=%@ %@ coreml_output=%@ %@ d8f=%s experts=%s route_weights=%s nsel=%u trials=%u evict_mib=%u mode=%@ seed=%u",
+              input_name, input_shape, output_name, output_shape, d8f_path, argv[3], route_weights_text, n_experts, trials, evict_mib, input_mode, random_state);
 
         ds4_d8f_file file;
         if (!ds4_d8f_open(d8f_path, &file)) die(@"ds4_d8f_open failed", nil);
@@ -444,9 +476,10 @@ int main(int argc, const char **argv) {
         float *gate_tmp = (float *)malloc((size_t)kMidDim * sizeof(float));
         float *up_tmp = (float *)malloc((size_t)kMidDim * sizeof(float));
         float *mid_tmp = (float *)malloc((size_t)kMidDim * sizeof(float));
+        float *down_tmp = (float *)calloc(kOutDim, sizeof(float));
         float *ref = (float *)calloc(kOutDim, sizeof(float));
         float *got = (float *)calloc(kOutDim, sizeof(float));
-        if (!x_f32 || !x_f16 || !gate_tmp || !up_tmp || !mid_tmp || !ref || !got) die(@"host allocation failed", nil);
+        if (!x_f32 || !x_f16 || !gate_tmp || !up_tmp || !mid_tmp || !down_tmp || !ref || !got) die(@"host allocation failed", nil);
         for (uint32_t index = 0; index < kHiddenDim; ++index) {
             float value = 0.35f * sinf((float)index * 0.011f) + 0.17f * cosf((float)index * 0.019f);
             x_f32[index] = value;
@@ -464,7 +497,8 @@ int main(int argc, const char **argv) {
                 if (up < -10.0f) up = -10.0f;
                 mid_tmp[row] = (gate / (1.0f + expf(-gate))) * up;
             }
-            reference_lut_accum(mid_tmp, slots[slot].down_cb_f32, slots[slot].down_idx, down_cols, kMidDim, kOutDim, ref);
+            reference_lut(mid_tmp, slots[slot].down_cb_f32, slots[slot].down_idx, down_cols, kMidDim, kOutDim, down_tmp);
+            for (uint32_t row = 0; row < kOutDim; ++row) ref[row] += route_weights[slot] * down_tmp[row];
         }
 
         id<MTLBuffer> ane_input = [device newBufferWithLength:(NSUInteger)batch * kHiddenDim * sizeof(uint16_t)
@@ -530,7 +564,9 @@ int main(int argc, const char **argv) {
             MPSGraphTensor *silu = [graph multiplicationWithPrimaryTensor:gate_clamped secondaryTensor:sig name:[prefix stringByAppendingString:@"_silu"]];
             MPSGraphTensor *mid = [graph multiplicationWithPrimaryTensor:silu secondaryTensor:up_clamped name:[prefix stringByAppendingString:@"_mid"]];
             MPSGraphTensor *down = build_lut(graph, mid, down_cb, down_idx, kMidDim, kOutDim, [prefix stringByAppendingString:@"_down"]);
-            total = total ? [graph additionWithPrimaryTensor:total secondaryTensor:down name:[prefix stringByAppendingString:@"_sum"]] : down;
+            MPSGraphTensor *weight = [graph constantWithScalar:(double)route_weights[slot] dataType:data_type];
+            MPSGraphTensor *weighted_down = [graph multiplicationWithPrimaryTensor:down secondaryTensor:weight name:[prefix stringByAppendingString:@"_weighted_down"]];
+            total = total ? [graph additionWithPrimaryTensor:total secondaryTensor:weighted_down name:[prefix stringByAppendingString:@"_sum"]] : weighted_down;
         }
         MPSGraphShapedType *x_type = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(kHiddenDim)] dataType:data_type];
         NSLog(@"[mpsgraph] compile_start nsel=%u", n_experts);
@@ -729,6 +765,7 @@ int main(int argc, const char **argv) {
         free(evict_buffer);
         free(got);
         free(ref);
+        free(down_tmp);
         free(mid_tmp);
         free(up_tmp);
         free(gate_tmp);
