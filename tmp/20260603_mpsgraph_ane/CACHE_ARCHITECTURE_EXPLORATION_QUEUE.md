@@ -18,6 +18,8 @@
 - Eviction bracket B=2048 r8: ANE→MPSGraph with CPU eviction after ANE lands around `9.1-9.7 ms` for 64/256/512 MiB sweeps, while no-evict ANE→MPSGraph often lands around `5-7 ms`. This supports a cache/scheduling-state effect, but the current canary has order contamination and must be counterbalanced before a production decision.
 - Real H3355 shared-expert CoreML export is viable. Layer-0 B=2048 8-bit palettized shared expert measured `11.618 ms` on CoreML/ANE with IOSurface/output backing, and overlapped with same-shape MPSGraph dense work at `1.696x` speedup (`27.096 ms` serial, `15.980 ms` concurrent).
 - 4-bit CoreML palettization is not fidelity-safe on the current shared-expert canary (`rms=0.0841229`, `ref_rms=0.427915`), while 8-bit is plausible (`rms=0.0050416`, `ref_rms=0.427915`). Cache/overlap work should therefore measure 8-bit shared experts first, not force 4-bit through an AIME gate.
+- `ane_mpsgraph_counterbalanced_canary.m` tests the virtual-bandwidth hypothesis directly with randomized per-trial case order and `same` versus `separate` input allocations. Real H3355 layer-0 B=2048 8-bit, no eviction: same-buffer ANE→MPS p50 was faster than same-buffer MPS-only (`17.840 ms` vs `23.452 ms`), while separate-buffer ANE→MPS was slower than separate-buffer MPS-only (`19.674 ms` vs `15.075 ms`). This is the first direct evidence that the useful effect is shared allocation/cache/page/scheduler state, not generic ANE warmup.
+- Counterbalanced overlap p50 speedups stayed positive across same/separate and 0/256MiB eviction (`1.495x` to `1.882x`), but eviction controls remain noisy under current load. Treat the signal as high-potential, not yet production-proof.
 
 ## Highest-Potential Experiments
 
@@ -33,6 +35,12 @@
 10. M1 Max cache-size inference: pointer-chase/sweep hidden-state buffers before MPSGraph and after ANE to estimate the effective shared-cache cliff for DS4-shaped tensors.
 11. Real shared-expert counterbalance: repeat the schedule matrix with the 8-bit H3355 layer-0 shared CoreML model, not only synthetic palettized matmul. This separates real weight-stream/cache behavior from model-shape-only overlap.
 12. Merge-buffer cache test: write ANE shared output into an output backing, run a GPU merge/add kernel immediately, then evict before merge. If eviction alone destroys merge speed, shared-output residency is a production lever.
+13. Real-D8F pairing: replace the synthetic MPSGraph dense leg with the exact MPSGraph D8F selected-down and gate/up LUT executables. The production question is whether ANE shared prefill warms or overlaps the actual D8F graph, not a dense stand-in.
+14. Metal eviction control: add a GPU eviction kernel over a large `MTLBuffer` with contiguous, strided, and random-ish page walks. CPU eviction proves host-visible cache/TLB sensitivity; Metal eviction separates GPU/SLC pressure from CPU-side page warming.
+15. Cache cliff sweep: run the counterbalanced harness at eviction sizes `0,16,32,64,128,256,512,1024,2048 MiB` with at least 48 trials under low load, logging p50/p90/p99. The goal is to infer the effective M1 Max shared-cache/page-residency cliff for DS4-shaped buffers.
+16. Trivial-CoreML page warm: compare real shared-expert ANE against a cheap CoreML identity/read model that touches the same input with minimal math. If both help MPSGraph, page/TLB/SLC warmth is enough; if only real ANE helps, scheduler or weight-stream side effects matter.
+17. Microbatch interleave: test `B=256,512,1024,2048` shared-expert ANE while GPU runs routed D8F for the same layer. Same-layer shared and routed branches are dependency-parallel; cross-layer pipelining is not valid until the merge/residual is complete.
+18. Command-queue/fence policy: test one shared Metal command queue versus separate queues plus explicit events/fences around input readiness and output merge. The target is overlap without accidental serialization or cache-destructive waits.
 
 ## Production Direction
 
@@ -40,3 +48,4 @@
 - Target ANE for high-B prefill shared experts first: fixed per-layer weights, no router dynamism, natural overlap with D8F routed GPU work, and low-copy ingress is proven.
 - Keep MPSGraph for exact D8F down/gateup canaries and graph-cache exploration. Treat MPSGraph + ANE overlap as a scheduling/cache optimization, not as a replacement for reaching the packed-index memory floor.
 - Treat the user’s “virtual bandwidth” hypothesis as plausible but unproven: the likely win is cache/SLC/TLB/DRAM-controller residency plus free parallel compute, not ANE magically warming GPU private cache. Promotion requires counterbalanced evidence and eviction controls.
+- The near-term runtime architecture should be same-layer parallelism: GPU computes routed D8F, ANE computes 8-bit shared expert from the same hidden-state allocation, GPU merges shared+routed outputs from CoreML output backing, then the normal layer dependency continues. Cache correctness matters at the input and merge buffers; violating that turns theoretical bandwidth into extra serialization.

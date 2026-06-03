@@ -170,3 +170,12 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - Real layer-0 shared expert B=2048 8-bit CoreML/ANE timing measured `predict_ms=11.618`, `fill_predict_ms=12.181`, `copy_predict_ms=12.053`, with CoreML output backing accepted.
 - Real shared expert ANE overlapped with same-shape MPSGraph dense work at B=2048: ANE `12.200 ms`, MPSGraph `14.896 ms`, serial `27.096 ms`, concurrent `15.980 ms`, speedup `1.696x`.
 - Production implication: shared-expert ANE prefill is not blocked by model construction or ingress. The only fidelity-plausible CoreML shared path so far is 8-bit; the next hard gate is comparing real `batch_ffn_norm` samples and merging ANE shared output with GPU/D8F routed output without CPU serialization.
+
+## 2026-06-03T23:50 JST — counterbalanced ANE/MPSGraph cache canary
+
+- Added `tmp/20260603_mpsgraph_ane/ane_mpsgraph_counterbalanced_canary.m`, a randomized per-trial scheduler harness for real CoreML/ANE shared-expert models. It records p50/p90 for ANE-only, MPS-only, evicted MPS, ANE→MPS, ANE→evict→MPS, MPS→ANE, serial, and concurrent cases.
+- The harness also has `same` and `separate` input modes. `same` feeds CoreML and MPSGraph from the same `MTLBuffer`; `separate` gives MPSGraph a distinct but equal buffer. This directly tests whether the win is shared-allocation residency rather than generic ANE/GPU overlap.
+- Real H3355 layer-0 B=2048 8-bit shared model, no eviction: same-buffer p50 MPS-only `23.452 ms`, same-buffer ANE→MPS p50 `17.840 ms`; separate-buffer MPS-only `15.075 ms`, separate-buffer ANE→MPS `19.674 ms`.
+- That pattern supports the user's virtual-bandwidth hypothesis in the narrow form: ANE work can leave shared allocation/cache/page/scheduler state that makes the immediately following MPSGraph pass cheaper. It is not a private-cache warmup story because the effect disappears or reverses when the MPS input is a separate allocation.
+- Overlap remains useful even when cache behavior is noisy: p50 overlap speedups were `1.882x` same/no-evict, `1.566x` same/256MiB-evict, `1.608x` separate/no-evict, and `1.495x` separate/256MiB-evict.
+- The eviction results are not yet promotion-grade. Separate-buffer 256MiB eviction behaved coherently (`mps_after_ane` `16.944 ms` → `mps_after_ane_evicted` `22.850 ms`), but same-buffer 256MiB had order/load noise (`17.294 ms` → `14.847 ms`). Next evidence must run more trials under lower load, include Metal eviction, and pair ANE shared with real MPSGraph D8F down/gateup instead of synthetic dense.

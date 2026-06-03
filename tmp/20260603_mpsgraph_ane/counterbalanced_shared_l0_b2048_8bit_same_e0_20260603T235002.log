@@ -1,0 +1,32 @@
+2026-06-03 23:50:03.161 ane_mpsgraph_counterbalanced_canary[79041:12049856] [coreml] compile_start path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage
+2026-06-03 23:50:07.229 ane_mpsgraph_counterbalanced_canary[79041:12049856] [shape] input=x (
+    2048,
+    4096
+) output=shared_out (
+    2048,
+    4096
+) trials=12 evict_mib=0 input_mode=same seed=17321
+2026-06-03 23:50:07.420 ane_mpsgraph_counterbalanced_canary[79041:12049856] [warmup] output_backing_used=yes
+2026-06-03 23:50:07.659 ane_mpsgraph_counterbalanced_canary[79041:12049856] [trial] index=0 order=mps_evicted,mps_after_ane,mps_only,ane_only,ane_after_mps,concurrent,serial_ane_mps,mps_after_ane_evicted
+2026-06-03 23:50:07.872 ane_mpsgraph_counterbalanced_canary[79041:12049856] [trial] index=1 order=mps_evicted,mps_after_ane,ane_only,concurrent,mps_after_ane_evicted,serial_ane_mps,ane_after_mps,mps_only
+2026-06-03 23:50:08.106 ane_mpsgraph_counterbalanced_canary[79041:12049856] [trial] index=2 order=mps_only,serial_ane_mps,ane_only,mps_after_ane_evicted,ane_after_mps,concurrent,mps_after_ane,mps_evicted
+2026-06-03 23:50:08.347 ane_mpsgraph_counterbalanced_canary[79041:12049856] [trial] index=3 order=mps_after_ane_evicted,serial_ane_mps,mps_evicted,ane_after_mps,ane_only,mps_after_ane,mps_only,concurrent
+2026-06-03 23:50:08.598 ane_mpsgraph_counterbalanced_canary[79041:12049856] [trial] index=4 order=mps_only,mps_after_ane,mps_after_ane_evicted,serial_ane_mps,mps_evicted,concurrent,ane_after_mps,ane_only
+2026-06-03 23:50:08.838 ane_mpsgraph_counterbalanced_canary[79041:12049856] [trial] index=5 order=mps_evicted,concurrent,mps_after_ane_evicted,serial_ane_mps,ane_only,mps_after_ane,mps_only,ane_after_mps
+2026-06-03 23:50:09.060 ane_mpsgraph_counterbalanced_canary[79041:12049856] [trial] index=6 order=concurrent,mps_after_ane,ane_only,mps_evicted,mps_only,mps_after_ane_evicted,ane_after_mps,serial_ane_mps
+2026-06-03 23:50:09.276 ane_mpsgraph_counterbalanced_canary[79041:12049856] [trial] index=7 order=mps_evicted,mps_only,serial_ane_mps,ane_after_mps,mps_after_ane_evicted,concurrent,ane_only,mps_after_ane
+2026-06-03 23:50:09.516 ane_mpsgraph_counterbalanced_canary[79041:12049856] [trial] index=8 order=concurrent,ane_after_mps,serial_ane_mps,ane_only,mps_only,mps_evicted,mps_after_ane,mps_after_ane_evicted
+2026-06-03 23:50:09.766 ane_mpsgraph_counterbalanced_canary[79041:12049856] [trial] index=9 order=ane_only,serial_ane_mps,mps_evicted,concurrent,mps_after_ane_evicted,mps_after_ane,ane_after_mps,mps_only
+2026-06-03 23:50:10.002 ane_mpsgraph_counterbalanced_canary[79041:12049856] [trial] index=10 order=mps_after_ane,serial_ane_mps,ane_after_mps,concurrent,mps_only,mps_after_ane_evicted,ane_only,mps_evicted
+2026-06-03 23:50:10.268 ane_mpsgraph_counterbalanced_canary[79041:12049856] [trial] index=11 order=mps_after_ane_evicted,mps_only,ane_only,serial_ane_mps,mps_evicted,ane_after_mps,mps_after_ane,concurrent
+2026-06-03 23:50:10.268 ane_mpsgraph_counterbalanced_canary[79041:12049856] [summary] mode=same evict_mib=0 case=ane_only n=12 min_ms=17.164 p50_ms=20.450 p90_ms=23.618 max_ms=24.166 mean_ms=20.753
+2026-06-03 23:50:10.268 ane_mpsgraph_counterbalanced_canary[79041:12049856] [summary] mode=same evict_mib=0 case=mps_only n=12 min_ms=12.504 p50_ms=23.452 p90_ms=24.320 max_ms=28.132 mean_ms=20.144
+2026-06-03 23:50:10.268 ane_mpsgraph_counterbalanced_canary[79041:12049856] [summary] mode=same evict_mib=0 case=mps_evicted n=12 min_ms=11.882 p50_ms=18.107 p90_ms=21.639 max_ms=25.730 mean_ms=18.373
+2026-06-03 23:50:10.268 ane_mpsgraph_counterbalanced_canary[79041:12049856] [summary] mode=same evict_mib=0 case=mps_after_ane n=12 min_ms=9.211 p50_ms=17.840 p90_ms=22.699 max_ms=29.665 mean_ms=18.040
+2026-06-03 23:50:10.268 ane_mpsgraph_counterbalanced_canary[79041:12049856] [summary] mode=same evict_mib=0 case=mps_after_ane_evicted n=12 min_ms=8.664 p50_ms=18.403 p90_ms=26.510 max_ms=29.460 mean_ms=17.441
+2026-06-03 23:50:10.268 ane_mpsgraph_counterbalanced_canary[79041:12049856] [summary] mode=same evict_mib=0 case=ane_after_mps n=12 min_ms=18.878 p50_ms=23.556 p90_ms=25.790 max_ms=27.087 mean_ms=23.237
+2026-06-03 23:50:10.268 ane_mpsgraph_counterbalanced_canary[79041:12049856] [summary] mode=same evict_mib=0 case=serial_ane_mps n=12 min_ms=33.452 p50_ms=36.939 p90_ms=44.463 max_ms=44.567 mean_ms=38.060
+2026-06-03 23:50:10.268 ane_mpsgraph_counterbalanced_canary[79041:12049856] [summary] mode=same evict_mib=0 case=concurrent n=12 min_ms=16.882 p50_ms=23.327 p90_ms=27.006 max_ms=32.647 mean_ms=22.904
+2026-06-03 23:50:10.268 ane_mpsgraph_counterbalanced_canary[79041:12049856] [derived] mode=same evict_mib=0 ane_plus_mps_p50_ms=43.902 serial_measured_p50_ms=36.939 concurrent_p50_ms=23.327 overlap_speedup_p50=1.882
+2026-06-03 23:50:10.268 ane_mpsgraph_counterbalanced_canary[79041:12049856] [cache_effect] mode=same evict_mib=0 mps_only_p50_ms=23.452 mps_evicted_p50_ms=18.107 mps_after_ane_p50_ms=17.840 mps_after_ane_evicted_p50_ms=18.403 evict_p50_ms=0.000
+2026-06-03 23:50:10.269 ane_mpsgraph_counterbalanced_canary[79041:12049856] [ane_output_sample] words=8388608 first=0x2aa6 0xb9fd 0xb7b9 0xb6a3
