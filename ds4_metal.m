@@ -50841,6 +50841,145 @@ static double ds4_d8f_ref_rank1_down_sidecar_delta(const ds4_d8f_file *file,
     return dot * (double)ds4_m1r_f16_to_f32(ds4_m1r_u16(a + (uint64_t)row * 2u));
 }
 
+typedef struct ds4_d8f_hotspan_stats {
+    uint64_t window_start;
+    uint64_t window_end;
+    uint64_t page_start;
+    uint64_t page_end;
+    uint64_t payload_bytes;
+    uint32_t span_count;
+    uint32_t missing_spans;
+} ds4_d8f_hotspan_stats;
+
+static void ds4_d8f_hotspan_init(ds4_d8f_hotspan_stats *stats) {
+    if (!stats) return;
+    stats->window_start = UINT64_MAX;
+    stats->window_end = 0;
+    stats->page_start = 0;
+    stats->page_end = 0;
+    stats->payload_bytes = 0;
+    stats->span_count = 0;
+    stats->missing_spans = 0;
+}
+
+static void ds4_d8f_hotspan_include(ds4_d8f_hotspan_stats *stats,
+                                    const ds4_d8f_file *file,
+                                    uint64_t offset,
+                                    uint64_t bytes) {
+    if (!stats || !file || bytes == 0u) return;
+    if (offset == 0u || offset + bytes < offset || offset + bytes > (uint64_t)file->size) {
+        stats->missing_spans++;
+        return;
+    }
+    if (offset < stats->window_start) stats->window_start = offset;
+    if (offset + bytes > stats->window_end) stats->window_end = offset + bytes;
+    stats->payload_bytes += bytes;
+    stats->span_count++;
+}
+
+static void ds4_d8f_hotspan_include_record(ds4_d8f_hotspan_stats *stats,
+                                           const ds4_d8f_file *file,
+                                           const ds4_d8f_record *record) {
+    if (!record) return;
+    ds4_d8f_hotspan_include(stats, file, record->codebook_offset, record->codebook_bytes);
+    ds4_d8f_hotspan_include(stats, file, record->index_offset, record->index_bytes);
+    ds4_d8f_hotspan_include(stats, file, record->scale_offset, record->scale_bytes);
+}
+
+static void ds4_d8f_hotspan_include_gateup(ds4_d8f_hotspan_stats *stats,
+                                           const ds4_d8f_file *file,
+                                           ds4_d8f_projection projection,
+                                           uint32_t expert) {
+    ds4_d8f_record base;
+    if (!ds4_d8f_get_record(file, projection, expert, &base)) {
+        if (stats) stats->missing_spans++;
+        return;
+    }
+    if (ds4_d8f_gateup_overlay_count(file) == 0u) {
+        ds4_d8f_hotspan_include_record(stats, file, &base);
+        return;
+    }
+    int needs_base = 0;
+    for (uint32_t row_block = 0; row_block < 16u; row_block++) {
+        ds4_d8f_record overlay;
+        if (ds4_d8f_get_gateup_overlay_record(file, projection, expert, row_block, &overlay)) {
+            ds4_d8f_hotspan_include_record(stats, file, &overlay);
+        } else {
+            needs_base = 1;
+        }
+    }
+    if (needs_base) ds4_d8f_hotspan_include_record(stats, file, &base);
+}
+
+static void ds4_d8f_hotspan_include_down(ds4_d8f_hotspan_stats *stats,
+                                         const ds4_d8f_file *file,
+                                         uint32_t expert) {
+    ds4_d8f_record down;
+    if (!ds4_d8f_get_record(file, DS4_D8F_DOWN, expert, &down)) {
+        if (stats) stats->missing_spans++;
+        return;
+    }
+    ds4_d8f_hotspan_include_record(stats, file, &down);
+    if (file && file->sidecar_table_offset && file->sidecar_record_bytes &&
+        expert < file->sidecar_records) {
+        ds4_d8f_hotspan_include(stats, file,
+                                file->sidecar_table_offset + (uint64_t)expert * file->sidecar_record_bytes,
+                                file->sidecar_record_bytes);
+    }
+    ds4_d8f_sidecar_record sidecar;
+    if (ds4_d8f_get_down_sidecar(file, expert, &sidecar)) {
+        ds4_d8f_hotspan_include(stats, file, sidecar.u_offset, sidecar.u_bytes);
+        ds4_d8f_hotspan_include(stats, file, sidecar.a_offset, sidecar.a_bytes);
+    }
+}
+
+static void ds4_d8f_hotspan_finish(ds4_d8f_hotspan_stats *stats,
+                                   const ds4_d8f_file *file) {
+    if (!stats || stats->window_start == UINT64_MAX || stats->window_end <= stats->window_start) {
+        if (stats) {
+            stats->window_start = 0;
+            stats->window_end = 0;
+            stats->page_start = 0;
+            stats->page_end = 0;
+        }
+        return;
+    }
+    long page_size_long = sysconf(_SC_PAGESIZE);
+    uint64_t page_size = page_size_long > 0 ? (uint64_t)page_size_long : 4096u;
+    uint64_t page_mask = page_size - 1u;
+    stats->page_start = stats->window_start & ~page_mask;
+    stats->page_end = (stats->window_end + page_mask) & ~page_mask;
+    if (file && stats->page_end > (uint64_t)file->size) stats->page_end = (uint64_t)file->size;
+}
+
+static ds4_d8f_hotspan_stats ds4_d8f_selected_hotspan(const ds4_d8f_file *file,
+                                                      const uint32_t *experts,
+                                                      uint32_t n_experts) {
+    ds4_d8f_hotspan_stats stats;
+    ds4_d8f_hotspan_init(&stats);
+    if (!file || !experts) return stats;
+    for (uint32_t slot = 0; slot < n_experts; slot++) {
+        const uint32_t expert = experts[slot];
+        if (expert >= 256u) {
+            stats.missing_spans++;
+            continue;
+        }
+        ds4_d8f_hotspan_include_gateup(&stats, file, DS4_D8F_GATE, expert);
+        ds4_d8f_hotspan_include_gateup(&stats, file, DS4_D8F_UP, expert);
+        ds4_d8f_hotspan_include_down(&stats, file, expert);
+    }
+    ds4_d8f_hotspan_finish(&stats, file);
+    return stats;
+}
+
+static int ds4_d8f_hotspan_prefetch(const ds4_d8f_file *file,
+                                    const ds4_d8f_hotspan_stats *stats) {
+    if (!file || !stats || stats->page_end <= stats->page_start) return 0;
+    const uint64_t bytes = stats->page_end - stats->page_start;
+    if (bytes > (uint64_t)SIZE_MAX) return 0;
+    return madvise((void *)(file->map + stats->page_start), (size_t)bytes, MADV_WILLNEED) == 0;
+}
+
 int ds4_gpu_mtl4_d8f_down_selected_canary(const char *d8f_path,
                                           const uint32_t *experts,
                                           uint32_t n_experts,
@@ -51327,6 +51466,10 @@ int ds4_gpu_mtl4_d8f_organ_selected_batch_canary(const char *d8f_path,
             return 0;
         }
     }
+    ds4_d8f_hotspan_stats hotspan = ds4_d8f_selected_hotspan(&file, experts, n_experts);
+    const int hotspan_prefetch_requested = ds4_gpu_env_bool("DS4_D8F_HOTSPAN_PREFETCH") > 0;
+    const int hotspan_prefetch_ok = hotspan_prefetch_requested ?
+        ds4_d8f_hotspan_prefetch(&file, &hotspan) : 0;
     float *x = (float *)malloc((size_t)n_tokens * ds4_gateup_in_dim * sizeof(float));
     float *mid_ref = (float *)malloc((size_t)n_tokens * n_experts * ds4_mid_dim * sizeof(float));
     float *route_weights = (float *)malloc((size_t)n_tokens * n_experts * sizeof(float));
@@ -51880,9 +52023,22 @@ int ds4_gpu_mtl4_d8f_organ_selected_batch_canary(const char *d8f_path,
     }
     free(tensor_out);
     free(selected_full);
+    const uint64_t hot_window_bytes =
+        hotspan.window_end > hotspan.window_start ? hotspan.window_end - hotspan.window_start : 0u;
+    const uint64_t hot_page_bytes =
+        hotspan.page_end > hotspan.page_start ? hotspan.page_end - hotspan.page_start : 0u;
+    const double hot_density = hot_window_bytes ?
+        (double)hotspan.payload_bytes / (double)hot_window_bytes : 0.0;
     fprintf(stderr,
-            "ds4: d8f_organ_selected_batch_canary route_weighted=1 nsel=%u rows=%u tokens=%u rounds=%u clamp=%.1f preweight_mid=%d gateup_tile4=%d down_tile8=%d down_tile16=%d pack=%.2f MiB gpu %.3f ms total (%.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d tensor_gpu %.3f ms total tensor_mismatch=%d tensor_zero=%d tensor_sentinel=%d tensor_max_abs=%.6e tensor_max_rel=%.6e tensor_rc=%d classic_gpu %.3f ms total classic_mismatch=%d classic_zero=%d classic_sentinel=%d classic_max_abs=%.6e classic_max_rel=%.6e classic_rc=%d classic_graph_gpu %.3f ms total classic_graph_mismatch=%d classic_graph_zero=%d classic_graph_sentinel=%d classic_graph_max_abs=%.6e classic_graph_max_rel=%.6e classic_graph_rc=%d selected_path=%s selected_gpu %.3f ms total selected_mismatch=%d selected_zero=%d selected_sentinel=%d selected_max_abs=%.6e selected_max_rel=%.6e selected_rc=%d",
-            n_experts, rows, n_tokens, rounds, swiglu_limit, preweight_mid, gateup_tile4, down_tile8, down_tile16, (double)file.size / 1048576.0, timed_ms,
+            "ds4: d8f_organ_selected_batch_canary route_weighted=1 nsel=%u rows=%u tokens=%u rounds=%u clamp=%.1f preweight_mid=%d gateup_tile4=%d down_tile8=%d down_tile16=%d pack=%.2f MiB hot_window=%.2f MiB hot_pages=%.2f MiB hot_payload=%.2f MiB hot_density=%.4f hot_spans=%u hot_missing=%u hot_prefetch=%d/%d gpu %.3f ms total (%.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d tensor_gpu %.3f ms total tensor_mismatch=%d tensor_zero=%d tensor_sentinel=%d tensor_max_abs=%.6e tensor_max_rel=%.6e tensor_rc=%d classic_gpu %.3f ms total classic_mismatch=%d classic_zero=%d classic_sentinel=%d classic_max_abs=%.6e classic_max_rel=%.6e classic_rc=%d classic_graph_gpu %.3f ms total classic_graph_mismatch=%d classic_graph_zero=%d classic_graph_sentinel=%d classic_graph_max_abs=%.6e classic_graph_max_rel=%.6e classic_graph_rc=%d selected_path=%s selected_gpu %.3f ms total selected_mismatch=%d selected_zero=%d selected_sentinel=%d selected_max_abs=%.6e selected_max_rel=%.6e selected_rc=%d",
+            n_experts, rows, n_tokens, rounds, swiglu_limit, preweight_mid, gateup_tile4, down_tile8, down_tile16,
+            (double)file.size / 1048576.0,
+            (double)hot_window_bytes / 1048576.0,
+            (double)hot_page_bytes / 1048576.0,
+            (double)hotspan.payload_bytes / 1048576.0,
+            hot_density, hotspan.span_count, hotspan.missing_spans,
+            hotspan_prefetch_requested, hotspan_prefetch_ok,
+            timed_ms,
             timed_ms * 1000.0 / ((double)n_tokens * (double)rows * (double)rounds),
             mismatch, gpu_zero, gpu_sentinel, max_abs, max_rel, ok,
             tensor_timed_ms, tensor_mismatch, tensor_zero, tensor_sentinel, tensor_max_abs, tensor_max_rel, tensor_ok,

@@ -34,10 +34,13 @@ from ds4_sparse_projection_splice import (
     FUSED_RECORD_BYTES,
     HEADER_BYTES,
     PROJECTIONS,
-    append_sidecars,
+    SIDECAR_RECORD,
+    SIDECAR_RECORD_BYTES,
+    append_aligned,
     copy_record,
     d8f_path,
     hardlink_pack,
+    read_payload,
     read_d8f,
     rewrite_header,
 )
@@ -193,6 +196,142 @@ def window_span(records: list[tuple[Any, ...]], experts: list[int]) -> tuple[int
     return (start, end, end - start)
 
 
+def span_summary(spans: list[tuple[int, int]]) -> dict[str, Any]:
+    valid = [(start, end) for start, end in spans if end > start]
+    if not valid:
+        return {
+            "window_start": 0,
+            "window_end": 0,
+            "window_bytes": 0,
+            "payload_bytes": 0,
+            "density": 0.0,
+            "span_count": 0,
+        }
+    start = min(item[0] for item in valid)
+    end = max(item[1] for item in valid)
+    payload_bytes = sum(end_i - start_i for start_i, end_i in valid)
+    window_bytes = end - start
+    return {
+        "window_start": start,
+        "window_end": end,
+        "window_bytes": window_bytes,
+        "payload_bytes": payload_bytes,
+        "density": (payload_bytes / window_bytes) if window_bytes else 0.0,
+        "span_count": len(valid),
+    }
+
+
+def runtime_hot_spans(info: dict[str, Any],
+                      records: list[tuple[Any, ...]],
+                      experts: list[int]) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for expert in experts:
+        for projection_id in range(len(PROJECTIONS)):
+            start, end, _ = payload_span(records[projection_id * EXPERTS + expert])
+            if end > start:
+                spans.append((start, end))
+        header = info.get("header", {})
+        sidecar_table_offset = int(header.get("sidecar_table_offset", 0) or 0)
+        sidecar_record_bytes = int(header.get("sidecar_record_bytes", SIDECAR_RECORD_BYTES) or SIDECAR_RECORD_BYTES)
+        sidecar_records = int(header.get("sidecar_records", 0) or 0)
+        if sidecar_table_offset and expert < sidecar_records:
+            start = sidecar_table_offset + expert * sidecar_record_bytes
+            spans.append((start, start + sidecar_record_bytes))
+        sidecar = info.get("sidecars", {}).get(expert)
+        if sidecar:
+            _, rank, _, _, u_offset, a_offset, u_bytes, a_bytes, *_ = sidecar
+            if int(rank):
+                spans.append((int(u_offset), int(u_offset) + int(u_bytes)))
+                spans.append((int(a_offset), int(a_offset) + int(a_bytes)))
+    return spans
+
+
+def runtime_hot_summary(info: dict[str, Any],
+                        records: list[tuple[Any, ...]],
+                        experts: list[int]) -> dict[str, Any]:
+    return span_summary(runtime_hot_spans(info, records, experts))
+
+
+def begin_hotblock_sidecars(source_path: Path,
+                            sidecars: dict[int, tuple[Any, ...]],
+                            hot_experts: list[int],
+                            handle) -> dict[str, Any] | None:
+    if not sidecars:
+        return None
+    table_offset = handle.tell()
+    padding = (-table_offset) % 16
+    if padding:
+        handle.write(b"\0" * padding)
+        table_offset += padding
+    table = bytearray(SIDECAR_RECORD_BYTES * EXPERTS)
+    handle.write(table)
+    written: set[int] = set()
+
+    def write_one(expert: int, record: tuple[Any, ...]) -> None:
+        source_expert, rank, in_dim, out_dim, u_offset, a_offset, u_bytes, a_bytes, flags, reserved, eff_rank, gain, aa_frac, reserved_f32 = record
+        u_payload = read_payload(source_path, int(u_offset), int(u_bytes))
+        a_payload = read_payload(source_path, int(a_offset), int(a_bytes))
+        new_u_offset = append_aligned(handle, u_payload)
+        new_a_offset = append_aligned(handle, a_payload)
+        table[int(expert) * SIDECAR_RECORD_BYTES:(int(expert) + 1) * SIDECAR_RECORD_BYTES] = SIDECAR_RECORD.pack(
+            int(source_expert),
+            int(rank),
+            int(in_dim),
+            int(out_dim),
+            new_u_offset,
+            new_a_offset,
+            int(u_bytes),
+            int(a_bytes),
+            int(flags),
+            int(reserved),
+            float(eff_rank),
+            float(gain),
+            float(aa_frac),
+            float(reserved_f32),
+        )
+        written.add(int(expert))
+
+    for expert in hot_experts:
+        record = sidecars.get(expert)
+        if record:
+            write_one(expert, record)
+    return {
+        "source_path": source_path,
+        "sidecars": sidecars,
+        "table_offset": table_offset,
+        "table": table,
+        "written": written,
+        "write_one": write_one,
+    }
+
+
+def finish_hotblock_sidecars(state: dict[str, Any] | None, handle) -> dict[str, Any]:
+    if not state:
+        return {}
+    sidecars: dict[int, tuple[Any, ...]] = state["sidecars"]
+    written: set[int] = state["written"]
+    write_one = state["write_one"]
+    for expert, record in sorted(sidecars.items()):
+        if expert not in written:
+            write_one(expert, record)
+    here = handle.tell()
+    handle.seek(int(state["table_offset"]))
+    handle.write(state["table"])
+    handle.seek(here)
+    return {
+        "sidecar_format": "DS4D8F_DOWN_RANK1",
+        "sidecar_table_offset": int(state["table_offset"]),
+        "sidecar_record_bytes": SIDECAR_RECORD_BYTES,
+        "sidecar_records": EXPERTS,
+        "sidecar_count": len(sidecars),
+        "sidecar_record_struct": "<IIIIQQIIIIffff",
+        "sidecar_payload_dtype": "fp16_le",
+        "sidecar_in_dim": 2048,
+        "sidecar_out_dim": 4096,
+        "d8f_hotblock_sidecar_payload_order": "hot_selected_sidecars_then_main_payload_then_remaining_sidecars",
+    }
+
+
 def ordered_experts(hot_experts: list[int]) -> list[int]:
     hot = []
     seen: set[int] = set()
@@ -243,11 +382,16 @@ def relayout_layer(source_pack: Path,
     old_records = list(info["records"])
     old_window = window_span(old_records, hot_experts)
     old_expert_spans = {str(expert): expert_span(old_records, expert)[2] for expert in hot_experts}
+    old_runtime = runtime_hot_summary(info, old_records, hot_experts)
     report.update({
         "ready": True,
         "source_bytes": info["bytes"],
         "source_hot_window_bytes": old_window[2],
         "source_hot_expert_span_bytes": old_expert_spans,
+        "source_runtime_hot_window_bytes": old_runtime["window_bytes"],
+        "source_runtime_hot_payload_bytes": old_runtime["payload_bytes"],
+        "source_runtime_hot_density": old_runtime["density"],
+        "source_runtime_hot_span_count": old_runtime["span_count"],
     })
     if not execute:
         return report
@@ -274,6 +418,7 @@ def relayout_layer(source_pack: Path,
         rewrite_header(handle, header)
         handle.write(b"\0" * (len(PROJECTIONS) * EXPERTS * FUSED_RECORD_BYTES))
         expert_order = ordered_experts(hot_experts)
+        sidecar_state = begin_hotblock_sidecars(source_path, info["sidecars"], hot_experts, handle)
         for expert_index, expert in enumerate(expert_order, 1):
             for projection_id, projection in enumerate(PROJECTIONS):
                 old_record = old_records[projection_id * EXPERTS + expert]
@@ -288,14 +433,7 @@ def relayout_layer(source_pack: Path,
                     "experts_total": len(expert_order),
                     "out_bytes": handle.tell(),
                 }, sort_keys=True), flush=True)
-        sidecar_header = append_sidecars(
-            source_path,
-            source_path,
-            info["sidecars"],
-            info["sidecars"],
-            set(),
-            handle,
-        )
+        sidecar_header = finish_hotblock_sidecars(sidecar_state, handle)
         header.update(sidecar_header)
         header["payload_sha256"] = {projection: payload_hashers[projection].hexdigest() for projection in PROJECTIONS}
         handle.seek(HEADER_BYTES)
@@ -312,12 +450,18 @@ def relayout_layer(source_pack: Path,
     new_records_t = list(new_info["records"])
     new_window = window_span(new_records_t, hot_experts)
     new_expert_spans = {str(expert): expert_span(new_records_t, expert)[2] for expert in hot_experts}
+    new_runtime = runtime_hot_summary(new_info, new_records_t, hot_experts)
     report.update({
         "materialized": True,
         "output_bytes": out_path.stat().st_size,
         "output_hot_window_bytes": new_window[2],
         "output_hot_expert_span_bytes": new_expert_spans,
         "hot_window_reduction": (old_window[2] / new_window[2]) if new_window[2] else None,
+        "output_runtime_hot_window_bytes": new_runtime["window_bytes"],
+        "output_runtime_hot_payload_bytes": new_runtime["payload_bytes"],
+        "output_runtime_hot_density": new_runtime["density"],
+        "output_runtime_hot_span_count": new_runtime["span_count"],
+        "runtime_hot_window_reduction": (old_runtime["window_bytes"] / new_runtime["window_bytes"]) if new_runtime["window_bytes"] else None,
     })
     return report
 
@@ -385,6 +529,9 @@ def main() -> int:
             "source_hot_window_bytes": report.get("source_hot_window_bytes"),
             "output_hot_window_bytes": report.get("output_hot_window_bytes"),
             "hot_window_reduction": report.get("hot_window_reduction"),
+            "source_runtime_hot_window_bytes": report.get("source_runtime_hot_window_bytes"),
+            "output_runtime_hot_window_bytes": report.get("output_runtime_hot_window_bytes"),
+            "runtime_hot_window_reduction": report.get("runtime_hot_window_reduction"),
             "reason": report.get("reason"),
         }, sort_keys=True), flush=True)
 
