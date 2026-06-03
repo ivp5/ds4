@@ -27,3 +27,15 @@ Append-only transaction log. Scope: IVP5 DS4 MPSGraph/ANE runtime architecture, 
 - Command: recompiled `coreml_shared_cache_probe.m` with `cc -O3 -Wall -Wextra -fobjc-arc -framework Foundation -framework CoreML`.
 - Command: ran one real L26 package through the stricter probe and saved `coreml_shared_cache_probe_l26_rankcheck_20260604T004600.log`.
 - Result: rank/feature invariants passed; L26 package loaded and predicted with `compile_ms=46.952`, `load_ms=2449.682`, `predict_ms=19.432`, and `delta_mib=79.23`.
+
+## 2026-06-04T00:47 JST — Exact routed canary compactness patch
+
+- Read the main timing body of `ane_d8f_routed_counterbalanced_canary.m`.
+- Finding: the concurrent ANE+D8F launch appeared twice with identical dispatch-group mechanics, once without merge and once with merge. That duplicated the fence/queue policy and made future queue experiments more error-prone.
+- Code action: extracted `run_concurrent_ane_d8f_ms`, keeping the same O(1) scheduling operation per timed case and the same O(n) D8F/CoreML work underneath.
+
+## 2026-06-04T00:48 JST — Exact routed canary validation
+
+- Command: recompiled `ane_d8f_routed_counterbalanced_canary.m` with `ds4_d8f_reader.c` and the CoreML/Metal/MPSGraph frameworks.
+- Command: ran one L26/E165 smoke with the layer-matched L26 shared CoreML package and saved `ane_d8f_routed_refactor_smoke_l26e165_same_e0_20260604T004800.log`.
+- Result: exactness still passed (`bad=0`, `rms=1.45568e-05`), CoreML output backing remained used, and both `concurrent` and `concurrent_then_merge` cases executed through the new helper.

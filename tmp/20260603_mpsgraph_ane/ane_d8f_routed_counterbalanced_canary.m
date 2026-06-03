@@ -203,6 +203,31 @@ static void run_merge_once(id<MTLCommandQueue> queue,
     [command_buffer waitUntilCompleted];
 }
 
+static double run_concurrent_ane_d8f_ms(MLModel *model,
+                                        MLDictionaryFeatureProvider *provider,
+                                        MLPredictionOptions *options,
+                                        MPSGraphExecutable *executable,
+                                        id<MTLCommandQueue> queue,
+                                        NSArray<MPSGraphTensorData *> *d8f_inputs,
+                                        NSArray<MPSGraphTensorData *> *d8f_outputs,
+                                        bool merge_after,
+                                        id<MTLComputePipelineState> merge_pipeline,
+                                        id<MTLBuffer> ane_output,
+                                        id<MTLBuffer> d8f_output,
+                                        id<MTLBuffer> merged_output) {
+    dispatch_group_t group = dispatch_group_create();
+    double start = now_seconds();
+    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        run_ane_once(model, provider, options);
+    });
+    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        run_d8f_once(executable, queue, d8f_inputs, d8f_outputs);
+    });
+    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+    if (merge_after) run_merge_once(queue, merge_pipeline, ane_output, d8f_output, merged_output);
+    return (now_seconds() - start) * 1e3;
+}
+
 static double evict_metal_cache(id<MTLCommandQueue> queue,
                                 id<MTLComputePipelineState> pipeline,
                                 id<MTLBuffer> buffer,
@@ -781,16 +806,10 @@ int main(int argc, const char **argv) {
                     run_d8f_once(executable, queue, d8f_inputs, d8f_outputs);
                     record_sample(samples, case_name, (now_seconds() - start) * 1e3);
                 } else if ([case_name isEqualToString:@"concurrent"]) {
-                    dispatch_group_t group = dispatch_group_create();
-                    start = now_seconds();
-                    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                        run_ane_once(model, provider, options);
-                    });
-                    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                        run_d8f_once(executable, queue, d8f_inputs, d8f_outputs);
-                    });
-                    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
-                    record_sample(samples, case_name, (now_seconds() - start) * 1e3);
+                    record_sample(samples, case_name,
+                                  run_concurrent_ane_d8f_ms(model, provider, options, executable, queue,
+                                                            d8f_inputs, d8f_outputs, false, merge_pipeline,
+                                                            ane_output, d8f_output, merged_output));
                 } else if ([case_name isEqualToString:@"merge_only"]) {
                     start = now_seconds();
                     run_merge_once(queue, merge_pipeline, ane_output, d8f_output, merged_output);
@@ -802,17 +821,10 @@ int main(int argc, const char **argv) {
                     run_merge_once(queue, merge_pipeline, ane_output, d8f_output, merged_output);
                     record_sample(samples, case_name, (now_seconds() - start) * 1e3);
                 } else if ([case_name isEqualToString:@"concurrent_then_merge"]) {
-                    dispatch_group_t group = dispatch_group_create();
-                    start = now_seconds();
-                    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                        run_ane_once(model, provider, options);
-                    });
-                    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                        run_d8f_once(executable, queue, d8f_inputs, d8f_outputs);
-                    });
-                    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
-                    run_merge_once(queue, merge_pipeline, ane_output, d8f_output, merged_output);
-                    record_sample(samples, case_name, (now_seconds() - start) * 1e3);
+                    record_sample(samples, case_name,
+                                  run_concurrent_ane_d8f_ms(model, provider, options, executable, queue,
+                                                            d8f_inputs, d8f_outputs, true, merge_pipeline,
+                                                            ane_output, d8f_output, merged_output));
                 }
             }
             NSLog(@"[trial] index=%u order=%@", trial, order);
