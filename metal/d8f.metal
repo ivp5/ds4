@@ -868,6 +868,34 @@ struct D8FDownLutArgs {
   uint reserved1;
 };
 
+struct D8FDownLutSidecarLite {
+  uint rank;
+  uint out_dim;
+  uint a_offset_lo;
+  uint a_offset_hi;
+};
+
+inline ulong d8f_down_lut_sidecar_a_offset(D8FDownLutSidecarLite sidecar) {
+  return ulong(sidecar.a_offset_lo) | (ulong(sidecar.a_offset_hi) << 32);
+}
+
+inline float d8f_down_lut_rank1_delta(
+    device const uchar *pack,
+    device const D8FDownLutSidecarLite *sidecars,
+    device const float *sidecar_dot,
+    constant D8FDownLutArgs &args,
+    uint token,
+    uint slot,
+    uint row) {
+  if (args.reserved0 == 0u) return 0.0f;
+  const D8FDownLutSidecarLite sidecar = sidecars[slot];
+  if (sidecar.rank != 1u || row >= sidecar.out_dim) return 0.0f;
+  const ulong a_offset = d8f_down_lut_sidecar_a_offset(sidecar);
+  if (a_offset == 0ul) return 0.0f;
+  const device half *a = (const device half *)(pack + a_offset);
+  return float(a[row]) * sidecar_dot[ulong(token) * ulong(args.n_selected) + ulong(slot)];
+}
+
 kernel void d8f_down_lut_score_selected_batch(
   device const uchar *pack          [[buffer(0)]],
   device const float *mid           [[buffer(1)]],
@@ -1074,6 +1102,9 @@ kernel void d8f_down_lut_gather_codes_selected_batch(
   device const float  *score        [[buffer(1)]],
   device float        *out          [[buffer(2)]],
   constant D8FDownLutArgs &args     [[buffer(3)]],
+  device const D8FDownLutSidecarLite *sidecars [[buffer(4)]],
+  device const float *sidecar_dot    [[buffer(5)]],
+  device const uchar *pack           [[buffer(6)]],
   threadgroup float *partial        [[threadgroup(0)]],
   uint tid [[thread_index_in_threadgroup]],
   ushort tiisg [[thread_index_in_simdgroup]],
@@ -1095,6 +1126,9 @@ kernel void d8f_down_lut_gather_codes_selected_batch(
           ulong(group) * ulong(args.score_group_stride) +
           ulong(code)];
     }
+    if (tid == 0u) {
+      acc += d8f_down_lut_rank1_delta(pack, sidecars, sidecar_dot, args, token, slot, row);
+    }
   }
   acc = simd_sum(acc);
   if (tiisg == 0u) partial[sgitg] = acc;
@@ -1111,6 +1145,9 @@ kernel void d8f_down_lut_gather_codes_selected_batch_tile8(
   device const float  *score        [[buffer(1)]],
   device float        *out          [[buffer(2)]],
   constant D8FDownLutArgs &args     [[buffer(3)]],
+  device const D8FDownLutSidecarLite *sidecars [[buffer(4)]],
+  device const float *sidecar_dot    [[buffer(5)]],
+  device const uchar *pack           [[buffer(6)]],
   threadgroup float *partial        [[threadgroup(0)]],
   uint tid [[thread_index_in_threadgroup]],
   ushort tiisg [[thread_index_in_simdgroup]],
@@ -1133,6 +1170,14 @@ kernel void d8f_down_lut_gather_codes_selected_batch_tile8(
         if (row >= args.rows) continue;
         const uint code = uint(codes[(ulong(slot) * ulong(args.rows) + ulong(row)) * ulong(groups) + ulong(group)]);
         if (code < args.max_k) acc[rr] += score[score_base + ulong(code)];
+      }
+    }
+    if (tid == 0u) {
+      for (uint rr = 0u; rr < 8u; rr++) {
+        const uint row = row_base + rr;
+        if (row < args.rows) {
+          acc[rr] += d8f_down_lut_rank1_delta(pack, sidecars, sidecar_dot, args, token, slot, row);
+        }
       }
     }
   }
@@ -1158,6 +1203,9 @@ kernel void d8f_down_lut_gather_codes_selected_batch_tile16(
   device const float  *score        [[buffer(1)]],
   device float        *out          [[buffer(2)]],
   constant D8FDownLutArgs &args     [[buffer(3)]],
+  device const D8FDownLutSidecarLite *sidecars [[buffer(4)]],
+  device const float *sidecar_dot    [[buffer(5)]],
+  device const uchar *pack           [[buffer(6)]],
   threadgroup float *partial        [[threadgroup(0)]],
   uint tid [[thread_index_in_threadgroup]],
   ushort tiisg [[thread_index_in_simdgroup]],
@@ -1180,6 +1228,14 @@ kernel void d8f_down_lut_gather_codes_selected_batch_tile16(
         if (row >= args.rows) continue;
         const uint code = uint(codes[(ulong(slot) * ulong(args.rows) + ulong(row)) * ulong(groups) + ulong(group)]);
         if (code < args.max_k) acc[rr] += score[score_base + ulong(code)];
+      }
+    }
+    if (tid == 0u) {
+      for (uint rr = 0u; rr < 16u; rr++) {
+        const uint row = row_base + rr;
+        if (row < args.rows) {
+          acc[rr] += d8f_down_lut_rank1_delta(pack, sidecars, sidecar_dot, args, token, slot, row);
+        }
       }
     }
   }

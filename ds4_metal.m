@@ -49080,6 +49080,12 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         uint32_t scale_bytes;
         uint32_t row_base;
     } d8f_lut_record_lite;
+    typedef struct d8f_lut_sidecar_lite {
+        uint32_t rank;
+        uint32_t out_dim;
+        uint32_t a_offset_lo;
+        uint32_t a_offset_hi;
+    } d8f_lut_sidecar_lite;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!ds4_d8f_down_lut_classic_pipeline_init()) return 0;
     if (!d8f_path || !experts || n_experts == 0 || n_experts > ds4_selected_expert_cap) return 0;
@@ -49096,6 +49102,9 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         ds4_d8f_close(&file);
         return 0;
     }
+    d8f_lut_sidecar_lite sidecars[ds4_selected_expert_cap] = {{0}};
+    float sidecar_dot[ds4_batch_token_cap * ds4_selected_expert_cap] = {0.0f};
+    uint32_t rank1_sidecar_count = 0;
     for (uint32_t slot = 0; slot < n_experts; slot++) {
         ds4_d8f_record rec;
         if (!ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &rec)) {
@@ -49105,10 +49114,29 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         }
         ds4_d8f_sidecar_record sidecar;
         if (ds4_d8f_get_down_sidecar(&file, experts[slot], &sidecar)) {
-            fprintf(stderr, "ds4_d8f: selected down LUT rejects rank%u sidecar expert=%u\n",
-                    sidecar.rank, experts[slot]);
-            free(recs); ds4_d8f_close(&file);
-            return 0;
+            const uint64_t file_size = (uint64_t)file.size;
+            const int sidecar_ok =
+                sidecar.rank == 1u &&
+                sidecar.in_dim == ds4_down_in_dim &&
+                sidecar.out_dim >= rows &&
+                sidecar.u_offset <= file_size &&
+                sidecar.a_offset <= file_size &&
+                sidecar.u_bytes <= file_size - sidecar.u_offset &&
+                sidecar.a_bytes <= file_size - sidecar.a_offset &&
+                sidecar.u_bytes >= ds4_down_in_dim * 2u &&
+                sidecar.a_bytes >= rows * 2u;
+            if (!sidecar_ok) {
+                fprintf(stderr,
+                        "ds4_d8f: selected down LUT rejects unsupported sidecar expert=%u rank=%u in=%u out=%u\n",
+                        experts[slot], sidecar.rank, sidecar.in_dim, sidecar.out_dim);
+                free(recs); ds4_d8f_close(&file);
+                return 0;
+            }
+            sidecars[slot].rank = 1u;
+            sidecars[slot].out_dim = sidecar.out_dim;
+            sidecars[slot].a_offset_lo = (uint32_t)(sidecar.a_offset & 0xffffffffull);
+            sidecars[slot].a_offset_hi = (uint32_t)(sidecar.a_offset >> 32);
+            rank1_sidecar_count++;
         }
         const uint64_t blocks = ((uint64_t)rec.index_bytes * 8ull) / (uint64_t)rec.bits;
         if (rec.block != 8u || blocks < (uint64_t)rows * groups ||
@@ -49154,6 +49182,25 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             }
         }
     }
+    if (rank1_sidecar_count > 0) {
+        for (uint32_t token = 0; token < n_tokens; token++) {
+            for (uint32_t slot = 0; slot < n_experts; slot++) {
+                if (sidecars[slot].rank != 1u) continue;
+                ds4_d8f_record down;
+                ds4_d8f_sidecar_record sidecar;
+                if (!ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &down) ||
+                    !ds4_d8f_get_down_sidecar(&file, experts[slot], &sidecar)) continue;
+                const uint8_t *u = file.map + sidecar.u_offset;
+                const float *slot_mid = mid + ((uint64_t)token * n_experts + slot) * ds4_down_in_dim;
+                double dot = 0.0;
+                for (uint32_t i = 0; i < ds4_down_in_dim; i++) {
+                    dot += (double)ds4_m1r_f16_to_f32(ds4_m1r_u16(u + (uint64_t)i * 2u)) *
+                           (double)ds4_d8f_ref_mid_at(&file, &down, slot_mid, i);
+                }
+                sidecar_dot[(uint64_t)token * n_experts + slot] = (float)dot;
+            }
+        }
+    }
     for (uint32_t token = 0; token < n_tokens; token++) {
         for (uint32_t row = 0; row < rows; row++) {
             double sum = 0.0;
@@ -49176,6 +49223,13 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                            ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * ds4_d8f_ref_mid_at(&file, &rec, slot_mid, x_base + 6u) +
                            ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * ds4_d8f_ref_mid_at(&file, &rec, slot_mid, x_base + 7u);
                 }
+                if (sidecars[slot].rank == 1u) {
+                    const uint64_t a_offset = (uint64_t)sidecars[slot].a_offset_lo |
+                                              ((uint64_t)sidecars[slot].a_offset_hi << 32);
+                    const uint8_t *a = file.map + a_offset;
+                    sum += (double)sidecar_dot[(uint64_t)token * n_experts + slot] *
+                           (double)ds4_m1r_f16_to_f32(ds4_m1r_u16(a + (uint64_t)row * 2u));
+                }
             }
             ref[(uint64_t)token * rows + row] = (float)sum;
         }
@@ -49184,7 +49238,13 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     const int half_score = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_HALF") > 0;
     const size_t score_bytes_per_value = half_score ? sizeof(uint16_t) : sizeof(float);
     const int native_code_env = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_NATIVE_CODES");
-    const int native_code_mode = !half_score && (native_code_env >= 0 ? native_code_env > 0 : n_tokens <= 4u);
+    if (half_score && rank1_sidecar_count > 0) {
+        fprintf(stderr, "ds4_d8f: down LUT rank1 sidecars require f32 score/native-code gather\n");
+        free(gpu_out); free(ref); free(selected_full); free(mid); free(recs); ds4_d8f_close(&file);
+        return 0;
+    }
+    const int native_code_mode = !half_score &&
+        (rank1_sidecar_count > 0 || (native_code_env >= 0 ? native_code_env > 0 : n_tokens <= 4u));
     const uint32_t default_gather_tile_rows = (n_tokens <= 1u) ? 1u : ((n_tokens <= 4u) ? 16u : 8u);
     uint32_t gather_tile_rows = ds4_gpu_env_u32("DS4_D8F_METAL_LUT_GATHER_TILE_ROWS", default_gather_tile_rows);
     if (half_score) gather_tile_rows = 1u;
@@ -49259,6 +49319,12 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         id<MTLBuffer> codeBuf = native_code_mode ? [g_device newBufferWithBytes:native_codes
                                                                          length:(NSUInteger)native_code_count * sizeof(uint16_t)
                                                                         options:MTLResourceStorageModeShared] : nil;
+        id<MTLBuffer> sidecarBuf = native_code_mode ? [g_device newBufferWithBytes:sidecars
+                                                                            length:(NSUInteger)n_experts * sizeof(*sidecars)
+                                                                           options:MTLResourceStorageModeShared] : nil;
+        id<MTLBuffer> sidecarDotBuf = native_code_mode ? [g_device newBufferWithBytes:sidecar_dot
+                                                                               length:(NSUInteger)n_tokens * n_experts * sizeof(float)
+                                                                              options:MTLResourceStorageModeShared] : nil;
         id<MTLBuffer> outBuf = [g_device newBufferWithLength:(NSUInteger)n_tokens * rows * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
         struct args_t {
@@ -49269,11 +49335,12 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         } args = {
             rows, ds4_down_in_dim, n_experts, n_tokens, ds4_d8f_table_offset, file.record_bytes,
             ds4_down_in_dim, n_experts * ds4_down_in_dim, n_experts, max_k,
-            max_k, groups * max_k, n_experts * groups * max_k, rows, 0u, 0u
+            max_k, groups * max_k, n_experts * groups * max_k, rows,
+            rank1_sidecar_count > 0 ? 1u : 0u, 0u
         };
         id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args) options:MTLResourceStorageModeShared];
         if (packBuf && midBuf && selBuf && recBuf && scoreBuf && outBuf && argsBuf &&
-            (!native_code_mode || codeBuf)) {
+            (!native_code_mode || (codeBuf && sidecarBuf && sidecarDotBuf))) {
             void (^dispatch_once)(void) = ^{
                 id<MTLCommandBuffer> cb = [g_queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -49321,6 +49388,9 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                     [enc setBuffer:scoreBuf offset:0 atIndex:1];
                     [enc setBuffer:outBuf offset:0 atIndex:2];
                     [enc setBuffer:argsBuf offset:0 atIndex:3];
+                    [enc setBuffer:sidecarBuf offset:0 atIndex:4];
+                    [enc setBuffer:sidecarDotBuf offset:0 atIndex:5];
+                    [enc setBuffer:packBuf offset:0 atIndex:6];
                 } else {
                     [enc setBuffer:packBuf offset:0 atIndex:0];
                     [enc setBuffer:selBuf offset:0 atIndex:1];
@@ -49395,12 +49465,13 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         }
     }
     fprintf(stderr,
-            "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s code_mode=%s code_source=%s sidecar_hits=%d gather_tile=%u score=%.2f MiB code=%.2f MiB pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
+            "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s code_mode=%s code_source=%s sidecar_hits=%d rank1_sidecars=%u gather_tile=%u score=%.2f MiB code=%.2f MiB pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
             n_experts, rows, n_tokens, rounds, max_k,
             half_score ? "f16" : "f32",
             native_code_mode ? "native_u16" : "bitpack",
             native_code_mode ? (native_code_sidecar_hits == (int)n_experts ? "sidecar" : "predecode") : "bitpack",
             native_code_sidecar_hits,
+            rank1_sidecar_count,
             gather_tile_rows,
             (double)(score_count * score_bytes_per_value) / 1048576.0,
             native_code_mode ? (double)(native_code_count * sizeof(uint16_t)) / 1048576.0 : 0.0,
