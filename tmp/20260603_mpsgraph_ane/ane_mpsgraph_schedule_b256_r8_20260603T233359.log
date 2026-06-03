@@ -1,0 +1,11 @@
+2026-06-03 23:33:59.683 ane_mpsgraph_schedule_canary[49920:11925644] [coreml] compile_start path=tmp/20260603_mpsgraph_ane/prefill_b256_d4096_n2048_20260603T232600.mlpackage
+2026-06-03 23:34:00.420 ane_mpsgraph_schedule_canary[49920:11925644] [shape] input=x (
+    256,
+    4096
+) output=y (
+    256,
+    2048
+) rounds=8
+2026-06-03 23:34:00.578 ane_mpsgraph_schedule_canary[49920:11925644] [warmup] output_backing_used=yes
+2026-06-03 23:34:00.640 ane_mpsgraph_schedule_canary[49920:11925644] [result] rounds=8 ane_ms=1.003 mps_ms=2.008 mps_after_ane_ms=1.156 ane_after_mps_ms=0.829 serial_ms=3.011 concurrent_ms=0.831 speedup=3.623 ane_thread_ms=0.827 mps_thread_ms=0.804
+2026-06-03 23:34:00.640 ane_mpsgraph_schedule_canary[49920:11925644] [ane_output_sample] words=524288 first=0xb80f 0xbc8e 0xaced 0xbd2e

@@ -150,3 +150,13 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - B=256 canary: output backing was used and `predict_ms=0.760`, `fill_predict_ms=1.083`, showing the ObjC/IOSurface path is much lower overhead than Python `numpy` input.
 - B=2048 canary with post-run output sample: output backing was used, first output halfwords were nonzero (`0xb55d 0x2e2a 0xb22d 0xb78a`), and 20-round timing measured `predict_ms=4.593`, `fill_predict_ms=4.729`, `copy_predict_ms=4.705`.
 - The DS4-style buffer-to-IOSurface ingest cost is therefore about `0.111 ms` for a `2048 x 4096` FP16 hidden-state copy into CoreML input. This does not block ANE prefill overlap; the harder remaining boundary is model generation/caching for real per-layer expert subsets and merging ANE outputs back into the DS4 prefill accumulation without serializing GPU work.
+
+## 2026-06-03T23:36 JST — ANE/MPSGraph scheduling and cache-state probe
+
+- Added `tmp/20260603_mpsgraph_ane/ane_mpsgraph_schedule_canary.m`, which wraps one shared `MTLBuffer.contents` pointer as a CoreML `MLMultiArray` while also feeding the same `MTLBuffer` to MPSGraph. This directly tests unified-memory scheduling/cache effects instead of comparing unrelated Python buffers.
+- Correct architecture model: ANE, GPU/MPSGraph, and CPU share DRAM and some system-level memory/cache/TLB state, but not a simple CPU-style private-cache hierarchy. The useful levers are shared allocation residency, SLC/page/TLB warmth, command scheduling, and avoiding staging copies.
+- B=256 schedule canary passed with output backing used and showed launch-noisy but strong overlap: ANE `1.003 ms`, MPSGraph `2.008 ms`, concurrent `0.831 ms`.
+- B=2048 r5: ANE `4.601 ms`, MPSGraph `6.230 ms`, ANE→MPSGraph inner `5.248 ms`, MPSGraph→ANE inner `10.201 ms`, concurrent `8.651 ms`, speedup `1.252x`.
+- B=2048 r20: ANE `4.561 ms`, MPSGraph `6.026 ms`, ANE→MPSGraph inner `8.066 ms`, MPSGraph→ANE inner `12.381 ms`, concurrent `5.944 ms`, speedup `1.781x`.
+- Added CPU eviction controls. Evicting 64/256/512 MiB after ANE before MPSGraph pushed ANE→MPSGraph inner time into the `9.1-9.7 ms` range, while no-evict ANE→MPSGraph often stayed `5-7 ms`. This is evidence that cache/scheduling state matters, but the current canary has order contamination; the next rigorous test must counterbalance/randomize permutation order and record per-round distributions.
+- Queued the cache work in `tmp/20260603_mpsgraph_ane/CACHE_ARCHITECTURE_EXPLORATION_QUEUE.md`. Current production direction remains: ANE high-B prefill shared-expert organ first, MPSGraph exact D8F down/gateup graph-cache exploration second, raw ANE D8F gather rejected for now.
