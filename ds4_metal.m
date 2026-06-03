@@ -52450,14 +52450,22 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             !half_mid && recbuf_enabled && !preweight_mid &&
             g_d8f_runtime_rec_buf &&
             g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline;
+        const int down_compact_tex_requested =
+            ds4_gpu_d8f_runtime_native_down_compact_tex_enabled_for_layer(layer) &&
+            g_d8f_runtime_compact_codebook_tex &&
+            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_compact_tex_classic_pipeline;
+        const int down_native_sidecars_available =
+            ds4_d8f_down_native_code_sidecar_count(&g_d8f_runtime_file) > 0u;
+        const int down_texbuf_available =
+            g_d8f_runtime_texbuf &&
+            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_classic_pipeline;
         const int down_native_recbuf =
             !down_tile32_recbuf &&
             !half_mid && recbuf_enabled && !preweight_mid && down_tile16 &&
             ds4_gpu_d8f_runtime_native_down_enabled_for_layer(layer, n_tokens) &&
-            ds4_d8f_down_native_code_sidecar_count(&g_d8f_runtime_file) > 0u &&
+            (down_native_sidecars_available || down_compact_tex_requested) &&
             g_d8f_runtime_rec_buf &&
-            g_d8f_runtime_texbuf &&
-            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_classic_pipeline;
+            (down_texbuf_available || down_compact_tex_requested);
         const int down_native_pack2d =
             down_native_recbuf &&
             ds4_gpu_d8f_runtime_native_down_pack2d_enabled_for_layer(layer) &&
@@ -52465,9 +52473,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_pack2d_classic_pipeline;
         const int down_native_compact_tex =
             down_native_recbuf &&
-            ds4_gpu_d8f_runtime_native_down_compact_tex_enabled_for_layer(layer) &&
-            g_d8f_runtime_compact_codebook_tex &&
-            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_compact_tex_classic_pipeline;
+            down_compact_tex_requested;
         const NSUInteger down_pack2d_warm_bytes =
             (NSUInteger)n_tokens * (NSUInteger)n_experts * 8192u * sizeof(float);
         const int down_native_pack2d_warm =
