@@ -1,0 +1,32 @@
+2026-06-04 00:09:55.031 ane_d8f_routed_counterbalanced_canary[96877:12539298] [coreml] compile_start path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage
+2026-06-04 00:09:57.526 ane_d8f_routed_counterbalanced_canary[96877:12539298] [shape] coreml_input=x (
+    2048,
+    4096
+) coreml_output=shared_out (
+    2048,
+    4096
+) d8f=/Users/silv/cl/tlp/montyneg/ds4/DeepSeek-V4-Flash_H3355_H3353_L26E165_gate_clean_D8F_800kctx_AIME_active_20260603/ds4_L26_gate_up_down_VQD8_noE8_rank1.d8f experts=191,61,201,18,100,78 route_weights=0.457488,0.361998,0.232502,0.188364,0.147002,0.112646 nsel=6 trials=6 evict_mib=0 mode=same seed=29001
+2026-06-04 00:09:57.888 ane_d8f_routed_counterbalanced_canary[96877:12539298] [mpsgraph] compile_start nsel=6
+2026-06-04 00:09:58.233 ane_d8f_routed_counterbalanced_canary[96877:12539298] [validate] bad=0 max_abs=6.1566e-05 max_rel=6.1566e-05 rms=1.41898e-05 sample_ref=0.0404594 sample_got=0.0404663
+2026-06-04 00:09:58.313 ane_d8f_routed_counterbalanced_canary[96877:12539298] [warmup] output_backing_used=yes
+2026-06-04 00:09:58.466 ane_d8f_routed_counterbalanced_canary[96877:12539298] [trial] index=0 order=d8f_evicted,serial_ane_d8f_merge,merge_only,d8f_after_ane_evicted,serial_ane_d8f,d8f_after_ane,d8f_only,concurrent_then_merge,ane_only,concurrent,ane_after_d8f
+2026-06-04 00:09:58.621 ane_d8f_routed_counterbalanced_canary[96877:12539298] [trial] index=1 order=d8f_evicted,d8f_only,ane_only,d8f_after_ane,d8f_after_ane_evicted,merge_only,concurrent_then_merge,serial_ane_d8f_merge,ane_after_d8f,concurrent,serial_ane_d8f
+2026-06-04 00:09:58.783 ane_d8f_routed_counterbalanced_canary[96877:12539298] [trial] index=2 order=ane_only,d8f_after_ane_evicted,d8f_evicted,concurrent,merge_only,serial_ane_d8f,serial_ane_d8f_merge,d8f_only,concurrent_then_merge,ane_after_d8f,d8f_after_ane
+2026-06-04 00:09:58.948 ane_d8f_routed_counterbalanced_canary[96877:12539298] [trial] index=3 order=d8f_evicted,d8f_only,ane_only,concurrent,serial_ane_d8f,serial_ane_d8f_merge,d8f_after_ane_evicted,concurrent_then_merge,merge_only,ane_after_d8f,d8f_after_ane
+2026-06-04 00:09:59.105 ane_d8f_routed_counterbalanced_canary[96877:12539298] [trial] index=4 order=ane_only,merge_only,d8f_evicted,d8f_after_ane_evicted,d8f_only,serial_ane_d8f,concurrent_then_merge,ane_after_d8f,serial_ane_d8f_merge,d8f_after_ane,concurrent
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [trial] index=5 order=serial_ane_d8f,merge_only,ane_only,d8f_after_ane,ane_after_d8f,d8f_only,d8f_evicted,serial_ane_d8f_merge,concurrent_then_merge,concurrent,d8f_after_ane_evicted
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [summary] mode=same evict_mib=0 nsel=6 case=ane_only n=6 min_ms=12.110 p50_ms=15.637 p90_ms=22.667 max_ms=22.667 mean_ms=15.786
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [summary] mode=same evict_mib=0 nsel=6 case=d8f_only n=6 min_ms=4.058 p50_ms=6.967 p90_ms=7.223 max_ms=7.223 mean_ms=5.847
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [summary] mode=same evict_mib=0 nsel=6 case=d8f_evicted n=6 min_ms=3.881 p50_ms=7.488 p90_ms=7.652 max_ms=7.652 mean_ms=5.875
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [summary] mode=same evict_mib=0 nsel=6 case=d8f_after_ane n=6 min_ms=4.405 p50_ms=7.196 p90_ms=7.718 max_ms=7.718 mean_ms=6.422
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [summary] mode=same evict_mib=0 nsel=6 case=d8f_after_ane_evicted n=6 min_ms=4.683 p50_ms=6.259 p90_ms=7.780 max_ms=7.780 mean_ms=6.182
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [summary] mode=same evict_mib=0 nsel=6 case=ane_after_d8f n=6 min_ms=13.717 p50_ms=15.773 p90_ms=16.134 max_ms=16.134 mean_ms=15.117
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [summary] mode=same evict_mib=0 nsel=6 case=serial_ane_d8f n=6 min_ms=16.785 p50_ms=19.568 p90_ms=20.822 max_ms=20.822 mean_ms=18.740
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [summary] mode=same evict_mib=0 nsel=6 case=concurrent n=6 min_ms=12.143 p50_ms=13.079 p90_ms=18.710 max_ms=18.710 mean_ms=13.751
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [summary] mode=same evict_mib=0 nsel=6 case=merge_only n=6 min_ms=0.272 p50_ms=0.311 p90_ms=1.015 max_ms=1.015 mean_ms=0.494
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [summary] mode=same evict_mib=0 nsel=6 case=serial_ane_d8f_merge n=6 min_ms=18.289 p50_ms=20.663 p90_ms=20.721 max_ms=20.721 mean_ms=19.897
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [summary] mode=same evict_mib=0 nsel=6 case=concurrent_then_merge n=6 min_ms=13.712 p50_ms=15.209 p90_ms=17.318 max_ms=17.318 mean_ms=15.351
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [derived] mode=same evict_mib=0 nsel=6 ane_plus_d8f_p50_ms=22.603 serial_measured_p50_ms=19.568 concurrent_p50_ms=13.079 overlap_speedup_p50=1.728
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [merge_effect] mode=same evict_mib=0 nsel=6 merge_p50_ms=0.311 ane_plus_d8f_plus_merge_p50_ms=22.914 serial_merge_p50_ms=20.663 concurrent_then_merge_p50_ms=15.209 overlap_merge_speedup_p50=1.507
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [cache_effect] mode=same evict_mib=0 nsel=6 d8f_only_p50_ms=6.967 d8f_evicted_p50_ms=7.488 d8f_after_ane_p50_ms=7.196 d8f_after_ane_evicted_p50_ms=6.259 evict_p50_ms=0.000
+2026-06-04 00:09:59.245 ane_d8f_routed_counterbalanced_canary[96877:12539298] [samples] ane0=0xa118 d8f0=0x292e merged0=0x27d0

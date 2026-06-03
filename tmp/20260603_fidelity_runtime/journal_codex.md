@@ -205,3 +205,12 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - Weighted exactness passed for selected six experts `165,0,1,2,3,4` with weights `0.35,0.2,0.15,0.1,0.1,0.1`: `bad=0`, `max_abs=3.03481e-05`, `rms=7.04666e-06`.
 - Weighted D8F-only p50 was `6.790 ms`; merge p50 was `0.295 ms`. The four-trial overlap timing had an outlier and is not promotion-grade: concurrent p50 `22.103 ms`, concurrent-then-merge p50 `25.594 ms`, overlap+merge speedup only `1.008x`.
 - Current implication: the exact graph now has the required route-weight semantics. The next useful performance measurement is a longer low-load weighted run or direct runtime integration with real router weights, not another unit-weight canary.
+
+## 2026-06-04T00:10 JST — real PE router weights into exact D8F canary
+
+- Used the existing `DS4_ROUTER_TRACE_PE` runtime hook on a short H3355 `Hi` run, producing `473` PE rows plus the CSV header under `tmp/20260604_real_router/pe_trace_h3355_hi_20260604T000811.csv`.
+- Added `tmp/20260604_real_router/route_trace_to_d8f_canary_args.py` to convert trace rows into exact-D8F canary arguments. The selected L26 decode row was row `456`, experts `191,61,201,18,100,78`, weights `0.457488,0.361998,0.232502,0.188364,0.147002,0.112646`.
+- Real-router weighted exactness passed for that row: `bad=0`, `max_abs=6.1566e-05`, `rms=1.41898e-05`.
+- Real-router weighted overlap survived merge in the six-trial same-buffer run: ANE `15.637 ms`, D8F `6.967 ms`, merge `0.311 ms`, serial+merge `20.663 ms`, concurrent+merge `15.209 ms`, overlap+merge speedup `1.507x`.
+- The cache-warmup claim is still not proven for exact D8F: D8F-after-ANE p50 was `7.196 ms` versus D8F-only `6.967 ms`. Treat real-router evidence as overlap support, not as proof that ANE warms the routed graph to the memory floor.
+- The next falsifier is real hidden-state input. Route weights now match runtime rows, but the canary still uses synthetic hidden values and the current CoreML shared model is L0 while the routed D8F path is L26.
