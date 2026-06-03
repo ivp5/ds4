@@ -45,6 +45,16 @@ static const char *kMetalSource =
 "         hi.x * mid4 + hi.y * mid5 + hi.z * mid6 + hi.w * mid7;\n"
 "}\n"
 "\n"
+"static inline float dot8_texture_gather(texture2d<float, access::sample> codebooks, uint slot, uint code, float mid0, float mid1, float mid2, float mid3, float mid4, float mid5, float mid6, float mid7) {\n"
+"  constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::nearest);\n"
+"  const float x = float(code * 2u) + 0.5f;\n"
+"  const float y = float(slot * 4u) + 0.5f;\n"
+"  const float4 lo = codebooks.gather(s, float2(x, y));\n"
+"  const float4 hi = codebooks.gather(s, float2(x, y + 2.0f));\n"
+"  return lo.x * mid0 + lo.y * mid1 + lo.z * mid2 + lo.w * mid3 +\n"
+"         hi.x * mid4 + hi.y * mid5 + hi.z * mid6 + hi.w * mid7;\n"
+"}\n"
+"\n"
 "static inline uint2 pack2d_coord(uint texel, uint width) {\n"
 "  const uint y = texel / width;\n"
 "  return uint2(texel - y * width, y);\n"
@@ -282,6 +292,77 @@ static const char *kMetalSource =
 "  }\n"
 "}\n"
 "\n"
+"kernel void selected_texture_gather(\n"
+"  texture2d<float, access::sample> codebooks [[texture(0)]],\n"
+"  device const ushort *codes [[buffer(0)]],\n"
+"  device const float *mid [[buffer(1)]],\n"
+"  device float *out [[buffer(2)]],\n"
+"  constant uint &max_k [[buffer(3)]],\n"
+"  constant uint &rows [[buffer(4)]],\n"
+"  constant uint &groups [[buffer(5)]],\n"
+"  constant uint &slots [[buffer(6)]],\n"
+"  threadgroup float *partial [[threadgroup(0)]],\n"
+"  uint tid [[thread_index_in_threadgroup]],\n"
+"  ushort lane [[thread_index_in_simdgroup]],\n"
+"  ushort simdgroup [[simdgroup_index_in_threadgroup]],\n"
+"  uint row_tile [[threadgroup_position_in_grid]]) {\n"
+"  const uint row_base = row_tile << 4;\n"
+"  float acc[16];\n"
+"  for (uint row_offset = 0; row_offset < 16u; row_offset++) acc[row_offset] = 0.0f;\n"
+"  for (uint slot = 0u; slot < slots; slot++) {\n"
+"    for (uint group = tid; group < groups; group += 256u) {\n"
+"      const uint mid_base = slot * groups * 8u + group * 8u;\n"
+"      const float mid0 = mid[mid_base + 0u];\n"
+"      const float mid1 = mid[mid_base + 1u];\n"
+"      const float mid2 = mid[mid_base + 2u];\n"
+"      const float mid3 = mid[mid_base + 3u];\n"
+"      const float mid4 = mid[mid_base + 4u];\n"
+"      const float mid5 = mid[mid_base + 5u];\n"
+"      const float mid6 = mid[mid_base + 6u];\n"
+"      const float mid7 = mid[mid_base + 7u];\n"
+"      for (uint row_offset = 0; row_offset < 16u; row_offset++) {\n"
+"        const uint row = row_base + row_offset;\n"
+"        if (row >= rows) continue;\n"
+"        const ushort code = codes[(ulong(slot) * ulong(rows) + ulong(row)) * ulong(groups) + ulong(group)];\n"
+"        if (code >= max_k) continue;\n"
+"        acc[row_offset] += dot8_texture_gather(codebooks, slot, uint(code), mid0, mid1, mid2, mid3, mid4, mid5, mid6, mid7);\n"
+"      }\n"
+"    }\n"
+"  }\n"
+"  for (uint row_offset = 0; row_offset < 16u; row_offset++) {\n"
+"    const float subtotal = simd_sum(acc[row_offset]);\n"
+"    if (lane == 0u) partial[row_offset * 8u + uint(simdgroup)] = subtotal;\n"
+"  }\n"
+"  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  if (tid == 0u) {\n"
+"    for (uint row_offset = 0; row_offset < 16u; row_offset++) {\n"
+"      const uint row = row_base + row_offset;\n"
+"      if (row >= rows) continue;\n"
+"      float total = 0.0f;\n"
+"      for (uint sg = 0u; sg < 8u; sg++) total += partial[row_offset * 8u + sg];\n"
+"      out[row] = total;\n"
+"    }\n"
+"  }\n"
+"}\n"
+"\n"
+"kernel void warm_pack2d_codebooks(\n"
+"  texture2d<half, access::read> codebooks [[texture(0)]],\n"
+"  device const uint *base_texels [[buffer(0)]],\n"
+"  device float *sink [[buffer(1)]],\n"
+"  constant uint &pack_width [[buffer(2)]],\n"
+"  constant uint &max_k [[buffer(3)]],\n"
+"  constant uint &slots [[buffer(4)]],\n"
+"  uint index [[thread_position_in_grid]]) {\n"
+"  const uint texels_per_slot = max_k * 2u;\n"
+"  const uint total = slots * texels_per_slot;\n"
+"  if (index >= total) return;\n"
+"  const uint slot = index / texels_per_slot;\n"
+"  const uint inner = index - slot * texels_per_slot;\n"
+"  const uint texel = base_texels[slot] + inner;\n"
+"  const half4 v = codebooks.read(pack2d_coord(texel, pack_width));\n"
+"  sink[index] = float(v.x) + float(v.y) + float(v.z) + float(v.w);\n"
+"}\n"
+"\n"
 "kernel void selected_pack2d_read(\n"
 "  texture2d<half, access::read> codebooks [[texture(0)]],\n"
 "  device const ushort *codes [[buffer(0)]],\n"
@@ -438,6 +519,19 @@ static id<MTLTexture> make_buffer_backed_texture(id<MTLBuffer> texel_buffer, uin
                                       bytesPerRow:(NSUInteger)width * 4u * sizeof(uint16_t)];
 }
 
+static id<MTLTexture> make_r16_buffer_backed_texture(id<MTLBuffer> texel_buffer, uint32_t width, uint32_t height) {
+    const NSUInteger bytes_per_row = (NSUInteger)width * sizeof(uint16_t);
+    if ((bytes_per_row & 15u) != 0u) return nil;
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float
+                                                                                          width:width
+                                                                                         height:height
+                                                                                      mipmapped:NO];
+    descriptor.usage = MTLTextureUsageShaderRead;
+    return [texel_buffer newTextureWithDescriptor:descriptor
+                                           offset:0
+                                      bytesPerRow:bytes_per_row];
+}
+
 static id<MTLTexture> make_texture_buffer(id<MTLBuffer> texel_buffer, uint32_t texel_count) {
     MTLTextureDescriptor *descriptor = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
                                                                                               width:texel_count
@@ -558,6 +652,38 @@ static double run_pack2d(id<MTLCommandQueue> queue,
     return best;
 }
 
+static double run_warm_pack2d(id<MTLCommandQueue> queue,
+                              id<MTLComputePipelineState> pipeline,
+                              id<MTLTexture> codebooks,
+                              id<MTLBuffer> base_texels,
+                              id<MTLBuffer> sink,
+                              uint32_t pack_width,
+                              uint32_t max_k,
+                              uint32_t slots,
+                              uint32_t rounds) {
+    double best = 1.0e30;
+    const uint32_t total = slots * max_k * 2u;
+    for (uint32_t round = 0; round < rounds; round++) {
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setTexture:codebooks atIndex:0];
+        [encoder setBuffer:base_texels offset:0 atIndex:0];
+        [encoder setBuffer:sink offset:0 atIndex:1];
+        [encoder setBytes:&pack_width length:sizeof(pack_width) atIndex:2];
+        [encoder setBytes:&max_k length:sizeof(max_k) atIndex:3];
+        [encoder setBytes:&slots length:sizeof(slots) atIndex:4];
+        [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        const double ms = (command_buffer.GPUEndTime - command_buffer.GPUStartTime) * 1000.0;
+        if (ms > 0.0 && ms < best) best = ms;
+    }
+    return best;
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         if (argc < 3) {
@@ -615,16 +741,18 @@ int main(int argc, char **argv) {
         }
         const NSUInteger codebook_bytes = (NSUInteger)slots * max_k * 8u * sizeof(uint16_t);
         const NSUInteger texel_bytes = (NSUInteger)slots * max_k * 2u * 4u * sizeof(uint16_t);
+        const NSUInteger gather_texel_bytes = (NSUInteger)slots * 4u * max_k * 2u * sizeof(uint16_t);
         const NSUInteger code_bytes = (NSUInteger)slots * rows * groups * sizeof(uint16_t);
         const NSUInteger mid_bytes = (NSUInteger)slots * in_dim * sizeof(float);
         const NSUInteger out_bytes = (NSUInteger)rows * sizeof(float);
         uint16_t *codebook_host = (uint16_t *)calloc(1, codebook_bytes);
         uint16_t *texel_host = (uint16_t *)calloc(1, texel_bytes);
+        uint16_t *gather_texel_host = (uint16_t *)calloc(1, gather_texel_bytes);
         uint16_t *code_host = (uint16_t *)malloc(code_bytes);
         float *mid_host = (float *)malloc(mid_bytes);
         float *ref = (float *)calloc(rows, sizeof(float));
-        if (!codebook_host || !texel_host || !code_host || !mid_host || !ref) {
-            free(codebook_host); free(texel_host); free(code_host); free(mid_host); free(ref);
+        if (!codebook_host || !texel_host || !gather_texel_host || !code_host || !mid_host || !ref) {
+            free(codebook_host); free(texel_host); free(gather_texel_host); free(code_host); free(mid_host); free(ref);
             ds4_d8f_close(&file);
             return 1;
         }
@@ -636,6 +764,15 @@ int main(int argc, char **argv) {
                     codebook_host[((uint64_t)slot * max_k + code) * 8u + lane] = bits;
                     texel_host[((uint64_t)slot * max_k * 2u + code * 2u + lane / 4u) * 4u + lane % 4u] = bits;
                 }
+                const uint64_t gather_base = ((uint64_t)slot * 4u * max_k + code) * 2u;
+                gather_texel_host[gather_base + 0u] = load_u16(source + 3u * 2u);
+                gather_texel_host[gather_base + 1u] = load_u16(source + 2u * 2u);
+                gather_texel_host[gather_base + (uint64_t)max_k * 2u + 0u] = load_u16(source + 0u * 2u);
+                gather_texel_host[gather_base + (uint64_t)max_k * 2u + 1u] = load_u16(source + 1u * 2u);
+                gather_texel_host[gather_base + (uint64_t)max_k * 4u + 0u] = load_u16(source + 7u * 2u);
+                gather_texel_host[gather_base + (uint64_t)max_k * 4u + 1u] = load_u16(source + 6u * 2u);
+                gather_texel_host[gather_base + (uint64_t)max_k * 6u + 0u] = load_u16(source + 4u * 2u);
+                gather_texel_host[gather_base + (uint64_t)max_k * 6u + 1u] = load_u16(source + 5u * 2u);
             }
             memcpy(code_host + (uint64_t)slot * rows * groups,
                    file.map + native[slot].offset,
@@ -674,7 +811,7 @@ int main(int argc, char **argv) {
                                                          error:&error];
         if (!library) {
             NSLog(@"library creation failed: %@", error);
-            free(codebook_host); free(texel_host); free(code_host); free(mid_host); free(ref);
+            free(codebook_host); free(texel_host); free(gather_texel_host); free(code_host); free(mid_host); free(ref);
             ds4_d8f_close(&file);
             return 1;
         }
@@ -682,18 +819,22 @@ int main(int argc, char **argv) {
         id<MTLComputePipelineState> texture_pipeline = make_pipeline(device, library, @"selected_texture");
         id<MTLComputePipelineState> texture_buffer_pipeline = make_pipeline(device, library, @"selected_texture_buffer");
         id<MTLComputePipelineState> texture_sample_pipeline = make_pipeline(device, library, @"selected_texture_sample");
+        id<MTLComputePipelineState> texture_gather_pipeline = make_pipeline(device, library, @"selected_texture_gather");
+        id<MTLComputePipelineState> warm_pack2d_pipeline = make_pipeline(device, library, @"warm_pack2d_codebooks");
         id<MTLComputePipelineState> pack2d_read_pipeline = make_pipeline(device, library, @"selected_pack2d_read");
         id<MTLComputePipelineState> pack2d_sample_pipeline = make_pipeline(device, library, @"selected_pack2d_sample");
         if (!buffer_pipeline || !texture_pipeline || !texture_buffer_pipeline || !texture_sample_pipeline ||
-            !pack2d_read_pipeline || !pack2d_sample_pipeline) {
-            free(codebook_host); free(texel_host); free(code_host); free(mid_host); free(ref);
+            !texture_gather_pipeline || !warm_pack2d_pipeline || !pack2d_read_pipeline || !pack2d_sample_pipeline) {
+            free(codebook_host); free(texel_host); free(gather_texel_host); free(code_host); free(mid_host); free(ref);
             ds4_d8f_close(&file);
             return 1;
         }
         id<MTLBuffer> codebook_buf = [device newBufferWithBytes:codebook_host length:codebook_bytes options:MTLResourceStorageModeShared];
         id<MTLBuffer> texel_buf = [device newBufferWithBytes:texel_host length:texel_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gather_texel_buf = [device newBufferWithBytes:gather_texel_host length:gather_texel_bytes options:MTLResourceStorageModeShared];
         id<MTLTexture> texture = make_buffer_backed_texture(texel_buf, max_k * 2u, slots);
         id<MTLTexture> texture_buffer = make_texture_buffer(texel_buf, slots * max_k * 2u);
+        id<MTLTexture> texture_gather = make_r16_buffer_backed_texture(gather_texel_buf, max_k * 2u, slots * 4u);
         const char *pack_width_env = getenv("DS4_TEXTURE_CANARY_PACK2D_WIDTH");
         uint32_t pack2d_width = pack_width_env && pack_width_env[0]
                               ? (uint32_t)strtoul(pack_width_env, NULL, 10)
@@ -729,13 +870,16 @@ int main(int argc, char **argv) {
         id<MTLBuffer> out_texture = [device newBufferWithLength:out_bytes options:MTLResourceStorageModeShared];
         id<MTLBuffer> out_texture_buffer = [device newBufferWithLength:out_bytes options:MTLResourceStorageModeShared];
         id<MTLBuffer> out_texture_sample = [device newBufferWithLength:out_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_texture_gather = [device newBufferWithLength:out_bytes options:MTLResourceStorageModeShared];
         id<MTLBuffer> out_pack2d_read = [device newBufferWithLength:out_bytes options:MTLResourceStorageModeShared];
         id<MTLBuffer> out_pack2d_sample = [device newBufferWithLength:out_bytes options:MTLResourceStorageModeShared];
-        if (!codebook_buf || !texel_buf || !texture || !texture_buffer || !code_buf || !mid_buf ||
+        id<MTLBuffer> warm_pack2d_sink = [device newBufferWithLength:(NSUInteger)slots * max_k * 2u * sizeof(float)
+                                                              options:MTLResourceStorageModeShared];
+        if (!codebook_buf || !texel_buf || !gather_texel_buf || !texture || !texture_buffer || !texture_gather || !code_buf || !mid_buf ||
             !out_buffer || !out_texture || !out_texture_buffer || !out_texture_sample ||
-            !out_pack2d_read || !out_pack2d_sample) {
+            !out_texture_gather || !out_pack2d_read || !out_pack2d_sample || !warm_pack2d_sink) {
             fprintf(stderr, "Metal allocation failed\n");
-            free(codebook_host); free(texel_host); free(code_host); free(mid_host); free(ref);
+            free(codebook_host); free(texel_host); free(gather_texel_host); free(code_host); free(mid_host); free(ref);
             ds4_d8f_close(&file);
             return 1;
         }
@@ -743,7 +887,10 @@ int main(int argc, char **argv) {
         (void)run_texture(queue, texture_pipeline, texture, code_buf, mid_buf, out_texture, max_k, rows, groups, slots, 1);
         (void)run_texture(queue, texture_buffer_pipeline, texture_buffer, code_buf, mid_buf, out_texture_buffer, max_k, rows, groups, slots, 1);
         (void)run_texture(queue, texture_sample_pipeline, texture, code_buf, mid_buf, out_texture_sample, max_k, rows, groups, slots, 1);
+        (void)run_texture(queue, texture_gather_pipeline, texture_gather, code_buf, mid_buf, out_texture_gather, max_k, rows, groups, slots, 1);
         if (pack2d_available) {
+            (void)run_warm_pack2d(queue, warm_pack2d_pipeline, pack2d_texture, base_texels_buf, warm_pack2d_sink,
+                                  pack2d_width, max_k, slots, 1);
             (void)run_pack2d(queue, pack2d_read_pipeline, pack2d_texture, code_buf, mid_buf, out_pack2d_read,
                              base_texels_buf, pack2d_width, max_k, rows, groups, slots, 1);
             (void)run_pack2d(queue, pack2d_sample_pipeline, pack2d_texture, code_buf, mid_buf, out_pack2d_sample,
@@ -753,17 +900,20 @@ int main(int argc, char **argv) {
         const float *texture_values = out_texture.contents;
         const float *texture_buffer_values = out_texture_buffer.contents;
         const float *texture_sample_values = out_texture_sample.contents;
+        const float *texture_gather_values = out_texture_gather.contents;
         const float *pack2d_read_values = out_pack2d_read.contents;
         const float *pack2d_sample_values = out_pack2d_sample.contents;
         float max_abs_buffer = 0.0f;
         float max_abs_texture = 0.0f;
         float max_abs_texture_buffer = 0.0f;
         float max_abs_texture_sample = 0.0f;
+        float max_abs_texture_gather = 0.0f;
         float max_abs_pack2d_read = pack2d_available ? 0.0f : NAN;
         float max_abs_pack2d_sample = pack2d_available ? 0.0f : NAN;
         float max_abs_buffer_texture = 0.0f;
         float max_abs_buffer_texture_buffer = 0.0f;
         float max_abs_buffer_texture_sample = 0.0f;
+        float max_abs_buffer_texture_gather = 0.0f;
         float max_abs_buffer_pack2d_read = pack2d_available ? 0.0f : NAN;
         float max_abs_buffer_pack2d_sample = pack2d_available ? 0.0f : NAN;
         for (uint32_t row = 0; row < rows; row++) {
@@ -771,31 +921,37 @@ int main(int argc, char **argv) {
             const float dt = fabsf(texture_values[row] - ref[row]);
             const float dtb = fabsf(texture_buffer_values[row] - ref[row]);
             const float dts = fabsf(texture_sample_values[row] - ref[row]);
+            const float dtg = fabsf(texture_gather_values[row] - ref[row]);
             const float dpr = pack2d_available ? fabsf(pack2d_read_values[row] - ref[row]) : NAN;
             const float dps = pack2d_available ? fabsf(pack2d_sample_values[row] - ref[row]) : NAN;
             const float dbt = fabsf(buffer_values[row] - texture_values[row]);
             const float dbtb = fabsf(buffer_values[row] - texture_buffer_values[row]);
             const float dbts = fabsf(buffer_values[row] - texture_sample_values[row]);
+            const float dbtg = fabsf(buffer_values[row] - texture_gather_values[row]);
             const float dbpr = pack2d_available ? fabsf(buffer_values[row] - pack2d_read_values[row]) : NAN;
             const float dbps = pack2d_available ? fabsf(buffer_values[row] - pack2d_sample_values[row]) : NAN;
             if (db > max_abs_buffer) max_abs_buffer = db;
             if (dt > max_abs_texture) max_abs_texture = dt;
             if (dtb > max_abs_texture_buffer) max_abs_texture_buffer = dtb;
             if (dts > max_abs_texture_sample) max_abs_texture_sample = dts;
+            if (dtg > max_abs_texture_gather) max_abs_texture_gather = dtg;
             if (pack2d_available && dpr > max_abs_pack2d_read) max_abs_pack2d_read = dpr;
             if (pack2d_available && dps > max_abs_pack2d_sample) max_abs_pack2d_sample = dps;
             if (dbt > max_abs_buffer_texture) max_abs_buffer_texture = dbt;
             if (dbtb > max_abs_buffer_texture_buffer) max_abs_buffer_texture_buffer = dbtb;
             if (dbts > max_abs_buffer_texture_sample) max_abs_buffer_texture_sample = dbts;
+            if (dbtg > max_abs_buffer_texture_gather) max_abs_buffer_texture_gather = dbtg;
             if (pack2d_available && dbpr > max_abs_buffer_pack2d_read) max_abs_buffer_pack2d_read = dbpr;
             if (pack2d_available && dbps > max_abs_buffer_pack2d_sample) max_abs_buffer_pack2d_sample = dbps;
         }
         const char *measure_order = getenv("DS4_TEXTURE_CANARY_ORDER");
-        if (!measure_order || !measure_order[0]) measure_order = "B2TSPQ";
+        if (!measure_order || !measure_order[0]) measure_order = "B2TSGPQ";
         double buffer_ms = 0.0;
         double texture_ms = 0.0;
         double texture_buffer_ms = 0.0;
         double texture_sample_ms = 0.0;
+        double texture_gather_ms = 0.0;
+        double pack2d_warm_ms = NAN;
         double pack2d_read_ms = NAN;
         double pack2d_sample_ms = NAN;
         for (const char *cursor = measure_order; *cursor; cursor++) {
@@ -807,6 +963,11 @@ int main(int argc, char **argv) {
                 texture_buffer_ms = run_texture(queue, texture_buffer_pipeline, texture_buffer, code_buf, mid_buf, out_texture_buffer, max_k, rows, groups, slots, rounds);
             } else if (*cursor == 'S' && texture_sample_ms == 0.0) {
                 texture_sample_ms = run_texture(queue, texture_sample_pipeline, texture, code_buf, mid_buf, out_texture_sample, max_k, rows, groups, slots, rounds);
+            } else if (*cursor == 'G' && texture_gather_ms == 0.0) {
+                texture_gather_ms = run_texture(queue, texture_gather_pipeline, texture_gather, code_buf, mid_buf, out_texture_gather, max_k, rows, groups, slots, rounds);
+            } else if (*cursor == 'W' && pack2d_available && isnan(pack2d_warm_ms)) {
+                pack2d_warm_ms = run_warm_pack2d(queue, warm_pack2d_pipeline, pack2d_texture, base_texels_buf, warm_pack2d_sink,
+                                                 pack2d_width, max_k, slots, rounds);
             } else if (*cursor == 'P' && pack2d_available && isnan(pack2d_read_ms)) {
                 pack2d_read_ms = run_pack2d(queue, pack2d_read_pipeline, pack2d_texture, code_buf, mid_buf, out_pack2d_read,
                                             base_texels_buf, pack2d_width, max_k, rows, groups, slots, rounds);
@@ -819,6 +980,11 @@ int main(int argc, char **argv) {
         if (texture_ms == 0.0) texture_ms = run_texture(queue, texture_pipeline, texture, code_buf, mid_buf, out_texture, max_k, rows, groups, slots, rounds);
         if (texture_buffer_ms == 0.0) texture_buffer_ms = run_texture(queue, texture_buffer_pipeline, texture_buffer, code_buf, mid_buf, out_texture_buffer, max_k, rows, groups, slots, rounds);
         if (texture_sample_ms == 0.0) texture_sample_ms = run_texture(queue, texture_sample_pipeline, texture, code_buf, mid_buf, out_texture_sample, max_k, rows, groups, slots, rounds);
+        if (texture_gather_ms == 0.0) texture_gather_ms = run_texture(queue, texture_gather_pipeline, texture_gather, code_buf, mid_buf, out_texture_gather, max_k, rows, groups, slots, rounds);
+        if (pack2d_available && isnan(pack2d_warm_ms)) {
+            pack2d_warm_ms = run_warm_pack2d(queue, warm_pack2d_pipeline, pack2d_texture, base_texels_buf, warm_pack2d_sink,
+                                             pack2d_width, max_k, slots, rounds);
+        }
         if (pack2d_available && isnan(pack2d_read_ms)) {
             pack2d_read_ms = run_pack2d(queue, pack2d_read_pipeline, pack2d_texture, code_buf, mid_buf, out_pack2d_read,
                                         base_texels_buf, pack2d_width, max_k, rows, groups, slots, rounds);
@@ -829,26 +995,30 @@ int main(int argc, char **argv) {
         }
         printf("real_texture_selected file=%s experts=%s rows=%u slots=%u max_k=%u rounds=%u "
                "order=%s pack2d=%d pack2d_width=%u pack2d_height=%lu pack2d_view=%.3fMiB "
-               "padded_codebook=%.3fMiB codes=%.3fMiB buffer=%.4fms tex_linear2d=%.4fms tex_buffer=%.4fms tex_sample=%.4fms "
+               "padded_codebook=%.3fMiB gather_codebook=%.3fMiB codes=%.3fMiB buffer=%.4fms tex_linear2d=%.4fms tex_buffer=%.4fms tex_sample=%.4fms tex_gather=%.4fms "
+               "tex_pack2d_warm=%.4fms "
                "tex_pack2d_read=%.4fms tex_pack2d_sample=%.4fms "
-               "speedup_2d=%.3fx speedup_tb=%.3fx speedup_sample=%.3fx speedup_pack2d_read=%.3fx speedup_pack2d_sample=%.3fx "
-               "max_abs_buffer=%.6g max_abs_texture=%.6g max_abs_texture_buffer=%.6g max_abs_texture_sample=%.6g "
+               "speedup_2d=%.3fx speedup_tb=%.3fx speedup_sample=%.3fx speedup_gather=%.3fx speedup_pack2d_read=%.3fx speedup_pack2d_sample=%.3fx "
+               "max_abs_buffer=%.6g max_abs_texture=%.6g max_abs_texture_buffer=%.6g max_abs_texture_sample=%.6g max_abs_texture_gather=%.6g "
                "max_abs_pack2d_read=%.6g max_abs_pack2d_sample=%.6g "
-               "max_abs_buf_tex=%.6g max_abs_buf_tb=%.6g max_abs_buf_sample=%.6g max_abs_buf_pack2d_read=%.6g max_abs_buf_pack2d_sample=%.6g\n",
+               "max_abs_buf_tex=%.6g max_abs_buf_tb=%.6g max_abs_buf_sample=%.6g max_abs_buf_gather=%.6g max_abs_buf_pack2d_read=%.6g max_abs_buf_pack2d_sample=%.6g\n",
                path, argv[2], rows, slots, max_k, rounds, measure_order,
                pack2d_available, pack2d_width, (unsigned long)pack2d_height,
                (double)pack2d_view_bytes / 1048576.0,
                (double)codebook_bytes / 1048576.0,
+               (double)gather_texel_bytes / 1048576.0,
                (double)code_bytes / 1048576.0,
-               buffer_ms, texture_ms, texture_buffer_ms, texture_sample_ms,
+               buffer_ms, texture_ms, texture_buffer_ms, texture_sample_ms, texture_gather_ms,
+               pack2d_warm_ms,
                pack2d_read_ms, pack2d_sample_ms,
                buffer_ms / texture_ms, buffer_ms / texture_buffer_ms, buffer_ms / texture_sample_ms,
+               buffer_ms / texture_gather_ms,
                buffer_ms / pack2d_read_ms, buffer_ms / pack2d_sample_ms,
-               max_abs_buffer, max_abs_texture, max_abs_texture_buffer, max_abs_texture_sample,
+               max_abs_buffer, max_abs_texture, max_abs_texture_buffer, max_abs_texture_sample, max_abs_texture_gather,
                max_abs_pack2d_read, max_abs_pack2d_sample,
-               max_abs_buffer_texture, max_abs_buffer_texture_buffer, max_abs_buffer_texture_sample,
+               max_abs_buffer_texture, max_abs_buffer_texture_buffer, max_abs_buffer_texture_sample, max_abs_buffer_texture_gather,
                max_abs_buffer_pack2d_read, max_abs_buffer_pack2d_sample);
-        free(codebook_host); free(texel_host); free(code_host); free(mid_host); free(ref);
+        free(codebook_host); free(texel_host); free(gather_texel_host); free(code_host); free(mid_host); free(ref);
         ds4_d8f_close(&file);
     }
     return 0;

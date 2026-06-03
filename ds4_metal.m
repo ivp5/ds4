@@ -1640,6 +1640,50 @@ static int ds4_gpu_d8f_runtime_native_down_pack2d_enabled_for_layer(uint32_t lay
     return has_allow;
 }
 
+static int ds4_gpu_d8f_runtime_native_down_compact_tex_enabled_for_layer(uint32_t layer) {
+    if (ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_COMPACT_TEX_DISABLE") > 0) return 0;
+    static int parsed = 0;
+    static int has_allow = 0;
+    static int has_disable = 0;
+    static uint64_t allow_mask = 0ull;
+    static uint64_t disable_mask = 0ull;
+    if (!parsed) {
+        const char *allow_csv = getenv("DS4_D8F_RUNTIME_NATIVE_DOWN_COMPACT_TEX_LAYERS");
+        const char *disable_csv = getenv("DS4_D8F_RUNTIME_NATIVE_DOWN_COMPACT_TEX_DISABLE_LAYERS");
+        has_allow = (allow_csv && allow_csv[0]) ? 1 : 0;
+        has_disable = (disable_csv && disable_csv[0]) ? 1 : 0;
+        allow_mask = has_allow ? ds4_gpu_d8f_layer_mask_from_csv(allow_csv) : 0ull;
+        disable_mask = has_disable ? ds4_gpu_d8f_layer_mask_from_csv(disable_csv) : 0ull;
+        parsed = 1;
+    }
+    if (layer >= 64u) return 0;
+    if (has_allow && ((allow_mask >> layer) & 1ull) == 0ull) return 0;
+    if (has_disable && ((disable_mask >> layer) & 1ull)) return 0;
+    const int explicit_compact = ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_COMPACT_TEX");
+    if (explicit_compact == 0) return 0;
+    if (explicit_compact > 0) return 1;
+    return has_allow;
+}
+
+static int ds4_gpu_d8f_runtime_native_down_pack2d_warm_enabled_for_layer(uint32_t layer) {
+    if (ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_PACK2D_WARM_DISABLE") > 0) return 0;
+    static int parsed = 0;
+    static int has_allow = 0;
+    static uint64_t allow_mask = 0ull;
+    if (!parsed) {
+        const char *allow_csv = getenv("DS4_D8F_RUNTIME_NATIVE_DOWN_PACK2D_WARM_LAYERS");
+        has_allow = (allow_csv && allow_csv[0]) ? 1 : 0;
+        allow_mask = has_allow ? ds4_gpu_d8f_layer_mask_from_csv(allow_csv) : 0ull;
+        parsed = 1;
+    }
+    if (layer >= 64u) return 0;
+    if (has_allow && ((allow_mask >> layer) & 1ull) == 0ull) return 0;
+    const int explicit_warm = ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_PACK2D_WARM");
+    if (explicit_warm == 0) return 0;
+    if (explicit_warm > 0) return 1;
+    return has_allow;
+}
+
 /*
  * Retained Metal4 defaults live here instead of behind user-visible options.
  * The public runtime has one automatic accelerated path plus the global
@@ -48470,6 +48514,8 @@ static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_recbuf_cla
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_pack2d_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_compact_tex_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_native_pack2d_warm_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_recbuf_hmid_classic_pipeline;
@@ -48560,6 +48606,10 @@ static int ds4_d8f_classic_pipeline_init(void) {
             ds4_gpu_get_pipeline_direct("d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes");
         g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_pack2d_classic_pipeline =
             ds4_gpu_get_pipeline_direct("d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_pack2d");
+        g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_compact_tex_classic_pipeline =
+            ds4_gpu_get_pipeline_direct("d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_compact_tex");
+        g_d8f_down_native_pack2d_warm_classic_pipeline =
+            ds4_gpu_get_pipeline_direct("d8f_down_native_pack2d_warm");
         g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram_classic_pipeline =
             ds4_gpu_get_pipeline("d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram");
         g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline =
@@ -48638,6 +48688,10 @@ static int ds4_d8f_classic_pipeline_init(void) {
         ds4_d8f_classic_direct_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes");
     g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_pack2d_classic_pipeline =
         ds4_d8f_classic_direct_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_pack2d");
+    g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_compact_tex_classic_pipeline =
+        ds4_d8f_classic_direct_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_compact_tex");
+    g_d8f_down_native_pack2d_warm_classic_pipeline =
+        ds4_d8f_classic_direct_pipeline_from_library(downLib, @"d8f_down_native_pack2d_warm");
     g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram_classic_pipeline =
         ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram");
     g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline =
@@ -51331,6 +51385,10 @@ static ds4_d8f_file g_d8f_runtime_file;
 static id<MTLBuffer> g_d8f_runtime_buf;
 static id<MTLTexture> g_d8f_runtime_texbuf;
 static id<MTLTexture> g_d8f_runtime_pack2d_tex;
+static id<MTLBuffer> g_d8f_runtime_compact_codebook_buf;
+static id<MTLTexture> g_d8f_runtime_compact_codebook_tex;
+static id<MTLBuffer> g_d8f_runtime_pack2d_warm_buf;
+static NSUInteger g_d8f_runtime_pack2d_warm_bytes;
 static id<MTLResidencySet> g_d8f_runtime_rs;
 static uint32_t g_d8f_runtime_layer = UINT32_MAX;
 static int g_d8f_runtime_open;
@@ -51377,6 +51435,8 @@ static ds4_d8f_file g_d8f_runtime_layer_file[ds4_d8f_runtime_layer_cap];
 static id<MTLBuffer> g_d8f_runtime_layer_buf[ds4_d8f_runtime_layer_cap];
 static id<MTLTexture> g_d8f_runtime_layer_texbuf[ds4_d8f_runtime_layer_cap];
 static id<MTLTexture> g_d8f_runtime_layer_pack2d_tex[ds4_d8f_runtime_layer_cap];
+static id<MTLBuffer> g_d8f_runtime_layer_compact_codebook_buf[ds4_d8f_runtime_layer_cap];
+static id<MTLTexture> g_d8f_runtime_layer_compact_codebook_tex[ds4_d8f_runtime_layer_cap];
 static id<MTLBuffer> g_d8f_runtime_layer_rec_buf[ds4_d8f_runtime_layer_cap];
 static int g_d8f_runtime_layer_open[ds4_d8f_runtime_layer_cap];
 static id<MTLBuffer> g_d8f_runtime_rec_buf;
@@ -51528,6 +51588,10 @@ static void ds4_d8f_runtime_active_clear(void) {
     g_d8f_runtime_buf = nil;
     g_d8f_runtime_texbuf = nil;
     g_d8f_runtime_pack2d_tex = nil;
+    g_d8f_runtime_compact_codebook_buf = nil;
+    g_d8f_runtime_compact_codebook_tex = nil;
+    g_d8f_runtime_pack2d_warm_buf = nil;
+    g_d8f_runtime_pack2d_warm_bytes = 0;
     g_d8f_runtime_rec_buf = nil;
     g_d8f_runtime_rs = nil;
     g_d8f_runtime_path[0] = '\0';
@@ -51554,6 +51618,8 @@ static void ds4_d8f_runtime_layer_reset(uint32_t layer) {
     g_d8f_runtime_layer_buf[layer] = nil;
     g_d8f_runtime_layer_texbuf[layer] = nil;
     g_d8f_runtime_layer_pack2d_tex[layer] = nil;
+    g_d8f_runtime_layer_compact_codebook_buf[layer] = nil;
+    g_d8f_runtime_layer_compact_codebook_tex[layer] = nil;
     g_d8f_runtime_layer_rec_buf[layer] = nil;
     if (g_d8f_runtime_layer_open[layer]) {
         ds4_d8f_close(&g_d8f_runtime_layer_file[layer]);
@@ -51585,6 +51651,8 @@ static void ds4_d8f_runtime_activate_layer(uint32_t layer) {
     g_d8f_runtime_buf = g_d8f_runtime_layer_buf[layer];
     g_d8f_runtime_texbuf = g_d8f_runtime_layer_texbuf[layer];
     g_d8f_runtime_pack2d_tex = g_d8f_runtime_layer_pack2d_tex[layer];
+    g_d8f_runtime_compact_codebook_buf = g_d8f_runtime_layer_compact_codebook_buf[layer];
+    g_d8f_runtime_compact_codebook_tex = g_d8f_runtime_layer_compact_codebook_tex[layer];
     g_d8f_runtime_rec_buf = g_d8f_runtime_layer_rec_buf[layer];
     g_d8f_runtime_rs = g_d8f_runtime_pack_rs;
     snprintf(g_d8f_runtime_path, sizeof(g_d8f_runtime_path), "%s",
@@ -51727,6 +51795,80 @@ static id<MTLTexture> ds4_d8f_runtime_new_pack_texture2d(id<MTLBuffer> pack_buf,
     return tex;
 }
 
+static id<MTLTexture> ds4_d8f_runtime_new_compact_down_codebook_texture(ds4_d8f_file *file,
+                                                                        id<MTLBuffer> *out_buf,
+                                                                        uint32_t layer) {
+    enum {
+        ds4_compact_down_codebook_width = 8192u,
+        ds4_compact_down_codebook_height = 256u
+    };
+    if (out_buf) *out_buf = nil;
+    if (!file) return nil;
+    const NSUInteger bytes_per_row =
+        (NSUInteger)ds4_compact_down_codebook_width * 4u * sizeof(uint16_t);
+    const NSUInteger atlas_bytes =
+        bytes_per_row * (NSUInteger)ds4_compact_down_codebook_height;
+    id<MTLBuffer> atlas_buf = [g_device newBufferWithLength:atlas_bytes
+                                                    options:MTLResourceStorageModeShared];
+    if (!atlas_buf) {
+        fprintf(stderr, "ds4_d8f: compact down codebook atlas allocation failed L%u bytes=%.3f MiB\n",
+                layer, (double)atlas_bytes / 1048576.0);
+        return nil;
+    }
+    uint8_t *atlas = (uint8_t *)atlas_buf.contents;
+    memset(atlas, 0, atlas_bytes);
+    for (uint32_t expert = 0; expert < 256u; expert++) {
+        ds4_d8f_record down;
+        if (!ds4_d8f_get_record(file, DS4_D8F_DOWN, expert, &down)) continue;
+        if (down.k == 0u || down.k > 4096u) continue;
+        const uint64_t copy_bytes = (uint64_t)down.k * 16ull;
+        if (copy_bytes > down.codebook_bytes ||
+            down.codebook_offset + copy_bytes > (uint64_t)file->size) {
+            fprintf(stderr,
+                    "ds4_d8f: compact down codebook atlas rejected L%u expert=%u k=%u copy=%llu cb_bytes=%llu\n",
+                    layer, expert, down.k,
+                    (unsigned long long)copy_bytes,
+                    (unsigned long long)down.codebook_bytes);
+            return nil;
+        }
+        memcpy(atlas + (NSUInteger)expert * bytes_per_row,
+               file->map + down.codebook_offset,
+               (size_t)copy_bytes);
+    }
+    MTLTextureDescriptor *desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                                           width:ds4_compact_down_codebook_width
+                                                          height:ds4_compact_down_codebook_height
+                                                       mipmapped:NO];
+    desc.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> tex = [atlas_buf newTextureWithDescriptor:desc
+                                                      offset:0
+                                                 bytesPerRow:bytes_per_row];
+    if (!tex) {
+        fprintf(stderr, "ds4_d8f: compact down codebook atlas texture failed L%u bytes=%.3f MiB\n",
+                layer, (double)atlas_bytes / 1048576.0);
+        return nil;
+    }
+    if (out_buf) *out_buf = atlas_buf;
+    return tex;
+}
+
+static int ds4_d8f_runtime_pack2d_warm_buffer_ensure(NSUInteger bytes) {
+    if (bytes == 0u) return 0;
+    if (g_d8f_runtime_pack2d_warm_buf &&
+        g_d8f_runtime_pack2d_warm_bytes >= bytes) {
+        return 1;
+    }
+    g_d8f_runtime_pack2d_warm_buf = [g_device newBufferWithLength:bytes
+                                                          options:MTLResourceStorageModeShared];
+    g_d8f_runtime_pack2d_warm_bytes = g_d8f_runtime_pack2d_warm_buf ? bytes : 0u;
+    if (!g_d8f_runtime_pack2d_warm_buf) {
+        fprintf(stderr, "ds4_d8f: pack2d warm scratch allocation failed bytes=%.3f MiB\n",
+                (double)bytes / 1048576.0);
+    }
+    return g_d8f_runtime_pack2d_warm_buf != nil;
+}
+
 static int ds4_d8f_runtime_cache_prepare(uint32_t layer, const char *path) {
     enum { ds4_gateup_in_dim = 4096, ds4_mid_dim = 2048, ds4_down_out_dim = 4096 };
     if (!path || !path[0] || layer >= ds4_d8f_runtime_layer_cap) return 0;
@@ -51809,6 +51951,15 @@ static int ds4_d8f_runtime_cache_prepare(uint32_t layer, const char *path) {
                                            (NSUInteger)file->size,
                                            max_native_down_codebook_end,
                                            layer);
+    if (ds4_gpu_d8f_runtime_native_down_compact_tex_enabled_for_layer(layer)) {
+        id<MTLBuffer> compact_codebook_buf = nil;
+        g_d8f_runtime_layer_compact_codebook_tex[layer] =
+            ds4_d8f_runtime_new_compact_down_codebook_texture(
+                file,
+                &compact_codebook_buf,
+                layer);
+        g_d8f_runtime_layer_compact_codebook_buf[layer] = compact_codebook_buf;
+    }
     ds4_d8f_runtime_record_lite *recs = g_d8f_runtime_record_staging;
     memset(recs, 0, sizeof(g_d8f_runtime_record_staging));
     for (uint32_t expert = 0; expert < 256u; expert++) {
@@ -52312,6 +52463,18 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             ds4_gpu_d8f_runtime_native_down_pack2d_enabled_for_layer(layer) &&
             g_d8f_runtime_pack2d_tex &&
             g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_pack2d_classic_pipeline;
+        const int down_native_compact_tex =
+            down_native_recbuf &&
+            ds4_gpu_d8f_runtime_native_down_compact_tex_enabled_for_layer(layer) &&
+            g_d8f_runtime_compact_codebook_tex &&
+            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_compact_tex_classic_pipeline;
+        const NSUInteger down_pack2d_warm_bytes =
+            (NSUInteger)n_tokens * (NSUInteger)n_experts * 8192u * sizeof(float);
+        const int down_native_pack2d_warm =
+            down_native_pack2d && !down_native_compact_tex &&
+            ds4_gpu_d8f_runtime_native_down_pack2d_warm_enabled_for_layer(layer) &&
+            g_d8f_down_native_pack2d_warm_classic_pipeline &&
+            ds4_d8f_runtime_pack2d_warm_buffer_ensure(down_pack2d_warm_bytes);
         const int down_tile16_recbuf = !down_tile32_recbuf &&
             !down_native_recbuf &&
             recbuf_enabled && !preweight_mid && down_tile16 &&
@@ -52381,6 +52544,8 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_hmid_classic_pipeline :
             down_tile32_recbuf ?
             g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline :
+            down_native_compact_tex ?
+            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_compact_tex_classic_pipeline :
             down_native_pack2d ?
             g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_pack2d_classic_pipeline :
             down_native_recbuf ?
@@ -52580,6 +52745,17 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                 [enc dispatchThreadgroups:MTLSizeMake(n_experts, n_tokens, 1) threadsPerThreadgroup:packet_tg];
             }
 
+            if (down_native_pack2d_warm) {
+                [enc setComputePipelineState:g_d8f_down_native_pack2d_warm_classic_pipeline];
+                [enc setTexture:g_d8f_runtime_pack2d_tex atIndex:0];
+                [enc setBuffer:selBuf offset:sel_off atIndex:0];
+                [enc setBuffer:down_arg_buf offset:0 atIndex:1];
+                [enc setBuffer:g_d8f_runtime_rec_buf offset:0 atIndex:2];
+                [enc setBuffer:g_d8f_runtime_pack2d_warm_buf offset:0 atIndex:3];
+                [enc dispatchThreads:MTLSizeMake((NSUInteger)n_tokens * (NSUInteger)n_experts * 8192u, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
+
             [enc setComputePipelineState:down_pso];
             [enc setBuffer:g_d8f_runtime_buf     offset:0 atIndex:0];
             [enc setBuffer:g_d8f_runtime_mid_buf offset:0 atIndex:1];
@@ -52589,7 +52765,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             if (!preweight_mid) [enc setBuffer:weightBuf offset:weight_off atIndex:5];
             if (down_any_recbuf) [enc setBuffer:g_d8f_runtime_rec_buf offset:0 atIndex:6];
             if (down_any_recbuf) [enc setBuffer:(rank1_sidecar_active ? g_d8f_runtime_sidecar_dot_buf : g_d8f_runtime_mid_buf) offset:0 atIndex:7];
-            if (down_native_recbuf) [enc setTexture:(down_native_pack2d ? g_d8f_runtime_pack2d_tex : g_d8f_runtime_texbuf) atIndex:0];
+            if (down_native_recbuf) [enc setTexture:(down_native_compact_tex ? g_d8f_runtime_compact_codebook_tex : (down_native_pack2d ? g_d8f_runtime_pack2d_tex : g_d8f_runtime_texbuf)) atIndex:0];
             [enc setThreadgroupMemoryLength:down_tg_mem atIndex:0];
             [enc dispatchThreadgroups:down_grid threadsPerThreadgroup:packet_tg];
             if (rank1_split_sidecar) {
@@ -52615,8 +52791,8 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
         static int s_d8f_inline_notice = 0;
         if (ok == 0 && !s_d8f_inline_notice) {
             s_d8f_inline_notice = 1;
-            fprintf(stderr, "ds4: D8F inline Metal routed organ enabled; MTL4 external path remains fallback; half_mid=%d gateup_tile4=%d down_tile32=%d down_native_tex=%d down_native_pack2d=%d down_cbsram=%u rank1_split=%d\n",
-                    half_mid, gateup_tile4, down_tile32_recbuf, down_native_recbuf, down_native_pack2d, down_cbsram_k_cap,
+            fprintf(stderr, "ds4: D8F inline Metal routed organ enabled; MTL4 external path remains fallback; half_mid=%d gateup_tile4=%d down_tile32=%d down_native_tex=%d down_native_pack2d=%d down_native_pack2d_warm=%d down_native_compact_tex=%d down_cbsram=%u rank1_split=%d\n",
+                    half_mid, gateup_tile4, down_tile32_recbuf, down_native_recbuf, down_native_pack2d, down_native_pack2d_warm, down_native_compact_tex, down_cbsram_k_cap,
                     rank1_split_sidecar);
         }
         static int s_d8f_half_mid_notice = 0;
