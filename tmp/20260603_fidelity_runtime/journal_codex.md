@@ -223,3 +223,12 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - Real-hidden exactness passed in every matrix run: `bad=0`, `max_abs=0.00120807`, `rms=0.000232264`. The larger RMS versus synthetic is expected because the activation range is real; it is still far below the existing canary failure threshold.
 - Real-hidden overlap+merge p50 stayed useful: same/no-evict `1.489x`, separate/no-evict `1.464x`, same/256MiB CPU-evict `1.225x`, separate/256MiB CPU-evict `1.140x`.
 - Cache-warmup remains unproven for exact D8F. Same/no-evict D8F-only was `7.325 ms` and D8F-after-ANE was `7.994 ms`; separate/no-evict was `6.828 ms` versus `7.530 ms`. The production lever is same-layer ANE/GPU overlap and low-cost merge, not a demonstrated ANE-to-D8F warm cache.
+
+## 2026-06-04T00:27 JST — Metal eviction control for real-hidden cache matrix
+
+- Extended `ane_d8f_routed_counterbalanced_canary.m` with an optional `cpu|metal` eviction mode. Metal mode runs a contiguous `uint32` write kernel over a large `MTLBuffer`, separating GPU/SLC pressure from CPU-side page/TLB/cache perturbation.
+- Updated `route_trace_to_d8f_canary_args.py` to emit the new eviction-mode argument when a hidden row is supplied.
+- Real-hidden exactness remained stable under Metal eviction: both same and separate 256MiB Metal-evict runs passed `bad=0`, `rms=0.000232264`.
+- Metal eviction is cheaper and more targeted than CPU eviction on this canary: 256MiB Metal evict p50 was about `2.1 ms`, while prior 256MiB CPU evict p50 was about `14.3 ms`.
+- Overlap survived Metal eviction: same/256MiB-metal overlap+merge speedup was `1.275x`; separate/256MiB-metal was `1.187x`. This is comparable to, and slightly cleaner than, CPU eviction evidence.
+- The cache story is still mixed rather than promotional. Same/metal D8F-after-ANE was slightly faster than D8F-only (`5.037 ms` vs `5.129 ms`), but separate/metal was slower (`7.178 ms` vs `5.237 ms`). Treat this as evidence that allocation/topology/scheduler state matters, not proof of a general ANE warm-cache effect.

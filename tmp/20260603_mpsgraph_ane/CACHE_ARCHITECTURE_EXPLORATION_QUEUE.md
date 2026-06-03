@@ -29,6 +29,7 @@
 - The real-router run again failed to prove D8F cache warmup: D8F-after-ANE was `7.196 ms` versus D8F-only `6.967 ms`. The defensible architecture is still free same-layer parallel compute plus low-cost merge; cache work remains exploratory until real hidden-state and eviction sweeps isolate a mechanism.
 - Real hidden-state input now passes the exact D8F canary. GPU-prefill `batch_ffn_norm` L26 row 9 from H3355 `Hi` has `rms=0.488569`, and route-weighted selected experts `191,61,201,146,78,209` passed exactness (`bad=0`, `rms=0.000232264`). This removes the synthetic-activation loophole for routed D8F scheduling canaries.
 - Real-hidden same/separate × CPU-evict matrix still supports overlap, not warmup: overlap+merge p50 speedups were `1.489x` same/no-evict, `1.464x` separate/no-evict, `1.225x` same/256MiB, and `1.140x` separate/256MiB. D8F-after-ANE was slower than D8F-only in both no-evict modes.
+- Metal eviction control now exists in the real-hidden canary. A 256MiB Metal write sweep costs about `2.1 ms` versus CPU eviction's `14.3 ms`, and overlap+merge still survives (`1.275x` same, `1.187x` separate). Same-buffer D8F-after-ANE was slightly faster than D8F-only under Metal eviction, but separate-buffer was slower; the mechanism is still allocation/scheduler/topology-sensitive, not a general warm-cache guarantee.
 
 ## Highest-Potential Experiments
 
@@ -51,7 +52,7 @@
 17. Microbatch interleave: test `B=256,512,1024,2048` shared-expert ANE while GPU runs routed D8F for the same layer. Same-layer shared and routed branches are dependency-parallel; cross-layer pipelining is not valid until the merge/residual is complete.
 18. Command-queue/fence policy: test one shared Metal command queue versus separate queues plus explicit events/fences around input readiness and output merge. The target is overlap without accidental serialization or cache-destructive waits.
 19. Merge survival canary: allocate CoreML shared output backing as a GPU-visible buffer/IOSurface, run exact D8F routed graph concurrently, then launch a Metal add/merge into the FFN output. Measure serial versus overlapped+merge; if merge erases the overlap, the architecture is not ready.
-20. Metal eviction control: repeat the real-hidden matrix with a GPU eviction kernel over a large `MTLBuffer`. CPU eviction perturbs host caches/TLBs; Metal eviction separates GPU/SLC residency from CPU page warming.
+20. Metal eviction size sweep: repeat real-hidden same/separate at `16,32,64,128,256,512,1024 MiB` with Metal eviction. The first pass only proves the control works at 256MiB.
 21. Real hidden-state replication: repeat L26 row 9 on at least two other prompts and one later layer. One real row closes the synthetic loophole; it does not establish activation-distribution stability.
 22. Layer-matched shared CoreML: export L26 shared-expert CoreML to pair with L26 routed D8F before making any merged-fidelity claim. Current L0 shared + L26 routed pairing is sufficient for scheduling/overlap shape, not same-layer output fidelity.
 23. Real-router weighted timing: rerun actual router top-k weights under a longer low-load schedule after metal eviction support. Short six-trial runs support overlap, but do not yet establish p90/p99 stability.

@@ -161,6 +161,27 @@ static id<MTLComputePipelineState> make_merge_pipeline(id<MTLDevice> device) {
     return pipeline;
 }
 
+static id<MTLComputePipelineState> make_evict_pipeline(id<MTLDevice> device) {
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "kernel void evict_u32(device uint *buffer [[buffer(0)]],\n"
+         "                       constant uint &words [[buffer(1)]],\n"
+         "                       uint gid [[thread_position_in_grid]]) {\n"
+         "  if (gid >= words) return;\n"
+         "  uint value = buffer[gid];\n"
+         "  buffer[gid] = value * 1664525u + 1013904223u + gid;\n"
+         "}\n";
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    if (!library) die(@"evict newLibraryWithSource failed", error);
+    id<MTLFunction> function = [library newFunctionWithName:@"evict_u32"];
+    if (!function) die(@"evict function missing", nil);
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+    if (!pipeline) die(@"evict pipeline failed", error);
+    return pipeline;
+}
+
 static void run_merge_once(id<MTLCommandQueue> queue,
                            id<MTLComputePipelineState> pipeline,
                            id<MTLBuffer> shared_output,
@@ -180,6 +201,39 @@ static void run_merge_once(id<MTLCommandQueue> queue,
     [encoder endEncoding];
     [command_buffer commit];
     [command_buffer waitUntilCompleted];
+}
+
+static double evict_metal_cache(id<MTLCommandQueue> queue,
+                                id<MTLComputePipelineState> pipeline,
+                                id<MTLBuffer> buffer,
+                                size_t bytes) {
+    if (!queue || !pipeline || !buffer || bytes < sizeof(uint32_t)) return 0.0;
+    uint32_t words = (uint32_t)(bytes / sizeof(uint32_t));
+    double start = now_seconds();
+    id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:buffer offset:0 atIndex:0];
+    [encoder setBytes:&words length:sizeof(words) atIndex:1];
+    NSUInteger threads = pipeline.maxTotalThreadsPerThreadgroup < 256 ? pipeline.maxTotalThreadsPerThreadgroup : 256;
+    if (threads == 0) threads = 1;
+    MTLSize threads_per_group = MTLSizeMake(threads, 1, 1);
+    MTLSize groups = MTLSizeMake(((NSUInteger)words + threads - 1) / threads, 1, 1);
+    [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads_per_group];
+    [encoder endEncoding];
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+    return now_seconds() - start;
+}
+
+static double evict_cache_once(bool use_metal_evict,
+                               uint8_t *cpu_buffer,
+                               id<MTLCommandQueue> queue,
+                               id<MTLComputePipelineState> metal_pipeline,
+                               id<MTLBuffer> metal_buffer,
+                               size_t bytes) {
+    return use_metal_evict ? evict_metal_cache(queue, metal_pipeline, metal_buffer, bytes)
+                           : evict_cpu_cache(cpu_buffer, bytes);
 }
 
 static bool prepare_codebook(const ds4_d8f_file *file,
@@ -432,7 +486,7 @@ static double p50_for_case(NSDictionary<NSString *, NSMutableArray<NSNumber *> *
 int main(int argc, const char **argv) {
     @autoreleasepool {
         if (argc < 4) {
-            fprintf(stderr, "usage: %s SHARED.mlpackage LAYER.d8f EXPERTS_CSV [trials] [evict_mib] [same|separate] [seed] [ROUTE_WEIGHTS_CSV] [HIDDEN_F32_BIN] [HIDDEN_ROW]\n", argv[0]);
+            fprintf(stderr, "usage: %s SHARED.mlpackage LAYER.d8f EXPERTS_CSV [trials] [evict_mib] [same|separate] [seed] [ROUTE_WEIGHTS_CSV] [HIDDEN_F32_BIN] [HIDDEN_ROW] [cpu|metal]\n", argv[0]);
             return 2;
         }
         NSString *model_path = [NSString stringWithUTF8String:argv[1]];
@@ -449,6 +503,9 @@ int main(int argc, const char **argv) {
         const char *hidden_path = argc >= 10 ? argv[9] : NULL;
         uint32_t hidden_row = argc >= 11 ? (uint32_t)strtoul(argv[10], NULL, 10) : 0u;
         const bool use_hidden_file = hidden_path && hidden_path[0] && strcmp(hidden_path, "-") != 0 && strcmp(hidden_path, "synthetic") != 0;
+        NSString *evict_mode = argc >= 12 ? [NSString stringWithUTF8String:argv[11]] : @"cpu";
+        const bool use_metal_evict = [evict_mode isEqualToString:@"metal"];
+        if (![evict_mode isEqualToString:@"cpu"] && !use_metal_evict) die(@"evict mode must be cpu or metal", nil);
         char route_weights_text[192];
         weights_csv(route_weights_text, sizeof(route_weights_text), route_weights, n_experts);
         BOOL separate_input = [input_mode isEqualToString:@"separate"];
@@ -468,9 +525,9 @@ int main(int argc, const char **argv) {
         uint32_t model_input_dim = input_shape[1].unsignedIntValue;
         uint32_t model_output_dim = output_shape[1].unsignedIntValue;
         if (model_input_dim != kHiddenDim || model_output_dim != kOutDim) die(@"CoreML shared model shape is not DS4 hidden->hidden", nil);
-        NSLog(@"[shape] coreml_input=%@ %@ coreml_output=%@ %@ d8f=%s experts=%s route_weights=%s nsel=%u trials=%u evict_mib=%u mode=%@ seed=%u hidden=%s row=%u",
-              input_name, input_shape, output_name, output_shape, d8f_path, argv[3], route_weights_text, n_experts, trials, evict_mib, input_mode, random_state,
-              use_hidden_file ? hidden_path : "synthetic", hidden_row);
+        NSLog(@"[shape] coreml_input=%@ %@ coreml_output=%@ %@ d8f=%s experts=%s route_weights=%s nsel=%u trials=%u evict_mib=%u evict_mode=%@ mode=%@ seed=%u hidden=%s row=%u",
+              input_name, input_shape, output_name, output_shape, d8f_path, argv[3], route_weights_text, n_experts, trials, evict_mib, evict_mode, input_mode,
+              random_state, use_hidden_file ? hidden_path : "synthetic", hidden_row);
 
         ds4_d8f_file file;
         if (!ds4_d8f_open(d8f_path, &file)) die(@"ds4_d8f_open failed", nil);
@@ -563,6 +620,7 @@ int main(int argc, const char **argv) {
         memset(d8f_output.contents, 0, kOutDim * sizeof(uint16_t));
         memset(merged_output.contents, 0, kOutDim * sizeof(uint16_t));
         id<MTLComputePipelineState> merge_pipeline = make_merge_pipeline(device);
+        id<MTLComputePipelineState> evict_pipeline = use_metal_evict ? make_evict_pipeline(device) : nil;
 
         MLMultiArray *ane_input_array = make_buffer_multiarray(ane_input, input_shape, MLMultiArrayDataTypeFloat16);
         MLMultiArray *ane_output_array = make_buffer_multiarray(ane_output, output_shape, MLMultiArrayDataTypeFloat16);
@@ -655,9 +713,14 @@ int main(int argc, const char **argv) {
         NSLog(@"[warmup] output_backing_used=%@", actual_output == ane_output_array ? @"yes" : @"no");
 
         size_t evict_bytes = (size_t)evict_mib * 1024u * 1024u;
-        uint8_t *evict_buffer = evict_bytes ? (uint8_t *)malloc(evict_bytes) : NULL;
-        if (evict_bytes && !evict_buffer) die(@"evict allocation failed", nil);
-        for (size_t index = 0; index < evict_bytes; ++index) evict_buffer[index] = (uint8_t)index;
+        uint8_t *evict_buffer = (evict_bytes && !use_metal_evict) ? (uint8_t *)malloc(evict_bytes) : NULL;
+        id<MTLBuffer> evict_metal_buffer = (evict_bytes && use_metal_evict) ? [device newBufferWithLength:evict_bytes options:MTLResourceStorageModeShared] : nil;
+        if (evict_bytes && !use_metal_evict && !evict_buffer) die(@"CPU evict allocation failed", nil);
+        if (evict_bytes && use_metal_evict && !evict_metal_buffer) die(@"Metal evict allocation failed", nil);
+        if (evict_buffer) {
+            for (size_t index = 0; index < evict_bytes; ++index) evict_buffer[index] = (uint8_t)index;
+        }
+        if (evict_metal_buffer) memset(evict_metal_buffer.contents, 0xa5, evict_bytes);
 
         NSArray<NSString *> *base_cases = @[
             @"ane_only",
@@ -690,7 +753,7 @@ int main(int argc, const char **argv) {
                     run_d8f_once(executable, queue, d8f_inputs, d8f_outputs);
                     record_sample(samples, case_name, (now_seconds() - start) * 1e3);
                 } else if ([case_name isEqualToString:@"d8f_evicted"]) {
-                    double evict_s = evict_cpu_cache(evict_buffer, evict_bytes);
+                    double evict_s = evict_cache_once(use_metal_evict, evict_buffer, queue, evict_pipeline, evict_metal_buffer, evict_bytes);
                     [evict_samples addObject:@(evict_s * 1e3)];
                     start = now_seconds();
                     run_d8f_once(executable, queue, d8f_inputs, d8f_outputs);
@@ -702,7 +765,7 @@ int main(int argc, const char **argv) {
                     record_sample(samples, case_name, (now_seconds() - start) * 1e3);
                 } else if ([case_name isEqualToString:@"d8f_after_ane_evicted"]) {
                     run_ane_once(model, provider, options);
-                    double evict_s = evict_cpu_cache(evict_buffer, evict_bytes);
+                    double evict_s = evict_cache_once(use_metal_evict, evict_buffer, queue, evict_pipeline, evict_metal_buffer, evict_bytes);
                     [evict_samples addObject:@(evict_s * 1e3)];
                     start = now_seconds();
                     run_d8f_once(executable, queue, d8f_inputs, d8f_outputs);
@@ -756,9 +819,10 @@ int main(int argc, const char **argv) {
         }
         for (NSString *case_name in base_cases) {
             NSDictionary<NSString *, NSNumber *> *summary = summary_for_values(samples[case_name] ?: @[]);
-            NSLog(@"[summary] mode=%@ evict_mib=%u nsel=%u case=%@ n=%@ min_ms=%.3f p50_ms=%.3f p90_ms=%.3f max_ms=%.3f mean_ms=%.3f",
+            NSLog(@"[summary] mode=%@ evict_mib=%u evict_mode=%@ nsel=%u case=%@ n=%@ min_ms=%.3f p50_ms=%.3f p90_ms=%.3f max_ms=%.3f mean_ms=%.3f",
                   input_mode,
                   evict_mib,
+                  evict_mode,
                   n_experts,
                   case_name,
                   summary[@"n"],
@@ -773,9 +837,10 @@ int main(int argc, const char **argv) {
         double d8f_p50 = p50_for_case(samples, @"d8f_only");
         double concurrent_p50 = p50_for_case(samples, @"concurrent");
         double serial_p50 = p50_for_case(samples, @"serial_ane_d8f");
-        NSLog(@"[derived] mode=%@ evict_mib=%u nsel=%u ane_plus_d8f_p50_ms=%.3f serial_measured_p50_ms=%.3f concurrent_p50_ms=%.3f overlap_speedup_p50=%.3f",
+        NSLog(@"[derived] mode=%@ evict_mib=%u evict_mode=%@ nsel=%u ane_plus_d8f_p50_ms=%.3f serial_measured_p50_ms=%.3f concurrent_p50_ms=%.3f overlap_speedup_p50=%.3f",
               input_mode,
               evict_mib,
+              evict_mode,
               n_experts,
               ane_p50 + d8f_p50,
               serial_p50,
@@ -784,18 +849,20 @@ int main(int argc, const char **argv) {
         double merge_p50 = p50_for_case(samples, @"merge_only");
         double serial_merge_p50 = p50_for_case(samples, @"serial_ane_d8f_merge");
         double concurrent_merge_p50 = p50_for_case(samples, @"concurrent_then_merge");
-        NSLog(@"[merge_effect] mode=%@ evict_mib=%u nsel=%u merge_p50_ms=%.3f ane_plus_d8f_plus_merge_p50_ms=%.3f serial_merge_p50_ms=%.3f concurrent_then_merge_p50_ms=%.3f overlap_merge_speedup_p50=%.3f",
+        NSLog(@"[merge_effect] mode=%@ evict_mib=%u evict_mode=%@ nsel=%u merge_p50_ms=%.3f ane_plus_d8f_plus_merge_p50_ms=%.3f serial_merge_p50_ms=%.3f concurrent_then_merge_p50_ms=%.3f overlap_merge_speedup_p50=%.3f",
               input_mode,
               evict_mib,
+              evict_mode,
               n_experts,
               merge_p50,
               ane_p50 + d8f_p50 + merge_p50,
               serial_merge_p50,
               concurrent_merge_p50,
               concurrent_merge_p50 > 0.0 ? (ane_p50 + d8f_p50 + merge_p50) / concurrent_merge_p50 : 0.0);
-        NSLog(@"[cache_effect] mode=%@ evict_mib=%u nsel=%u d8f_only_p50_ms=%.3f d8f_evicted_p50_ms=%.3f d8f_after_ane_p50_ms=%.3f d8f_after_ane_evicted_p50_ms=%.3f evict_p50_ms=%.3f",
+        NSLog(@"[cache_effect] mode=%@ evict_mib=%u evict_mode=%@ nsel=%u d8f_only_p50_ms=%.3f d8f_evicted_p50_ms=%.3f d8f_after_ane_p50_ms=%.3f d8f_after_ane_evicted_p50_ms=%.3f evict_p50_ms=%.3f",
               input_mode,
               evict_mib,
+              evict_mode,
               n_experts,
               d8f_p50,
               p50_for_case(samples, @"d8f_evicted"),

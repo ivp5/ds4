@@ -39,6 +39,7 @@ def main():
     parser.add_argument("--seed", type=int, default=29001)
     parser.add_argument("--hidden-f32", default=None)
     parser.add_argument("--hidden-row", type=int, default=None)
+    parser.add_argument("--evict-mode", choices=["cpu", "metal"], default="cpu")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -62,6 +63,7 @@ def main():
     if args.hidden_f32:
         command.append(args.hidden_f32)
         command.append(str(args.hidden_row if args.hidden_row is not None else int(row["pos"])))
+        command.append(args.evict_mode)
     payload = {
         "trace_csv": args.trace_csv,
         "row": int(row["row"]),
@@ -75,6 +77,7 @@ def main():
         "d8f_path": d8f_path,
         "hidden_f32": args.hidden_f32,
         "hidden_row": args.hidden_row if args.hidden_row is not None else (int(row["pos"]) if args.hidden_f32 else None),
+        "evict_mode": args.evict_mode,
         "command": command,
     }
     if args.json:
