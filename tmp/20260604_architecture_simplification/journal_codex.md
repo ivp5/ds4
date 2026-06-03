@@ -39,3 +39,9 @@ Append-only transaction log. Scope: IVP5 DS4 MPSGraph/ANE runtime architecture, 
 - Command: recompiled `ane_d8f_routed_counterbalanced_canary.m` with `ds4_d8f_reader.c` and the CoreML/Metal/MPSGraph frameworks.
 - Command: ran one L26/E165 smoke with the layer-matched L26 shared CoreML package and saved `ane_d8f_routed_refactor_smoke_l26e165_same_e0_20260604T004800.log`.
 - Result: exactness still passed (`bad=0`, `rms=1.45568e-05`), CoreML output backing remained used, and both `concurrent` and `concurrent_then_merge` cases executed through the new helper.
+
+## 2026-06-04T00:49 JST — Architecture review artifact
+
+- Added `ARCHITECTURE_REVIEW.md` to consolidate the current architecture decision instead of leaving it distributed across timing logs.
+- Decision captured: H3355/D8F remains active; ANE is for shared high-B prefill overlap; MPSGraph remains an oracle/probe/down-only candidate until packed-index and executable-cache tests settle it.
+- Complexity rule captured: hot path O(n) over touched tensor data, O(1) over unrelated layers/packs, and no hot lazy CoreML loads.
