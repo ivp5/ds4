@@ -1,0 +1,18 @@
+[config] batch=256 input_dim=4096 output_dim=2048 experts=1 bits=4 opset=iOS26 deployment=macOS26
+[coreml] convert_start t=1780496481760
+Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]
+Running MIL default pipeline:   0%|          | 0/95 [00:00<?, ? passes/s]Running MIL default pipeline: 100%|██████████| 95/95 [00:00<00:00, 1798.53 passes/s]
+Running MIL backend_mlprogram pipeline:   0%|          | 0/12 [00:00<?, ? passes/s]Running MIL backend_mlprogram pipeline: 100%|██████████| 12/12 [00:00<00:00, 21354.11 passes/s]
+[coreml] convert_done t=1780496482946
+[coreml] palettize_start bits=4 t=1780496482946
+Running compression pass palettize_weights:   0%|          | 0/1 [00:00<?, ? ops/s]Running compression pass palettize_weights: 100%|██████████| 1/1 [00:01<00:00,  1.05s/ ops]Running compression pass palettize_weights: 100%|██████████| 1/1 [00:01<00:00,  1.05s/ ops]
+Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]
+Running MIL default pipeline:   0%|          | 0/92 [00:00<?, ? passes/s]Running MIL default pipeline: 100%|██████████| 92/92 [00:00<00:00, 2157.41 passes/s]
+Running MIL backend_mlprogram pipeline:   0%|          | 0/12 [00:00<?, ? passes/s]Running MIL backend_mlprogram pipeline: 100%|██████████| 12/12 [00:00<00:00, 1111.74 passes/s]
+[coreml] palettize_done t=1780496484791
+[warmup] start
+[warmup] done t=1780496484844
+[ane] elapsed_ms=3.527 t=1780496484848
+[gpu] elapsed_ms=2.489 t=1780496484850
+[concurrent] elapsed_ms=12.737 t=1780496484863
+[result] serial_ms=6.015 concurrent_ms=12.737 speedup=0.472 ane_GFLOPs=1217.8 gpu_GFLOPs=1725.9

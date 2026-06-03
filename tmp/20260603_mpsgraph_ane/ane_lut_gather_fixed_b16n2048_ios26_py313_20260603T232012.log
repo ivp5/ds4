@@ -1,0 +1,15 @@
+[config] input_dim=4096 output_dim=2048 codes=256 rounds=4 batch=16 opset=iOS26 deployment=macOS26
+[batched] materialized_indices_MB=67.109
+[batched] convert_start t=1780496413324
+Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]Running MIL frontend_milinternal pipeline: 0 passes [00:00, ? passes/s]
+Running MIL default pipeline:   0%|          | 0/95 [00:00<?, ? passes/s]Running MIL default pipeline: 100%|██████████| 95/95 [00:00<00:00, 3044.88 passes/s]
+Running MIL backend_mlprogram pipeline:   0%|          | 0/12 [00:00<?, ? passes/s]Running MIL backend_mlprogram pipeline: 100%|██████████| 12/12 [00:00<00:00, 9308.61 passes/s]
+[batched] convert_done t=1780496413639
+[batched] warmup=1/3 t=1780496413867
+[batched] warmup=2/3 t=1780496414067
+[batched] warmup=3/3 t=1780496414265
+[batched] round=1/4 t=1780496414460
+[batched] round=2/4 t=1780496414662
+[batched] round=3/4 t=1780496414857
+[batched] round=4/4 t=1780496415053
+[batched] ok rounds=4 us_per=196979.927 input_MB=0.131
