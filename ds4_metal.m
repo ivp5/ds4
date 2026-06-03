@@ -48948,6 +48948,7 @@ int ds4_gpu_mtl4_d8f_down_selected_canary(const char *d8f_path,
 }
 
 static id<MTLComputePipelineState> g_d8f_down_lut_score_selected_batch_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_lut_score_i8_selected_batch_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gather_selected_batch_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gather_selected_batch_tile8_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gather_selected_batch_tile16_pipeline;
@@ -48973,6 +48974,7 @@ static int ds4_d8f_down_lut_classic_pipeline_init(void) {
         return 0;
     }
     id<MTLFunction> score_fn = [lib newFunctionWithName:@"d8f_down_lut_score_selected_batch"];
+    id<MTLFunction> score_i8_fn = [lib newFunctionWithName:@"d8f_down_lut_score_i8_selected_batch"];
     id<MTLFunction> gather_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_selected_batch"];
     id<MTLFunction> gather_tile8_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_selected_batch_tile8"];
     id<MTLFunction> gather_tile16_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_selected_batch_tile16"];
@@ -48981,7 +48983,7 @@ static int ds4_d8f_down_lut_classic_pipeline_init(void) {
     id<MTLFunction> gather_codes_tile16_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_codes_selected_batch_tile16"];
     id<MTLFunction> scoreh_fn = [lib newFunctionWithName:@"d8f_down_lut_scoreh_selected_batch"];
     id<MTLFunction> gatherh_fn = [lib newFunctionWithName:@"d8f_down_lut_gatherh_selected_batch"];
-    if (!score_fn || !gather_fn || !gather_tile8_fn || !gather_tile16_fn ||
+    if (!score_fn || !score_i8_fn || !gather_fn || !gather_tile8_fn || !gather_tile16_fn ||
         !gather_codes_fn || !gather_codes_tile8_fn || !gather_codes_tile16_fn ||
         !scoreh_fn || !gatherh_fn) {
         fprintf(stderr, "ds4_d8f: down LUT Metal function lookup failed\n");
@@ -48991,6 +48993,13 @@ static int ds4_d8f_down_lut_classic_pipeline_init(void) {
         [g_device newComputePipelineStateWithFunction:score_fn error:&err];
     if (!g_d8f_down_lut_score_selected_batch_pipeline) {
         fprintf(stderr, "ds4_d8f: down LUT score pipeline failed: %s\n",
+                err.localizedDescription.UTF8String);
+        return 0;
+    }
+    g_d8f_down_lut_score_i8_selected_batch_pipeline =
+        [g_device newComputePipelineStateWithFunction:score_i8_fn error:&err];
+    if (!g_d8f_down_lut_score_i8_selected_batch_pipeline) {
+        fprintf(stderr, "ds4_d8f: down LUT score i8 pipeline failed: %s\n",
                 err.localizedDescription.UTF8String);
         return 0;
     }
@@ -49086,6 +49095,12 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         uint32_t a_offset_lo;
         uint32_t a_offset_hi;
     } d8f_lut_sidecar_lite;
+    typedef struct d8f_lut_i8_codebook_lite {
+        uint32_t k;
+        uint32_t offset;
+        uint32_t scale_offset;
+        uint32_t reserved;
+    } d8f_lut_i8_codebook_lite;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!ds4_d8f_down_lut_classic_pipeline_init()) return 0;
     if (!d8f_path || !experts || n_experts == 0 || n_experts > ds4_selected_expert_cap) return 0;
@@ -49164,6 +49179,9 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     }
     const uint64_t native_code_count = (uint64_t)n_experts * rows * groups;
     uint16_t *native_codes = NULL;
+    d8f_lut_i8_codebook_lite *i8_recs = NULL;
+    int8_t *i8_codebooks = NULL;
+    uint32_t i8_codebook_bytes = 0;
     float *mid = (float *)malloc((size_t)n_tokens * n_experts * ds4_down_in_dim * sizeof(float));
     uint32_t *selected_full = (uint32_t *)malloc((size_t)n_tokens * n_experts * sizeof(uint32_t));
     float *ref = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
@@ -49237,6 +49255,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     const uint64_t score_count = (uint64_t)n_tokens * n_experts * groups * max_k;
     const int half_score = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_HALF") > 0;
     const size_t score_bytes_per_value = half_score ? sizeof(uint16_t) : sizeof(float);
+    const int i8_score_mode = !half_score && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_I8") > 0;
     const int native_code_env = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_NATIVE_CODES");
     if (half_score && rank1_sidecar_count > 0) {
         fprintf(stderr, "ds4_d8f: down LUT rank1 sidecars require f32 score/native-code gather\n");
@@ -49300,6 +49319,53 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             }
         }
     }
+    if (i8_score_mode) {
+        i8_recs = (d8f_lut_i8_codebook_lite *)calloc(n_experts, sizeof(*i8_recs));
+        uint64_t total_i8_bytes = 0;
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            ds4_d8f_record rec;
+            ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &rec);
+            total_i8_bytes += (uint64_t)rec.k * 8u + (uint64_t)rec.k * sizeof(float);
+        }
+        if (!i8_recs || total_i8_bytes > UINT32_MAX) {
+            free(i8_recs); free(native_codes); free(gpu_out); free(ref); free(selected_full); free(mid); free(recs); ds4_d8f_close(&file);
+            return 0;
+        }
+        i8_codebook_bytes = (uint32_t)total_i8_bytes;
+        i8_codebooks = (int8_t *)malloc((size_t)i8_codebook_bytes);
+        if (!i8_codebooks) {
+            free(i8_recs); free(native_codes); free(gpu_out); free(ref); free(selected_full); free(mid); free(recs); ds4_d8f_close(&file);
+            return 0;
+        }
+        uint32_t i8_offset = 0;
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            ds4_d8f_record rec;
+            ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &rec);
+            const uint8_t *cb = file.map + rec.codebook_offset;
+            i8_recs[slot].k = rec.k;
+            i8_recs[slot].offset = i8_offset;
+            i8_recs[slot].scale_offset = i8_offset + rec.k * 8u;
+            float *slot_scales = (float *)(void *)(i8_codebooks + i8_recs[slot].scale_offset);
+            for (uint32_t code = 0; code < rec.k; code++) {
+                float max_abs_code = 0.0f;
+                for (uint32_t d = 0; d < 8u; d++) {
+                    const float v = fabsf(ds4_m1r_f16_to_f32(ds4_m1r_u16(cb + ((uint64_t)code * 8u + d) * 2u)));
+                    if (v > max_abs_code) max_abs_code = v;
+                }
+                const float scale = max_abs_code > 0.0f ? max_abs_code / 127.0f : 1.0f;
+                slot_scales[code] = scale;
+                for (uint32_t d = 0; d < 8u; d++) {
+                    const uint32_t i = code * 8u + d;
+                    const float v = ds4_m1r_f16_to_f32(ds4_m1r_u16(cb + (uint64_t)i * 2u));
+                    float qf = roundf(v / scale);
+                    if (qf > 127.0f) qf = 127.0f;
+                    if (qf < -127.0f) qf = -127.0f;
+                    i8_codebooks[i8_offset + i] = (int8_t)qf;
+                }
+            }
+            i8_offset += rec.k * 8u + rec.k * (uint32_t)sizeof(float);
+        }
+    }
     @autoreleasepool {
         id<MTLBuffer> packBuf = [g_device newBufferWithBytesNoCopy:(void *)file.map
                                                             length:file.size
@@ -49316,6 +49382,12 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                                                     options:MTLResourceStorageModeShared];
         id<MTLBuffer> scoreBuf = [g_device newBufferWithLength:(NSUInteger)score_count * score_bytes_per_value
                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> i8RecBuf = i8_score_mode ? [g_device newBufferWithBytes:i8_recs
+                                                                        length:(NSUInteger)n_experts * sizeof(*i8_recs)
+                                                                       options:MTLResourceStorageModeShared] : nil;
+        id<MTLBuffer> i8CodebookBuf = i8_score_mode ? [g_device newBufferWithBytes:i8_codebooks
+                                                                             length:(NSUInteger)i8_codebook_bytes
+                                                                            options:MTLResourceStorageModeShared] : nil;
         id<MTLBuffer> codeBuf = native_code_mode ? [g_device newBufferWithBytes:native_codes
                                                                          length:(NSUInteger)native_code_count * sizeof(uint16_t)
                                                                         options:MTLResourceStorageModeShared] : nil;
@@ -49340,19 +49412,26 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         };
         id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args) options:MTLResourceStorageModeShared];
         if (packBuf && midBuf && selBuf && recBuf && scoreBuf && outBuf && argsBuf &&
+            (!i8_score_mode || (i8RecBuf && i8CodebookBuf)) &&
             (!native_code_mode || (codeBuf && sidecarBuf && sidecarDotBuf))) {
             void (^dispatch_once)(void) = ^{
                 id<MTLCommandBuffer> cb = [g_queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:half_score
+                [enc setComputePipelineState:i8_score_mode
+                    ? g_d8f_down_lut_score_i8_selected_batch_pipeline
+                    : (half_score
                     ? g_d8f_down_lut_scoreh_selected_batch_pipeline
-                    : g_d8f_down_lut_score_selected_batch_pipeline];
+                    : g_d8f_down_lut_score_selected_batch_pipeline)];
                 [enc setBuffer:packBuf offset:0 atIndex:0];
                 [enc setBuffer:midBuf offset:0 atIndex:1];
                 [enc setBuffer:selBuf offset:0 atIndex:2];
                 [enc setBuffer:scoreBuf offset:0 atIndex:3];
                 [enc setBuffer:argsBuf offset:0 atIndex:4];
                 [enc setBuffer:recBuf offset:0 atIndex:5];
+                if (i8_score_mode) {
+                    [enc setBuffer:i8RecBuf offset:0 atIndex:6];
+                    [enc setBuffer:i8CodebookBuf offset:0 atIndex:7];
+                }
                 [enc dispatchThreads:MTLSizeMake(max_k, groups, n_tokens * n_experts)
                     threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
                 id<MTLComputePipelineState> gather_pipeline = half_score
@@ -49467,7 +49546,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     fprintf(stderr,
             "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s code_mode=%s code_source=%s sidecar_hits=%d rank1_sidecars=%u gather_tile=%u score=%.2f MiB code=%.2f MiB pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
             n_experts, rows, n_tokens, rounds, max_k,
-            half_score ? "f16" : "f32",
+            i8_score_mode ? "f32_i8cb" : (half_score ? "f16" : "f32"),
             native_code_mode ? "native_u16" : "bitpack",
             native_code_mode ? (native_code_sidecar_hits == (int)n_experts ? "sidecar" : "predecode") : "bitpack",
             native_code_sidecar_hits,
@@ -49513,7 +49592,11 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         fprintf(stderr, "ds4: d8f_metal_lut_down_native_codes code=%.2f MiB\n",
                 (double)(native_code_count * sizeof(uint16_t)) / 1048576.0);
     }
-    free(native_codes); free(gpu_out); free(ref); free(selected_full); free(mid); free(recs); ds4_d8f_close(&file);
+    if (i8_score_mode) {
+        fprintf(stderr, "ds4: d8f_metal_lut_down_i8_codebook codebook=%.2f MiB\n",
+                (double)i8_codebook_bytes / 1048576.0);
+    }
+    free(i8_codebooks); free(i8_recs); free(native_codes); free(gpu_out); free(ref); free(selected_full); free(mid); free(recs); ds4_d8f_close(&file);
     return ok;
 }
 

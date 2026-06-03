@@ -875,6 +875,13 @@ struct D8FDownLutSidecarLite {
   uint a_offset_hi;
 };
 
+struct D8FDownLutI8CodebookLite {
+  uint k;
+  uint offset;
+  uint scale_offset;
+  uint reserved;
+};
+
 inline ulong d8f_down_lut_sidecar_a_offset(D8FDownLutSidecarLite sidecar) {
   return ulong(sidecar.a_offset_lo) | (ulong(sidecar.a_offset_hi) << 32);
 }
@@ -936,6 +943,54 @@ kernel void d8f_down_lut_score_selected_batch(
       float(cb[5]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 5u) +
       float(cb[6]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 6u) +
       float(cb[7]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 7u);
+}
+
+kernel void d8f_down_lut_score_i8_selected_batch(
+  device const uchar *pack          [[buffer(0)]],
+  device const float *mid           [[buffer(1)]],
+  device const uint  *selected      [[buffer(2)]],
+  device float       *score         [[buffer(3)]],
+  constant D8FDownLutArgs &args     [[buffer(4)]],
+  device const D8FRecordLite *recs  [[buffer(5)]],
+  device const D8FDownLutI8CodebookLite *i8_recs [[buffer(6)]],
+  device const char *i8_codebook    [[buffer(7)]],
+  uint3 gid [[thread_position_in_grid]]) {
+  const uint code = gid.x;
+  const uint group = gid.y;
+  const uint token_slot = gid.z;
+  if (group >= (args.in_dim >> 3) || token_slot >= args.n_tokens * args.n_selected) return;
+  const uint token = token_slot / args.n_selected;
+  const uint slot = token_slot - token * args.n_selected;
+  const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];
+  const D8FRecordLite rec = recs[8192u + expert];
+  const D8FDownLutI8CodebookLite i8 = i8_recs[slot];
+  const ulong out_index =
+      ulong(token) * ulong(args.score_token_stride) +
+      ulong(slot) * ulong(args.score_slot_stride) +
+      ulong(group) * ulong(args.score_group_stride) +
+      ulong(code);
+  if (code >= args.max_k) return;
+  if (code >= i8.k) {
+    score[out_index] = 0.0f;
+    return;
+  }
+  const uint x_base = group << 3;
+  const device float *slot_mid =
+      mid + ulong(token) * ulong(args.mid_token_stride) +
+      ulong(slot) * ulong(args.mid_slot_stride);
+  const device char *cb = i8_codebook + ulong(i8.offset) + ulong(code) * 8ul;
+  const device float *i8_scales = (const device float *)(i8_codebook + ulong(i8.scale_offset));
+  const float scale = i8_scales[code];
+  score[out_index] =
+      scale * (
+      float(cb[0]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 0u) +
+      float(cb[1]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 1u) +
+      float(cb[2]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 2u) +
+      float(cb[3]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 3u) +
+      float(cb[4]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 4u) +
+      float(cb[5]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 5u) +
+      float(cb[6]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 6u) +
+      float(cb[7]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 7u));
 }
 
 kernel void d8f_down_lut_gather_selected_batch(
