@@ -272,6 +272,11 @@ def runtime_hot_spans(info: dict[str, Any],
             if int(rank):
                 spans.append((int(u_offset), int(u_offset) + int(u_bytes)))
                 spans.append((int(a_offset), int(a_offset) + int(a_bytes)))
+        native = info.get("down_native_code_sidecars", {}).get(expert)
+        if native:
+            _, _, _, _, offset, byte_count, _ = native
+            if int(byte_count):
+                spans.append((int(offset), int(offset) + int(byte_count)))
     return spans
 
 

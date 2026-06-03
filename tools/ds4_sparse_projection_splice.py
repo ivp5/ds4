@@ -23,6 +23,8 @@ FUSED_RECORD_BYTES = 64
 FUSED_RECORD = struct.Struct("<IIIIIIQQQIIII")
 SIDECAR_RECORD_BYTES = 64
 SIDECAR_RECORD = struct.Struct("<IIIIQQIIIIffff")
+DOWN_NATIVE_CODE_RECORD_BYTES = 32
+DOWN_NATIVE_CODE_RECORD = struct.Struct("<IIIIQII")
 
 
 def emit(**fields: object) -> None:
@@ -150,6 +152,23 @@ def read_d8f(path: Path) -> dict[str, Any]:
                 record = SIDECAR_RECORD.unpack_from(table, expert * SIDECAR_RECORD_BYTES)
                 if int(record[1]) != 0:
                     sidecars[expert] = record
+        down_native_code_sidecars: dict[int, tuple[Any, ...]] = {}
+        down_native_offset = int(header.get("down_native_code_sidecar_table_offset", 0) or 0)
+        down_native_records = int(header.get("down_native_code_sidecar_records", 0) or 0)
+        down_native_record_bytes = int(header.get("down_native_code_sidecar_record_bytes", DOWN_NATIVE_CODE_RECORD_BYTES) or DOWN_NATIVE_CODE_RECORD_BYTES)
+        if down_native_offset:
+            if down_native_records != EXPERTS or down_native_record_bytes != DOWN_NATIVE_CODE_RECORD_BYTES:
+                result.update({"valid": False, "reason": "unsupported_down_native_code_sidecar_shape", "bytes": size})
+                return result
+            handle.seek(down_native_offset)
+            table = handle.read(EXPERTS * DOWN_NATIVE_CODE_RECORD_BYTES)
+            if len(table) != EXPERTS * DOWN_NATIVE_CODE_RECORD_BYTES:
+                result.update({"valid": False, "reason": "truncated_down_native_code_sidecar_table", "bytes": size})
+                return result
+            for expert in range(EXPERTS):
+                record = DOWN_NATIVE_CODE_RECORD.unpack_from(table, expert * DOWN_NATIVE_CODE_RECORD_BYTES)
+                if int(record[5]) != 0:
+                    down_native_code_sidecars[expert] = record
     result.update({
         "valid": True,
         "bytes": size,
@@ -157,6 +176,7 @@ def read_d8f(path: Path) -> dict[str, Any]:
         "records": records,
         "gateup_overlays": gateup_overlays,
         "sidecars": sidecars,
+        "down_native_code_sidecars": down_native_code_sidecars,
     })
     return result
 
