@@ -48951,6 +48951,9 @@ static id<MTLComputePipelineState> g_d8f_down_lut_score_selected_batch_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gather_selected_batch_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gather_selected_batch_tile8_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gather_selected_batch_tile16_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_lut_gather_codes_selected_batch_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_lut_gather_codes_selected_batch_tile8_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_lut_gather_codes_selected_batch_tile16_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_scoreh_selected_batch_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gatherh_selected_batch_pipeline;
 static int g_d8f_down_lut_classic_init_attempted;
@@ -48973,9 +48976,14 @@ static int ds4_d8f_down_lut_classic_pipeline_init(void) {
     id<MTLFunction> gather_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_selected_batch"];
     id<MTLFunction> gather_tile8_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_selected_batch_tile8"];
     id<MTLFunction> gather_tile16_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_selected_batch_tile16"];
+    id<MTLFunction> gather_codes_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_codes_selected_batch"];
+    id<MTLFunction> gather_codes_tile8_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_codes_selected_batch_tile8"];
+    id<MTLFunction> gather_codes_tile16_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_codes_selected_batch_tile16"];
     id<MTLFunction> scoreh_fn = [lib newFunctionWithName:@"d8f_down_lut_scoreh_selected_batch"];
     id<MTLFunction> gatherh_fn = [lib newFunctionWithName:@"d8f_down_lut_gatherh_selected_batch"];
-    if (!score_fn || !gather_fn || !gather_tile8_fn || !gather_tile16_fn || !scoreh_fn || !gatherh_fn) {
+    if (!score_fn || !gather_fn || !gather_tile8_fn || !gather_tile16_fn ||
+        !gather_codes_fn || !gather_codes_tile8_fn || !gather_codes_tile16_fn ||
+        !scoreh_fn || !gatherh_fn) {
         fprintf(stderr, "ds4_d8f: down LUT Metal function lookup failed\n");
         return 0;
     }
@@ -49004,6 +49012,27 @@ static int ds4_d8f_down_lut_classic_pipeline_init(void) {
         [g_device newComputePipelineStateWithFunction:gather_tile16_fn error:&err];
     if (!g_d8f_down_lut_gather_selected_batch_tile16_pipeline) {
         fprintf(stderr, "ds4_d8f: down LUT gather tile16 pipeline failed: %s\n",
+                err.localizedDescription.UTF8String);
+        return 0;
+    }
+    g_d8f_down_lut_gather_codes_selected_batch_pipeline =
+        [g_device newComputePipelineStateWithFunction:gather_codes_fn error:&err];
+    if (!g_d8f_down_lut_gather_codes_selected_batch_pipeline) {
+        fprintf(stderr, "ds4_d8f: down LUT gather codes pipeline failed: %s\n",
+                err.localizedDescription.UTF8String);
+        return 0;
+    }
+    g_d8f_down_lut_gather_codes_selected_batch_tile8_pipeline =
+        [g_device newComputePipelineStateWithFunction:gather_codes_tile8_fn error:&err];
+    if (!g_d8f_down_lut_gather_codes_selected_batch_tile8_pipeline) {
+        fprintf(stderr, "ds4_d8f: down LUT gather codes tile8 pipeline failed: %s\n",
+                err.localizedDescription.UTF8String);
+        return 0;
+    }
+    g_d8f_down_lut_gather_codes_selected_batch_tile16_pipeline =
+        [g_device newComputePipelineStateWithFunction:gather_codes_tile16_fn error:&err];
+    if (!g_d8f_down_lut_gather_codes_selected_batch_tile16_pipeline) {
+        fprintf(stderr, "ds4_d8f: down LUT gather codes tile16 pipeline failed: %s\n",
                 err.localizedDescription.UTF8String);
         return 0;
     }
@@ -49105,6 +49134,8 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         free(recs); ds4_d8f_close(&file);
         return 0;
     }
+    const uint64_t native_code_count = (uint64_t)n_experts * rows * groups;
+    uint16_t *native_codes = NULL;
     float *mid = (float *)malloc((size_t)n_tokens * n_experts * ds4_down_in_dim * sizeof(float));
     uint32_t *selected_full = (uint32_t *)malloc((size_t)n_tokens * n_experts * sizeof(uint32_t));
     float *ref = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
@@ -49152,6 +49183,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     const uint64_t score_count = (uint64_t)n_tokens * n_experts * groups * max_k;
     const int half_score = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_HALF") > 0;
     const size_t score_bytes_per_value = half_score ? sizeof(uint16_t) : sizeof(float);
+    const int native_code_mode = !half_score && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_NATIVE_CODES") > 0;
     const uint32_t default_gather_tile_rows = (n_tokens <= 1u) ? 1u : ((n_tokens <= 4u) ? 16u : 8u);
     uint32_t gather_tile_rows = ds4_gpu_env_u32("DS4_D8F_METAL_LUT_GATHER_TILE_ROWS", default_gather_tile_rows);
     if (half_score) gather_tile_rows = 1u;
@@ -49172,6 +49204,29 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     float first_mismatch_ref = 0.0f, first_mismatch_gpu = 0.0f;
     int first_mismatch_set = 0;
     float dbg_ref[4] = {0}, dbg_gpu[4] = {0};
+    if (native_code_mode) {
+        native_codes = (uint16_t *)malloc((size_t)native_code_count * sizeof(uint16_t));
+        if (!native_codes) {
+            free(gpu_out); free(ref); free(selected_full); free(mid); free(recs); ds4_d8f_close(&file);
+            return 0;
+        }
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            ds4_d8f_record rec;
+            ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &rec);
+            for (uint32_t row = 0; row < rows; row++) {
+                for (uint32_t group = 0; group < groups; group++) {
+                    const uint32_t code = ds4_d8f_code_at(&file, &rec, (uint64_t)row * groups + group);
+                    if (code > UINT16_MAX) {
+                        fprintf(stderr, "ds4_d8f: native-code LUT code overflow expert=%u code=%u\n",
+                                experts[slot], code);
+                        free(native_codes); free(gpu_out); free(ref); free(selected_full); free(mid); free(recs); ds4_d8f_close(&file);
+                        return 0;
+                    }
+                    native_codes[((uint64_t)slot * rows + row) * groups + group] = (uint16_t)code;
+                }
+            }
+        }
+    }
     @autoreleasepool {
         id<MTLBuffer> packBuf = [g_device newBufferWithBytesNoCopy:(void *)file.map
                                                             length:file.size
@@ -49188,6 +49243,9 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                                                     options:MTLResourceStorageModeShared];
         id<MTLBuffer> scoreBuf = [g_device newBufferWithLength:(NSUInteger)score_count * score_bytes_per_value
                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> codeBuf = native_code_mode ? [g_device newBufferWithBytes:native_codes
+                                                                         length:(NSUInteger)native_code_count * sizeof(uint16_t)
+                                                                        options:MTLResourceStorageModeShared] : nil;
         id<MTLBuffer> outBuf = [g_device newBufferWithLength:(NSUInteger)n_tokens * rows * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
         struct args_t {
@@ -49201,7 +49259,8 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             max_k, groups * max_k, n_experts * groups * max_k, rows, 0u, 0u
         };
         id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args) options:MTLResourceStorageModeShared];
-        if (packBuf && midBuf && selBuf && recBuf && scoreBuf && outBuf && argsBuf) {
+        if (packBuf && midBuf && selBuf && recBuf && scoreBuf && outBuf && argsBuf &&
+            (!native_code_mode || codeBuf)) {
             void (^dispatch_once)(void) = ^{
                 id<MTLCommandBuffer> cb = [g_queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -49231,12 +49290,32 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                     gather_grid_rows = (rows + 7u) >> 3;
                 }
                 [enc setComputePipelineState:gather_pipeline];
-                [enc setBuffer:packBuf offset:0 atIndex:0];
-                [enc setBuffer:selBuf offset:0 atIndex:1];
-                [enc setBuffer:scoreBuf offset:0 atIndex:2];
-                [enc setBuffer:outBuf offset:0 atIndex:3];
-                [enc setBuffer:argsBuf offset:0 atIndex:4];
-                [enc setBuffer:recBuf offset:0 atIndex:5];
+                if (native_code_mode) {
+                    if (gather_tile_rows == 16u) {
+                        [enc setComputePipelineState:g_d8f_down_lut_gather_codes_selected_batch_tile16_pipeline];
+                        gather_partial_bytes = 16u * 8u * sizeof(float);
+                        gather_grid_rows = (rows + 15u) >> 4;
+                    } else if (gather_tile_rows == 8u) {
+                        [enc setComputePipelineState:g_d8f_down_lut_gather_codes_selected_batch_tile8_pipeline];
+                        gather_partial_bytes = 8u * 8u * sizeof(float);
+                        gather_grid_rows = (rows + 7u) >> 3;
+                    } else {
+                        [enc setComputePipelineState:g_d8f_down_lut_gather_codes_selected_batch_pipeline];
+                        gather_partial_bytes = 8u * sizeof(float);
+                        gather_grid_rows = rows;
+                    }
+                    [enc setBuffer:codeBuf offset:0 atIndex:0];
+                    [enc setBuffer:scoreBuf offset:0 atIndex:1];
+                    [enc setBuffer:outBuf offset:0 atIndex:2];
+                    [enc setBuffer:argsBuf offset:0 atIndex:3];
+                } else {
+                    [enc setBuffer:packBuf offset:0 atIndex:0];
+                    [enc setBuffer:selBuf offset:0 atIndex:1];
+                    [enc setBuffer:scoreBuf offset:0 atIndex:2];
+                    [enc setBuffer:outBuf offset:0 atIndex:3];
+                    [enc setBuffer:argsBuf offset:0 atIndex:4];
+                    [enc setBuffer:recBuf offset:0 atIndex:5];
+                }
                 [enc setThreadgroupMemoryLength:gather_partial_bytes atIndex:0];
                 [enc dispatchThreadgroups:MTLSizeMake(gather_grid_rows, n_tokens, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -49303,10 +49382,13 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         }
     }
     fprintf(stderr,
-            "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s gather_tile=%u score=%.2f MiB pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
+            "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s code_mode=%s gather_tile=%u score=%.2f MiB code=%.2f MiB pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
             n_experts, rows, n_tokens, rounds, max_k,
-            half_score ? "f16" : "f32", gather_tile_rows,
+            half_score ? "f16" : "f32",
+            native_code_mode ? "native_u16" : "bitpack",
+            gather_tile_rows,
             (double)(score_count * score_bytes_per_value) / 1048576.0,
+            native_code_mode ? (double)(native_code_count * sizeof(uint16_t)) / 1048576.0 : 0.0,
             (double)file.size / 1048576.0, timed_ms,
             timed_ms / (double)rounds,
             timed_ms * 1000.0 / ((double)n_tokens * (double)rows * (double)rounds),
@@ -49341,7 +49423,11 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     fprintf(stderr, " experts=");
     for (uint32_t slot = 0; slot < n_experts; slot++) fprintf(stderr, "%s%u", slot ? "," : "", experts[slot]);
     fprintf(stderr, "\n");
-    free(gpu_out); free(ref); free(selected_full); free(mid); free(recs); ds4_d8f_close(&file);
+    if (native_code_mode) {
+        fprintf(stderr, "ds4: d8f_metal_lut_down_native_codes code=%.2f MiB\n",
+                (double)(native_code_count * sizeof(uint16_t)) / 1048576.0);
+    }
+    free(native_codes); free(gpu_out); free(ref); free(selected_full); free(mid); free(recs); ds4_d8f_close(&file);
     return ok;
 }
 
