@@ -49099,7 +49099,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         uint32_t k;
         uint32_t offset;
         uint32_t scale_offset;
-        uint32_t reserved;
+        uint32_t keep_offset;
     } d8f_lut_i8_codebook_lite;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!ds4_d8f_down_lut_classic_pipeline_init()) return 0;
@@ -49182,6 +49182,8 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     d8f_lut_i8_codebook_lite *i8_recs = NULL;
     int8_t *i8_codebooks = NULL;
     uint32_t i8_codebook_bytes = 0;
+    uint32_t i8_codebook_kept = 0;
+    uint32_t i8_codebook_total = 0;
     float *mid = (float *)malloc((size_t)n_tokens * n_experts * ds4_down_in_dim * sizeof(float));
     uint32_t *selected_full = (uint32_t *)malloc((size_t)n_tokens * n_experts * sizeof(uint32_t));
     float *ref = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
@@ -49256,6 +49258,8 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     const int half_score = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_HALF") > 0;
     const size_t score_bytes_per_value = half_score ? sizeof(uint16_t) : sizeof(float);
     const int i8_score_mode = !half_score && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_I8") > 0;
+    const char *i8_max_rel_env = getenv("DS4_D8F_METAL_LUT_SCORE_I8_MAX_REL");
+    const double i8_max_rel = (i8_max_rel_env && i8_max_rel_env[0]) ? strtod(i8_max_rel_env, NULL) : 1.0;
     const int native_code_env = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_NATIVE_CODES");
     if (half_score && rank1_sidecar_count > 0) {
         fprintf(stderr, "ds4_d8f: down LUT rank1 sidecars require f32 score/native-code gather\n");
@@ -49325,7 +49329,8 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         for (uint32_t slot = 0; slot < n_experts; slot++) {
             ds4_d8f_record rec;
             ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &rec);
-            total_i8_bytes += (uint64_t)rec.k * 8u + (uint64_t)rec.k * sizeof(float);
+            total_i8_bytes += (uint64_t)rec.k * 8u + (uint64_t)rec.k * sizeof(float) + (uint64_t)rec.k;
+            i8_codebook_total += rec.k;
         }
         if (!i8_recs || total_i8_bytes > UINT32_MAX) {
             free(i8_recs); free(native_codes); free(gpu_out); free(ref); free(selected_full); free(mid); free(recs); ds4_d8f_close(&file);
@@ -49345,7 +49350,9 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             i8_recs[slot].k = rec.k;
             i8_recs[slot].offset = i8_offset;
             i8_recs[slot].scale_offset = i8_offset + rec.k * 8u;
+            i8_recs[slot].keep_offset = i8_recs[slot].scale_offset + rec.k * (uint32_t)sizeof(float);
             float *slot_scales = (float *)(void *)(i8_codebooks + i8_recs[slot].scale_offset);
+            uint8_t *slot_keep = (uint8_t *)(void *)(i8_codebooks + i8_recs[slot].keep_offset);
             for (uint32_t code = 0; code < rec.k; code++) {
                 float max_abs_code = 0.0f;
                 for (uint32_t d = 0; d < 8u; d++) {
@@ -49354,6 +49361,8 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                 }
                 const float scale = max_abs_code > 0.0f ? max_abs_code / 127.0f : 1.0f;
                 slot_scales[code] = scale;
+                double ss_src = 0.0;
+                double ss_diff = 0.0;
                 for (uint32_t d = 0; d < 8u; d++) {
                     const uint32_t i = code * 8u + d;
                     const float v = ds4_m1r_f16_to_f32(ds4_m1r_u16(cb + (uint64_t)i * 2u));
@@ -49361,9 +49370,16 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                     if (qf > 127.0f) qf = 127.0f;
                     if (qf < -127.0f) qf = -127.0f;
                     i8_codebooks[i8_offset + i] = (int8_t)qf;
+                    const double recon = (double)((int8_t)qf) * (double)scale;
+                    const double diff = recon - (double)v;
+                    ss_src += (double)v * (double)v;
+                    ss_diff += diff * diff;
                 }
+                const double rel_l2 = sqrt(ss_diff / (ss_src + 1e-24));
+                slot_keep[code] = rel_l2 <= i8_max_rel ? 1u : 0u;
+                if (slot_keep[code]) i8_codebook_kept++;
             }
-            i8_offset += rec.k * 8u + rec.k * (uint32_t)sizeof(float);
+            i8_offset += rec.k * 8u + rec.k * (uint32_t)sizeof(float) + rec.k;
         }
     }
     @autoreleasepool {
@@ -49544,7 +49560,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         }
     }
     fprintf(stderr,
-            "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s code_mode=%s code_source=%s sidecar_hits=%d rank1_sidecars=%u gather_tile=%u score=%.2f MiB code=%.2f MiB pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
+            "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s code_mode=%s code_source=%s sidecar_hits=%d rank1_sidecars=%u gather_tile=%u score=%.2f MiB code=%.2f MiB i8_keep=%u/%u pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
             n_experts, rows, n_tokens, rounds, max_k,
             i8_score_mode ? "f32_i8cb" : (half_score ? "f16" : "f32"),
             native_code_mode ? "native_u16" : "bitpack",
@@ -49554,6 +49570,8 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             gather_tile_rows,
             (double)(score_count * score_bytes_per_value) / 1048576.0,
             native_code_mode ? (double)(native_code_count * sizeof(uint16_t)) / 1048576.0 : 0.0,
+            i8_codebook_kept,
+            i8_codebook_total,
             (double)file.size / 1048576.0, timed_ms,
             timed_ms / (double)rounds,
             timed_ms * 1000.0 / ((double)n_tokens * (double)rows * (double)rounds),

@@ -879,7 +879,7 @@ struct D8FDownLutI8CodebookLite {
   uint k;
   uint offset;
   uint scale_offset;
-  uint reserved;
+  uint keep_offset;
 };
 
 inline ulong d8f_down_lut_sidecar_a_offset(D8FDownLutSidecarLite sidecar) {
@@ -980,6 +980,20 @@ kernel void d8f_down_lut_score_i8_selected_batch(
       ulong(slot) * ulong(args.mid_slot_stride);
   const device char *cb = i8_codebook + ulong(i8.offset) + ulong(code) * 8ul;
   const device float *i8_scales = (const device float *)(i8_codebook + ulong(i8.scale_offset));
+  const device uchar *i8_keep = (const device uchar *)(i8_codebook + ulong(i8.keep_offset));
+  if (i8_keep[code] == 0u) {
+    const device half *hcb = (const device half *)(pack + rec.codebook_offset + ulong(code) * 16ul);
+    score[out_index] =
+        float(hcb[0]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 0u) +
+        float(hcb[1]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 1u) +
+        float(hcb[2]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 2u) +
+        float(hcb[3]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 3u) +
+        float(hcb[4]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 4u) +
+        float(hcb[5]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 5u) +
+        float(hcb[6]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 6u) +
+        float(hcb[7]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 7u);
+    return;
+  }
   const float scale = i8_scales[code];
   score[out_index] =
       scale * (
