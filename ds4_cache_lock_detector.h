@@ -24,14 +24,13 @@ extern "C" {
 
 typedef loop_detector ds4_cache_lock_detector;
 
-typedef struct {
-    bool locked;
-    uint32_t n_distinct;
-    uint32_t n_total;
-    float repeat_factor;
-    uint64_t top_ngram_hash;
-    uint16_t top_count;
-} ds4_cache_lock_state;
+/* No snapshot/state struct. Derived values are read IN-BAND via the accessors
+ * below (ds4_cache_lock_is_locked / _repeat_factor), computed live from the
+ * detector — the single source of truth. The former ds4_cache_lock_state +
+ * get_state copy-out carried fields (top_count/top_ngram_hash) that outlived
+ * their source after the loop_detector dropped them, so callers read always-0
+ * phantoms. Eliminated 2026-06-03 (one-level-up bug-class kill): a value that
+ * isn't stored can't drift; a field that doesn't exist can't be misread. */
 
 /* The compat shim silently drops tuning args. Warn loudly if caller passes
  * non-default values so the discrepancy is visible at runtime. Note also
@@ -71,29 +70,16 @@ static inline int32_t ds4_cache_lock_predict_next(const ds4_cache_lock_detector 
     return guess_next_token_assuming_loop_continues(d);
 }
 
-/* TRIPWIRE: state-mapping depends on loop_detector field names below.
- * If those are renamed in ds4_inflight.h, update here too.
- * Mapping:
- *   ds4_cache_lock_state.locked         <- model_is_stuck_in_a_loop
- *   ds4_cache_lock_state.n_distinct     <- how_many_distinct_ngrams_currently
- *   ds4_cache_lock_state.n_total        <- how_many_ngram_occurrences_total
- *   ds4_cache_lock_state.repeat_factor  <- computed = n_total / n_distinct
- *   ds4_cache_lock_state.top_ngram_hash <- DEPRECATED: source fields cut as
- *     stale-cache. Kept in struct ABI for legacy compat but reported as 0.
- *   ds4_cache_lock_state.top_count      <- DEPRECATED: same. */
-static inline void ds4_cache_lock_get_state(const ds4_cache_lock_detector *d,
-                                             ds4_cache_lock_state *out) {
-    if (!d || !out) return;
-    out->locked         = d->model_is_stuck_in_a_loop;
-    out->n_distinct     = d->how_many_distinct_ngrams_currently;
-    out->n_total        = d->how_many_ngram_occurrences_total;
-    out->repeat_factor  = d->how_many_distinct_ngrams_currently > 0
-                       ? (float)d->how_many_ngram_occurrences_total
-                         / (float)d->how_many_distinct_ngrams_currently
-                       : 1.0f;
-    /* Stale-cache fields cut from loop_detector; legacy callers see 0. */
-    out->top_ngram_hash = 0;
-    out->top_count      = 0;
+/* In-band accessors — compute derived state live from the detector (the single
+ * source of truth). O(1), no allocation, no parallel representation to drift.
+ * TRIPWIRE: depends on loop_detector field names in ds4_inflight.h. */
+static inline bool ds4_cache_lock_is_locked(const ds4_cache_lock_detector *d) {
+    return d ? d->model_is_stuck_in_a_loop : false;
+}
+static inline float ds4_cache_lock_repeat_factor(const ds4_cache_lock_detector *d) {
+    if (!d || d->how_many_distinct_ngrams_currently == 0) return 1.0f;
+    return (float)d->how_many_ngram_occurrences_total
+         / (float)d->how_many_distinct_ngrams_currently;
 }
 
 #ifdef __cplusplus

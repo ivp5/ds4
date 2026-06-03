@@ -471,6 +471,7 @@ struct D8FDownBatchArgs {
   uint sidecar_record_bytes;
   uint sidecar_rank_max;
   uint sidecar_dot_stride;
+  uint cbsram_k_cap;
 };
 
 inline ulong d8f_sidecar_table_offset(constant D8FDownBatchArgs &args) {
@@ -1100,6 +1101,130 @@ kernel void d8f_down_sum_selected_weighted_batch_tile16_recbuf(
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+  }
+  for (uint rr = 0u; rr < 16u; rr++) {
+    acc[rr] = simd_sum(acc[rr]);
+    if (tiisg == 0u) partial[rr * 8u + sgitg] = acc[rr];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    for (uint rr = 0u; rr < 16u; rr++) {
+      const uint row = row_base + rr;
+      if (row < args.rows) {
+        float total = 0.0f;
+        for (uint sg = 0u; sg < 8u; sg++) total += partial[rr * 8u + sg];
+        out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] = total;
+      }
+    }
+  }
+}
+
+kernel void d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram(
+  device const uchar *pack               [[buffer(0)]],
+  device const float *mid                [[buffer(1)]],
+  device const uint  *selected           [[buffer(2)]],
+  device float       *out                [[buffer(3)]],
+  constant D8FDownBatchArgs &args        [[buffer(4)]],
+  device const float *route_weights      [[buffer(5)]],
+  device const D8FRecordLite *recs       [[buffer(6)]],
+  device const float *sidecar_dot        [[buffer(7)]],
+  threadgroup float *partial             [[threadgroup(0)]],
+  uint tid [[thread_index_in_threadgroup]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]],
+  uint2 pos [[threadgroup_position_in_grid]]) {
+  (void)sidecar_dot;
+  const uint row_base = pos.x << 4;
+  const uint token = pos.y;
+  if (token >= args.n_tokens) return;
+  const uint blocks_per_row = args.in_dim >> 3;
+  device const float *token_mid = mid + ulong(token) * ulong(args.mid_token_stride);
+  device const float *token_weights = route_weights + ulong(token) * ulong(args.route_token_stride);
+  threadgroup half *cb_cache = (threadgroup half *)(partial + 128u);
+  float acc[16];
+  for (uint rr = 0u; rr < 16u; rr++) acc[rr] = 0.0f;
+  for (uint slot = 0u; slot < args.n_selected; slot++) {
+    const float rw = token_weights[slot];
+    if (rw == 0.0f) continue;
+    const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];
+    const D8FRecordLite rec = recs[8192u + expert];
+    device const uchar *side_rec = d8f_down_sidecar_record(pack, args, expert);
+    const uint side_rank = side_rec ? d8f_u32(side_rec + 4) : 0u;
+    const uint side_in_dim = side_rec ? d8f_u32(side_rec + 8) : 0u;
+    const uint side_out_dim = side_rec ? d8f_u32(side_rec + 12) : 0u;
+    const ulong side_u_off = side_rec ? d8f_u64(side_rec + 16) : 0ul;
+    const ulong side_a_off = side_rec ? d8f_u64(side_rec + 24) : 0ul;
+    const bool side_rank1 = side_rank == 1u && side_in_dim == args.in_dim &&
+                            side_out_dim == args.rows && side_u_off != 0ul &&
+                            side_a_off != 0ul;
+    const uint cbsram_k_cap = min(args.cbsram_k_cap, 1024u);
+    const bool use_cb_cache = cbsram_k_cap > 0u && rec.k > 0u && rec.k <= cbsram_k_cap;
+    if (use_cb_cache) {
+      device const half *cb_src = (const device half *)(pack + rec.codebook_offset);
+      const uint cb_vals = rec.k << 3;
+      for (uint ci = tid; ci < cb_vals; ci += 256u) cb_cache[ci] = cb_src[ci];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    device const half *side_u = side_rank1 ? (const device half *)(pack + side_u_off) : nullptr;
+    device const half *side_a = side_rank1 ? (const device half *)(pack + side_a_off) : nullptr;
+    const device float *slot_mid = token_mid + ulong(slot) * ulong(args.mid_slot_stride);
+    float side_dot = 0.0f;
+    for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {
+      const uint x_base = block_col << 3;
+      const float m0 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 0u);
+      const float m1 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 1u);
+      const float m2 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 2u);
+      const float m3 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 3u);
+      const float m4 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 4u);
+      const float m5 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 5u);
+      const float m6 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 6u);
+      const float m7 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 7u);
+      if (side_rank1) {
+        side_dot += float(side_u[x_base + 0u]) * m0 + float(side_u[x_base + 1u]) * m1 +
+                    float(side_u[x_base + 2u]) * m2 + float(side_u[x_base + 3u]) * m3 +
+                    float(side_u[x_base + 4u]) * m4 + float(side_u[x_base + 5u]) * m5 +
+                    float(side_u[x_base + 6u]) * m6 + float(side_u[x_base + 7u]) * m7;
+      }
+      for (uint rr = 0u; rr < 16u; rr++) {
+        const uint row = row_base + rr;
+        if (row >= args.rows) continue;
+        const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);
+        const ulong bit_off = block_index * ulong(rec.bits);
+        const ulong byte_off = bit_off >> 3;
+        const uint shift = uint(bit_off & 7ul);
+        device const uchar *ix = pack + rec.index_offset + byte_off;
+        const uint w = uint(ix[0]) | (uint(ix[1]) << 8u) | (uint(ix[2]) << 16u) | (uint(ix[3]) << 24u);
+        const uint code = (w >> shift) & rec.mask;
+        if (code >= rec.k) continue;
+        if (use_cb_cache) {
+          threadgroup const half *cb = cb_cache + ulong(code) * 8ul;
+          acc[rr] += rw * (float(cb[0]) * m0 + float(cb[1]) * m1 +
+                           float(cb[2]) * m2 + float(cb[3]) * m3 +
+                           float(cb[4]) * m4 + float(cb[5]) * m5 +
+                           float(cb[6]) * m6 + float(cb[7]) * m7);
+        } else {
+          const device half *cb = (const device half *)(pack + rec.codebook_offset + ulong(code) * 16ul);
+          acc[rr] += rw * (float(cb[0]) * m0 + float(cb[1]) * m1 +
+                           float(cb[2]) * m2 + float(cb[3]) * m3 +
+                           float(cb[4]) * m4 + float(cb[5]) * m5 +
+                           float(cb[6]) * m6 + float(cb[7]) * m7);
+        }
+      }
+    }
+    if (side_rank1) {
+      side_dot = simd_sum(side_dot);
+      if (tiisg == 0u) partial[sgitg] = side_dot;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (tid == 0u) {
+        float dot_total = 0.0f;
+        for (uint sg = 0u; sg < 8u; sg++) dot_total += partial[sg];
+        for (uint rr = 0u; rr < 16u; rr++) {
+          const uint row = row_base + rr;
+          if (row < args.rows) acc[rr] += rw * float(side_a[row]) * dot_total;
+        }
+      }
+    }
+    if (use_cb_cache || side_rank1) threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   for (uint rr = 0u; rr < 16u; rr++) {
     acc[rr] = simd_sum(acc[rr]);

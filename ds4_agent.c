@@ -6304,6 +6304,11 @@ static void agent_bash_job_free(agent_bash_job *job) {
     }
     if (job->pipe_fd >= 0) close(job->pipe_fd);
     if (job->tmp_fd >= 0) close(job->tmp_fd);
+    /* The observation (head/tail of this file) is built and published before a
+     * job is ever freed, so the mkstemp output file is dead here.  Without this
+     * unlink every bash command leaked one /tmp/ds4_agent_output_* file for the
+     * life of the agent (silv 2026-06-03 audit). */
+    if (job->path[0]) unlink(job->path);
     free(job->cmd);
     free(job);
 }

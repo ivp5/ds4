@@ -13933,6 +13933,49 @@ static bool metal_graph_encode_decode_layer(
   ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8_DIRECT, layer->attn_output_a);
   s_n_storage_dispatch_fp8_direct++;
   ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8_DIRECT, layer->attn_output_b);
+  bool fp8_attn_out_onecb_hc_done = false;
+  if (fuse_fp8_attn_out_hc &&
+  getenv("DS4_ENABLE_FP8_ATTN_OUT_ONECB_HC") != NULL &&
+  getenv("DS4_DISABLE_FP8_ATTN_OUT_ONECB_HC") == NULL) {
+  const bool store_fp8_attn_out =
+  getenv("DS4_FP8_ATTN_OUT_HC_STORE_BLOCK") != NULL ||
+  metal_graph_debug_wants("attn_out", il, pos);
+  const int onecb_ok = ds4_gpu_attention_output_fp8_e4m3_e8m0_hc_onecb_tensor(g->after_attn_hc,
+  g->attn_low,
+  g->attn_out,
+  layer->attn_output_a->storage.metal_buffer,
+  layer->attn_output_a->storage.scale_metal_buffer,
+  layer->attn_output_a->storage.scale_length,
+  layer->attn_output_b->storage.metal_buffer,
+  layer->attn_output_b->storage.scale_metal_buffer,
+  layer->attn_output_b->storage.scale_length,
+  group_dim,
+  rank,
+  n_groups,
+  g->heads,
+  g->cur_hc,
+  g->hc_post,
+  g->hc_comb,
+  DS4_N_EMBD,
+  DS4_N_HC,
+  1,
+  store_fp8_attn_out ? 1 : 0);
+  if (onecb_ok) {
+  fp8_attn_out_onecb_hc_done = true;
+  static int s_fp8_attn_out_onecb_logged = 0;
+  if (!s_fp8_attn_out_onecb_logged) {
+  s_fp8_attn_out_onecb_logged = 1;
+  fprintf(stderr, "ds4: FP8 attn output one-CB HC fused path active\n");
+  }
+  } else {
+  static int s_fp8_attn_out_onecb_fail_logged = 0;
+  if (!s_fp8_attn_out_onecb_fail_logged) {
+  s_fp8_attn_out_onecb_fail_logged = 1;
+  fprintf(stderr, "ds4: FP8 attn output one-CB HC fused path failed; falling back\n");
+  }
+  }
+  }
+  if (!fp8_attn_out_onecb_hc_done) {
   ok = ds4_gpu_attention_output_low_fp8_e4m3_e8m0_storage(g->attn_low,
   layer->attn_output_a->storage.metal_buffer,
   layer->attn_output_a->storage.scale_metal_buffer,
@@ -13971,6 +14014,7 @@ static bool metal_graph_encode_decode_layer(
   DS4_N_EMBD,
   g->attn_low,
   1) != 0;
+  }
   }
   }
   } else if (ok && fuse_attn_out_hc) {
@@ -14173,7 +14217,6 @@ static bool metal_graph_encode_decode_layer(
  const bool fuse_shared_gate_up_fp8 =
  !g->quality &&
  shared_gate_up_fp8_native &&
- getenv("DS4_METAL_ENABLE_SHARED_GATE_UP_FP8_SWIGLU_FUSION") != NULL &&
  getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL &&
  getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_FP8_SWIGLU_FUSION") == NULL;
  if (ok && fuse_shared_gate_up) {
@@ -15228,9 +15271,11 @@ static bool metal_graph_encode_token_raw_swa(
  * encoding the rest. The split point is layer-based because this executor is
  * a fixed DS4 tape, not a dynamic node graph; four layers is the measured
  * point where the prefix is large enough to hide useful work without
- * starving the second command buffer.
+ * starving the second command buffer. D8F/PRIME reuses the same overlap
+ * mechanism but defaults to an earlier split; H3355 decode A/B on 2026-06-03
+ * measured split=2 ahead of split=4, split=8, and split=0.
  */
- uint32_t split_after_layers = 4;
+ uint32_t split_after_layers = ds4_prime_path_enabled() ? 2u : 4u;
  const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
  if (split_env && split_env[0]) {
  char *end = NULL;
@@ -18982,8 +19027,10 @@ static bool metal_graph_verify_decode2_exact(
  int *top1,
  float *logits1) {
  if (!g || !top0 || (!top1 && !logits1) || g->raw_cap == 0) return false;
- const bool cache_logits0_on_device = logits0 == NULL;
- if (cache_logits0_on_device && !g->spec_logits) return false;
+	 const bool cache_logits0_on_device = logits0 == NULL;
+	 if (cache_logits0_on_device && !g->spec_logits) return false;
+	 const bool batch_output = getenv("DS4_MTP_DECODE2_BATCH_OUTPUT") != NULL;
+	 const bool fused_output = !batch_output && getenv("DS4_MTP_DECODE2_FUSED_OUTPUT") != NULL;
 
  const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
  ds4_gpu_tensor *cur0 = metal_graph_tensor_row_view(g->batch_cur_hc, 0, hc_dim);
@@ -19056,11 +19103,115 @@ static bool metal_graph_verify_decode2_exact(
  }
  if (ok) ok = ds4_gpu_end_commands() != 0;
  else (void)ds4_gpu_synchronize();
- g->spec_capture_prefix1 = saved_capture;
- g->cur_hc = saved_cur;
- g->after_ffn_hc = saved_after;
+	 g->spec_capture_prefix1 = saved_capture;
+	 g->cur_hc = saved_cur;
+	 g->after_ffn_hc = saved_after;
 
- if (ok) {
+	 if (ok && batch_output) {
+	 /*
+	  * Opt-in measurement path: exact decode2 still runs the two proposed
+	  * tokens through the normal one-token layer kernels/cache order above, but
+	  * collapses the two final HC rows with the existing batched output head.
+	  * This removes two output-head command streams plus the row0 logits copy.
+	  * It is not default because the batched output kernels can perturb nearly
+	  * tied logits; DS4_MTP_DECODE2_BATCH_OUTPUT=1 measures whether that cost cut
+	  * is useful enough to harden.
+	  */
+	 ds4_gpu_tensor *saved_batch_cur = g->batch_cur_hc;
+	 ds4_gpu_tensor *final_batch_cur = (DS4_N_LAYER & 1u) ? g->batch_next_hc : g->batch_cur_hc;
+	 ok = ds4_gpu_begin_commands() != 0;
+	 if (ok) {
+	 g->batch_cur_hc = final_batch_cur;
+	 ok = metal_graph_encode_output_head_batch(g, model, weights, 2u, weights->output->dim[1]);
+	 g->batch_cur_hc = saved_batch_cur;
+	 }
+	 if (ok) ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
+	 g->spec_logits,
+	 DS4_N_VOCAB,
+	 1,
+	 2) != 0;
+	 if (ok) ok = ds4_gpu_end_commands() != 0;
+	 else (void)ds4_gpu_synchronize();
+	 g->batch_cur_hc = saved_batch_cur;
+	 if (ok) {
+	 int tops[2] = {-1, -1};
+	 ok = ds4_gpu_tensor_read(g->comp_selected, 0, tops, sizeof(tops)) != 0;
+	 if (ok) {
+	 *top0 = tops[0];
+	 if (top1) *top1 = tops[1];
+	 }
+	 }
+	 if (ok && logits0) ok = metal_graph_read_spec_logits_row(g, 0, logits0);
+	 if (ok && logits1) ok = metal_graph_read_spec_logits_row(g, 1, logits1);
+	 ds4_gpu_tensor_free(next1);
+	 ds4_gpu_tensor_free(next0);
+	 ds4_gpu_tensor_free(cur1);
+	 ds4_gpu_tensor_free(cur0);
+	 return ok;
+	 }
+
+	 if (ok && fused_output) {
+	 /*
+	  * Row-exact measurement path. Unlike DS4_MTP_DECODE2_BATCH_OUTPUT, this
+	  * keeps the proven one-row output head for each verifier row; it only keeps
+	  * both row output heads, top-k reductions, and the row0 logits copy inside a
+	  * single command buffer. The expected win is command-buffer/encoder
+	  * headroom, not math reduction, and continuation should match the strict
+	  * baseline.
+	  */
+	 ds4_gpu_tensor *top0_view = ds4_gpu_tensor_view(g->comp_selected, 0, sizeof(uint32_t));
+	 ds4_gpu_tensor *top1_view = ds4_gpu_tensor_view(g->comp_selected, sizeof(uint32_t), sizeof(uint32_t));
+	 ok = top0_view && top1_view;
+	 if (ok) ok = ds4_gpu_begin_commands() != 0;
+	 if (ok) {
+	 g->cur_hc = cur0;
+	 ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+	 }
+	 if (ok) ok = ds4_gpu_indexer_topk_tensor(top0_view,
+	 g->logits,
+	 DS4_N_VOCAB,
+	 1,
+	 1) != 0;
+	 if (ok && (cache_logits0_on_device || logits0)) {
+	 ok = ds4_gpu_tensor_copy(g->spec_logits,
+	 0,
+	 g->logits,
+	 0,
+	 (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+	 }
+	 if (ok) {
+	 g->cur_hc = cur1;
+	 ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+	 }
+	 if (ok && top1) {
+	 ok = ds4_gpu_indexer_topk_tensor(top1_view,
+	 g->logits,
+	 DS4_N_VOCAB,
+	 1,
+	 1) != 0;
+	 }
+	 if (ok) ok = ds4_gpu_end_commands() != 0;
+	 else (void)ds4_gpu_synchronize();
+	 g->cur_hc = saved_cur;
+	 if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, top0, sizeof(*top0)) != 0;
+	 if (ok && top1) ok = ds4_gpu_tensor_read(g->comp_selected, sizeof(uint32_t), top1, sizeof(*top1)) != 0;
+	 if (ok && logits0) ok = metal_graph_read_spec_logits_row(g, 0, logits0);
+	 if (ok && logits1) {
+	 ok = ds4_gpu_tensor_read(g->logits,
+	 0,
+	 logits1,
+	 (uint64_t)DS4_N_VOCAB * sizeof(logits1[0])) != 0;
+	 }
+	 ds4_gpu_tensor_free(top1_view);
+	 ds4_gpu_tensor_free(top0_view);
+	 ds4_gpu_tensor_free(next1);
+	 ds4_gpu_tensor_free(next0);
+	 ds4_gpu_tensor_free(cur1);
+	 ds4_gpu_tensor_free(cur0);
+	 return ok;
+	 }
+
+	 if (ok) {
  g->cur_hc = cur0;
  ok = ds4_gpu_begin_commands() != 0;
  if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
@@ -20717,10 +20868,8 @@ static int generate_raw_swa_cpu(
  const int locked = ds4_cache_lock_push(cache_lock, (int32_t)token);
  if (locked && !was_locked) {
  cache_lock_fired_step = i;
- ds4_cache_lock_state st;
- ds4_cache_lock_get_state(cache_lock, &st);
- fprintf(stderr, "ds4: CACHE_LOCK fired at step %d (repeat_factor=%.2f top_count=%u)\n",
- i, (double)st.repeat_factor, (unsigned)st.top_count);
+ fprintf(stderr, "ds4: CACHE_LOCK fired at step %d (repeat_factor=%.2f)\n",
+ i, (double)ds4_cache_lock_repeat_factor(cache_lock));
  /* silv 2026-05-27 task #668 — auto-rescue: when loop fires, sharpen
   * attention to break the rote-recall pattern (cross-prompt sweep on
   * IQ2_XXS showed sharper temperature destabilizes rote answers).
@@ -20929,10 +21078,8 @@ static int generate_metal_graph_raw_swa(
  if (locked && !was_locked) {
  cache_lock_fired_step = i;
  cache_lock_skip_budget = cache_lock_skip_max;
- ds4_cache_lock_state st;
- ds4_cache_lock_get_state(cache_lock, &st);
- fprintf(stderr, "ds4: CACHE_LOCK fired at step %d (gpu) repeat_factor=%.2f top_count=%u skip_budget=%d\n",
- i, (double)st.repeat_factor, (unsigned)st.top_count, cache_lock_skip_budget);
+ fprintf(stderr, "ds4: CACHE_LOCK fired at step %d (gpu) repeat_factor=%.2f skip_budget=%d\n",
+ i, (double)ds4_cache_lock_repeat_factor(cache_lock), cache_lock_skip_budget);
  }
  if (locked && cache_lock_skip_budget > 0) {
  const int32_t pred = ds4_cache_lock_predict_next(cache_lock);
@@ -21153,8 +21300,7 @@ struct ds4_session {
  int *mtp_verify_tops;
  int mtp_draft_token;
  int logits_argmax_token;
- uint64_t mtp_probe_total;
- uint64_t mtp_probe_hit;
+ ds4_mtp_stats mtp_stats;
  ds4_session_progress_fn progress;
  void *progress_ud;
  /* antirez/main 2026-05-25: fine-grained prefill display progress callback. */
@@ -21167,6 +21313,19 @@ struct ds4_session {
  bool logits_host_valid;
  bool logits_argmax_valid;
 };
+
+static void ds4_session_mtp_note_commit(ds4_session *s, int drafted, int committed) {
+ if (!s || drafted <= 0) return;
+ if (committed < 0) committed = 0;
+ if (committed > drafted) committed = drafted;
+ s->mtp_stats.spec_drafted += (uint64_t)drafted;
+ s->mtp_stats.spec_committed += (uint64_t)committed;
+ if (committed == drafted) {
+ s->mtp_stats.spec_full_accept++;
+ } else if (committed > 0) {
+ s->mtp_stats.spec_partial_accept++;
+ }
+}
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -21577,6 +21736,17 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
  return e && e->backend != DS4_BACKEND_CPU && e->mtp_ready ? e->mtp_draft_tokens : 0;
+}
+
+void ds4_session_mtp_stats(ds4_session *s, ds4_mtp_stats *out) {
+ if (!out) return;
+ memset(out, 0, sizeof(*out));
+ if (s) *out = s->mtp_stats;
+}
+
+void ds4_session_mtp_stats_reset(ds4_session *s) {
+ if (!s) return;
+ memset(&s->mtp_stats, 0, sizeof(s->mtp_stats));
 }
 
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
@@ -25341,16 +25511,16 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
  probe_mtp && !mtp_d8f_default_off && e->mtp_ready && s->mtp_logits &&
  (e->mtp_draft_tokens > 1 || mtp_probe_log);
  if (probe_mtp && s->mtp_draft_valid) {
- if (mtp_probe_log) {
- s->mtp_probe_total++;
- if (s->mtp_draft_token == token) s->mtp_probe_hit++;
- fprintf(stderr,
- "ds4: mtp probe token=%d draft=%d hit=%llu/%llu\n",
- token,
- s->mtp_draft_token,
- (unsigned long long)s->mtp_probe_hit,
- (unsigned long long)s->mtp_probe_total);
- }
+	 if (mtp_probe_log) {
+	 s->mtp_stats.probe_total++;
+	 if (s->mtp_draft_token == token) s->mtp_stats.probe_hit++;
+	 fprintf(stderr,
+	 "ds4: mtp probe token=%d draft=%d hit=%llu/%llu\n",
+	 token,
+	 s->mtp_draft_token,
+	 (unsigned long long)s->mtp_stats.probe_hit,
+	 (unsigned long long)s->mtp_stats.probe_total);
+	 }
  s->mtp_draft_valid = false;
  }
  if (ds4_skip_confidence_gate_enabled()) {
@@ -25424,8 +25594,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  snprintf(err, errlen, "GPU support is not compiled in");
  return -1;
 #else
- if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
- ds4_engine *e = s->engine;
+	 if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+	 ds4_engine *e = s->engine;
+	 s->mtp_stats.spec_calls++;
 
  /*
  * MTP in DeepSeek V4 is a speculative drafter, not a replacement sampler.
@@ -25440,7 +25611,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  accepted[n_accept++] = first_token;
  if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
 
- if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
+	 if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) {
+	 s->mtp_stats.spec_no_draft++;
+	 return n_accept;
+	 }
+	 s->mtp_stats.spec_ready++;
 
  int draft_cap = e->mtp_draft_tokens;
  if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
@@ -25491,13 +25666,16 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  * this point there is no suffix to verify, so the exact behavior is to emit
  * only first_token and skip all speculative work.
  */
- const int target_first = ds4_session_argmax(s);
- if (target_first != drafts[0]) {
- if (getenv("DS4_MTP_SPEC_LOG")) {
- fprintf(stderr, "ds4: mtp spec miss first draft=%d\n", drafts[0]);
- }
- return n_accept;
- }
+	 const int target_first = ds4_session_argmax(s);
+	 if (target_first != drafts[0]) {
+	 s->mtp_stats.spec_first_miss++;
+	 ds4_session_mtp_note_commit(s, draft_n, 0);
+	 if (getenv("DS4_MTP_SPEC_LOG")) {
+	 fprintf(stderr, "ds4: mtp spec miss first draft=%d\n", drafts[0]);
+	 }
+	 return n_accept;
+	 }
+	 s->mtp_stats.spec_first_hit++;
  if (drafts[0] == eos_token) draft_cap = 1;
  const uint32_t mtp_base_raw = s->graph.mtp_n_raw;
  /*
@@ -25516,7 +25694,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  ds4_gpu_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
  ds4_gpu_tensor *out_hc = (draft_n & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
  int mtp_top = -1;
- if (!metal_graph_eval_mtp_draft_from_hc(&s->graph,
+	 if (!metal_graph_eval_mtp_draft_from_hc(&s->graph,
  &e->model,
  &e->weights,
  &e->mtp_model,
@@ -25526,10 +25704,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  drafts[draft_n - 1],
  (uint32_t)(s->checkpoint.len + draft_n - 1),
  mtp_need_logits ? s->mtp_logits : NULL,
- &mtp_top))
- {
- return n_accept;
- }
+	 &mtp_top))
+	 {
+	 s->mtp_stats.spec_fail++;
+	 ds4_session_mtp_note_commit(s, draft_n, 0);
+	 return n_accept;
+	 }
  drafts[draft_n] = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
  /* silv 2026-05-27 Spec-tree Turn 3: capture top-K alternatives for
   * post-verify diagnostic. Uses logits_top_k from this file (defined
@@ -25556,7 +25736,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  logits_top2(s->mtp_logits, DS4_N_VOCAB, &mtp_last_top0, &v0, &mtp_last_top1, &v1);
  mtp_last_margin = v0 - v1;
  }
- if (mtp_last_margin < mtp_margin_threshold) {
+	 if (mtp_last_margin < mtp_margin_threshold) {
  float *row_logits = s->mtp_verify_logits;
  const int start = s->checkpoint.len;
  const double verify_t0 = mtp_timing ? now_sec() : 0.0;
@@ -25575,9 +25755,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  ds4_session_note_host_logits(s);
  token_vec_push(&s->checkpoint, drafts[0]);
  accepted[n_accept++] = drafts[0];
- s->checkpoint_valid = true;
- s->mtp_draft_valid = false;
- DS4_MTP_KEEP_ACCEPTED(1);
+	 s->checkpoint_valid = true;
+	 s->mtp_draft_valid = false;
+	 DS4_MTP_KEEP_ACCEPTED(1);
+	 s->mtp_stats.spec_margin_skip++;
+	 ds4_session_mtp_note_commit(s, draft_n, 1);
  if (mtp_timing) {
  const double done = now_sec();
  fprintf(stderr,
@@ -25617,13 +25799,16 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  int row1_top = -1;
  const double snapshot_t0 = mtp_timing ? now_sec() : 0.0;
  bool have_frontier = false;
- bool ok = true;
- if (decode2_snapshot) {
+	 bool ok = true;
+	 if (decode2_snapshot) {
  have_frontier = spec_frontier_snapshot(&frontier, s);
  ok = have_frontier;
  }
- const double snapshot_done = mtp_timing ? now_sec() : 0.0;
- if (ok) {
+	 const double snapshot_done = mtp_timing ? now_sec() : 0.0;
+	 s->mtp_stats.spec_decode2_exact++;
+	 if (getenv("DS4_MTP_DECODE2_BATCH_OUTPUT")) s->mtp_stats.spec_decode2_batch_output++;
+	 if (getenv("DS4_MTP_DECODE2_FUSED_OUTPUT")) s->mtp_stats.spec_decode2_fused_output++;
+	 if (ok) {
  ok = metal_graph_verify_decode2_exact(&s->graph,
  &e->model,
  &e->weights,
@@ -25647,9 +25832,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  token_vec_push(&s->checkpoint, drafts[1]);
  accepted[n_accept++] = drafts[0];
  if (n_accept < accepted_cap) accepted[n_accept++] = drafts[1];
- s->checkpoint_valid = true;
- s->mtp_draft_valid = false;
- DS4_MTP_KEEP_ACCEPTED(2);
+	 s->checkpoint_valid = true;
+	 s->mtp_draft_valid = false;
+	 DS4_MTP_KEEP_ACCEPTED(2);
+	 ds4_session_mtp_note_commit(s, draft_n, 2);
  if (mtp_timing) {
  fprintf(stderr,
  "ds4: mtp timing decode2 drafted=2 committed=2 draft=%.3f ms snapshot=%.3f ms verify=%.3f ms total=%.3f ms\n",
@@ -25676,9 +25862,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  if (ok) {
  token_vec_push(&s->checkpoint, drafts[0]);
  accepted[n_accept++] = drafts[0];
- s->checkpoint_valid = true;
- s->mtp_draft_valid = false;
- DS4_MTP_KEEP_ACCEPTED(1);
+	 s->checkpoint_valid = true;
+	 s->mtp_draft_valid = false;
+	 DS4_MTP_KEEP_ACCEPTED(1);
+	 ds4_session_mtp_note_commit(s, draft_n, 1);
  if (mtp_timing) {
  const double replay_done = now_sec();
  fprintf(stderr,
@@ -25698,8 +25885,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  } else {
  snprintf(err, errlen, "MTP decode2 verifier failed without snapshot");
  s->checkpoint_valid = false;
- DS4_MTP_KEEP_ACCEPTED(0);
- spec_frontier_free(&frontier);
+	 DS4_MTP_KEEP_ACCEPTED(0);
+	 s->mtp_stats.spec_fail++;
+	 ds4_session_mtp_note_commit(s, draft_n, 0);
+	 spec_frontier_free(&frontier);
  return -1;
  }
  spec_frontier_free(&frontier);
@@ -25739,10 +25928,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  ok = have_frontier;
  }
  const double snapshot_done = mtp_timing ? now_sec() : 0.0;
- if (ok) {
- for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
- verifier_may_have_mutated = true;
- ok = metal_graph_verify_suffix_tops(&s->graph,
+	 if (ok) {
+	 for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
+	 verifier_may_have_mutated = true;
+	 s->mtp_stats.spec_micro_verify++;
+	 ok = metal_graph_verify_suffix_tops(&s->graph,
  &e->model,
  &e->weights,
  &s->checkpoint,
@@ -25816,10 +26006,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  accepted[n_accept++] = drafts[i];
  if (drafts[i] == eos_token) break;
  }
- s->checkpoint_valid = true;
- s->mtp_draft_valid = false;
- DS4_MTP_KEEP_ACCEPTED(replayed);
- spec_frontier_free(&frontier);
+	 s->checkpoint_valid = true;
+	 s->mtp_draft_valid = false;
+	 DS4_MTP_KEEP_ACCEPTED(replayed);
+	 ds4_session_mtp_note_commit(s, draft_n, replayed);
+	 spec_frontier_free(&frontier);
  return n_accept;
  }
  }
@@ -25836,9 +26027,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  accepted[n_accept++] = drafts[i];
  if (drafts[i] == eos_token) break;
  }
- s->checkpoint_valid = true;
- s->mtp_draft_valid = false;
- DS4_MTP_KEEP_ACCEPTED(draft_n);
+	 s->checkpoint_valid = true;
+	 s->mtp_draft_valid = false;
+	 DS4_MTP_KEEP_ACCEPTED(draft_n);
+	 ds4_session_mtp_note_commit(s, draft_n, draft_n);
  if (mtp_timing) {
  fprintf(stderr,
  "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms total=%.3f ms\n",
@@ -25864,10 +26056,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
  ds4_session_note_host_logits(s);
  accepted[n_accept++] = drafts[0];
- s->checkpoint_valid = true;
- s->mtp_draft_valid = false;
- DS4_MTP_KEEP_ACCEPTED(1);
- token_vec_push(&s->checkpoint, drafts[0]);
+	 s->checkpoint_valid = true;
+	 s->mtp_draft_valid = false;
+	 DS4_MTP_KEEP_ACCEPTED(1);
+	 token_vec_push(&s->checkpoint, drafts[0]);
+	 ds4_session_mtp_note_commit(s, draft_n, 1);
  if (mtp_timing) {
  fprintf(stderr,
  "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms total=%.3f ms noreplay=1\n",
@@ -25897,10 +26090,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
  ds4_session_note_host_logits(s);
  accepted[n_accept++] = drafts[0];
- s->checkpoint_valid = true;
- s->mtp_draft_valid = false;
- DS4_MTP_KEEP_ACCEPTED(1);
- token_vec_push(&s->checkpoint, drafts[0]);
+	 s->checkpoint_valid = true;
+	 s->mtp_draft_valid = false;
+	 DS4_MTP_KEEP_ACCEPTED(1);
+	 token_vec_push(&s->checkpoint, drafts[0]);
+	 ds4_session_mtp_note_commit(s, draft_n, 1);
  if (mtp_timing) {
  const double replay_done = now_sec();
  fprintf(stderr,
@@ -25938,9 +26132,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  accepted[n_accept++] = drafts[i];
  if (drafts[i] == eos_token) break;
  }
- s->checkpoint_valid = true;
- s->mtp_draft_valid = false;
- DS4_MTP_KEEP_ACCEPTED(commit_drafts);
+	 s->checkpoint_valid = true;
+	 s->mtp_draft_valid = false;
+	 DS4_MTP_KEEP_ACCEPTED(commit_drafts);
+	 ds4_session_mtp_note_commit(s, draft_n, commit_drafts);
  if (mtp_timing) {
  const double replay_done = now_sec();
  fprintf(stderr,
@@ -25964,11 +26159,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  } else if (!verifier_may_have_mutated) {
  /* Snapshot setup failed before the verifier touched Metal state.
  * Fall through to the exact sequential verifier below. */
- } else {
- snprintf(err, errlen, "MTP verifier failed");
- s->checkpoint_valid = false;
- DS4_MTP_KEEP_ACCEPTED(0);
- spec_frontier_free(&frontier);
+	 } else {
+	 snprintf(err, errlen, "MTP verifier failed");
+	 s->checkpoint_valid = false;
+	 DS4_MTP_KEEP_ACCEPTED(0);
+	 s->mtp_stats.spec_fail++;
+	 ds4_session_mtp_note_commit(s, draft_n, 0);
+	 spec_frontier_free(&frontier);
  return -1;
  }
  spec_frontier_free(&frontier);
@@ -25983,10 +26180,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  * wrong state. This path is deliberately slow and should not be selected
  * during normal --mtp operation.
  */
- int verified = 0;
- int target_top = ds4_session_argmax(s);
- bool logits_on_host = true;
- const double seq_t0 = mtp_timing ? now_sec() : 0.0;
+	 int verified = 0;
+	 int target_top = ds4_session_argmax(s);
+	 bool logits_on_host = true;
+	 const double seq_t0 = mtp_timing ? now_sec() : 0.0;
+	 s->mtp_stats.spec_seq_fallback++;
  for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
  if (target_top != drafts[i]) {
  if (getenv("DS4_MTP_SPEC_LOG")) {
@@ -26030,9 +26228,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  }
  logits_on_host = true;
  ds4_session_note_host_logits(s);
- }
- (void)logits_on_host;
- DS4_MTP_KEEP_ACCEPTED(verified);
+	 }
+	 (void)logits_on_host;
+	 DS4_MTP_KEEP_ACCEPTED(verified);
+	 ds4_session_mtp_note_commit(s, draft_n, verified);
 #undef DS4_MTP_KEEP_ACCEPTED
  if (mtp_timing) {
  fprintf(stderr,

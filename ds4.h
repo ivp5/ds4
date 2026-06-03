@@ -74,6 +74,27 @@ typedef struct ds4_session ds4_session;
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 
 typedef struct {
+    uint64_t probe_total;
+    uint64_t probe_hit;
+    uint64_t spec_calls;
+    uint64_t spec_no_draft;
+    uint64_t spec_ready;
+    uint64_t spec_first_hit;
+    uint64_t spec_first_miss;
+    uint64_t spec_drafted;
+    uint64_t spec_committed;
+    uint64_t spec_full_accept;
+    uint64_t spec_partial_accept;
+    uint64_t spec_margin_skip;
+    uint64_t spec_decode2_exact;
+    uint64_t spec_decode2_batch_output;
+    uint64_t spec_decode2_fused_output;
+    uint64_t spec_micro_verify;
+    uint64_t spec_seq_fallback;
+    uint64_t spec_fail;
+} ds4_mtp_stats;
+
+typedef struct {
     const char *model_path;
     const char *mtp_path;
     ds4_backend backend;
@@ -287,6 +308,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+void ds4_session_mtp_stats(ds4_session *s, ds4_mtp_stats *out);
+void ds4_session_mtp_stats_reset(ds4_session *s);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

@@ -755,6 +755,28 @@ int ds4_gpu_attention_output_low_fp8_e4m3_e8m0_storage(
  const ds4_gpu_tensor *heads,
  uint32_t n_tokens);
 
+int ds4_gpu_attention_output_fp8_e4m3_e8m0_hc_onecb_tensor(
+ ds4_gpu_tensor *out_hc,
+ ds4_gpu_tensor *low,
+ ds4_gpu_tensor *block_out,
+ void *a_weight_buf,
+ void *a_scale_buf,
+ uint64_t a_scale_bytes,
+ void *b_weight_buf,
+ void *b_scale_buf,
+ uint64_t b_scale_bytes,
+ uint64_t group_dim,
+ uint64_t rank,
+ uint32_t n_groups,
+ const ds4_gpu_tensor *heads,
+ const ds4_gpu_tensor *residual_hc,
+ const ds4_gpu_tensor *post,
+ const ds4_gpu_tensor *comb,
+ uint32_t n_embd,
+ uint32_t n_hc,
+ uint32_t n_tokens,
+ int store_block_out);
+
 /* =========================================================================
  * Router, Shared Expert, and Routed MoE.
  * =========================================================================
@@ -1970,6 +1992,19 @@ int ds4_gpu_d8f_prefix_graph_canary(const char *d8f_dir,
                                     uint32_t n_tokens,
                                     uint32_t rounds,
                                     float swiglu_limit);
+#if defined(__APPLE__)
+int ds4_gpu_mpsgraph_d8f_down_lut_canary(const char *d8f_path,
+                                         uint32_t expert,
+                                         uint32_t rows,
+                                         uint32_t rounds,
+                                         uint32_t mode);
+int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
+                                                  const uint32_t *experts,
+                                                  uint32_t n_experts,
+                                                  uint32_t rows,
+                                                  uint32_t rounds,
+                                                  uint32_t mode);
+#endif
 int ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor(const char *d8f_path,
                                                   uint32_t layer,
                                                   ds4_gpu_tensor *selected_experts,

@@ -682,6 +682,52 @@ static bool cli_mtp_spec_allowed(ds4_engine *engine, const cli_generation_option
     return true;
 }
 
+static void cli_print_mtp_stats(ds4_session *session) {
+    ds4_mtp_stats st;
+    ds4_session_mtp_stats(session, &st);
+    if (!cli_env_enabled("DS4_MTP_STATS") &&
+        st.probe_total == 0 && st.spec_calls == 0) {
+        return;
+    }
+    if (st.probe_total > 0) {
+        double hit_rate = (double)st.probe_hit / (double)st.probe_total;
+        fprintf(stderr,
+                "ds4: mtp probe summary hits=%llu/%llu hit_rate=%.3f\n",
+                (unsigned long long)st.probe_hit,
+                (unsigned long long)st.probe_total,
+                hit_rate);
+    }
+    if (st.spec_calls > 0) {
+        double first_rate = st.spec_ready ? (double)st.spec_first_hit / (double)st.spec_ready : 0.0;
+        double commit_rate = st.spec_drafted ? (double)st.spec_committed / (double)st.spec_drafted : 0.0;
+        double avg_extra = st.spec_ready ? (double)st.spec_committed / (double)st.spec_ready : 0.0;
+        fprintf(stderr,
+                "ds4: mtp spec summary calls=%llu ready=%llu no_draft=%llu "
+                "first_hit=%llu first_miss=%llu first_hit_rate=%.3f "
+                "drafted=%llu committed=%llu commit_rate=%.3f avg_extra=%.3f "
+                "full=%llu partial=%llu margin_skip=%llu decode2=%llu decode2_batch_out=%llu decode2_fused_out=%llu micro=%llu seq=%llu fail=%llu\n",
+                (unsigned long long)st.spec_calls,
+                (unsigned long long)st.spec_ready,
+                (unsigned long long)st.spec_no_draft,
+                (unsigned long long)st.spec_first_hit,
+                (unsigned long long)st.spec_first_miss,
+                first_rate,
+                (unsigned long long)st.spec_drafted,
+                (unsigned long long)st.spec_committed,
+                commit_rate,
+                avg_extra,
+                (unsigned long long)st.spec_full_accept,
+                (unsigned long long)st.spec_partial_accept,
+                (unsigned long long)st.spec_margin_skip,
+                (unsigned long long)st.spec_decode2_exact,
+                (unsigned long long)st.spec_decode2_batch_output,
+                (unsigned long long)st.spec_decode2_fused_output,
+                (unsigned long long)st.spec_micro_verify,
+                (unsigned long long)st.spec_seq_fallback,
+                (unsigned long long)st.spec_fail);
+    }
+}
+
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
@@ -732,6 +778,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
+    ds4_session_mtp_stats_reset(session);
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample_with_presence_penalty(session,
@@ -813,6 +860,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    cli_print_mtp_stats(session);
 
     ds4_session_free(session);
     return 0;
@@ -1399,6 +1447,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
+    ds4_session_mtp_stats_reset(chat->session);
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample_with_presence_penalty(chat->session,
@@ -1470,6 +1519,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    cli_print_mtp_stats(chat->session);
     return 0;
 }
 
@@ -2664,6 +2714,40 @@ int main(int argc, char **argv) {
         const uint32_t nc = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
         const uint32_t nh = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 1;
         return ds4_gpu_mtl4_indexer_scores_tiled_canary(nt, nc, nh) ? 0 : 1;
+    }
+    /* --d8f-mpsgraph-lut-down-canary <d8f> [EXPERTS_CSV [rows [rounds [mode]]]]
+     * Real D8F VQ-GEMV loophole canary: table=x[groups,8]@codebook[8,k],
+     * gather(table, idx), reduce groups. mode=0 fp16 throughput path, mode=1 fp32 fidelity path. */
+    if (argc >= 3 && !strcmp(argv[1], "--d8f-mpsgraph-lut-down-canary")) {
+#if defined(__APPLE__)
+        const char *path = argv[2];
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        uint32_t experts[ds4_cli_selected_expert_cap] = {165u, 0u, 1u, 2u, 3u, 4u};
+        uint32_t n_experts = 1u;
+        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
+            n_experts = 0u;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0u) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-mpsgraph-lut-down-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
+        const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
+        const uint32_t mode = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 0u;
+        return ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(path, experts, n_experts, rows, rounds, mode) ? 0 : 1;
+#else
+        fprintf(stderr, "ds4: --d8f-mpsgraph-lut-down-canary requires Apple MPSGraph\n");
+        return 1;
+#endif
     }
     /* --mul-mm-f16-canary [M [N [K]]] : #732 dense FP16 matmul */
     if (argc >= 2 && !strcmp(argv[1], "--mul-mm-f16-canary")) {
