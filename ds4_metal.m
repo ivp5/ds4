@@ -51841,15 +51841,44 @@ static id<MTLTexture> ds4_d8f_runtime_new_compact_down_codebook_texture(ds4_d8f_
                                                           height:ds4_compact_down_codebook_height
                                                        mipmapped:NO];
     desc.usage = MTLTextureUsageShaderRead;
-    id<MTLTexture> tex = [atlas_buf newTextureWithDescriptor:desc
-                                                      offset:0
-                                                 bytesPerRow:bytes_per_row];
+    id<MTLBuffer> texture_buf = atlas_buf;
+    const char *private_env = getenv("DS4_D8F_RUNTIME_NATIVE_DOWN_COMPACT_TEX_PRIVATE");
+    if (private_env && private_env[0] == '1' && g_queue) {
+        id<MTLBuffer> private_buf = [g_device newBufferWithLength:atlas_bytes
+                                                          options:MTLResourceStorageModePrivate];
+        id<MTLCommandBuffer> command_buf = private_buf ? [g_queue commandBuffer] : nil;
+        id<MTLBlitCommandEncoder> blit = command_buf ? [command_buf blitCommandEncoder] : nil;
+        if (blit) {
+            [blit copyFromBuffer:atlas_buf
+                    sourceOffset:0
+                        toBuffer:private_buf
+               destinationOffset:0
+                            size:atlas_bytes];
+            [blit endEncoding];
+            [command_buf commit];
+            [command_buf waitUntilCompleted];
+            if (command_buf.status == MTLCommandBufferStatusCompleted) {
+                texture_buf = private_buf;
+            } else {
+                fprintf(stderr,
+                        "ds4_d8f: compact down codebook private atlas copy failed L%u status=%lu; using shared atlas\n",
+                        layer, (unsigned long)command_buf.status);
+            }
+        } else if (private_env && private_env[0] == '1') {
+            fprintf(stderr,
+                    "ds4_d8f: compact down codebook private atlas unavailable L%u; using shared atlas\n",
+                    layer);
+        }
+    }
+    id<MTLTexture> tex = [texture_buf newTextureWithDescriptor:desc
+                                                       offset:0
+                                                  bytesPerRow:bytes_per_row];
     if (!tex) {
         fprintf(stderr, "ds4_d8f: compact down codebook atlas texture failed L%u bytes=%.3f MiB\n",
                 layer, (double)atlas_bytes / 1048576.0);
         return nil;
     }
-    if (out_buf) *out_buf = atlas_buf;
+    if (out_buf) *out_buf = texture_buf;
     return tex;
 }
 
