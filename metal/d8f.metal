@@ -334,6 +334,11 @@ static float d8f_mid_value(device const uchar *pack, ulong scale_off, device con
   const device half *inv_scale = (const device half *)(pack + scale_off);
   return slot_mid[idx] * float(inv_scale[idx]);
 }
+static float d8f_mid_value_range(device const uchar *pack, ulong scale_off, device const float *slot_mid, uint local_idx, uint global_idx) {
+  if (scale_off == 0ul) return slot_mid[local_idx];
+  const device half *inv_scale = (const device half *)(pack + scale_off);
+  return slot_mid[local_idx] * float(inv_scale[global_idx]);
+}
 static float d8f_mid_value_h(device const uchar *pack, ulong scale_off, device const half *slot_mid, uint idx) {
   const float v = float(slot_mid[idx]);
   if (scale_off == 0ul) return v;
@@ -837,6 +842,13 @@ struct D8FRecordLite {
   uint row_base;
 };
 
+struct D8FRowBlockRangeArgs {
+  uint row_offset;
+  uint row_count;
+  uint reserved0;
+  uint reserved1;
+};
+
 kernel void d8f_gateup_swiglu_selected_batch_recbuf(
   device const uchar *pack          [[buffer(0)]],
   device const float *x_base_all    [[buffer(1)]],
@@ -903,6 +915,79 @@ kernel void d8f_gateup_swiglu_selected_batch_recbuf(
     gate_total = min(gate_total, args.clamp);
     up_total = clamp(up_total, -args.clamp, args.clamp);
     mid[ulong(token) * ulong(args.mid_token_stride) + ulong(slot) * ulong(args.mid_slot_stride) + ulong(row)] = (gate_total / (1.0f + exp(-gate_total))) * up_total;
+  }
+}
+
+kernel void d8f_gateup_swiglu_selected_batch_recbuf_range(
+  device const uchar *pack          [[buffer(0)]],
+  device const float *x_base_all    [[buffer(1)]],
+  device const uint  *selected      [[buffer(2)]],
+  device float       *mid           [[buffer(3)]],
+  constant D8FGateUpBatchArgs &args [[buffer(4)]],
+  device const D8FRecordLite *recs  [[buffer(5)]],
+  constant D8FRowBlockRangeArgs &range [[buffer(6)]],
+  threadgroup float *partial        [[threadgroup(0)]],
+  uint tid [[thread_index_in_threadgroup]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]],
+  uint3 pos [[threadgroup_position_in_grid]]) {
+  const uint local_row = pos.x;
+  const uint slot = pos.y;
+  const uint token = pos.z;
+  if (local_row >= range.row_count || slot >= args.n_selected || token >= args.n_tokens) return;
+  const uint row = range.row_offset + local_row;
+  if (row >= args.rows) return;
+  device const float *x = x_base_all + ulong(token) * ulong(args.x_token_stride);
+  const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];
+  const uint row_block = row >> 7;
+  const D8FRecordLite gate_rec = recs[expert * 16u + row_block];
+  const D8FRecordLite up_rec = recs[4096u + expert * 16u + row_block];
+  const uint blocks_per_row = args.in_dim >> 3;
+  float gate_acc = 0.0f;
+  float up_acc = 0.0f;
+  for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {
+    const ulong gate_block_index = ulong(row - gate_rec.row_base) * ulong(blocks_per_row) + ulong(block_col);
+    const ulong up_block_index = ulong(row - up_rec.row_base) * ulong(blocks_per_row) + ulong(block_col);
+    const uint x_base = block_col << 3;
+    const float x0 = x[x_base + 0u];
+    const float x1 = x[x_base + 1u];
+    const float x2 = x[x_base + 2u];
+    const float x3 = x[x_base + 3u];
+    const float x4 = x[x_base + 4u];
+    const float x5 = x[x_base + 5u];
+    const float x6 = x[x_base + 6u];
+    const float x7 = x[x_base + 7u];
+    const ulong gate_bit_off = gate_block_index * ulong(gate_rec.bits);
+    const ulong gate_byte_off = gate_bit_off >> 3;
+    const uint gate_shift = uint(gate_bit_off & 7ul);
+    device const uchar *gate_ix = pack + gate_rec.index_offset + gate_byte_off;
+    const uint gate_w = uint(gate_ix[0]) | (uint(gate_ix[1]) << 8u) | (uint(gate_ix[2]) << 16u) | (uint(gate_ix[3]) << 24u);
+    const uint gate_code = (gate_w >> gate_shift) & gate_rec.mask;
+    const device half *gate_cb = (const device half *)(pack + gate_rec.codebook_offset + ulong(gate_code) * 16ul);
+    gate_acc += float(gate_cb[0]) * x0 + float(gate_cb[1]) * x1 + float(gate_cb[2]) * x2 + float(gate_cb[3]) * x3 +
+                float(gate_cb[4]) * x4 + float(gate_cb[5]) * x5 + float(gate_cb[6]) * x6 + float(gate_cb[7]) * x7;
+    const ulong up_bit_off = up_block_index * ulong(up_rec.bits);
+    const ulong up_byte_off = up_bit_off >> 3;
+    const uint up_shift = uint(up_bit_off & 7ul);
+    device const uchar *up_ix = pack + up_rec.index_offset + up_byte_off;
+    const uint up_w = uint(up_ix[0]) | (uint(up_ix[1]) << 8u) | (uint(up_ix[2]) << 16u) | (uint(up_ix[3]) << 24u);
+    const uint up_code = (up_w >> up_shift) & up_rec.mask;
+    const device half *up_cb = (const device half *)(pack + up_rec.codebook_offset + ulong(up_code) * 16ul);
+    up_acc += float(up_cb[0]) * x0 + float(up_cb[1]) * x1 + float(up_cb[2]) * x2 + float(up_cb[3]) * x3 +
+              float(up_cb[4]) * x4 + float(up_cb[5]) * x5 + float(up_cb[6]) * x6 + float(up_cb[7]) * x7;
+  }
+  gate_acc = simd_sum(gate_acc);
+  up_acc = simd_sum(up_acc);
+  if (tiisg == 0u) { partial[sgitg] = gate_acc; partial[8u + sgitg] = up_acc; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float gate_total = 0.0f;
+    float up_total = 0.0f;
+    for (uint sg = 0u; sg < 8u; sg++) { gate_total += partial[sg]; up_total += partial[8u + sg]; }
+    gate_total = min(gate_total, args.clamp);
+    up_total = clamp(up_total, -args.clamp, args.clamp);
+    mid[ulong(token) * ulong(args.mid_token_stride) + ulong(slot) * ulong(args.mid_slot_stride) + ulong(local_row)] =
+      (gate_total / (1.0f + exp(-gate_total))) * up_total;
   }
 }
 
@@ -1114,6 +1199,82 @@ kernel void d8f_down_sum_selected_weighted_batch_tile16_recbuf(
         float total = 0.0f;
         for (uint sg = 0u; sg < 8u; sg++) total += partial[rr * 8u + sg];
         out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] = total;
+      }
+    }
+  }
+}
+
+kernel void d8f_down_sum_selected_weighted_batch_tile16_recbuf_range_accum(
+  device const uchar *pack               [[buffer(0)]],
+  device const float *mid                [[buffer(1)]],
+  device const uint  *selected           [[buffer(2)]],
+  device float       *out                [[buffer(3)]],
+  constant D8FDownBatchArgs &args        [[buffer(4)]],
+  device const float *route_weights      [[buffer(5)]],
+  device const D8FRecordLite *recs       [[buffer(6)]],
+  constant D8FRowBlockRangeArgs &range   [[buffer(7)]],
+  threadgroup float *partial             [[threadgroup(0)]],
+  uint tid [[thread_index_in_threadgroup]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]],
+  uint2 pos [[threadgroup_position_in_grid]]) {
+  const uint row_base = pos.x << 4;
+  const uint token = pos.y;
+  if (token >= args.n_tokens || range.row_count == 0u) return;
+  const uint blocks_per_row = args.in_dim >> 3;
+  const uint block_begin = range.row_offset >> 3;
+  const uint block_end = (range.row_offset + range.row_count) >> 3;
+  device const float *token_mid = mid + ulong(token) * ulong(args.mid_token_stride);
+  device const float *token_weights = route_weights + ulong(token) * ulong(args.route_token_stride);
+  float acc[16];
+  for (uint rr = 0u; rr < 16u; rr++) acc[rr] = 0.0f;
+  for (uint slot = 0u; slot < args.n_selected; slot++) {
+    const float rw = token_weights[slot];
+    if (rw == 0.0f) continue;
+    const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];
+    const D8FRecordLite rec = recs[8192u + expert];
+    const device float *slot_mid = token_mid + ulong(slot) * ulong(args.mid_slot_stride);
+    for (uint block_col = block_begin + tid; block_col < block_end && block_col < blocks_per_row; block_col += 256u) {
+      const uint global_x_base = block_col << 3;
+      const uint local_x_base = global_x_base - range.row_offset;
+      const float m0 = d8f_mid_value_range(pack, rec.scale_offset, slot_mid, local_x_base + 0u, global_x_base + 0u);
+      const float m1 = d8f_mid_value_range(pack, rec.scale_offset, slot_mid, local_x_base + 1u, global_x_base + 1u);
+      const float m2 = d8f_mid_value_range(pack, rec.scale_offset, slot_mid, local_x_base + 2u, global_x_base + 2u);
+      const float m3 = d8f_mid_value_range(pack, rec.scale_offset, slot_mid, local_x_base + 3u, global_x_base + 3u);
+      const float m4 = d8f_mid_value_range(pack, rec.scale_offset, slot_mid, local_x_base + 4u, global_x_base + 4u);
+      const float m5 = d8f_mid_value_range(pack, rec.scale_offset, slot_mid, local_x_base + 5u, global_x_base + 5u);
+      const float m6 = d8f_mid_value_range(pack, rec.scale_offset, slot_mid, local_x_base + 6u, global_x_base + 6u);
+      const float m7 = d8f_mid_value_range(pack, rec.scale_offset, slot_mid, local_x_base + 7u, global_x_base + 7u);
+      for (uint rr = 0u; rr < 16u; rr++) {
+        const uint row = row_base + rr;
+        if (row >= args.rows) continue;
+        const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);
+        const ulong bit_off = block_index * ulong(rec.bits);
+        const ulong byte_off = bit_off >> 3;
+        const uint shift = uint(bit_off & 7ul);
+        device const uchar *ix = pack + rec.index_offset + byte_off;
+        const uint w = uint(ix[0]) | (uint(ix[1]) << 8u) | (uint(ix[2]) << 16u) | (uint(ix[3]) << 24u);
+        const uint code = (w >> shift) & rec.mask;
+        const device half *cb = (const device half *)(pack + rec.codebook_offset + ulong(code) * 16ul);
+        acc[rr] += rw * (float(cb[0]) * m0 + float(cb[1]) * m1 +
+                         float(cb[2]) * m2 + float(cb[3]) * m3 +
+                         float(cb[4]) * m4 + float(cb[5]) * m5 +
+                         float(cb[6]) * m6 + float(cb[7]) * m7);
+      }
+    }
+  }
+  for (uint rr = 0u; rr < 16u; rr++) {
+    acc[rr] = simd_sum(acc[rr]);
+    if (tiisg == 0u) partial[rr * 8u + sgitg] = acc[rr];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    for (uint rr = 0u; rr < 16u; rr++) {
+      const uint row = row_base + rr;
+      if (row < args.rows) {
+        float total = 0.0f;
+        for (uint sg = 0u; sg < 8u; sg++) total += partial[rr * 8u + sg];
+        out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] += total;
       }
     }
   }

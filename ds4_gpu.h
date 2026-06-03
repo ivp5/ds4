@@ -1984,6 +1984,13 @@ int ds4_gpu_mtl4_d8f_organ_selected_batch_canary(const char *d8f_path,
                                                  uint32_t n_tokens,
                                                  uint32_t rounds,
                                                  float swiglu_limit);
+int ds4_gpu_mtl4_d8f_rowblock_interleave_canary(const char *d8f_path,
+                                                const uint32_t *experts,
+                                                uint32_t n_experts,
+                                                uint32_t rows,
+                                                uint32_t n_tokens,
+                                                uint32_t rounds,
+                                                float swiglu_limit);
 int ds4_gpu_d8f_prefix_graph_canary(const char *d8f_dir,
                                     const uint32_t *experts,
                                     uint32_t n_experts,

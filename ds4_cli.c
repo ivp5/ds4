@@ -3229,6 +3229,34 @@ int main(int argc, char **argv) {
         return ds4_gpu_mtl4_d8f_organ_selected_batch_canary(
             d8f_path, experts, n_experts, rows, tokens, rounds, clamp) ? 0 : 1;
     }
+    if (argc >= 3 && !strcmp(argv[1], "--d8f-rowblock-interleave-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *d8f_path = argv[2];
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t n_experts = 3;
+        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-rowblock-interleave-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
+        const uint32_t tokens = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 1u;
+        const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1u;
+        const float clamp = (argc >= 8) ? strtof(argv[7], NULL) : 10.0f;
+        return ds4_gpu_mtl4_d8f_rowblock_interleave_canary(
+            d8f_path, experts, n_experts, rows, tokens, rounds, clamp) ? 0 : 1;
+    }
     if (argc >= 3 && !strcmp(argv[1], "--d8f-prefix-graph-canary")) {
         enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *d8f_dir = argv[2];

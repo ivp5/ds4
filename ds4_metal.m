@@ -49872,6 +49872,7 @@ static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_mtl4_pipel
 static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_tile4_mtl4_pipeline;
 static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_weighted_mtl4_pipeline;
 static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_recbuf_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_recbuf_range_mtl4_pipeline;
 static int g_d8f_gateup_swiglu_selected_mtl4_init_attempted;
 static int g_d8f_gateup_swiglu_selected_mtl4_init_ok;
 
@@ -49907,6 +49908,11 @@ static int ds4_d8f_gateup_swiglu_selected_mtl4_pipeline_init(void) {
             d8f_embedded,
             @"ds4_d8f_gateup_swiglu_selected_batch_recbuf_mtl4",
             @"d8f_gateup_swiglu_selected_batch_recbuf",
+            256, NULL, 0);
+        g_d8f_gateup_swiglu_selected_batch_recbuf_range_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+            d8f_embedded,
+            @"ds4_d8f_gateup_swiglu_selected_batch_recbuf_range_mtl4",
+            @"d8f_gateup_swiglu_selected_batch_recbuf_range",
             256, NULL, 0);
     }
     g_d8f_gateup_swiglu_selected_mtl4_init_ok =
@@ -50528,6 +50534,7 @@ static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_preweighted_batch_tile16_mtl4_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_mtl4_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_range_accum_mtl4_pipeline;
 static int g_d8f_down_sum_selected_mtl4_init_attempted;
 static int g_d8f_down_sum_selected_mtl4_init_ok;
 
@@ -50579,6 +50586,12 @@ static int ds4_d8f_down_sum_selected_mtl4_pipeline_init(void) {
             @"ds4_d8f_down_sum_selected_weighted_batch_tile32_recbuf_mtl4",
             @"d8f_down_sum_selected_weighted_batch_tile32_recbuf",
             256, NULL, 0);
+        g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_range_accum_mtl4_pipeline =
+            ds4_mtl4_build_kernel_pipeline(
+                d8f_embedded,
+                @"ds4_d8f_down_sum_selected_weighted_batch_tile16_recbuf_range_accum_mtl4",
+                @"d8f_down_sum_selected_weighted_batch_tile16_recbuf_range_accum",
+                256, NULL, 0);
     }
     g_d8f_down_sum_selected_mtl4_init_ok =
         (g_d8f_down_sum_selected_mtl4_pipeline &&
@@ -52865,6 +52878,310 @@ static int ds4_d8f_runtime_rank1_sidecar_supported_or_fail(uint32_t layer,
             "L%u count=%u path=%s caller=%s; set DS4_D8F_IGNORE_RANK1=1 only for diagnostics\n",
             layer, sidecar_count, path ? path : "(null)", caller ? caller : "unknown");
     return 0;
+}
+
+int ds4_gpu_mtl4_d8f_rowblock_interleave_canary(const char *d8f_path,
+                                                const uint32_t *experts,
+                                                uint32_t n_experts,
+                                                uint32_t rows,
+                                                uint32_t n_tokens,
+                                                uint32_t rounds,
+                                                float swiglu_limit) {
+    enum {
+        ds4_selected_expert_cap = 6,
+        ds4_batch_token_cap = 16,
+        ds4_gateup_in_dim = 4096,
+        ds4_mid_dim = 2048,
+        ds4_mid_rowblock = 128,
+        ds4_mid_rowblocks = 16,
+        ds4_down_out_dim = 4096,
+        ds4_d8f_table_offset = 4096
+    };
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_d8f_gateup_swiglu_selected_mtl4_pipeline_init()) return 0;
+    if (!ds4_d8f_down_sum_selected_mtl4_pipeline_init()) return 0;
+    if (!g_d8f_gateup_swiglu_selected_batch_recbuf_range_mtl4_pipeline ||
+        !g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_range_accum_mtl4_pipeline) {
+        fprintf(stderr, "ds4_d8f: rowblock interleave MTL4 pipelines unavailable\n");
+        return 0;
+    }
+    if (!d8f_path || !experts || n_experts == 0 || n_experts > ds4_selected_expert_cap) return 0;
+    if (rows == 0 || rows > ds4_down_out_dim) rows = 128u;
+    if (n_tokens == 0 || n_tokens > ds4_batch_token_cap) n_tokens = 1u;
+    if (rounds == 0) rounds = 1u;
+    if (!(swiglu_limit > 0.0f)) swiglu_limit = 10.0f;
+    uint32_t tile_rows = ds4_gpu_env_u32("DS4_D8F_ROWBLOCK_TILE_ROWS", ds4_mid_rowblock);
+    if (tile_rows < ds4_mid_rowblock || tile_rows > ds4_mid_dim ||
+        (tile_rows % ds4_mid_rowblock) != 0u || (ds4_mid_dim % tile_rows) != 0u) {
+        fprintf(stderr, "ds4_d8f: invalid DS4_D8F_ROWBLOCK_TILE_ROWS=%u; require multiple of 128 up to 2048\n",
+                tile_rows);
+        return 0;
+    }
+    const uint32_t tile_count = ds4_mid_dim / tile_rows;
+    ds4_d8f_file file;
+    if (!ds4_d8f_open(d8f_path, &file)) return 0;
+    for (uint32_t slot = 0; slot < n_experts; slot++) {
+        ds4_d8f_sidecar_record sidecar;
+        if (ds4_d8f_get_down_sidecar(&file, experts[slot], &sidecar)) {
+            fprintf(stderr,
+                    "ds4_d8f: rowblock interleave canary currently rejects selected rank%u sidecar expert=%u\n",
+                    sidecar.rank, experts[slot]);
+            ds4_d8f_close(&file);
+            return 0;
+        }
+    }
+    const uint32_t gate_blocks_per_row = ds4_gateup_in_dim >> 3;
+    const uint32_t down_blocks_per_row = ds4_mid_dim >> 3;
+    for (uint32_t slot = 0; slot < n_experts; slot++) {
+        ds4_d8f_record gate, up, down;
+        if (!ds4_d8f_get_record(&file, DS4_D8F_GATE, experts[slot], &gate) ||
+            !ds4_d8f_get_record(&file, DS4_D8F_UP, experts[slot], &up) ||
+            !ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &down)) {
+            fprintf(stderr, "ds4_d8f: rowblock selected expert %u missing\n", experts[slot]);
+            ds4_d8f_close(&file);
+            return 0;
+        }
+        const uint64_t gate_blocks = ((uint64_t)gate.index_bytes * 8ull) / (uint64_t)gate.bits;
+        const uint64_t up_blocks = ((uint64_t)up.index_bytes * 8ull) / (uint64_t)up.bits;
+        const uint64_t down_blocks = ((uint64_t)down.index_bytes * 8ull) / (uint64_t)down.bits;
+        if (gate.block != 8u || up.block != 8u || down.block != 8u ||
+            gate_blocks < (uint64_t)ds4_mid_dim * gate_blocks_per_row ||
+            up_blocks < (uint64_t)ds4_mid_dim * gate_blocks_per_row ||
+            down_blocks < (uint64_t)rows * down_blocks_per_row ||
+            ((down.flags & 1u) != 0u && down.scale_bytes < ds4_mid_dim * 2u)) {
+            fprintf(stderr, "ds4_d8f: rowblock selected expert %u too short rows=%u\n", experts[slot], rows);
+            ds4_d8f_close(&file);
+            return 0;
+        }
+    }
+    float *x = (float *)malloc((size_t)n_tokens * ds4_gateup_in_dim * sizeof(float));
+    float *mid_ref = (float *)malloc((size_t)n_tokens * n_experts * ds4_mid_dim * sizeof(float));
+    float *route_weights = (float *)malloc((size_t)n_tokens * n_experts * sizeof(float));
+    uint32_t *selected_full = (uint32_t *)malloc((size_t)n_tokens * n_experts * sizeof(uint32_t));
+    float *ref = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
+    float *gpu_out = (float *)malloc((size_t)n_tokens * rows * sizeof(float));
+    if (!x || !mid_ref || !route_weights || !selected_full || !ref || !gpu_out) {
+        free(gpu_out); free(ref); free(selected_full); free(route_weights); free(mid_ref); free(x);
+        ds4_d8f_close(&file);
+        return 0;
+    }
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            selected_full[(uint64_t)token * n_experts + slot] = experts[slot];
+        }
+        float *xt = x + (uint64_t)token * ds4_gateup_in_dim;
+        for (uint32_t i = 0; i < ds4_gateup_in_dim; i++) {
+            xt[i] = 0.35f * sinf((float)(i + 17u * token) * 0.011f) +
+                    0.17f * cosf((float)(i + 31u * token) * 0.019f);
+        }
+        float route_sum = 0.0f;
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            const float v = 1.0f / (1.0f + (float)slot + 0.25f * (float)((token + slot) % 3u));
+            route_weights[(uint64_t)token * n_experts + slot] = v;
+            route_sum += v;
+        }
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            route_weights[(uint64_t)token * n_experts + slot] /= route_sum;
+        }
+    }
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        const float *xt = x + (uint64_t)token * ds4_gateup_in_dim;
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            ds4_d8f_record gate, up;
+            ds4_d8f_get_record(&file, DS4_D8F_GATE, experts[slot], &gate);
+            ds4_d8f_get_record(&file, DS4_D8F_UP, experts[slot], &up);
+            float *slot_mid = mid_ref + ((uint64_t)token * n_experts + slot) * ds4_mid_dim;
+            for (uint32_t row = 0; row < ds4_mid_dim; row++) {
+                ds4_d8f_record gate_overlay, up_overlay;
+                const uint32_t row_block = row >> 7;
+                const ds4_d8f_record *gate_ref =
+                    ds4_d8f_get_gateup_overlay_record(&file, DS4_D8F_GATE, experts[slot], row_block, &gate_overlay)
+                    ? &gate_overlay : &gate;
+                const ds4_d8f_record *up_ref =
+                    ds4_d8f_get_gateup_overlay_record(&file, DS4_D8F_UP, experts[slot], row_block, &up_overlay)
+                    ? &up_overlay : &up;
+                float gv = ds4_d8f_ref_dot(&file, gate_ref, xt, row, ds4_gateup_in_dim);
+                float uv = ds4_d8f_ref_dot(&file, up_ref, xt, row, ds4_gateup_in_dim);
+                if (gv > swiglu_limit) gv = swiglu_limit;
+                if (uv > swiglu_limit) uv = swiglu_limit;
+                if (uv < -swiglu_limit) uv = -swiglu_limit;
+                slot_mid[row] = (gv / (1.0f + expf(-gv))) * uv;
+            }
+        }
+    }
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        for (uint32_t row = 0; row < rows; row++) {
+            double sum = 0.0;
+            for (uint32_t slot = 0; slot < n_experts; slot++) {
+                ds4_d8f_record down;
+                ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &down);
+                const float *slot_mid = mid_ref + ((uint64_t)token * n_experts + slot) * ds4_mid_dim;
+                const float route_weight = route_weights[(uint64_t)token * n_experts + slot];
+                for (uint32_t block_col = 0; block_col < down_blocks_per_row; block_col++) {
+                    const uint64_t block_index = (uint64_t)row * down_blocks_per_row + block_col;
+                    const uint32_t code = ds4_d8f_code_at(&file, &down, block_index);
+                    if (code >= down.k) continue;
+                    const uint8_t *half = file.map + down.codebook_offset + (uint64_t)code * 16u;
+                    const uint32_t x_base = block_col << 3;
+                    const double block_sum =
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 0u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 0u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 2u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 1u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 4u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 2u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 6u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 3u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 8u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 4u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 10u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 5u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 6u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 7u);
+                    sum += (double)route_weight * block_sum;
+                }
+            }
+            ref[(uint64_t)token * rows + row] = (float)sum;
+        }
+    }
+    int ok = 0, mismatch = 0, gpu_zero = 0, gpu_sentinel = 0;
+    double max_abs = 0.0, max_rel = 0.0, timed_ms = 0.0;
+    float dbg_ref[4] = {0}, dbg_gpu[4] = {0};
+    struct gate_args_t { uint32_t rows, in_dim, n_selected, n_tokens, table_offset, record_bytes, mid_slot_stride, mid_token_stride, x_token_stride, selected_token_stride; float clamp; } gate_args = {
+        ds4_mid_dim, ds4_gateup_in_dim, n_experts, n_tokens, ds4_d8f_table_offset,
+        file.record_bytes, tile_rows, n_experts * tile_rows,
+        ds4_gateup_in_dim, n_experts, swiglu_limit
+    };
+    struct down_args_t {
+        uint32_t rows, in_dim, n_selected, n_tokens, table_offset, record_bytes, mid_slot_stride, mid_token_stride, out_token_stride, route_token_stride, selected_token_stride;
+        uint32_t sidecar_table_offset_lo, sidecar_table_offset_hi, sidecar_record_bytes, sidecar_rank_max, sidecar_dot_stride, cbsram_k_cap;
+    } down_args = {
+        rows, ds4_mid_dim, n_experts, n_tokens, ds4_d8f_table_offset, file.record_bytes,
+        tile_rows, n_experts * tile_rows, rows, n_experts, n_experts,
+        0u, 0u, 0u, 0u, 0u, 0u
+    };
+    struct range_args_t { uint32_t row_offset, row_count, reserved0, reserved1; } ranges[ds4_mid_rowblocks];
+    for (uint32_t rb = 0; rb < tile_count; rb++) {
+        ranges[rb] = (struct range_args_t){ rb * tile_rows, tile_rows, 0u, 0u };
+    }
+    if (!ds4_d8f_runtime_cache_prepare(file.layer, d8f_path)) {
+        fprintf(stderr, "ds4_d8f: rowblock runtime cache prepare failed L%u\n", file.layer);
+    } else {
+        @autoreleasepool {
+            id<MTLBuffer> xBuf = [g_device newBufferWithBytes:x length:(NSUInteger)n_tokens * ds4_gateup_in_dim * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> selBuf = [g_device newBufferWithBytes:selected_full length:(NSUInteger)n_tokens * n_experts * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> routeBuf = [g_device newBufferWithBytes:route_weights length:(NSUInteger)n_tokens * n_experts * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> midBuf = [g_device newBufferWithLength:(NSUInteger)n_tokens * n_experts * tile_rows * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> outBuf = [g_device newBufferWithLength:(NSUInteger)n_tokens * rows * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> gateArgsBuf = [g_device newBufferWithBytes:&gate_args length:sizeof(gate_args) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> downArgsBuf = [g_device newBufferWithBytes:&down_args length:sizeof(down_args) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> rangeArgsBuf = [g_device newBufferWithBytes:ranges length:sizeof(ranges) options:MTLResourceStorageModeShared];
+            id<MTLResidencySet> rs = nil;
+            if (xBuf && selBuf && routeBuf && midBuf && outBuf && gateArgsBuf && downArgsBuf && rangeArgsBuf) {
+                MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+                rsDesc.initialCapacity = 8;
+                NSError *err = nil;
+                rs = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+            }
+            if (rs) {
+                id<MTLAllocation> allocs[8] = { xBuf, selBuf, routeBuf, midBuf, outBuf, gateArgsBuf, downArgsBuf, rangeArgsBuf };
+                [rs addAllocations:allocs count:8];
+                [rs commit];
+                ds4_residency_request_checked(rs, __func__);
+                [g_polar_queue addResidencySet:rs];
+                void (^dispatch_once)(void) = ^{
+                    memset(outBuf.contents, 0, (size_t)n_tokens * rows * sizeof(float));
+                    id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                    [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                    [cb useResidencySet:rs];
+                    if (g_d8f_runtime_pack_rs) [cb useResidencySet:g_d8f_runtime_pack_rs];
+                    id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    const MTLSize tg = MTLSizeMake(256, 1, 1);
+                    id<MTL4ArgumentTable> gateTables[ds4_mid_rowblocks] = { nil };
+                    id<MTL4ArgumentTable> downTables[ds4_mid_rowblocks] = { nil };
+                    for (uint32_t rb = 0; rb < tile_count; rb++) {
+                        const uint64_t range_addr = rangeArgsBuf.gpuAddress + (uint64_t)rb * sizeof(struct range_args_t);
+                        id<MTL4ArgumentTable> gateAt = ds4_mtl4_pool_acquire(7);
+                        gateTables[rb] = gateAt;
+                        [gateAt setAddress:g_d8f_runtime_buf.gpuAddress atIndex:0];
+                        [gateAt setAddress:xBuf.gpuAddress atIndex:1];
+                        [gateAt setAddress:selBuf.gpuAddress atIndex:2];
+                        [gateAt setAddress:midBuf.gpuAddress atIndex:3];
+                        [gateAt setAddress:gateArgsBuf.gpuAddress atIndex:4];
+                        [gateAt setAddress:g_d8f_runtime_rec_buf.gpuAddress atIndex:5];
+                        [gateAt setAddress:range_addr atIndex:6];
+                        [enc setComputePipelineState:g_d8f_gateup_swiglu_selected_batch_recbuf_range_mtl4_pipeline];
+                        [enc setArgumentTable:gateAt];
+                        [enc setThreadgroupMemoryLength:16u * sizeof(float) atIndex:0];
+                        [enc dispatchThreadgroups:MTLSizeMake(tile_rows, n_experts, n_tokens) threadsPerThreadgroup:tg];
+                        [enc barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+                        id<MTL4ArgumentTable> downAt = ds4_mtl4_pool_acquire(8);
+                        downTables[rb] = downAt;
+                        [downAt setAddress:g_d8f_runtime_buf.gpuAddress atIndex:0];
+                        [downAt setAddress:midBuf.gpuAddress atIndex:1];
+                        [downAt setAddress:selBuf.gpuAddress atIndex:2];
+                        [downAt setAddress:outBuf.gpuAddress atIndex:3];
+                        [downAt setAddress:downArgsBuf.gpuAddress atIndex:4];
+                        [downAt setAddress:routeBuf.gpuAddress atIndex:5];
+                        [downAt setAddress:g_d8f_runtime_rec_buf.gpuAddress atIndex:6];
+                        [downAt setAddress:range_addr atIndex:7];
+                        [enc setComputePipelineState:g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_range_accum_mtl4_pipeline];
+                        [enc setArgumentTable:downAt];
+                        [enc setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
+                        [enc dispatchThreadgroups:MTLSizeMake((rows + 15u) >> 4, n_tokens, 1) threadsPerThreadgroup:tg];
+                        [enc barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+                    }
+                    [enc endEncoding];
+                    [cb endCommandBuffer];
+                    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                    MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                    [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                    id<MTL4CommandBuffer> bufs[1] = { cb };
+                    [g_polar_queue commit:bufs count:1 options:opts];
+                    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+                    for (uint32_t rb = 0; rb < tile_count; rb++) {
+                        if (gateTables[rb]) ds4_mtl4_pool_release(gateTables[rb], 7);
+                        if (downTables[rb]) ds4_mtl4_pool_release(downTables[rb], 8);
+                    }
+                };
+                dispatch_once();
+                mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+                const uint64_t t0 = mach_absolute_time();
+                for (uint32_t r = 0; r < rounds; r++) dispatch_once();
+                const uint64_t t1 = mach_absolute_time();
+                timed_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+                memcpy(gpu_out, outBuf.contents, (size_t)n_tokens * rows * sizeof(float));
+                const uint64_t count = (uint64_t)n_tokens * rows;
+                for (uint64_t i = 0; i < count; i++) {
+                    if (i < 4u) { dbg_ref[i] = ref[i]; dbg_gpu[i] = gpu_out[i]; }
+                    if (gpu_out[i] == 0.0f) gpu_zero++;
+                    if (gpu_out[i] == -1234567.0f) gpu_sentinel++;
+                    const double err_abs = fabs((double)gpu_out[i] - (double)ref[i]);
+                    const double denom = fabs((double)ref[i]) > 1e-4 ? fabs((double)ref[i]) : 1e-4;
+                    const double err_rel = err_abs / denom;
+                    if (err_abs > max_abs) max_abs = err_abs;
+                    if (err_rel > max_rel) max_rel = err_rel;
+                    if (err_abs > 7e-4 && err_rel > 7e-4) mismatch++;
+                }
+                ok = (mismatch == 0 && gpu_sentinel == 0);
+                [g_polar_queue removeResidencySet:rs];
+                [rs endResidency];
+            } else {
+                fprintf(stderr, "ds4_d8f: rowblock interleave buffer/residency allocation failed\n");
+            }
+        }
+    }
+    fprintf(stderr,
+            "ds4: d8f_rowblock_interleave_canary nsel=%u rows=%u tokens=%u rounds=%u clamp=%.1f layer=%u overlays=%u pack=%.2f MiB tile_rows=%u tile_count=%u tile_dispatches=%u tile_mid=%.2f KiB gpu %.3f ms total (%.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
+            n_experts, rows, n_tokens, rounds, swiglu_limit, file.layer,
+            ds4_d8f_gateup_overlay_count(&file), (double)file.size / 1048576.0,
+            tile_rows, tile_count, tile_count * 2u,
+            (double)(n_tokens * n_experts * tile_rows * sizeof(float)) / 1024.0,
+            timed_ms, timed_ms * 1000.0 / ((double)n_tokens * (double)rows * (double)rounds),
+            mismatch, gpu_zero, gpu_sentinel, max_abs, max_rel, ok);
+    for (uint32_t i = 0; i < n_tokens * rows && i < 4u; i++) {
+        fprintf(stderr, " out%u_ref=%.7g out%u_gpu=%.7g", i, dbg_ref[i], i, dbg_gpu[i]);
+    }
+    fprintf(stderr, " experts=");
+    for (uint32_t slot = 0; slot < n_experts; slot++) fprintf(stderr, "%s%u", slot ? "," : "", experts[slot]);
+    fprintf(stderr, "\n");
+    free(gpu_out); free(ref); free(selected_full); free(route_weights); free(mid_ref); free(x);
+    ds4_d8f_close(&file);
+    return ok;
 }
 
 int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
