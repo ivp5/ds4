@@ -55,9 +55,10 @@ typedef struct ds4_prefix_cache_entry {
      */
 } ds4_prefix_cache_entry;
 
-/* The cache itself. Held as a static singleton inside ds4_prefix_cache.c
- * to keep the engine state lean. Init/free are explicit so the engine
- * lifecycle can manage it. */
+/* The cache itself. A file-scope SINGLETON inside ds4_prefix_cache.c —
+ * one ds4_engine per process means one cache, so it is never passed by
+ * pointer and never reloaded between calls. Init/free bound the process
+ * lifecycle. (silv 2026-06-04 "all caches global" directive.) */
 typedef struct ds4_prefix_cache {
     ds4_prefix_cache_entry entries[DS4_PREFIX_CACHE_LRU_CAPACITY];
     uint64_t next_seq;              /* monotonic counter for LRU */
@@ -67,14 +68,14 @@ typedef struct ds4_prefix_cache {
     uint64_t stat_evictions;        /* LRU evictions */
 } ds4_prefix_cache;
 
-/* Initialize the cache. Returns 1 on success, 0 on failure. Idempotent. */
-int ds4_prefix_cache_init(ds4_prefix_cache *cache);
+/* Initialize the singleton (resets it to empty). Returns 1. Idempotent. */
+int ds4_prefix_cache_init(void);
 
 /* Free all cache resources. Phase 2+ will release per-layer GPU buffers. */
-void ds4_prefix_cache_free(ds4_prefix_cache *cache);
+void ds4_prefix_cache_free(void);
 
 /* Compute the FNV-1a 64-bit hash over a token sequence. Exposed for
- * testing + use by the engine before it calls lookup(). */
+ * testing + use by the engine before it calls lookup(). Pure. */
 uint64_t ds4_prefix_cache_hash_tokens(const int *tokens, uint32_t n_tokens);
 
 /* Lookup a prefix in the cache. Returns the entry pointer if found
@@ -82,25 +83,22 @@ uint64_t ds4_prefix_cache_hash_tokens(const int *tokens, uint32_t n_tokens);
  * owned by the cache and remains valid until the next lookup() that
  * triggers eviction. Phase 2 will widen the API to also return the
  * per-layer state restoration handles. */
-const ds4_prefix_cache_entry *ds4_prefix_cache_lookup(
-    ds4_prefix_cache *cache,
-    uint64_t prefix_hash);
+const ds4_prefix_cache_entry *ds4_prefix_cache_lookup(uint64_t prefix_hash);
 
 /* Store a new prefix entry. If the cache is full, the least-recently-used
  * entry is evicted. Returns 1 on success, 0 on failure (e.g. when Phase 2+
  * GPU resource allocation fails). Phase 1 only stores hash + n_tokens. */
-int ds4_prefix_cache_store(
-    ds4_prefix_cache *cache,
-    uint64_t prefix_hash,
-    uint32_t n_tokens);
+int ds4_prefix_cache_store(uint64_t prefix_hash, uint32_t n_tokens);
 
 /* Invalidate all entries (e.g. when the model changes). */
-void ds4_prefix_cache_invalidate_all(ds4_prefix_cache *cache);
+void ds4_prefix_cache_invalidate_all(void);
+
+/* True once any lookup or store has occurred — lets callers gate stats
+ * reporting without reaching into the cache struct. */
+int ds4_prefix_cache_was_used(void);
 
 /* Get human-readable stats for reporting. Caller passes a buffer; the
  * function fills it with a one-line summary. Returns bytes written. */
-int ds4_prefix_cache_stats(
-    const ds4_prefix_cache *cache,
-    char *buf, size_t buflen);
+int ds4_prefix_cache_stats(char *buf, size_t buflen);
 
 #endif /* DS4_PREFIX_CACHE_H */

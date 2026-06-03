@@ -136,44 +136,60 @@ uint64_t g_ds4_hot_misses = 0;
 uint64_t g_ds4_masked_skips = 0;
 uint64_t g_ds4_total_dispatches = 0;
 
+/* silv 2026-06-04 ("all caches global" + "statically allocated, avoid runtime
+ * dynamic alloc"): the hot-store is a per-process SINGLETON — alloc() is called
+ * exactly once per process (engine OR bench, never two coexisting; verified by
+ * call-site audit). Its fixed-size metadata arrays (DS4_N_LAYER*DS4_N_EXPERT
+ * each = 43*256, a compile constant) and the struct itself live at file scope,
+ * allocated once at load — NOT malloc'd per alloc(). Only fp16_heap stays
+ * runtime-malloc'd: its size is the residency budget (unknown at compile time;
+ * grow_to() realloc's it). 10 of the 11 prior allocations are now static. */
+#define DS4_HOT_NLE (DS4_N_LAYER * DS4_N_EXPERT)
+static ds4_hot_expert_store g_hot_store;
+static int64_t  g_hot_gate_offset[DS4_HOT_NLE];
+static int64_t  g_hot_up_offset[DS4_HOT_NLE];
+static int64_t  g_hot_down_offset[DS4_HOT_NLE];
+static uint64_t g_hot_gate_row_blocks[DS4_HOT_NLE];
+static uint64_t g_hot_up_row_blocks[DS4_HOT_NLE];
+static uint64_t g_hot_down_row_blocks[DS4_HOT_NLE];
+static uint64_t g_hot_gate_basis_hadamard16[DS4_HOT_NLE];
+static uint64_t g_hot_up_basis_hadamard16[DS4_HOT_NLE];
+static uint64_t g_hot_down_basis_hadamard16[DS4_HOT_NLE];
+
 ds4_hot_expert_store *ds4_hot_expert_store_alloc(uint64_t budget_bytes) {
-    ds4_hot_expert_store *store = (ds4_hot_expert_store *)calloc(1, sizeof(*store));
-    if (!store) return NULL;
-    const size_t offsets_bytes = (size_t)DS4_N_LAYER * DS4_N_EXPERT * sizeof(int64_t);
-    store->gate_offset = (int64_t *)malloc(offsets_bytes);
-    store->up_offset   = (int64_t *)malloc(offsets_bytes);
-    store->down_offset = (int64_t *)malloc(offsets_bytes);
-    const size_t row_blocks_bytes = (size_t)DS4_N_LAYER * DS4_N_EXPERT * sizeof(uint64_t);
-    store->gate_row_blocks = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
-    store->up_row_blocks   = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
-    store->down_row_blocks = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
-    /* silv 2026-05-27 — per-organ Hadamard-16 basis bitmasks (DEPLOYMENT_RULES.md
-     * task #647). calloc'd to zero ⇒ default "not basis-transformed". */
-    store->gate_basis_hadamard16 = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
-    store->up_basis_hadamard16   = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
-    store->down_basis_hadamard16 = (uint64_t *)calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(uint64_t));
-    store->calibration_domain_id = 0;  /* Rule 6: 0 ⇒ basis flags refused */
-    (void)row_blocks_bytes;
-    if (!store->gate_offset || !store->up_offset || !store->down_offset ||
-        !store->gate_row_blocks || !store->up_row_blocks || !store->down_row_blocks ||
-        !store->gate_basis_hadamard16 || !store->up_basis_hadamard16 || !store->down_basis_hadamard16) {
-        ds4_hot_expert_store_free(store);
-        return NULL;
-    }
-    /* Initialize all offsets to -1 (not pinned). */
-    for (uint64_t i = 0; i < (uint64_t)DS4_N_LAYER * DS4_N_EXPERT; i++) {
+    ds4_hot_expert_store *store = &g_hot_store;
+    /* Single-instance reset: release any prior heap before re-init (alloc is
+     * once-per-process in practice; this keeps the contract correct anyway). */
+    if (store->fp16_heap) { free(store->fp16_heap); store->fp16_heap = NULL; }
+    memset(store, 0, sizeof(*store));
+    store->gate_offset           = g_hot_gate_offset;
+    store->up_offset             = g_hot_up_offset;
+    store->down_offset           = g_hot_down_offset;
+    store->gate_row_blocks       = g_hot_gate_row_blocks;
+    store->up_row_blocks         = g_hot_up_row_blocks;
+    store->down_row_blocks       = g_hot_down_row_blocks;
+    store->gate_basis_hadamard16 = g_hot_gate_basis_hadamard16;
+    store->up_basis_hadamard16   = g_hot_up_basis_hadamard16;
+    store->down_basis_hadamard16 = g_hot_down_basis_hadamard16;
+    /* offsets → -1 (not pinned); row-block + basis masks → 0 (re-init safe). */
+    for (size_t i = 0; i < (size_t)DS4_HOT_NLE; i++) {
         store->gate_offset[i] = -1;
         store->up_offset[i]   = -1;
         store->down_offset[i] = -1;
     }
-    /* silv 2026-05-27: allocate the heap upfront so pin functions can write
-     * to (heap + offset) safely. Previously NULL — caused segfault when
-     * pin function tried to dequant into the heap. */
+    memset(g_hot_gate_row_blocks,       0, sizeof(g_hot_gate_row_blocks));
+    memset(g_hot_up_row_blocks,         0, sizeof(g_hot_up_row_blocks));
+    memset(g_hot_down_row_blocks,       0, sizeof(g_hot_down_row_blocks));
+    memset(g_hot_gate_basis_hadamard16, 0, sizeof(g_hot_gate_basis_hadamard16));
+    memset(g_hot_up_basis_hadamard16,   0, sizeof(g_hot_up_basis_hadamard16));
+    memset(g_hot_down_basis_hadamard16, 0, sizeof(g_hot_down_basis_hadamard16));
+    store->calibration_domain_id = 0;  /* Rule 6: 0 ⇒ basis flags refused */
+    /* fp16_heap is the ONLY runtime allocation — sized by the residency budget.
+     * Allocated upfront so pin functions can write to (heap + offset) safely. */
     store->fp16_heap = malloc((size_t)budget_bytes);
     if (!store->fp16_heap) {
         fprintf(stderr, "ds4_hot_expert_store_alloc: heap malloc %.2f GB failed\n",
                 budget_bytes / 1e9);
-        ds4_hot_expert_store_free(store);
         return NULL;
     }
     store->heap_bytes = 0;
@@ -184,17 +200,13 @@ ds4_hot_expert_store *ds4_hot_expert_store_alloc(uint64_t budget_bytes) {
 
 void ds4_hot_expert_store_free(ds4_hot_expert_store *store) {
     if (!store) return;
-    if (store->gate_offset) free(store->gate_offset);
-    if (store->up_offset)   free(store->up_offset);
-    if (store->down_offset) free(store->down_offset);
-    if (store->gate_row_blocks) free(store->gate_row_blocks);
-    if (store->up_row_blocks)   free(store->up_row_blocks);
-    if (store->down_row_blocks) free(store->down_row_blocks);
-    if (store->gate_basis_hadamard16) free(store->gate_basis_hadamard16);
-    if (store->up_basis_hadamard16)   free(store->up_basis_hadamard16);
-    if (store->down_basis_hadamard16) free(store->down_basis_hadamard16);
-    if (store->fp16_heap)   free(store->fp16_heap);
-    free(store);
+    /* Only fp16_heap is heap-allocated now; the struct + 9 metadata arrays are
+     * file-scope statics (the singleton persists, ready for a future alloc()).
+     * Reset scalars so a stale read can't see live counts. This is also strictly
+     * safer than the old free(store): no dangling struct for g_active_hot_store. */
+    if (store->fp16_heap) { free(store->fp16_heap); store->fp16_heap = NULL; }
+    store->heap_bytes = 0;
+    store->n_pinned = 0;
 }
 
 /* silv 2026-05-27 — basis-aware accessors (ENCODE_FINAL.md item #2, task #647).

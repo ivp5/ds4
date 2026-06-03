@@ -16,9 +16,7 @@ typedef struct ds4_journal ds4_journal;
 
 #ifdef DS4_JOURNAL_ENABLE
 
-ds4_journal *ds4_journal_open(const char *db_path,
- uint32_t flush_threshold,
- uint32_t flush_interval_ms);
+ds4_journal *ds4_journal_open(const char *db_path);
 int64_t ds4_journal_begin_session(ds4_journal *j, const char *model_path,
  int ctx_size, const char *backend,
  const char *options_json);
@@ -36,8 +34,8 @@ void ds4_journal_close(ds4_journal *j);
 
 #else /* journal compiled out — inline no-ops, zero overhead */
 
-static inline ds4_journal *ds4_journal_open(const char *a, uint32_t b, uint32_t c)
- { (void)a; (void)b; (void)c; return NULL; }
+static inline ds4_journal *ds4_journal_open(const char *a)
+ { (void)a; return NULL; }
 static inline int64_t ds4_journal_begin_session(ds4_journal *a, const char *b,
  int c, const char *d, const char *e)
  { (void)a; (void)b; (void)c; (void)d; (void)e; return 0; }

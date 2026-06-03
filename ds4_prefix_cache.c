@@ -6,14 +6,31 @@
  * Phase 3: disk-backed LRU at ~/Library/Caches/ds4/prefix_cache/.
  *
  * This file has zero ds4_engine dependencies on purpose — the cache is
- * a pure data structure that the engine code will wire up in Phase 2. */
+ * a pure data structure that the engine code wires up in Phase 2.
+ *
+ * 2026-06-04 (silv "all caches global" directive): the cache is now the
+ * file-scope SINGLETON its header always documented — g_prefix_cache,
+ * zero-initialized at load, persisting for the whole process, never passed
+ * by pointer and never reloaded between calls. Verified safe: every DS4
+ * entry point (cli/agent/eval/bench/logitlens/server) opens exactly one
+ * ds4_engine per process — MTP is a ds4_model, not a second engine — so a
+ * lone global can never be clobbered by a coexisting engine. The pointer
+ * argument is dropped from every function: callers share state instead of
+ * threading it. (Multi-instance caches like the per-session kvstore stay
+ * pointer-threaded; that is correct, not a smell — globalize only when the
+ * instance is genuinely single.) */
 
 #include "ds4_prefix_cache.h"
 #include <stdio.h>
 #include <string.h>
 
+/* The one cache. File-scope so functions share it without parameter
+ * threading; static-zero at load; lives the whole process. The single
+ * named refresh boundary is ds4_prefix_cache_init(). */
+static ds4_prefix_cache g_prefix_cache;
+
 /* FNV-1a 64-bit hash. Deterministic across runs; identical input
- * (tokens + length) always produces the same hash. */
+ * (tokens + length) always produces the same hash. Pure — no cache state. */
 uint64_t ds4_prefix_cache_hash_tokens(const int *tokens, uint32_t n_tokens) {
     /* FNV-1a 64 constants */
     const uint64_t fnv_offset = 0xcbf29ce484222325ULL;
@@ -32,28 +49,24 @@ uint64_t ds4_prefix_cache_hash_tokens(const int *tokens, uint32_t n_tokens) {
     return h;
 }
 
-int ds4_prefix_cache_init(ds4_prefix_cache *cache) {
-    if (!cache) return 0;
-    memset(cache, 0, sizeof(*cache));
+int ds4_prefix_cache_init(void) {
+    memset(&g_prefix_cache, 0, sizeof(g_prefix_cache));
     /* Mark all entries invalid */
     for (int i = 0; i < DS4_PREFIX_CACHE_LRU_CAPACITY; i++) {
-        cache->entries[i].valid = 0;
+        g_prefix_cache.entries[i].valid = 0;
     }
-    cache->next_seq = 1; /* skip 0 so a valid entry never has last_used_seq=0 ambiguity */
+    g_prefix_cache.next_seq = 1; /* skip 0 so a valid entry never has last_used_seq=0 ambiguity */
     return 1;
 }
 
-void ds4_prefix_cache_free(ds4_prefix_cache *cache) {
-    if (!cache) return;
+void ds4_prefix_cache_free(void) {
     /* Phase 2+ will release per-layer GPU buffers here. Phase 1 has
      * no resources to free — the entries are POD. */
-    memset(cache, 0, sizeof(*cache));
+    memset(&g_prefix_cache, 0, sizeof(g_prefix_cache));
 }
 
-const ds4_prefix_cache_entry *ds4_prefix_cache_lookup(
-    ds4_prefix_cache *cache,
-    uint64_t prefix_hash) {
-    if (!cache) return NULL;
+const ds4_prefix_cache_entry *ds4_prefix_cache_lookup(uint64_t prefix_hash) {
+    ds4_prefix_cache *cache = &g_prefix_cache;
     cache->stat_lookups++;
     for (int i = 0; i < DS4_PREFIX_CACHE_LRU_CAPACITY; i++) {
         ds4_prefix_cache_entry *e = &cache->entries[i];
@@ -69,7 +82,8 @@ const ds4_prefix_cache_entry *ds4_prefix_cache_lookup(
 
 /* Find the LRU victim (entry with the smallest last_used_seq, including
  * any invalid slot). Returns the index of the slot to overwrite. */
-static int ds4_prefix_cache_find_lru_slot(const ds4_prefix_cache *cache) {
+static int ds4_prefix_cache_find_lru_slot(void) {
+    const ds4_prefix_cache *cache = &g_prefix_cache;
     int best = 0;
     uint64_t best_seq = cache->entries[0].valid ? cache->entries[0].last_used_seq : 0;
     if (!cache->entries[0].valid) return 0;
@@ -84,11 +98,8 @@ static int ds4_prefix_cache_find_lru_slot(const ds4_prefix_cache *cache) {
     return best;
 }
 
-int ds4_prefix_cache_store(
-    ds4_prefix_cache *cache,
-    uint64_t prefix_hash,
-    uint32_t n_tokens) {
-    if (!cache) return 0;
+int ds4_prefix_cache_store(uint64_t prefix_hash, uint32_t n_tokens) {
+    ds4_prefix_cache *cache = &g_prefix_cache;
     /* Check if already present — update LRU + n_tokens instead of duplicating. */
     for (int i = 0; i < DS4_PREFIX_CACHE_LRU_CAPACITY; i++) {
         ds4_prefix_cache_entry *e = &cache->entries[i];
@@ -99,7 +110,7 @@ int ds4_prefix_cache_store(
         }
     }
     /* Find victim slot */
-    const int slot = ds4_prefix_cache_find_lru_slot(cache);
+    const int slot = ds4_prefix_cache_find_lru_slot();
     ds4_prefix_cache_entry *e = &cache->entries[slot];
     const int was_valid = e->valid;
     e->prefix_hash = prefix_hash;
@@ -112,19 +123,23 @@ int ds4_prefix_cache_store(
     return 1;
 }
 
-void ds4_prefix_cache_invalidate_all(ds4_prefix_cache *cache) {
-    if (!cache) return;
+void ds4_prefix_cache_invalidate_all(void) {
     for (int i = 0; i < DS4_PREFIX_CACHE_LRU_CAPACITY; i++) {
-        cache->entries[i].valid = 0;
+        g_prefix_cache.entries[i].valid = 0;
     }
     /* Phase 2+ will release per-layer GPU buffers attached to invalidated
      * entries here. */
 }
 
-int ds4_prefix_cache_stats(
-    const ds4_prefix_cache *cache,
-    char *buf, size_t buflen) {
-    if (!cache || !buf || buflen == 0) return 0;
+int ds4_prefix_cache_was_used(void) {
+    /* True once any lookup or store has happened — lets callers gate stats
+     * reporting without reaching into the cache struct. */
+    return (g_prefix_cache.stat_lookups > 0 || g_prefix_cache.stat_stores > 0) ? 1 : 0;
+}
+
+int ds4_prefix_cache_stats(char *buf, size_t buflen) {
+    const ds4_prefix_cache *cache = &g_prefix_cache;
+    if (!buf || buflen == 0) return 0;
     int n_valid = 0;
     for (int i = 0; i < DS4_PREFIX_CACHE_LRU_CAPACITY; i++) {
         if (cache->entries[i].valid) n_valid++;
@@ -143,13 +158,10 @@ int ds4_prefix_cache_stats(
 }
 
 /* Phase 1 self-test: validates the in-memory LRU + hash properties
- * before any GPU integration. Exits 0 on success, 1 on failure. */
+ * before any GPU integration. Returns 1 on success, 0 on failure.
+ * Operates on the global singleton (init() is the reset boundary). */
 int ds4_prefix_cache_phase1_self_test(void) {
-    ds4_prefix_cache cache;
-    if (!ds4_prefix_cache_init(&cache)) {
-        fprintf(stderr, "prefix_cache: init failed\n");
-        return 0;
-    }
+    ds4_prefix_cache_init();
 
     /* 1. Hash determinism: same input → same output, different input → different. */
     int toks_a[5] = {100, 200, 300, 400, 500};
@@ -174,60 +186,60 @@ int ds4_prefix_cache_phase1_self_test(void) {
         fprintf(stderr, "prefix_cache: empty-hash mismatch\n");
         return 0;
     }
-    if (ds4_prefix_cache_lookup(&cache, h_a) != NULL) {
+    if (ds4_prefix_cache_lookup(h_a) != NULL) {
         fprintf(stderr, "prefix_cache: pre-store lookup should miss\n");
         return 0;
     }
 
     /* 3. Store + lookup round-trip */
-    if (!ds4_prefix_cache_store(&cache, h_a, 5)) {
+    if (!ds4_prefix_cache_store(h_a, 5)) {
         fprintf(stderr, "prefix_cache: store failed\n");
         return 0;
     }
-    const ds4_prefix_cache_entry *e = ds4_prefix_cache_lookup(&cache, h_a);
+    const ds4_prefix_cache_entry *e = ds4_prefix_cache_lookup(h_a);
     if (!e || e->prefix_hash != h_a || e->n_tokens != 5) {
         fprintf(stderr, "prefix_cache: round-trip failed\n");
         return 0;
     }
 
     /* 4. Update existing entry (same hash): should not duplicate or evict */
-    const uint64_t lookups_before = cache.stat_lookups;
-    if (!ds4_prefix_cache_store(&cache, h_a, 10)) {
+    const uint64_t lookups_before = g_prefix_cache.stat_lookups;
+    if (!ds4_prefix_cache_store(h_a, 10)) {
         fprintf(stderr, "prefix_cache: re-store failed\n");
         return 0;
     }
-    e = ds4_prefix_cache_lookup(&cache, h_a);
+    e = ds4_prefix_cache_lookup(h_a);
     if (!e || e->n_tokens != 10) {
         fprintf(stderr, "prefix_cache: re-store update n_tokens failed\n");
         return 0;
     }
-    if (cache.stat_lookups != lookups_before + 1) {
+    if (g_prefix_cache.stat_lookups != lookups_before + 1) {
         fprintf(stderr, "prefix_cache: lookup stat tracking wrong\n");
         return 0;
     }
 
-    /* 5. LRU eviction: store 9 distinct entries, the first should be evicted */
-    ds4_prefix_cache_init(&cache); /* reset */
+    /* 5. LRU eviction: store CAPACITY+1 distinct entries, the first should be evicted */
+    ds4_prefix_cache_init(); /* reset */
     uint64_t hashes[DS4_PREFIX_CACHE_LRU_CAPACITY + 1];
     for (int i = 0; i <= DS4_PREFIX_CACHE_LRU_CAPACITY; i++) {
         int t = 1000 + i;
         hashes[i] = ds4_prefix_cache_hash_tokens(&t, 1);
-        if (!ds4_prefix_cache_store(&cache, hashes[i], (uint32_t)(i + 1))) {
+        if (!ds4_prefix_cache_store(hashes[i], (uint32_t)(i + 1))) {
             fprintf(stderr, "prefix_cache: LRU fill store %d failed\n", i);
             return 0;
         }
     }
-    if (cache.stat_evictions != 1) {
+    if (g_prefix_cache.stat_evictions != 1) {
         fprintf(stderr, "prefix_cache: expected 1 eviction, got %llu\n",
-                (unsigned long long)cache.stat_evictions);
+                (unsigned long long)g_prefix_cache.stat_evictions);
         return 0;
     }
-    if (ds4_prefix_cache_lookup(&cache, hashes[0]) != NULL) {
+    if (ds4_prefix_cache_lookup(hashes[0]) != NULL) {
         fprintf(stderr, "prefix_cache: hashes[0] should have been evicted\n");
         return 0;
     }
     for (int i = 1; i <= DS4_PREFIX_CACHE_LRU_CAPACITY; i++) {
-        if (ds4_prefix_cache_lookup(&cache, hashes[i]) == NULL) {
+        if (ds4_prefix_cache_lookup(hashes[i]) == NULL) {
             fprintf(stderr, "prefix_cache: hashes[%d] should be present\n", i);
             return 0;
         }
@@ -235,7 +247,7 @@ int ds4_prefix_cache_phase1_self_test(void) {
 
     /* 6. Stats reporting */
     char statbuf[256];
-    const int n = ds4_prefix_cache_stats(&cache, statbuf, sizeof(statbuf));
+    const int n = ds4_prefix_cache_stats(statbuf, sizeof(statbuf));
     if (n <= 0 || n >= (int)sizeof(statbuf)) {
         fprintf(stderr, "prefix_cache: stats truncation\n");
         return 0;
@@ -243,15 +255,15 @@ int ds4_prefix_cache_phase1_self_test(void) {
     fprintf(stderr, "%s\n", statbuf);
 
     /* 7. Invalidate all */
-    ds4_prefix_cache_invalidate_all(&cache);
+    ds4_prefix_cache_invalidate_all();
     for (int i = 0; i <= DS4_PREFIX_CACHE_LRU_CAPACITY; i++) {
-        if (ds4_prefix_cache_lookup(&cache, hashes[i]) != NULL) {
+        if (ds4_prefix_cache_lookup(hashes[i]) != NULL) {
             fprintf(stderr, "prefix_cache: invalidate_all left entry %d\n", i);
             return 0;
         }
     }
 
-    ds4_prefix_cache_free(&cache);
+    ds4_prefix_cache_free();
     fprintf(stderr, "ds4: prefix_cache Phase 1 self-test PASSED "
             "(hash determinism + sensitivity + LRU eviction + invalidate)\n");
     return 1;

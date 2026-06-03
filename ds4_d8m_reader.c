@@ -1,12 +1,8 @@
 #include "ds4_d8m_reader.h"
+#include "ds4_pack_io.h"   /* shared mmap open/validate/close — one correct copy, not N */
 
-#include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 enum {
     DS4_D8M_HEADER_BYTES = 4096,
@@ -55,21 +51,11 @@ bool ds4_d8m_open(const char *path, ds4_d8m_file *file) {
     if (!path || !file) return false;
     memset(file, 0, sizeof(*file));
     file->fd = -1;
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "ds4_d8m: open(%s) failed: %s\n", path, strerror(errno));
-        return false;
-    }
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < DS4_D8M_HEADER_BYTES + DS4_D8M_RECORD_COUNT * DS4_D8M_RECORD_BYTES) {
-        fprintf(stderr, "ds4_d8m: bad size for %s\n", path);
-        close(fd);
-        return false;
-    }
-    void *mapped = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (mapped == MAP_FAILED) {
-        fprintf(stderr, "ds4_d8m: mmap(%s) failed: %s\n", path, strerror(errno));
-        close(fd);
+    /* Shared mmap+fstat+min-size open (magic=NULL: the 8-byte magic is checked below). */
+    void *mapped = NULL; size_t map_size = 0; int fd = -1;
+    if (!ds4_pack_mmap_open_flags(path, "ds4_d8m", NULL,
+                                  DS4_D8M_HEADER_BYTES + DS4_D8M_RECORD_COUNT * DS4_D8M_RECORD_BYTES,
+                                  MAP_PRIVATE, &mapped, &map_size, &fd)) {
         return false;
     }
     const uint8_t *base = (const uint8_t *)mapped;
@@ -80,26 +66,23 @@ bool ds4_d8m_open(const char *path, ds4_d8m_file *file) {
         record_bytes = DS4_D8A_RECORD_BYTES;
     } else {
         fprintf(stderr, "ds4_d8m: bad magic in %s\n", path);
-        munmap(mapped, (size_t)st.st_size);
-        close(fd);
+        ds4_pack_munmap_close(&mapped, &map_size, &fd);
         return false;
     }
-    if ((uint64_t)DS4_D8M_HEADER_BYTES + (uint64_t)DS4_D8M_RECORD_COUNT * record_bytes > (uint64_t)st.st_size) {
+    if ((uint64_t)DS4_D8M_HEADER_BYTES + (uint64_t)DS4_D8M_RECORD_COUNT * record_bytes > (uint64_t)map_size) {
         fprintf(stderr, "ds4_d8m: bad table size for %s record_bytes=%u\n", path, record_bytes);
-        munmap(mapped, (size_t)st.st_size);
-        close(fd);
+        ds4_pack_munmap_close(&mapped, &map_size, &fd);
         return false;
     }
     file->version = d8m_u32(base + 8);
     file->header_json_bytes = d8m_u32(base + 12);
     if (file->version != 1 || 16u + file->header_json_bytes > DS4_D8M_HEADER_BYTES) {
         fprintf(stderr, "ds4_d8m: unsupported header version=%u json=%u\n", file->version, file->header_json_bytes);
-        munmap(mapped, (size_t)st.st_size);
-        close(fd);
+        ds4_pack_munmap_close(&mapped, &map_size, &fd);
         return false;
     }
     file->map = base;
-    file->size = (size_t)st.st_size;
+    file->size = map_size;
     file->fd = fd;
     file->record_bytes = record_bytes;
     file->table_offset = DS4_D8M_HEADER_BYTES;
@@ -128,8 +111,8 @@ bool ds4_d8m_open(const char *path, ds4_d8m_file *file) {
 
 void ds4_d8m_close(ds4_d8m_file *file) {
     if (!file) return;
-    if (file->map && file->size) munmap((void *)file->map, file->size);
-    if (file->fd >= 0) close(file->fd);
+    void *m = (void *)file->map;   /* drop const for the shared munmap+close */
+    ds4_pack_munmap_close(&m, &file->size, &file->fd);
     memset(file, 0, sizeof(*file));
     file->fd = -1;
 }

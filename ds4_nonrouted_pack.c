@@ -1,19 +1,41 @@
 /* ds4_nonrouted_pack.c — DS4 V4 non-routed weights pack reader.
- *
- * Minimal JSON manifest parser (no external deps): expects format produced
- * by pack_nonrouted.py exactly. Handles dtype strings + shape int arrays.
- */
+ * Minimal dependency-free JSON manifest parser; format per pack_nonrouted.py.
+ * static-top pass 2026-06-04: file-scope dtype table + parse scratch,
+ * count_prefix O(log n), overflow-guarded ints. */
 #include "ds4_nonrouted_pack.h"
+#include "ds4_pack_io.h"   /* shared mmap open/validate/close — one correct copy, not N */
 
-#include <errno.h>
-#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+
+/* ===================================================================== *
+ * File-scope statics (silv doctrine: used/expected state defined + sized
+ * at the top; reusable scratch allocated once, not per-call). All touched
+ * only on the single-threaded pack-open path — no concurrent mutation.
+ * ===================================================================== */
+
+/* Single source of truth for the dtype enum<->name<->element-size mapping.
+ * Indexed by ds4_nrpk_dtype value (contiguous 0..7). dtype_from_string,
+ * dtype_name and dtype_bytes all derive from this one table, so they cannot
+ * drift apart. */
+static const struct { const char *name; uint8_t bytes; } NRPK_DTYPE[] = {
+    [DS4_NRPK_DTYPE_UNKNOWN]  = { "UNK",     0 },
+    [DS4_NRPK_DTYPE_F32]      = { "F32",     4 },
+    [DS4_NRPK_DTYPE_F16]      = { "F16",     2 },
+    [DS4_NRPK_DTYPE_BF16]     = { "BF16",    2 },
+    [DS4_NRPK_DTYPE_I8]       = { "I8",      1 },
+    [DS4_NRPK_DTYPE_F8_E4M3]  = { "F8_E4M3", 1 },
+    [DS4_NRPK_DTYPE_F8_E8M0]  = { "F8_E8M0", 1 },
+    [DS4_NRPK_DTYPE_I32]      = { "I32",     4 },
+};
+#define NRPK_DTYPE_N (sizeof(NRPK_DTYPE) / sizeof(NRPK_DTYPE[0]))
+
+/* Reusable manifest-parse scratch, reused per entry (open is single-threaded). */
+static char g_nrpk_key[64];     /* current object key                   */
+static char g_nrpk_dt[16];      /* dtype string being decoded           */
+static char g_nrpk_skip[256];   /* sink for skipped unknown string vals */
 
 static void ds4_nrpk_log(const char *fmt, ...) {
     va_list ap;
@@ -26,40 +48,18 @@ static void ds4_nrpk_log(const char *fmt, ...) {
 
 ds4_nrpk_dtype ds4_nrpk_dtype_from_string(const char *s) {
     if (!s) return DS4_NRPK_DTYPE_UNKNOWN;
-    if (!strcmp(s, "F32"))      return DS4_NRPK_DTYPE_F32;
-    if (!strcmp(s, "F16"))      return DS4_NRPK_DTYPE_F16;
-    if (!strcmp(s, "BF16"))     return DS4_NRPK_DTYPE_BF16;
-    if (!strcmp(s, "I8"))       return DS4_NRPK_DTYPE_I8;
-    if (!strcmp(s, "I32"))      return DS4_NRPK_DTYPE_I32;
-    if (!strcmp(s, "F8_E4M3"))  return DS4_NRPK_DTYPE_F8_E4M3;
-    if (!strcmp(s, "F8_E8M0"))  return DS4_NRPK_DTYPE_F8_E8M0;
+    for (uint32_t d = 1; d < NRPK_DTYPE_N; d++) {
+        if (!strcmp(s, NRPK_DTYPE[d].name)) return (ds4_nrpk_dtype)d;
+    }
     return DS4_NRPK_DTYPE_UNKNOWN;
 }
 
 const char *ds4_nrpk_dtype_name(ds4_nrpk_dtype d) {
-    switch (d) {
-        case DS4_NRPK_DTYPE_F32:     return "F32";
-        case DS4_NRPK_DTYPE_F16:     return "F16";
-        case DS4_NRPK_DTYPE_BF16:    return "BF16";
-        case DS4_NRPK_DTYPE_I8:      return "I8";
-        case DS4_NRPK_DTYPE_I32:     return "I32";
-        case DS4_NRPK_DTYPE_F8_E4M3: return "F8_E4M3";
-        case DS4_NRPK_DTYPE_F8_E8M0: return "F8_E8M0";
-        default:                     return "UNK";
-    }
+    return (uint32_t)d < NRPK_DTYPE_N ? NRPK_DTYPE[d].name : "UNK";
 }
 
 size_t ds4_nrpk_dtype_bytes(ds4_nrpk_dtype d) {
-    switch (d) {
-        case DS4_NRPK_DTYPE_F32: return 4;
-        case DS4_NRPK_DTYPE_F16:
-        case DS4_NRPK_DTYPE_BF16: return 2;
-        case DS4_NRPK_DTYPE_I32: return 4;
-        case DS4_NRPK_DTYPE_I8:
-        case DS4_NRPK_DTYPE_F8_E4M3:
-        case DS4_NRPK_DTYPE_F8_E8M0: return 1;
-        default: return 0;
-    }
+    return (uint32_t)d < NRPK_DTYPE_N ? NRPK_DTYPE[d].bytes : 0;
 }
 
 /* Skip whitespace. */
@@ -92,21 +92,27 @@ static const char *parse_str(const char *p, const char *end,
     return p + 1;
 }
 
-/* Parse JSON integer. */
+/* Parse JSON integer (saturating on overflow rather than wrapping). */
 static const char *parse_int(const char *p, const char *end, int64_t *out) {
     p = skip_ws(p, end);
     int neg = 0;
     if (p < end && *p == '-') { neg = 1; p++; }
-    int64_t v = 0;
+    uint64_t v = 0;
     int any = 0;
     while (p < end && *p >= '0' && *p <= '9') {
-        v = v * 10 + (*p - '0');
+        if (v <= (UINT64_MAX - 9) / 10) v = v * 10 + (uint64_t)(*p - '0');
+        /* else: saturate — manifest is malformed; bounds check downstream rejects */
         p++;
         any = 1;
     }
     if (!any) return NULL;
-    *out = neg ? -v : v;
+    if (v > (uint64_t)INT64_MAX) v = (uint64_t)INT64_MAX;
+    *out = neg ? -(int64_t)v : (int64_t)v;
     return p;
+}
+
+static bool nrpk_range_within(uint64_t off, uint64_t len, uint64_t limit) {
+    return off <= limit && len <= limit - off;
 }
 
 /* Parse one manifest entry: {"name": "...", "dtype": "...", "shape": [...],
@@ -119,22 +125,20 @@ static const char *parse_entry(const char *p, const char *end,
     while (p < end) {
         p = skip_ws(p, end);
         if (p < end && *p == '}') return p + 1;
-        char key[64];
-        p = parse_str(p, end, key, sizeof(key));
+        p = parse_str(p, end, g_nrpk_key, sizeof(g_nrpk_key));
         if (!p) return NULL;
         p = expect_char(p, end, ':');
         if (!p) return NULL;
         p = skip_ws(p, end);
-        if (!p || p >= end) return NULL;
-        if (!strcmp(key, "name")) {
+        if (p >= end) return NULL;
+        if (!strcmp(g_nrpk_key, "name")) {
             p = parse_str(p, end, out->name, sizeof(out->name));
             if (!p) return NULL;
-        } else if (!strcmp(key, "dtype")) {
-            char dt[16];
-            p = parse_str(p, end, dt, sizeof(dt));
+        } else if (!strcmp(g_nrpk_key, "dtype")) {
+            p = parse_str(p, end, g_nrpk_dt, sizeof(g_nrpk_dt));
             if (!p) return NULL;
-            out->dtype = ds4_nrpk_dtype_from_string(dt);
-        } else if (!strcmp(key, "shape")) {
+            out->dtype = ds4_nrpk_dtype_from_string(g_nrpk_dt);
+        } else if (!strcmp(g_nrpk_key, "shape")) {
             p = expect_char(p, end, '[');
             if (!p) return NULL;
             uint32_t nd = 0;
@@ -144,35 +148,36 @@ static const char *parse_entry(const char *p, const char *end,
                 int64_t d;
                 p = parse_int(p, end, &d);
                 if (!p) return NULL;
+                if (d < 0 || (uint64_t)d > UINT32_MAX) return NULL;
                 out->dims[nd++] = (uint32_t)d;
                 p = skip_ws(p, end);
                 if (p < end && *p == ',') p++;
             }
             out->n_dims = nd;
-        } else if (!strcmp(key, "data_off")) {
+        } else if (!strcmp(g_nrpk_key, "data_off")) {
             int64_t v;
             p = parse_int(p, end, &v);
             if (!p) return NULL;
+            if (v < 0) return NULL;
             out->data_off = (uint64_t)v;
-        } else if (!strcmp(key, "data_bytes")) {
+        } else if (!strcmp(g_nrpk_key, "data_bytes")) {
             int64_t v;
             p = parse_int(p, end, &v);
             if (!p) return NULL;
+            if (v < 0) return NULL;
             out->data_bytes = (uint64_t)v;
         } else {
             /* Skip unknown value (string, int, or array). */
             p = skip_ws(p, end);
             if (p >= end) return NULL;
             if (*p == '"') {
-                char tmp[256];
-                p = parse_str(p, end, tmp, sizeof(tmp));
+                p = parse_str(p, end, g_nrpk_skip, sizeof(g_nrpk_skip));
                 if (!p) return NULL;
             } else if (*p == '[') {
-                /* Skip to matching ] */
-                int depth = 0;
+                int depth = 0;        /* skip to matching ] */
                 while (p < end) {
                     if (*p == '[') depth++;
-                    else if (*p == ']') { depth--; if (depth == 0) { p++; break; } }
+                    else if (*p == ']') { if (--depth == 0) { p++; break; } }
                     p++;
                 }
             } else {
@@ -188,9 +193,8 @@ static const char *parse_entry(const char *p, const char *end,
 }
 
 static int entry_cmp(const void *a, const void *b) {
-    const ds4_nrpk_entry *ea = (const ds4_nrpk_entry *)a;
-    const ds4_nrpk_entry *eb = (const ds4_nrpk_entry *)b;
-    return strcmp(ea->name, eb->name);
+    return strcmp(((const ds4_nrpk_entry *)a)->name,
+                  ((const ds4_nrpk_entry *)b)->name);
 }
 
 bool ds4_nrpk_open(const char *pack_path, ds4_nrpk *out) {
@@ -199,70 +203,46 @@ bool ds4_nrpk_open(const char *pack_path, ds4_nrpk *out) {
     out->fd = -1;
     strncpy(out->pack_path, pack_path, sizeof(out->pack_path) - 1);
 
-    int fd = open(pack_path, O_RDONLY);
-    if (fd < 0) {
-        ds4_nrpk_log("open(%s) failed: %s", pack_path, strerror(errno));
+    /* Shared mmap+fstat+min-size open (magic=NULL: the 8-byte magic is verified below). */
+    if (!ds4_pack_mmap_open(pack_path, "ds4_nrpk", NULL, sizeof(ds4_nrpk_header),
+                            &out->map, &out->map_size, &out->fd)) {
         return false;
     }
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        ds4_nrpk_log("fstat failed: %s", strerror(errno));
-        close(fd);
+    const ds4_nrpk_header *hdr = (const ds4_nrpk_header *)out->map;
+    const uint64_t file_bytes = (uint64_t)out->map_size;
+    const char *fail =
+        memcmp(hdr->magic, DS4_NRPK_MAGIC, 8) != 0                 ? "bad magic" :
+        hdr->version != DS4_NRPK_VERSION                           ? "unsupported version" :
+        hdr->total_bytes != file_bytes                             ? "size mismatch" :
+        !nrpk_range_within(hdr->manifest_offset, hdr->manifest_bytes, file_bytes) ? "manifest out of bounds" :
+        !nrpk_range_within(hdr->data_offset, hdr->data_bytes, file_bytes)         ? "data out of bounds" :
+        NULL;
+    if (fail) {
+        ds4_nrpk_log("%s (version=%u total=%llu file=%zu)", fail, hdr->version,
+                     (unsigned long long)hdr->total_bytes, out->map_size);
+        ds4_pack_munmap_close(&out->map, &out->map_size, &out->fd);
         return false;
     }
-    if ((size_t)st.st_size < sizeof(ds4_nrpk_header)) {
-        ds4_nrpk_log("file too small");
-        close(fd);
-        return false;
-    }
-    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) {
-        ds4_nrpk_log("mmap failed: %s", strerror(errno));
-        close(fd);
-        return false;
-    }
-    const ds4_nrpk_header *hdr = (const ds4_nrpk_header *)map;
-    if (memcmp(hdr->magic, DS4_NRPK_MAGIC, 8) != 0) {
-        ds4_nrpk_log("bad magic");
-        munmap(map, (size_t)st.st_size);
-        close(fd);
-        return false;
-    }
-    if (hdr->version != DS4_NRPK_VERSION) {
-        ds4_nrpk_log("unsupported version %u", hdr->version);
-        munmap(map, (size_t)st.st_size);
-        close(fd);
-        return false;
-    }
-    if (hdr->total_bytes != (uint64_t)st.st_size) {
-        ds4_nrpk_log("size mismatch: hdr says %llu, file is %lld",
-                     (unsigned long long)hdr->total_bytes,
-                     (long long)st.st_size);
-        munmap(map, (size_t)st.st_size);
-        close(fd);
-        return false;
-    }
+    out->hdr        = hdr;
+    out->data_arena = (const uint8_t *)out->map + hdr->data_offset;
 
-    out->fd       = fd;
-    out->map      = map;
-    out->map_size = (size_t)st.st_size;
-    out->hdr      = hdr;
-    out->data_arena = (const uint8_t *)map + hdr->data_offset;
-
-    /* Parse manifest. */
-    const char *m_start = (const char *)map + hdr->manifest_offset;
-    const char *m_end   = m_start + hdr->manifest_bytes;
-
+    /* Entries: the ONE heap allocation, and it stays heap by design. n_tensors
+     * is determined by the file at runtime (nonrouted is a subset of a 69187-
+     * tensor model — no honest compile-time cap exists; a guessed cap could
+     * reject a valid pack, a provably-safe cap wastes ~15 MB for ~1500 actual
+     * entries). This is calloc'd ONCE at open and freed at close — the doctrine's
+     * allowed case (load-time, runtime-sized), not the per-call realloc it bans. */
     out->entries = (ds4_nrpk_entry *)calloc(hdr->n_tensors, sizeof(ds4_nrpk_entry));
     if (!out->entries) {
-        munmap(map, out->map_size);
-        close(fd);
+        ds4_pack_munmap_close(&out->map, &out->map_size, &out->fd);
         memset(out, 0, sizeof(*out));
         out->fd = -1;
         return false;
     }
 
-    const char *p = m_start;
+    /* Parse manifest. */
+    const char *p     = (const char *)out->map + hdr->manifest_offset;
+    const char *m_end = p + hdr->manifest_bytes;
     p = expect_char(p, m_end, '[');
     if (!p) {
         ds4_nrpk_log("manifest missing '['");
@@ -278,14 +258,15 @@ bool ds4_nrpk_open(const char *pack_path, ds4_nrpk *out) {
             ds4_nrpk_close(out);
             return false;
         }
-        p = parse_entry(p, m_end, &out->entries[count]);
+        ds4_nrpk_entry *e = &out->entries[count];
+        p = parse_entry(p, m_end, e);
         if (!p) {
             ds4_nrpk_log("failed to parse entry %u", count);
             ds4_nrpk_close(out);
             return false;
         }
-        if (out->entries[count].data_off + out->entries[count].data_bytes > hdr->data_bytes) {
-            ds4_nrpk_log("entry %s out of data bounds", out->entries[count].name);
+        if (!nrpk_range_within(e->data_off, e->data_bytes, hdr->data_bytes)) {
+            ds4_nrpk_log("entry %s out of data bounds", e->name);
             ds4_nrpk_close(out);
             return false;
         }
@@ -305,8 +286,7 @@ bool ds4_nrpk_open(const char *pack_path, ds4_nrpk *out) {
 
 void ds4_nrpk_close(ds4_nrpk *p) {
     if (!p) return;
-    if (p->map && p->map_size > 0) munmap(p->map, p->map_size);
-    if (p->fd >= 0) close(p->fd);
+    ds4_pack_munmap_close(&p->map, &p->map_size, &p->fd);
     free(p->entries);
     memset(p, 0, sizeof(*p));
     p->fd = -1;
@@ -314,7 +294,6 @@ void ds4_nrpk_close(ds4_nrpk *p) {
 
 const ds4_nrpk_entry *ds4_nrpk_lookup(const ds4_nrpk *p, const char *name) {
     if (!p || !name || !p->entries) return NULL;
-    /* Binary search */
     int32_t lo = 0, hi = (int32_t)p->n_entries - 1;
     while (lo <= hi) {
         int32_t mid = (lo + hi) >> 1;
@@ -330,14 +309,30 @@ const void *ds4_nrpk_get_data(const ds4_nrpk *p, const ds4_nrpk_entry *e) {
     return p->data_arena + e->data_off;
 }
 
+/* Count entries whose name starts with `prefix`. The array is sorted by name,
+ * so all matches form a contiguous range [first, last): two binary searches
+ * make this O(log n) instead of an O(n) scan. */
 uint32_t ds4_nrpk_count_prefix(const ds4_nrpk *p, const char *prefix) {
-    if (!p || !prefix) return 0;
+    if (!p || !prefix || !p->entries || p->n_entries == 0) return 0;
     size_t plen = strlen(prefix);
-    uint32_t count = 0;
-    for (uint32_t i = 0; i < p->n_entries; i++) {
-        if (strncmp(p->entries[i].name, prefix, plen) == 0) count++;
+    if (plen == 0) return p->n_entries;
+    const uint32_t n = p->n_entries;
+    /* first = lowest index with name >= prefix  (lower bound) */
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) >> 1;
+        if (strcmp(p->entries[mid].name, prefix) < 0) lo = mid + 1; else hi = mid;
     }
-    return count;
+    uint32_t first = lo;
+    /* last = lowest index in [first,n) whose name no longer starts with prefix.
+     * Within [first,n), strncmp(name,prefix,plen) is 0 for matches (contiguous,
+     * first) then >0 for the rest, so a binary search on (>0) finds the end. */
+    hi = n;
+    for (lo = first; lo < hi; ) {
+        uint32_t mid = (lo + hi) >> 1;
+        if (strncmp(p->entries[mid].name, prefix, plen) <= 0) lo = mid + 1; else hi = mid;
+    }
+    return lo - first;
 }
 
 void ds4_nrpk_print_summary(const ds4_nrpk *p) {
@@ -354,24 +349,23 @@ void ds4_nrpk_print_summary(const ds4_nrpk *p) {
         (double)p->hdr->data_bytes / 1e9,
         (double)p->hdr->total_bytes / 1e9);
     /* dtype histogram */
-    uint32_t hist[8] = {0};
-    uint64_t hist_bytes[8] = {0};
+    uint32_t hist[NRPK_DTYPE_N] = {0};
+    uint64_t hist_bytes[NRPK_DTYPE_N] = {0};
     for (uint32_t i = 0; i < p->n_entries; i++) {
         const ds4_nrpk_entry *e = &p->entries[i];
-        if (e->dtype < 8) {
+        if ((uint32_t)e->dtype < NRPK_DTYPE_N) {
             hist[e->dtype]++;
             hist_bytes[e->dtype] += e->data_bytes;
         }
     }
-    for (uint32_t d = 1; d < 8; d++) {
+    for (uint32_t d = 1; d < NRPK_DTYPE_N; d++) {
         if (hist[d] > 0) {
             fprintf(stderr, "  %-8s: %5u tensors, %.2f GB\n",
-                ds4_nrpk_dtype_name((ds4_nrpk_dtype)d),
-                hist[d], (double)hist_bytes[d] / 1e9);
+                NRPK_DTYPE[d].name, hist[d], (double)hist_bytes[d] / 1e9);
         }
     }
     /* Selected sample lookups */
-    const char *samples[] = {
+    static const char *samples[] = {
         "embed.weight", "head.weight", "norm.weight",
         "layers.0.attn.wq_b.weight", "layers.0.attn_norm.weight",
         "layers.22.ffn.gate.weight",
@@ -381,15 +375,15 @@ void ds4_nrpk_print_summary(const ds4_nrpk *p) {
     fprintf(stderr, "  sample lookups:\n");
     for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); i++) {
         const ds4_nrpk_entry *e = ds4_nrpk_lookup(p, samples[i]);
-        if (e) {
-            fprintf(stderr, "    %-50s dtype=%s shape=[", samples[i],
-                    ds4_nrpk_dtype_name(e->dtype));
-            for (uint32_t d = 0; d < e->n_dims; d++) {
-                fprintf(stderr, "%s%u", d > 0 ? "," : "", e->dims[d]);
-            }
-            fprintf(stderr, "] bytes=%llu\n", (unsigned long long)e->data_bytes);
-        } else {
+        if (!e) {
             fprintf(stderr, "    %-50s NOT FOUND\n", samples[i]);
+            continue;
         }
+        fprintf(stderr, "    %-50s dtype=%s shape=[", samples[i],
+                ds4_nrpk_dtype_name(e->dtype));
+        for (uint32_t d = 0; d < e->n_dims; d++) {
+            fprintf(stderr, "%s%u", d > 0 ? "," : "", e->dims[d]);
+        }
+        fprintf(stderr, "] bytes=%llu\n", (unsigned long long)e->data_bytes);
     }
 }

@@ -3125,7 +3125,7 @@ ds4_journal *ds4_get_journal(void) {
  g_ds4_journal_init_attempted = 1;
  const char *db_path = getenv("DS4_JOURNAL_DB");
  if (db_path && *db_path) {
- g_ds4_journal = ds4_journal_open(db_path, 0, 0);
+ g_ds4_journal = ds4_journal_open(db_path);
  if (g_ds4_journal) {
  g_ds4_journal_session = ds4_journal_begin_session(
  g_ds4_journal, "deepseek4", 0, "metal", NULL);
@@ -19586,7 +19586,9 @@ struct ds4_engine {
  float directional_steering_ffn_scale;
  uint32_t power_percent;     /* 1..100; 0 means uninitialized → treated as 100 */
  ds4_polar_pool polar_pool;  /* #563 Phase B: per-(layer, kind) PLR2 mmap pool */
- ds4_prefix_cache prefix_cache;  /* silv 2026-05-27 Phase 2: cached prefix activations */
+ /* prefix_cache: now a file-scope singleton in ds4_prefix_cache.c (silv
+  * 2026-06-04 "all caches global") — one engine per process => one cache,
+  * no struct member, no pointer threading. */
  uint8_t polar_layer_enabled[DS4_POLAR_MAX_LAYERS]; /* #563 Phase B-2: DS4_POLAR_LAYERS mask */
  bool quality;
  bool metal_ready;
@@ -23591,7 +23593,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  /* silv 2026-05-27 Phase 2: initialize prefix activation cache.
   * Phase 1 ships only hash + LRU bookkeeping. Phase 3+ adds disk-backed
   * GPU state save/restore. */
- ds4_prefix_cache_init(&e->prefix_cache);
+ ds4_prefix_cache_init();
  /* #563 Phase B-1.5: load PLR2 polar files if DS4_POLAR_DIR is set.
   * Held alongside FP4 weights; no dispatch substitution yet (Phase B-2). */
  ds4_polar_pool_init(&e->polar_pool);
@@ -24906,13 +24908,13 @@ void ds4_engine_close(ds4_engine *e) {
  }
  ds4_storage_dispatch_print_sites();
  /* silv 2026-05-27 Phase 2: dump prefix cache stats if any activity, then free */
- if (e->prefix_cache.stat_lookups > 0 || e->prefix_cache.stat_stores > 0) {
+ if (ds4_prefix_cache_was_used()) {
    char statbuf[256];
-   if (ds4_prefix_cache_stats(&e->prefix_cache, statbuf, sizeof(statbuf)) > 0) {
+   if (ds4_prefix_cache_stats(statbuf, sizeof(statbuf)) > 0) {
      fprintf(stderr, "%s\n", statbuf);
    }
  }
- ds4_prefix_cache_free(&e->prefix_cache);
+ ds4_prefix_cache_free();
  ds4_polar_pool_close(&e->polar_pool);  /* #563 Phase B-1: release mmap'd PLR2 */
  weights_free(&e->weights);
  vocab_free(&e->vocab);

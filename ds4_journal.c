@@ -65,8 +65,7 @@ static const char SCHEMA_DDL[] =
  "CREATE TRIGGER IF NOT EXISTS jno_upd_event BEFORE UPDATE ON event BEGIN SELECT RAISE(ABORT,'journal is append-only'); END;"
  "CREATE TRIGGER IF NOT EXISTS jno_del_event BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT,'journal is append-only'); END;";
 
-ds4_journal *ds4_journal_open(const char *db_path, uint32_t a, uint32_t b) {
- (void)a; (void)b; /* legacy flush_threshold + flush_interval_ms — ignored now */
+ds4_journal *ds4_journal_open(const char *db_path) {
  if (!db_path || g_journal_is_open) return g_journal_is_open ? &g_journal_handle : NULL;
  if (sqlite3_open(db_path, &g_journal_handle.db) != SQLITE_OK) {
  fprintf(stderr, "ds4_journal: cannot open %s\n", db_path);

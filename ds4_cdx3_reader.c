@@ -1,13 +1,9 @@
 #include "ds4_cdx3_reader.h"
+#include "ds4_pack_io.h"   /* shared mmap open/validate/close — one correct copy, not N */
 
-#include <errno.h>
-#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 static uint16_t cdx3_u16(const uint8_t *p) {
     return (uint16_t)p[0] | (uint16_t)((uint16_t)p[1] << 8);
@@ -55,33 +51,6 @@ static float cdx3_f16_to_f32(uint16_t h) {
     return value;
 }
 
-static bool cdx3_mmap_readonly(const char *path, void **map, size_t *size, int *fd_out) {
-    *map = NULL;
-    *size = 0;
-    *fd_out = -1;
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "ds4_cdx3: open(%s) failed: %s\n", path, strerror(errno));
-        return false;
-    }
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
-        fprintf(stderr, "ds4_cdx3: fstat(%s) failed or empty: %s\n", path, strerror(errno));
-        close(fd);
-        return false;
-    }
-    void *mapped = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (mapped == MAP_FAILED) {
-        fprintf(stderr, "ds4_cdx3: mmap(%s) failed: %s\n", path, strerror(errno));
-        close(fd);
-        return false;
-    }
-    *map = mapped;
-    *size = (size_t)st.st_size;
-    *fd_out = fd;
-    return true;
-}
-
 static ds4_cdx3_record cdx3_record_at(const ds4_cdx3_file *file, uint32_t record_index) {
     const uint8_t *p = file->records + (size_t)record_index * DS4_CDX3I_RECORD_BYTES;
     ds4_cdx3_record r;
@@ -107,19 +76,20 @@ bool ds4_cdx3_open(const char *pack_path, const char *index_path, ds4_cdx3_file 
     memset(out, 0, sizeof(*out));
     out->pack_fd = -1;
     out->index_fd = -1;
-    if (!cdx3_mmap_readonly(pack_path, &out->pack_map, &out->pack_size, &out->pack_fd)) return false;
-    if (!cdx3_mmap_readonly(index_path, &out->index_map, &out->index_size, &out->index_fd)) {
-        ds4_cdx3_close(out);
+    /* pack: shared mmap validates min-8 + 4-byte "CDX3" magic (MAP_PRIVATE as before). */
+    if (!ds4_pack_mmap_open_flags(pack_path, "ds4_cdx3", "CDX3", 8, MAP_PRIVATE,
+                                  &out->pack_map, &out->pack_size, &out->pack_fd)) {
         return false;
     }
-    if (out->pack_size < 8 || memcmp(out->pack_map, "CDX3", 4) != 0) {
-        fprintf(stderr, "ds4_cdx3: bad CDX3 pack magic\n");
+    /* index: helper validates min header bytes; the 7-byte CDX3I magic is checked below. */
+    if (!ds4_pack_mmap_open_flags(index_path, "ds4_cdx3", NULL, DS4_CDX3I_HEADER_BYTES, MAP_PRIVATE,
+                                  &out->index_map, &out->index_size, &out->index_fd)) {
         ds4_cdx3_close(out);
         return false;
     }
     const uint8_t *idx = (const uint8_t *)out->index_map;
-    if (out->index_size < DS4_CDX3I_HEADER_BYTES || memcmp(idx, DS4_CDX3I_MAGIC, 7) != 0) {
-        fprintf(stderr, "ds4_cdx3: bad CDX3I index magic/size\n");
+    if (memcmp(idx, DS4_CDX3I_MAGIC, 7) != 0) {
+        fprintf(stderr, "ds4_cdx3: bad CDX3I index magic\n");
         ds4_cdx3_close(out);
         return false;
     }
@@ -151,10 +121,8 @@ bool ds4_cdx3_open(const char *pack_path, const char *index_path, ds4_cdx3_file 
 
 void ds4_cdx3_close(ds4_cdx3_file *file) {
     if (!file) return;
-    if (file->pack_map && file->pack_map != MAP_FAILED) munmap(file->pack_map, file->pack_size);
-    if (file->index_map && file->index_map != MAP_FAILED) munmap(file->index_map, file->index_size);
-    if (file->pack_fd >= 0) close(file->pack_fd);
-    if (file->index_fd >= 0) close(file->index_fd);
+    ds4_pack_munmap_close(&file->pack_map, &file->pack_size, &file->pack_fd);
+    ds4_pack_munmap_close(&file->index_map, &file->index_size, &file->index_fd);
     memset(file, 0, sizeof(*file));
     file->pack_fd = -1;
     file->index_fd = -1;
