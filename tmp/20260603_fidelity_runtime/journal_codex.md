@@ -190,3 +190,11 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - Six-expert separate/no-evict p50: ANE `14.749 ms`, D8F `6.914 ms`, serial `19.865 ms`, concurrent `13.535 ms`, speedup `1.600x`. Same/256MiB p50 speedup was `1.613x`; separate/256MiB was `1.355x`.
 - The synthetic-dense cache warmup result does not transfer cleanly to exact D8F routed. For six experts, same/no-evict D8F-only `7.270 ms` versus D8F-after-ANE `7.760 ms`; separate/no-evict `6.914 ms` versus `7.273 ms`. Treat ANE+D8F as a parallel-overlap win first, not a proven D8F cache warmup.
 - Next runtime move: build an opt-in layer-local scheduler that launches ANE shared expert and GPU/MPSGraph routed D8F from the same hidden-state buffer, then measures GPU merge from CoreML output backing. The merge/fence cost now decides whether the overlap survives integration.
+
+## 2026-06-04T00:02 JST — GPU merge survival for ANE shared + D8F routed
+
+- Extended `ane_d8f_routed_counterbalanced_canary.m` with a Metal `merge_first_row` half-add kernel that reads CoreML shared output backing and exact D8F routed output, then writes merged FFN output without CPU readback.
+- Merge cost is not the blocker. Same-buffer/no-evict selected-six p50 merge-only was `0.418 ms`; separate-buffer/no-evict was `0.608 ms`.
+- Overlap survives merge. Same-buffer/no-evict p50: ANE `13.459 ms`, D8F `7.922 ms`, merge `0.418 ms`, serial+merge `20.317 ms`, concurrent-then-merge `17.511 ms`, overlap+merge speedup `1.245x`.
+- Separate-buffer/no-evict p50: ANE `16.672 ms`, D8F `4.570 ms`, merge `0.608 ms`, serial+merge `20.896 ms`, concurrent-then-merge `17.455 ms`, overlap+merge speedup `1.252x`.
+- Current production implication: same-layer ANE shared + GPU/MPSGraph routed + GPU merge is mechanically viable and does not collapse on the first merge. Next falsifiers are route weights, real batch/microbatch scheduling, and moving from a canary executable into an opt-in layer-local runtime organ.

@@ -140,6 +140,48 @@ static double evict_cpu_cache(uint8_t *buffer, size_t bytes) {
     return now_seconds() - start;
 }
 
+static id<MTLComputePipelineState> make_merge_pipeline(id<MTLDevice> device) {
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "kernel void merge_first_row(const device half *shared [[buffer(0)]],\n"
+         "                            const device half *routed [[buffer(1)]],\n"
+         "                            device half *out [[buffer(2)]],\n"
+         "                            uint gid [[thread_position_in_grid]]) {\n"
+         "  if (gid >= 4096) return;\n"
+         "  out[gid] = shared[gid] + routed[gid];\n"
+         "}\n";
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    if (!library) die(@"merge newLibraryWithSource failed", error);
+    id<MTLFunction> function = [library newFunctionWithName:@"merge_first_row"];
+    if (!function) die(@"merge function missing", nil);
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+    if (!pipeline) die(@"merge pipeline failed", error);
+    return pipeline;
+}
+
+static void run_merge_once(id<MTLCommandQueue> queue,
+                           id<MTLComputePipelineState> pipeline,
+                           id<MTLBuffer> shared_output,
+                           id<MTLBuffer> routed_output,
+                           id<MTLBuffer> merged_output) {
+    id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:shared_output offset:0 atIndex:0];
+    [encoder setBuffer:routed_output offset:0 atIndex:1];
+    [encoder setBuffer:merged_output offset:0 atIndex:2];
+    NSUInteger threads = pipeline.maxTotalThreadsPerThreadgroup < 256 ? pipeline.maxTotalThreadsPerThreadgroup : 256;
+    if (threads == 0) threads = 1;
+    MTLSize threads_per_group = MTLSizeMake(threads, 1, 1);
+    MTLSize groups = MTLSizeMake((kOutDim + threads - 1) / threads, 1, 1);
+    [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads_per_group];
+    [encoder endEncoding];
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+}
+
 static bool prepare_codebook(const ds4_d8f_file *file,
                              const ds4_d8f_record *record,
                              uint32_t codebook_cols,
@@ -433,7 +475,9 @@ int main(int argc, const char **argv) {
                                                        options:MTLResourceStorageModeShared];
         id<MTLBuffer> d8f_output = [device newBufferWithLength:kOutDim * sizeof(uint16_t)
                                                        options:MTLResourceStorageModeShared];
-        if (!ane_input || !mps_input || !ane_output || !d8f_output) die(@"MTLBuffer allocation failed", nil);
+        id<MTLBuffer> merged_output = [device newBufferWithLength:kOutDim * sizeof(uint16_t)
+                                                          options:MTLResourceStorageModeShared];
+        if (!ane_input || !mps_input || !ane_output || !d8f_output || !merged_output) die(@"MTLBuffer allocation failed", nil);
         uint16_t *ane_words = (uint16_t *)ane_input.contents;
         for (uint32_t row = 0; row < batch; ++row) {
             memcpy(ane_words + (uint64_t)row * kHiddenDim, x_f16, (size_t)kHiddenDim * sizeof(uint16_t));
@@ -441,6 +485,8 @@ int main(int argc, const char **argv) {
         if (separate_input) memcpy(mps_input.contents, x_f16, (size_t)kHiddenDim * sizeof(uint16_t));
         memset(ane_output.contents, 0, (NSUInteger)batch * kOutDim * sizeof(uint16_t));
         memset(d8f_output.contents, 0, kOutDim * sizeof(uint16_t));
+        memset(merged_output.contents, 0, kOutDim * sizeof(uint16_t));
+        id<MTLComputePipelineState> merge_pipeline = make_merge_pipeline(device);
 
         MLMultiArray *ane_input_array = make_buffer_multiarray(ane_input, input_shape, MLMultiArrayDataTypeFloat16);
         MLMultiArray *ane_output_array = make_buffer_multiarray(ane_output, output_shape, MLMultiArrayDataTypeFloat16);
@@ -523,6 +569,7 @@ int main(int argc, const char **argv) {
         for (uint32_t index = 0; index < 3u; ++index) {
             run_ane_once(model, provider, options);
             run_d8f_once(executable, queue, d8f_inputs, d8f_outputs);
+            run_merge_once(queue, merge_pipeline, ane_output, d8f_output, merged_output);
         }
         id<MLFeatureProvider> backing_check = [model predictionFromFeatures:provider options:options error:&error];
         if (!backing_check) die(@"CoreML backing check failed", error);
@@ -542,7 +589,10 @@ int main(int argc, const char **argv) {
             @"d8f_after_ane_evicted",
             @"ane_after_d8f",
             @"serial_ane_d8f",
-            @"concurrent"
+            @"concurrent",
+            @"merge_only",
+            @"serial_ane_d8f_merge",
+            @"concurrent_then_merge"
         ];
         NSMutableDictionary<NSString *, NSMutableArray<NSNumber *> *> *samples = [NSMutableDictionary dictionary];
         NSMutableArray<NSNumber *> *evict_samples = [NSMutableArray array];
@@ -600,6 +650,28 @@ int main(int argc, const char **argv) {
                     });
                     dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
                     record_sample(samples, case_name, (now_seconds() - start) * 1e3);
+                } else if ([case_name isEqualToString:@"merge_only"]) {
+                    start = now_seconds();
+                    run_merge_once(queue, merge_pipeline, ane_output, d8f_output, merged_output);
+                    record_sample(samples, case_name, (now_seconds() - start) * 1e3);
+                } else if ([case_name isEqualToString:@"serial_ane_d8f_merge"]) {
+                    start = now_seconds();
+                    run_ane_once(model, provider, options);
+                    run_d8f_once(executable, queue, d8f_inputs, d8f_outputs);
+                    run_merge_once(queue, merge_pipeline, ane_output, d8f_output, merged_output);
+                    record_sample(samples, case_name, (now_seconds() - start) * 1e3);
+                } else if ([case_name isEqualToString:@"concurrent_then_merge"]) {
+                    dispatch_group_t group = dispatch_group_create();
+                    start = now_seconds();
+                    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        run_ane_once(model, provider, options);
+                    });
+                    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        run_d8f_once(executable, queue, d8f_inputs, d8f_outputs);
+                    });
+                    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+                    run_merge_once(queue, merge_pipeline, ane_output, d8f_output, merged_output);
+                    record_sample(samples, case_name, (now_seconds() - start) * 1e3);
                 }
             }
             NSLog(@"[trial] index=%u order=%@", trial, order);
@@ -631,6 +703,18 @@ int main(int argc, const char **argv) {
               serial_p50,
               concurrent_p50,
               concurrent_p50 > 0.0 ? (ane_p50 + d8f_p50) / concurrent_p50 : 0.0);
+        double merge_p50 = p50_for_case(samples, @"merge_only");
+        double serial_merge_p50 = p50_for_case(samples, @"serial_ane_d8f_merge");
+        double concurrent_merge_p50 = p50_for_case(samples, @"concurrent_then_merge");
+        NSLog(@"[merge_effect] mode=%@ evict_mib=%u nsel=%u merge_p50_ms=%.3f ane_plus_d8f_plus_merge_p50_ms=%.3f serial_merge_p50_ms=%.3f concurrent_then_merge_p50_ms=%.3f overlap_merge_speedup_p50=%.3f",
+              input_mode,
+              evict_mib,
+              n_experts,
+              merge_p50,
+              ane_p50 + d8f_p50 + merge_p50,
+              serial_merge_p50,
+              concurrent_merge_p50,
+              concurrent_merge_p50 > 0.0 ? (ane_p50 + d8f_p50 + merge_p50) / concurrent_merge_p50 : 0.0);
         NSLog(@"[cache_effect] mode=%@ evict_mib=%u nsel=%u d8f_only_p50_ms=%.3f d8f_evicted_p50_ms=%.3f d8f_after_ane_p50_ms=%.3f d8f_after_ane_evicted_p50_ms=%.3f evict_p50_ms=%.3f",
               input_mode,
               evict_mib,
@@ -640,7 +724,7 @@ int main(int argc, const char **argv) {
               p50_for_case(samples, @"d8f_after_ane"),
               p50_for_case(samples, @"d8f_after_ane_evicted"),
               evict_summary[@"p50"].doubleValue);
-        NSLog(@"[samples] ane0=0x%04x d8f0=0x%04x", ((uint16_t *)ane_output.contents)[0], ((uint16_t *)d8f_output.contents)[0]);
+        NSLog(@"[samples] ane0=0x%04x d8f0=0x%04x merged0=0x%04x", ((uint16_t *)ane_output.contents)[0], ((uint16_t *)d8f_output.contents)[0], ((uint16_t *)merged_output.contents)[0]);
 
         free(evict_buffer);
         free(got);
