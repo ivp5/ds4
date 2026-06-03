@@ -22,7 +22,7 @@ The clean runtime architecture is a small set of cold-owned organs:
 - Hot path must be O(n) over touched blocks/rows/tensors and O(1) over unrelated layers/packs.
 - Cold path may scan packages/layers, but must expose resident footprint and load/compile time.
 - No hidden full-model scans in token decode; no lazy `2.4 s` CoreML model loads inside generation.
-- Expanded MPSGraph gather remains O(n), but with inflated constants from materialized `int32` indices; direct packed-index MPSGraph decode is correct but slower; packed-index Metal is the baseline for memory-floor comparison.
+- Expanded MPSGraph gather remains O(n), but with inflated constants from materialized `int32` indices; direct packed-index MPSGraph decode is correct but slower; packed-index Metal now has a first viable baseline near expanded-gather speed.
 
 ## Simplifications Applied
 
@@ -46,4 +46,4 @@ The clean runtime architecture is a small set of cold-owned organs:
 2. Runtime sidecar scaffold: one default-off owner for CoreML model cache, D8F graph/kernel cache, hidden backing, parallel launch, and merge.
 3. Package cache manifest: record layer package path, compile URL, resident footprint, load state, and validation status in one typed table.
 4. Canary harness library: if more ANE/MPSGraph canaries are added, extract shared CoreML feature/backing helpers instead of copy-pasting per file.
-5. Packed Metal baseline: quantify actual bytes/op against MPSGraph expanded and packed gather so “memory floor” has a measured reference.
+5. Real D8F Metal baseline: feed H3355 VQ-D8 records/codebooks into the 128-thread packed-index kernel and compare against MPSGraph down E165 and selected-six logs.

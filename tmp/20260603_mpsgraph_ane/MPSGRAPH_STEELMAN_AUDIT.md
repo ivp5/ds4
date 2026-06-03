@@ -42,7 +42,7 @@ MPSGraph has not been exhausted. The current evidence is deep enough to reject t
 
 ## Current Architecture Decision
 
-Do not promote generic MPSGraph gather or packed-index MPSGraph decode as the final D8F runtime. Keep MPSGraph as an exact graph oracle, overlap probe, and possible down-only cache organ while the production path moves toward:
+Do not promote generic MPSGraph gather or packed-index MPSGraph decode as the final D8F runtime. The first custom Metal packed VQ-D8 baseline is already near MPSGraph expanded-gather timing while retaining packed indices, so keep MPSGraph as an exact graph oracle, overlap probe, and possible down-only cache organ while the production path moves toward:
 
 1. cold-loaded CoreML shared-expert package cache;
 2. cold-compiled routed D8F graph or fused Metal kernel cache;

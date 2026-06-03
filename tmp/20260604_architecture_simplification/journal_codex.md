@@ -53,3 +53,9 @@ Append-only transaction log. Scope: IVP5 DS4 MPSGraph/ANE runtime architecture, 
 - Result: MPSGraph does not make it fast. 12-bit VQ-D8 index storage shrank `2.666x`, but packed decode ran slower than expanded gather (`766.167 us` vs `668.612 us` in one run; `1408.538 us` vs `724.956 us` in the clean rerun).
 - Retested real H3355 L26 VQ-D8 LUT canaries through `ds4`: down E165 `808.583 us`, down selected-six `1903.469 us`, gate/up E165 `1187.917 us`, gate/up selected-six `2871.323 us`; all passed `bad=0`.
 - Architecture update: direct packed-index MPSGraph is not the routed memory-floor path. The next compact high-probability route is a custom Metal packed VQ-D8 LUT kernel baseline, while MPSGraph remains useful as exact oracle and overlap probe.
+
+## 2026-06-04T01:05 JST — Metal packed LUT baseline
+
+- Added `metal_vqd8_lut_packed_probe.m` as the direct custom-Metal counterpart to the MPSGraph packed-index probe.
+- Finding: one simdgroup per row was too serial (`1725.340 us/op`), but four simdgroups per row with a threadgroup reduction reached `730.958 us/op` with `bad=0`.
+- Architecture update: the packed-index memory-floor path is custom Metal, not MPSGraph. The next useful patch is to feed real D8F records/codebooks into this kernel and compare against `ds4_mpsgraph` down E165 `808.583 us/op`.

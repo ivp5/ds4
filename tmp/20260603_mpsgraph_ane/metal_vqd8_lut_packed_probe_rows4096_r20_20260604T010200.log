@@ -1,0 +1,10 @@
+newLibraryWithSource failed: program_source:11:13: error: expecting input declarations with either all scalar types or all vector types with the same number of elements
+kernel void vqd8_lut_packed(const device half *x [[buffer(0)]],
+            ^
+program_source:17:35: note: declaration with attribute 'threadgroup_position_in_grid' of type 'uint3' (vector of 3 'unsigned int' values) here
+                            uint3 tg [[threadgroup_position_in_grid]],
+                            ~~~~~~^~
+program_source:18:34: note: declaration with attribute 'thread_position_in_threadgroup' of type 'uint' (aka 'unsigned int') here
+                            uint lane [[thread_position_in_threadgroup]]) {
+                            ~~~~~^~~~
+

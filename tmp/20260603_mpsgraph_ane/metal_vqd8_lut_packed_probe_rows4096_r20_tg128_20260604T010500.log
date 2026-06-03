@@ -1,0 +1,1 @@
+metal_vqd8_lut_packed_probe: rows=4096 rounds=20 groups=256 k=4096 us/op=730.958 packed_index_MB=1.573 codebook_MB=0.066 bad=0 max_abs=0.00375366 rms=0.000810868 sample_ref=0.925185 sample_got=0.925293

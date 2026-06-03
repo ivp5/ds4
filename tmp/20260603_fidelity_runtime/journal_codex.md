@@ -258,3 +258,11 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - 12-bit VQ-D8 packed decode is also correct but not fast enough: first run expanded `668.612 us`, packed `766.167 us`; clean rerun expanded `724.956 us`, packed `1408.538 us`; both had `bad=0` and index storage shrink `2.666x`.
 - Fresh real H3355 L26 VQ-D8 LUT canaries passed. Down single expert E165: `808.583 us/op`, `bad=0`; down selected six `165,0,1,2,3,4`: `1903.469 us/op`, `bad=0`; gate/up E165: `1187.917 us/op`, `bad=0`; gate/up selected six: `2871.323 us/op`, `bad=0`.
 - Decision: MPSGraph can express packed VQ-D8 LUT indices, but direct packed decode/gather does not reach the memory floor. Keep MPSGraph for exactness/oracle/overlap/down-only tests; move memory-floor routed work toward custom Metal packed-index kernels.
+
+## 2026-06-04T01:05 JST — custom Metal packed VQ-D8 LUT baseline
+
+- Added `tmp/20260603_mpsgraph_ane/metal_vqd8_lut_packed_probe.m`, a synthetic 12-bit VQ-D8 LUT down-shape kernel using packed indices directly instead of expanded `int32` indices.
+- First Metal impact was an MSL attribute error from mixing `uint3 threadgroup_position_in_grid` with scalar thread position; scalar row/thread attributes fixed it.
+- Naive one-simdgroup-per-row kernel was correct but slow: `1725.340 us/op`, `bad=0`, `rms=0.000810868`.
+- The 128-thread/four-simdgroup row kernel reached `730.958 us/op`, `bad=0`, `rms=0.000810868`, with packed index traffic `1.573 MB` and codebook `0.066 MB`.
+- This is the first useful memory-floor direction: custom Metal packed VQ-D8 is already near MPSGraph expanded-gather timing while retaining packed 12-bit indices. Next step is a real D8F-record kernel, then fuse selected experts and route weights.
