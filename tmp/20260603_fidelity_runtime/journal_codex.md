@@ -232,3 +232,12 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - Metal eviction is cheaper and more targeted than CPU eviction on this canary: 256MiB Metal evict p50 was about `2.1 ms`, while prior 256MiB CPU evict p50 was about `14.3 ms`.
 - Overlap survived Metal eviction: same/256MiB-metal overlap+merge speedup was `1.275x`; separate/256MiB-metal was `1.187x`. This is comparable to, and slightly cleaner than, CPU eviction evidence.
 - The cache story is still mixed rather than promotional. Same/metal D8F-after-ANE was slightly faster than D8F-only (`5.037 ms` vs `5.129 ms`), but separate/metal was slower (`7.178 ms` vs `5.237 ms`). Treat this as evidence that allocation/topology/scheduler state matters, not proof of a general ANE warm-cache effect.
+
+## 2026-06-04T00:34 JST — layer-matched L26 shared expert CoreML canary
+
+- Exported a layer-matched L26 B=2048 8-bit palettized shared-expert CoreML model from the H3355 non-routed pack: `tmp/20260603_mpsgraph_ane/shared_l26_b2048_8bit_20260604T003136.mlpackage`. The package is `24M`, matching the existing L0 package size, so all-layer 8-bit shared experts are a plausible ~1-2GB class overlay, not a memory-budget wall.
+- Toolchain note: Python 3.14 `coremltools` imports but cannot export MLProgram blobs here because `BlobWriter` is unavailable. The existing proven CoreML export path uses `/opt/homebrew/bin/python3.13`; that path produced the L26 package successfully.
+- Extended `validate_coreml_shared_expert_ones.py` to validate arbitrary real hidden rows, not only all-ones inputs.
+- L26 shared 8-bit fidelity passed the cheap gates. Ones row: `max_abs=0.012057`, `rms=0.00294488`, `ref_rms=0.374573`. Real L26 hidden row 9: `max_abs=0.0113556`, `rms=0.00146171`, `ref_rms=0.0795328`.
+- Layer-matched L26 shared + L26 routed D8F overlap remains viable on the real hidden row. Same/no-evict p50: ANE `13.775 ms`, D8F `5.455 ms`, merge `0.561 ms`, concurrent+merge `14.463 ms`, overlap+merge speedup `1.368x`.
+- Cache warmup still does not promote: D8F-after-ANE was `7.429 ms` versus D8F-only `5.455 ms`. The runtime path should be explicit overlap and merge, not relying on hidden cache warming.

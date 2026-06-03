@@ -1,0 +1,3 @@
+[config] layer=26 batch=2048 clamp=10.0 model=tmp/20260603_mpsgraph_ane/shared_l26_b2048_8bit_20260604T003136.mlpackage
+[hidden] source=ones
+[result] shape=(2048, 4096) max_abs=0.012057 max_rel=0.012057 rms=0.00294488 ref_rms=0.374573 sample_ref=-1.03729 sample_got=-1.04297

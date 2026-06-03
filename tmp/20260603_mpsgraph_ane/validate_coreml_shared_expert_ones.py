@@ -7,7 +7,7 @@ import numpy as np
 from make_coreml_shared_expert_from_nrpk import dequant_fp8_transposed, read_manifest
 
 
-def reference_ones(pack, layer, clamp):
+def reference_shared(pack, layer, clamp, hidden):
     entries, data_offset = read_manifest(pack)
     prefix = f"layers.{layer}.ffn.shared_experts"
     gate_t = dequant_fp8_transposed(
@@ -19,12 +19,31 @@ def reference_ones(pack, layer, clamp):
     up_t = dequant_fp8_transposed(
         pack, entries, data_offset, f"{prefix}.w3.weight", f"{prefix}.w3.scale"
     ).astype(np.float32)
-    gate = gate_t.sum(axis=0)
-    up = up_t.sum(axis=0)
+    gate = hidden @ gate_t
+    up = hidden @ up_t
     gate = np.minimum(gate, clamp)
     up = np.clip(up, -clamp, clamp)
     mid = (gate / (1.0 + np.exp(-gate))) * up
     return mid @ down_t
+
+
+def load_hidden(path, row):
+    data = np.fromfile(path, dtype=np.float32)
+    if data.size % 4096 != 0:
+        raise SystemExit(f"hidden file has non-row size: {path} floats={data.size}")
+    rows = data.size // 4096
+    if row < 0:
+        row += rows
+    if row < 0 or row >= rows:
+        raise SystemExit(f"hidden row {row} outside {rows} rows")
+    hidden = data.reshape(rows, 4096)[row].astype(np.float32)
+    print(
+        f"[hidden] source=file path={path} row={row} rows={rows} "
+        f"mean={hidden.mean():.6g} rms={np.sqrt(np.mean(hidden * hidden)):.6g} "
+        f"max_abs={np.max(np.abs(hidden)):.6g} first={hidden[0]:.6g}",
+        flush=True,
+    )
+    return hidden
 
 
 def main():
@@ -34,15 +53,21 @@ def main():
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--clamp", type=float, default=10.0)
+    parser.add_argument("--hidden-f32", default=None)
+    parser.add_argument("--hidden-row", type=int, default=0)
     args = parser.parse_args()
 
     print(
         f"[config] layer={args.layer} batch={args.batch} clamp={args.clamp} model={args.model}",
         flush=True,
     )
-    ref = reference_ones(args.pack, args.layer, args.clamp)
+    hidden = load_hidden(args.hidden_f32, args.hidden_row) if args.hidden_f32 else np.ones(4096, dtype=np.float32)
+    if not args.hidden_f32:
+        print("[hidden] source=ones", flush=True)
+    ref = reference_shared(args.pack, args.layer, args.clamp, hidden)
     model = ct.models.MLModel(args.model, compute_units=ct.ComputeUnit.CPU_AND_NE)
-    pred = model.predict({"x": np.ones((args.batch, 4096), dtype=np.float16)})
+    batch = np.repeat(hidden.astype(np.float16)[None, :], args.batch, axis=0)
+    pred = model.predict({"x": batch})
     out = np.asarray(pred["shared_out"], dtype=np.float32)
     row = out[0]
     diff = row - ref
