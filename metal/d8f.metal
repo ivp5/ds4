@@ -898,6 +898,26 @@ struct D8FDownLutI8CodebookLite {
   uint keep_offset;
 };
 
+inline float d8f_dot8_codebook_texbuf(texture_buffer<half, access::read> codebook_tex,
+                                      ulong codebook_offset,
+                                      uint code,
+                                      float m0,
+                                      float m1,
+                                      float m2,
+                                      float m3,
+                                      float m4,
+                                      float m5,
+                                      float m6,
+                                      float m7) {
+  const uint base = uint((codebook_offset >> 3) + ulong(code) * 2ul);
+  const half4 lo = codebook_tex.read(base);
+  const half4 hi = codebook_tex.read(base + 1u);
+  return float(lo.x) * m0 + float(lo.y) * m1 +
+         float(lo.z) * m2 + float(lo.w) * m3 +
+         float(hi.x) * m4 + float(hi.y) * m5 +
+         float(hi.z) * m6 + float(hi.w) * m7;
+}
+
 inline ulong d8f_down_lut_sidecar_a_offset(D8FDownLutSidecarLite sidecar) {
   return ulong(sidecar.a_offset_lo) | (ulong(sidecar.a_offset_hi) << 32);
 }
@@ -2306,6 +2326,7 @@ kernel void d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes(
   device const float *route_weights      [[buffer(5)]],
   device const D8FRecordLite *recs       [[buffer(6)]],
   device const float *sidecar_dot        [[buffer(7)]],
+  texture_buffer<half, access::read> codebook_tex [[texture(0)]],
   threadgroup float *partial             [[threadgroup(0)]],
   uint tid [[thread_index_in_threadgroup]],
   ushort tiisg [[thread_index_in_simdgroup]],
@@ -2374,11 +2395,8 @@ kernel void d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes(
           code = (w >> shift) & rec.mask;
         }
         if (code >= rec.k) continue;
-        const device half *cb = (const device half *)(pack + rec.codebook_offset + ulong(code) * 16ul);
-        acc[rr] += rw * (float(cb[0]) * m0 + float(cb[1]) * m1 +
-                         float(cb[2]) * m2 + float(cb[3]) * m3 +
-                         float(cb[4]) * m4 + float(cb[5]) * m5 +
-                         float(cb[6]) * m6 + float(cb[7]) * m7);
+        acc[rr] += rw * d8f_dot8_codebook_texbuf(codebook_tex, rec.codebook_offset, code,
+                                                  m0, m1, m2, m3, m4, m5, m6, m7);
       }
     }
     if (side_rank1) {
