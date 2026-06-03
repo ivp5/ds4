@@ -160,3 +160,13 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - B=2048 r20: ANE `4.561 ms`, MPSGraph `6.026 ms`, ANE→MPSGraph inner `8.066 ms`, MPSGraph→ANE inner `12.381 ms`, concurrent `5.944 ms`, speedup `1.781x`.
 - Added CPU eviction controls. Evicting 64/256/512 MiB after ANE before MPSGraph pushed ANE→MPSGraph inner time into the `9.1-9.7 ms` range, while no-evict ANE→MPSGraph often stayed `5-7 ms`. This is evidence that cache/scheduling state matters, but the current canary has order contamination; the next rigorous test must counterbalance/randomize permutation order and record per-round distributions.
 - Queued the cache work in `tmp/20260603_mpsgraph_ane/CACHE_ARCHITECTURE_EXPLORATION_QUEUE.md`. Current production direction remains: ANE high-B prefill shared-expert organ first, MPSGraph exact D8F down/gateup graph-cache exploration second, raw ANE D8F gather rejected for now.
+
+## 2026-06-03T23:43 JST — real H3355 shared expert CoreML/ANE canary
+
+- Added `tmp/20260603_mpsgraph_ane/make_coreml_shared_expert_from_nrpk.py`, which reads the H3355 non-routed pack, dequants real shared-expert FP8 E4M3 weights with E8M0 tile scales, and emits a CoreML shared-expert graph for layer-local `w1`, `w3`, and `w2`.
+- Added `tmp/20260603_mpsgraph_ane/validate_coreml_shared_expert_ones.py`, a cheap fidelity canary that compares CoreML output against a direct dequant reference on an all-ones hidden-state batch.
+- 4-bit CoreML palettization is not fidelity-safe on this canary: `max_abs=0.369388`, `rms=0.0841229`, `ref_rms=0.427915`, roughly `19.7%` RMS/reference RMS.
+- 8-bit CoreML palettization is the viable candidate so far: `max_abs=0.0198364`, `rms=0.0050416`, `ref_rms=0.427915`, roughly `1.18%` RMS/reference RMS.
+- Real layer-0 shared expert B=2048 8-bit CoreML/ANE timing measured `predict_ms=11.618`, `fill_predict_ms=12.181`, `copy_predict_ms=12.053`, with CoreML output backing accepted.
+- Real shared expert ANE overlapped with same-shape MPSGraph dense work at B=2048: ANE `12.200 ms`, MPSGraph `14.896 ms`, serial `27.096 ms`, concurrent `15.980 ms`, speedup `1.696x`.
+- Production implication: shared-expert ANE prefill is not blocked by model construction or ingress. The only fidelity-plausible CoreML shared path so far is 8-bit; the next hard gate is comparing real `batch_ffn_norm` samples and merging ANE shared output with GPU/D8F routed output without CPU serialization.

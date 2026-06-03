@@ -1,0 +1,2 @@
+[config] layer=0 batch=128 clamp=10.0 model=tmp/20260603_mpsgraph_ane/shared_l0_b128_8bit_20260603T234257.mlpackage
+[result] shape=(128, 4096) max_abs=0.0198364 max_rel=0.0198364 rms=0.0050416 ref_rms=0.427915 sample_ref=0.0502063 sample_got=0.0519409

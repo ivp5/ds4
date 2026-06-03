@@ -1,0 +1,13 @@
+2026-06-03 23:43:29.737 coreml_iosurface_ingress_canary[50624:11931462] [compile] start path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage
+2026-06-03 23:43:32.210 coreml_iosurface_ingress_canary[50624:11931462] [shape] input=x (
+    2048,
+    4096
+) output=shared_out (
+    2048,
+    4096
+)
+2026-06-03 23:43:32.250 coreml_iosurface_ingress_canary[50624:11931462] [warmup] 1 output_backing_used=yes
+2026-06-03 23:43:32.262 coreml_iosurface_ingress_canary[50624:11931462] [warmup] 2 output_backing_used=yes
+2026-06-03 23:43:32.274 coreml_iosurface_ingress_canary[50624:11931462] [warmup] 3 output_backing_used=yes
+2026-06-03 23:43:32.561 coreml_iosurface_ingress_canary[50624:11931462] [result] rounds=8 predict_ms=11.618 fill_predict_ms=12.181 fill_delta_ms=0.563 copy_predict_ms=12.053 copy_delta_ms=0.436
+2026-06-03 23:43:32.561 coreml_iosurface_ingress_canary[50624:11931462] [output_sample] words=8388608 first=0x2aa6 0xb9fd 0xb7b9 0xb6a3
