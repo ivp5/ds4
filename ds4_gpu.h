@@ -2018,6 +2018,14 @@ int ds4_gpu_mpsgraph_d8f_gateup_lut_selected_canary(const char *d8f_path,
                                                     uint32_t rounds,
                                                     uint32_t mode,
                                                     float swiglu_limit);
+int ds4_gpu_mpsgraph_d8f_hybrid_lut_organ_canary(const char *d8f_path,
+                                                 const uint32_t *experts,
+                                                 uint32_t n_experts,
+                                                 uint32_t rows,
+                                                 uint32_t n_tokens,
+                                                 uint32_t rounds,
+                                                 uint32_t mode,
+                                                 float swiglu_limit);
 #endif
 int ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor(const char *d8f_path,
                                                   uint32_t layer,

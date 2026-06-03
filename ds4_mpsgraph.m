@@ -222,6 +222,55 @@ static void ds4_mpsgraph_reference_lut(const float *x,
     ds4_mpsgraph_reference_down_lut_accum(x, codebook, indices, codebook_cols, in_dim, rows, out);
 }
 
+static float ds4_mpsgraph_d8f_ref_dot(const ds4_d8f_file *file,
+                                      const ds4_d8f_record *record,
+                                      const float *input,
+                                      uint32_t row,
+                                      uint32_t in_dim) {
+    enum { block = 8 };
+    if (!file || !record || !input || record->k == 0u || record->bits == 0u ||
+        in_dim == 0u || (in_dim & 7u) != 0u) return 0.0f;
+    const uint32_t groups = in_dim / block;
+    uint32_t local_row = row;
+    if (record->row_block != 0u) {
+        const uint32_t row_base = record->row_block * 128u;
+        if (row < row_base || row >= row_base + 128u) return 0.0f;
+        local_row = row - row_base;
+    }
+    double sum = 0.0;
+    for (uint32_t group = 0; group < groups; group++) {
+        const uint64_t block_index = (uint64_t)local_row * groups + group;
+        const uint32_t code = ds4_d8f_code_at(file, record, block_index);
+        if (code >= record->k) continue;
+        const uint8_t *codebook = file->map + record->codebook_offset + (uint64_t)code * block * sizeof(uint16_t);
+        const uint32_t input_base = group * block;
+        for (uint32_t dim = 0; dim < block; dim++) {
+            sum += (double)ds4_mpsgraph_f16_to_f32(ds4_mpsgraph_u16(codebook + dim * sizeof(uint16_t))) *
+                   (double)input[input_base + dim];
+        }
+    }
+    return (float)sum;
+}
+
+static void ds4_mpsgraph_prepare_scaled_mid(const ds4_d8f_file *file,
+                                            const ds4_d8f_record *down,
+                                            const float *mid,
+                                            float route_weight,
+                                            uint32_t in_dim,
+                                            float *scaled_f32,
+                                            uint16_t *scaled_f16) {
+    const bool has_scale = down && (down->flags & 1u) != 0u && down->scale_offset != 0u;
+    for (uint32_t index = 0; index < in_dim; index++) {
+        float value = mid[index] * route_weight;
+        if (has_scale) {
+            const uint8_t *scale = file->map + down->scale_offset + (uint64_t)index * sizeof(uint16_t);
+            value *= ds4_mpsgraph_f16_to_f32(ds4_mpsgraph_u16(scale));
+        }
+        scaled_f32[index] = value;
+        scaled_f16[index] = ds4_mpsgraph_f32_to_f16(value);
+    }
+}
+
 static MPSGraphTensor *ds4_mpsgraph_build_lut(MPSGraph *graph,
                                               MPSGraphTensor *x,
                                               MPSGraphTensor *codebook,
@@ -244,6 +293,31 @@ static MPSGraphTensor *ds4_mpsgraph_build_lut(MPSGraph *graph,
                                                    axis:0
                                                    name:@"d8f_lut_reduce"];
     return [graph reshapeTensor:out withShape:@[@(rows)] name:@"d8f_lut_out"];
+}
+
+static MPSGraphTensor *ds4_mpsgraph_build_lut_batched(MPSGraph *graph,
+                                                      MPSGraphTensor *x,
+                                                      MPSGraphTensor *codebook,
+                                                      MPSGraphTensor *indices,
+                                                      uint32_t n_tokens,
+                                                      uint32_t in_dim,
+                                                      uint32_t rows) {
+    enum { block = 8 };
+    (void)rows;
+    const uint32_t groups = in_dim / block;
+    MPSGraphTensor *xr = [graph reshapeTensor:x
+                                    withShape:@[@(n_tokens), @(groups), @(block)]
+                                         name:@"d8f_lut_batched_x_reshaped"];
+    MPSGraphTensor *table = [graph matrixMultiplicationWithPrimaryTensor:xr
+                                                         secondaryTensor:codebook
+                                                                    name:@"d8f_lut_batched_table"];
+    MPSGraphTensor *gathered = [graph gatherAlongAxis:2
+                                   withUpdatesTensor:table
+                                       indicesTensor:indices
+                                                name:@"d8f_lut_batched_gather"];
+    return [graph reductionSumWithTensor:gathered
+                                    axis:1
+                                    name:@"d8f_lut_batched_reduce"];
 }
 
 int ds4_gpu_mpsgraph_d8f_down_lut_canary(const char *d8f_path,
@@ -463,6 +537,351 @@ int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
         free(got); free(ref);
         ds4_d8f_close(&file);
         return bad == 0 ? 1 : 0;
+    }
+}
+
+int ds4_gpu_mpsgraph_d8f_hybrid_lut_organ_canary(const char *d8f_path,
+                                                 const uint32_t *experts,
+                                                 uint32_t n_experts,
+                                                 uint32_t rows,
+                                                 uint32_t n_tokens,
+                                                 uint32_t rounds,
+                                                 uint32_t mode,
+                                                 float swiglu_limit) {
+    enum {
+        block = 8,
+        selected_expert_cap = 6,
+        token_cap = 16,
+        gateup_in_dim = 4096,
+        mid_dim = 2048,
+        down_out_dim = 4096,
+        token_slot_cap = selected_expert_cap * token_cap
+    };
+    @autoreleasepool {
+        if (!d8f_path || !experts || n_experts == 0u || n_experts > selected_expert_cap) return 0;
+        if (rows == 0u || rows > down_out_dim) rows = down_out_dim;
+        if (n_tokens == 0u) n_tokens = 1u;
+        if (n_tokens > token_cap) n_tokens = token_cap;
+        if (rounds == 0u) rounds = 20u;
+        if (!(swiglu_limit > 0.0f)) swiglu_limit = 10.0f;
+        const bool fp32_path = mode != 0u;
+        ds4_d8f_file file;
+        if (!ds4_d8f_open(d8f_path, &file)) return 0;
+        ds4_d8f_record gate_records[selected_expert_cap];
+        ds4_d8f_record up_records[selected_expert_cap];
+        ds4_d8f_record down_records[selected_expert_cap];
+        uint32_t max_k = 0u;
+        const uint32_t gate_groups = gateup_in_dim / block;
+        const uint32_t down_groups = mid_dim / block;
+        for (uint32_t slot_index = 0; slot_index < n_experts; slot_index++) {
+            if (experts[slot_index] >= 256u ||
+                !ds4_d8f_get_record(&file, DS4_D8F_GATE, experts[slot_index], &gate_records[slot_index]) ||
+                !ds4_d8f_get_record(&file, DS4_D8F_UP, experts[slot_index], &up_records[slot_index]) ||
+                !ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot_index], &down_records[slot_index])) {
+                fprintf(stderr, "ds4_mpsgraph: hybrid missing expert %u in %s\n", experts[slot_index], d8f_path);
+                ds4_d8f_close(&file);
+                return 0;
+            }
+            ds4_d8f_sidecar_record sidecar;
+            if (ds4_d8f_get_down_sidecar(&file, experts[slot_index], &sidecar)) {
+                fprintf(stderr,
+                        "ds4_mpsgraph: hybrid rejects selected rank%u sidecar expert=%u\n",
+                        sidecar.rank, experts[slot_index]);
+                ds4_d8f_close(&file);
+                return 0;
+            }
+            const uint64_t needed_gate_blocks = (uint64_t)mid_dim * gate_groups;
+            const uint64_t needed_down_blocks = (uint64_t)rows * down_groups;
+            const uint64_t gate_blocks = ((uint64_t)gate_records[slot_index].index_bytes * 8ull) /
+                                         (uint64_t)gate_records[slot_index].bits;
+            const uint64_t up_blocks = ((uint64_t)up_records[slot_index].index_bytes * 8ull) /
+                                       (uint64_t)up_records[slot_index].bits;
+            const uint64_t down_blocks = ((uint64_t)down_records[slot_index].index_bytes * 8ull) /
+                                         (uint64_t)down_records[slot_index].bits;
+            if (gate_records[slot_index].block != block || up_records[slot_index].block != block ||
+                down_records[slot_index].block != block ||
+                gate_blocks < needed_gate_blocks || up_blocks < needed_gate_blocks ||
+                down_blocks < needed_down_blocks ||
+                ((down_records[slot_index].flags & 1u) != 0u &&
+                 down_records[slot_index].scale_bytes < mid_dim * sizeof(uint16_t))) {
+                fprintf(stderr, "ds4_mpsgraph: hybrid invalid expert=%u rows=%u\n",
+                        experts[slot_index], rows);
+                ds4_d8f_close(&file);
+                return 0;
+            }
+            if (down_records[slot_index].k > max_k) max_k = down_records[slot_index].k;
+        }
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        id<MTLCommandQueue> queue = device ? [device newCommandQueue] : nil;
+        if (!device || !queue) {
+            fprintf(stderr, "ds4_mpsgraph: hybrid no Metal device/queue\n");
+            ds4_d8f_close(&file);
+            return 0;
+        }
+        const uint32_t token_slots = n_tokens * n_experts;
+        const size_t mid_f32_bytes = (size_t)mid_dim * sizeof(float);
+        const size_t mid_f16_bytes = (size_t)mid_dim * sizeof(uint16_t);
+        const size_t input_bytes = (size_t)gateup_in_dim * sizeof(float);
+        const size_t idx_bytes = (size_t)down_groups * rows * sizeof(int32_t);
+        const size_t output_count = (size_t)n_tokens * rows;
+        const size_t output_f32_bytes = output_count * sizeof(float);
+        const size_t output_timed_bytes = fp32_path ? output_f32_bytes : output_count * sizeof(uint16_t);
+        float *token_input = (float *)malloc(input_bytes);
+        float *mid_raw = (float *)malloc(mid_f32_bytes);
+        float *ref = (float *)calloc(output_count, sizeof(float));
+        float *got = (float *)calloc(output_count, sizeof(float));
+        float *codebook_f32[selected_expert_cap] = {0};
+        uint16_t *codebook_f16[selected_expert_cap] = {0};
+        int32_t *indices[selected_expert_cap] = {0};
+        float *mid_scaled_f32[token_slot_cap] = {0};
+        uint16_t *mid_scaled_f16[token_slot_cap] = {0};
+        bool ok = token_input && mid_raw && ref && got;
+        for (uint32_t slot_index = 0; ok && slot_index < n_experts; slot_index++) {
+            const uint32_t codebook_cols = down_records[slot_index].k + 1u;
+            codebook_f32[slot_index] = (float *)malloc((size_t)block * codebook_cols * sizeof(float));
+            codebook_f16[slot_index] = (uint16_t *)malloc((size_t)block * codebook_cols * sizeof(uint16_t));
+            indices[slot_index] = (int32_t *)malloc(idx_bytes);
+            ok = codebook_f32[slot_index] && codebook_f16[slot_index] && indices[slot_index] &&
+                 ds4_mpsgraph_prepare_codebook(&file, &down_records[slot_index], codebook_cols,
+                                               codebook_f32[slot_index], codebook_f16[slot_index]) &&
+                 ds4_mpsgraph_prepare_indices(&file, &down_records[slot_index], rows, mid_dim,
+                                              indices[slot_index]);
+        }
+        for (uint32_t token_slot = 0; ok && token_slot < token_slots; token_slot++) {
+            mid_scaled_f32[token_slot] = (float *)malloc(mid_f32_bytes);
+            mid_scaled_f16[token_slot] = (uint16_t *)malloc(mid_f16_bytes);
+            ok = mid_scaled_f32[token_slot] && mid_scaled_f16[token_slot];
+        }
+        for (uint32_t token_index = 0; ok && token_index < n_tokens; token_index++) {
+            for (uint32_t input_index = 0; input_index < gateup_in_dim; input_index++) {
+                token_input[input_index] =
+                    0.35f * sinf((float)(input_index + 17u * token_index) * 0.011f) +
+                    0.17f * cosf((float)(input_index + 31u * token_index) * 0.019f);
+            }
+            float route_weight_sum = 0.0f;
+            float route_weights[selected_expert_cap] = {0};
+            for (uint32_t slot_index = 0; slot_index < n_experts; slot_index++) {
+                const float route = 1.0f / (1.0f + (float)slot_index +
+                                            0.25f * (float)((token_index + slot_index) % 3u));
+                route_weights[slot_index] = route;
+                route_weight_sum += route;
+            }
+            for (uint32_t slot_index = 0; slot_index < n_experts; slot_index++) {
+                route_weights[slot_index] /= route_weight_sum;
+                for (uint32_t row_index = 0; row_index < mid_dim; row_index++) {
+                    ds4_d8f_record gate_overlay;
+                    ds4_d8f_record up_overlay;
+                    const uint32_t row_block = row_index >> 7;
+                    const ds4_d8f_record *gate_record =
+                        ds4_d8f_get_gateup_overlay_record(&file, DS4_D8F_GATE,
+                                                          experts[slot_index], row_block, &gate_overlay)
+                        ? &gate_overlay : &gate_records[slot_index];
+                    const ds4_d8f_record *up_record =
+                        ds4_d8f_get_gateup_overlay_record(&file, DS4_D8F_UP,
+                                                          experts[slot_index], row_block, &up_overlay)
+                        ? &up_overlay : &up_records[slot_index];
+                    float gate_value = ds4_mpsgraph_d8f_ref_dot(&file, gate_record, token_input,
+                                                                row_index, gateup_in_dim);
+                    float up_value = ds4_mpsgraph_d8f_ref_dot(&file, up_record, token_input,
+                                                              row_index, gateup_in_dim);
+                    if (gate_value > swiglu_limit) gate_value = swiglu_limit;
+                    if (up_value > swiglu_limit) up_value = swiglu_limit;
+                    if (up_value < -swiglu_limit) up_value = -swiglu_limit;
+                    mid_raw[row_index] = (gate_value / (1.0f + expf(-gate_value))) * up_value;
+                }
+                const uint32_t token_slot = token_index * n_experts + slot_index;
+                ds4_mpsgraph_prepare_scaled_mid(&file, &down_records[slot_index], mid_raw,
+                                                route_weights[slot_index], mid_dim,
+                                                mid_scaled_f32[token_slot],
+                                                mid_scaled_f16[token_slot]);
+                ds4_mpsgraph_reference_down_lut_accum(mid_scaled_f32[token_slot],
+                                                      codebook_f32[slot_index],
+                                                      indices[slot_index],
+                                                      down_records[slot_index].k + 1u,
+                                                      mid_dim, rows,
+                                                      ref + (size_t)token_index * rows);
+            }
+        }
+        if (!ok) {
+            fprintf(stderr, "ds4_mpsgraph: hybrid failed to allocate or prepare tensors\n");
+            for (uint32_t token_slot = 0; token_slot < token_slot_cap; token_slot++) {
+                free(mid_scaled_f16[token_slot]);
+                free(mid_scaled_f32[token_slot]);
+            }
+            for (uint32_t slot_index = 0; slot_index < selected_expert_cap; slot_index++) {
+                free(indices[slot_index]);
+                free(codebook_f16[slot_index]);
+                free(codebook_f32[slot_index]);
+            }
+            free(got); free(ref); free(mid_raw); free(token_input);
+            ds4_d8f_close(&file);
+            return 0;
+        }
+        MPSGraph *graph = [[MPSGraph alloc] init];
+        graph.options = MPSGraphOptionsDefault;
+        MPSDataType data_type = fp32_path ? MPSDataTypeFloat32 : MPSDataTypeFloat16;
+        NSMutableDictionary *feeds = [NSMutableDictionary dictionaryWithCapacity:n_experts];
+        NSMutableDictionary *feed_types = [NSMutableDictionary dictionaryWithCapacity:n_experts];
+        NSMutableArray *inputs = [NSMutableArray arrayWithCapacity:n_experts];
+        MPSGraphTensor *out = nil;
+        for (uint32_t slot_index = 0; slot_index < n_experts; slot_index++) {
+            const uint32_t codebook_cols = down_records[slot_index].k + 1u;
+            NSData *codebook_data = fp32_path ?
+                [NSData dataWithBytes:codebook_f32[slot_index]
+                               length:(size_t)block * codebook_cols * sizeof(float)] :
+                [NSData dataWithBytes:codebook_f16[slot_index]
+                               length:(size_t)block * codebook_cols * sizeof(uint16_t)];
+            NSMutableData *index_batch = [NSMutableData dataWithLength:(size_t)n_tokens * idx_bytes];
+            for (uint32_t token_index = 0; token_index < n_tokens; token_index++) {
+                memcpy((uint8_t *)index_batch.mutableBytes + (size_t)token_index * idx_bytes,
+                       indices[slot_index], idx_bytes);
+            }
+            MPSGraphTensor *codebook_tensor = [graph constantWithData:codebook_data
+                                                                shape:@[@(block), @(codebook_cols)]
+                                                             dataType:data_type];
+            MPSGraphTensor *index_tensor = [graph constantWithData:index_batch
+                                                             shape:@[@(n_tokens), @(down_groups), @(rows)]
+                                                          dataType:MPSDataTypeInt32];
+            NSMutableData *mid_batch = [NSMutableData dataWithLength:(size_t)n_tokens * (fp32_path ? mid_f32_bytes : mid_f16_bytes)];
+            for (uint32_t token_index = 0; token_index < n_tokens; token_index++) {
+                const uint32_t token_slot = token_index * n_experts + slot_index;
+                void *dst = (uint8_t *)mid_batch.mutableBytes + (size_t)token_index * (fp32_path ? mid_f32_bytes : mid_f16_bytes);
+                const void *src = fp32_path ? (const void *)mid_scaled_f32[token_slot] : (const void *)mid_scaled_f16[token_slot];
+                memcpy(dst, src, fp32_path ? mid_f32_bytes : mid_f16_bytes);
+            }
+            NSString *mid_name = [NSString stringWithFormat:@"d8f_hybrid_mid_s%u", slot_index];
+            MPSGraphTensor *mid = [graph placeholderWithShape:@[@(n_tokens), @(mid_dim)]
+                                                     dataType:data_type
+                                                         name:mid_name];
+            MPSGraphTensor *slot_out = ds4_mpsgraph_build_lut_batched(graph, mid, codebook_tensor,
+                                                                      index_tensor, n_tokens,
+                                                                      mid_dim, rows);
+            out = out ? [graph additionWithPrimaryTensor:out secondaryTensor:slot_out name:@"d8f_hybrid_batched_sum"] : slot_out;
+            id<MTLBuffer> mid_buffer = [device newBufferWithBytes:mid_batch.bytes
+                                                           length:mid_batch.length
+                                                          options:MTLResourceStorageModeShared];
+            MPSGraphTensorData *mid_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:mid_buffer
+                                                                                   shape:@[@(n_tokens), @(mid_dim)]
+                                                                                dataType:data_type];
+            MPSGraphShapedType *mid_type = [[MPSGraphShapedType alloc] initWithShape:@[@(n_tokens), @(mid_dim)]
+                                                                             dataType:data_type];
+            feeds[mid] = mid_data;
+            feed_types[mid] = mid_type;
+            [inputs addObject:mid_data];
+        }
+        NSDictionary *result = [graph runWithMTLCommandQueue:queue
+                                                       feeds:feeds
+                                               targetTensors:@[out]
+                                            targetOperations:nil];
+        MPSGraphTensorData *out_data = result[out];
+        if (!out_data) {
+            fprintf(stderr, "ds4_mpsgraph: hybrid no output tensor data\n");
+            for (uint32_t token_slot = 0; token_slot < token_slot_cap; token_slot++) {
+                free(mid_scaled_f16[token_slot]);
+                free(mid_scaled_f32[token_slot]);
+            }
+            for (uint32_t slot_index = 0; slot_index < selected_expert_cap; slot_index++) {
+                free(indices[slot_index]);
+                free(codebook_f16[slot_index]);
+                free(codebook_f32[slot_index]);
+            }
+            free(got); free(ref); free(mid_raw); free(token_input);
+            ds4_d8f_close(&file);
+            return 0;
+        }
+        MPSNDArray *ndarray = [out_data mpsndarray];
+        if (fp32_path) {
+            [ndarray readBytes:got strideBytes:nil];
+        } else {
+            uint16_t *got_h = (uint16_t *)calloc(output_count, sizeof(uint16_t));
+            if (!got_h) {
+                fprintf(stderr, "ds4_mpsgraph: hybrid output allocation failed\n");
+                for (uint32_t token_slot = 0; token_slot < token_slot_cap; token_slot++) {
+                    free(mid_scaled_f16[token_slot]);
+                    free(mid_scaled_f32[token_slot]);
+                }
+                for (uint32_t slot_index = 0; slot_index < selected_expert_cap; slot_index++) {
+                    free(indices[slot_index]);
+                    free(codebook_f16[slot_index]);
+                    free(codebook_f32[slot_index]);
+                }
+                free(got); free(ref); free(mid_raw); free(token_input);
+                ds4_d8f_close(&file);
+                return 0;
+            }
+            [ndarray readBytes:got_h strideBytes:nil];
+            for (size_t output_index = 0; output_index < output_count; output_index++) {
+                got[output_index] = ds4_mpsgraph_f16_to_f32(got_h[output_index]);
+            }
+            free(got_h);
+        }
+        double max_abs = 0.0, max_rel = 0.0, rms = 0.0;
+        uint32_t bad = 0u;
+        const double tol_abs = fp32_path ? 2.0e-3 : 2.5e-1 * (double)n_experts;
+        const double tol_rel = fp32_path ? 2.0e-3 : 2.5e-2;
+        for (size_t output_index = 0; output_index < output_count; output_index++) {
+            const double diff = fabs((double)got[output_index] - (double)ref[output_index]);
+            const double denom = fmax(1.0, fabs((double)ref[output_index]));
+            const double rel = diff / denom;
+            if (diff > max_abs) max_abs = diff;
+            if (rel > max_rel) max_rel = rel;
+            rms += diff * diff;
+            if (diff > tol_abs && rel > tol_rel) bad++;
+        }
+        rms = sqrt(rms / (double)output_count);
+        MPSGraphCompilationDescriptor *compile_descriptor = ds4_mpsgraph_compile_descriptor();
+        MPSGraphExecutable *executable = [graph compileWithDevice:nil
+                                                            feeds:feed_types
+                                                    targetTensors:@[out]
+                                                 targetOperations:nil
+                                            compilationDescriptor:compile_descriptor];
+        executable.options = MPSGraphOptionsNone;
+        id<MTLBuffer> timed_out = [device newBufferWithLength:output_timed_bytes
+                                                      options:MTLResourceStorageModeShared];
+        MPSGraphTensorData *timed_out_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:timed_out
+                                                                                     shape:@[@(n_tokens), @(rows)]
+                                                                                  dataType:data_type];
+        NSArray *outputs = @[timed_out_data];
+        const double elapsed = ds4_mpsgraph_time_executable(executable, queue, inputs, outputs, rounds);
+        const double us_per = elapsed * 1.0e6 / (double)rounds;
+        const size_t scalar_bytes = fp32_path ? sizeof(float) : sizeof(uint16_t);
+        double logical_bytes = (double)output_timed_bytes;
+        for (uint32_t token_index = 0; token_index < n_tokens; token_index++) {
+            for (uint32_t slot_index = 0; slot_index < n_experts; slot_index++) {
+                const uint32_t codebook_cols = down_records[slot_index].k + 1u;
+                logical_bytes += (double)((fp32_path ? mid_f32_bytes : mid_f16_bytes) +
+                                          (size_t)block * codebook_cols * scalar_bytes +
+                                          idx_bytes +
+                                          (size_t)down_groups * codebook_cols * scalar_bytes);
+            }
+        }
+        const double logical_gbps = us_per > 0.0 ? logical_bytes / (us_per * 1000.0) : 0.0;
+        char expert_csv[128];
+        expert_csv[0] = '\0';
+        for (uint32_t slot_index = 0; slot_index < n_experts; slot_index++) {
+            char item[24];
+            snprintf(item, sizeof(item), "%s%u", slot_index ? "," : "", experts[slot_index]);
+            strlcat(expert_csv, item, sizeof(expert_csv));
+        }
+        fprintf(stderr,
+                "ds4_mpsgraph: d8f_hybrid_lut_organ path=%s experts=%s nsel=%u rows=%u tokens=%u token_slots=%u graph_feeds=%u max_k=%u mode=%s compile=%s exec=%s rounds=%u clamp=%.1f input_mid=cpu_classic_equiv us/op=%.3f ms/op=%.3f logical_MB/op=%.3f logical_GBps=%.3f bad=%u max_abs=%.6g max_rel=%.6g rms=%.6g sample_ref=%.6g sample_got=%.6g\n",
+                d8f_path, expert_csv, n_experts, rows, n_tokens, token_slots, n_experts, max_k,
+                fp32_path ? "fp32" : "fp16", ds4_mpsgraph_compile_mode(),
+                ds4_mpsgraph_execution_mode(), rounds, swiglu_limit,
+                us_per, us_per / 1000.0, logical_bytes / 1.0e6, logical_gbps,
+                bad, max_abs, max_rel, rms, (double)ref[0], (double)got[0]);
+        for (uint32_t token_slot = 0; token_slot < token_slot_cap; token_slot++) {
+            free(mid_scaled_f16[token_slot]);
+            free(mid_scaled_f32[token_slot]);
+        }
+        for (uint32_t slot_index = 0; slot_index < selected_expert_cap; slot_index++) {
+            free(indices[slot_index]);
+            free(codebook_f16[slot_index]);
+            free(codebook_f32[slot_index]);
+        }
+        free(got); free(ref); free(mid_raw); free(token_input);
+        ds4_d8f_close(&file);
+        return bad == 0u ? 1 : 0;
     }
 }
 
