@@ -49258,6 +49258,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     const int half_score = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_HALF") > 0;
     const size_t score_bytes_per_value = half_score ? sizeof(uint16_t) : sizeof(float);
     const int i8_score_mode = !half_score && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_I8") > 0;
+    const int i8_act_scale = i8_score_mode && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_I8_ACTSCALE") > 0;
     const char *i8_max_rel_env = getenv("DS4_D8F_METAL_LUT_SCORE_I8_MAX_REL");
     const double i8_max_rel = (i8_max_rel_env && i8_max_rel_env[0]) ? strtod(i8_max_rel_env, NULL) : 1.0;
     const int native_code_env = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_NATIVE_CODES");
@@ -49347,6 +49348,25 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             ds4_d8f_record rec;
             ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &rec);
             const uint8_t *cb = file.map + rec.codebook_offset;
+            double cov[64] = {0.0};
+            if (i8_act_scale) {
+                const float *slot_mid_base = mid + (uint64_t)slot * ds4_down_in_dim;
+                for (uint32_t token = 0; token < n_tokens; token++) {
+                    const float *slot_mid = slot_mid_base + (uint64_t)token * n_experts * ds4_down_in_dim;
+                    for (uint32_t group = 0; group < groups; group++) {
+                        double x[8];
+                        const uint32_t x_base = group << 3;
+                        for (uint32_t d = 0; d < 8u; d++) {
+                            x[d] = (double)ds4_d8f_ref_mid_at(&file, &rec, slot_mid, x_base + d);
+                        }
+                        for (uint32_t a = 0; a < 8u; a++) {
+                            for (uint32_t b = 0; b < 8u; b++) {
+                                cov[a * 8u + b] += x[a] * x[b];
+                            }
+                        }
+                    }
+                }
+            }
             i8_recs[slot].k = rec.k;
             i8_recs[slot].offset = i8_offset;
             i8_recs[slot].scale_offset = i8_offset + rec.k * 8u;
@@ -49360,17 +49380,47 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                     if (v > max_abs_code) max_abs_code = v;
                 }
                 const float scale = max_abs_code > 0.0f ? max_abs_code / 127.0f : 1.0f;
-                slot_scales[code] = scale;
+                float chosen_scale = scale;
+                if (i8_act_scale && max_abs_code > 0.0f) {
+                    static const float factors[] = {
+                        0.50f, 0.625f, 0.75f, 0.875f, 1.0f,
+                        1.125f, 1.25f, 1.50f, 1.75f, 2.0f
+                    };
+                    double best_obj = 1.0e300;
+                    for (uint32_t fi = 0; fi < (uint32_t)(sizeof(factors) / sizeof(factors[0])); fi++) {
+                        const float cand_scale = scale * factors[fi];
+                        double diff[8];
+                        for (uint32_t d = 0; d < 8u; d++) {
+                            const uint32_t i = code * 8u + d;
+                            const float v = ds4_m1r_f16_to_f32(ds4_m1r_u16(cb + (uint64_t)i * 2u));
+                            float qf = roundf(v / cand_scale);
+                            if (qf > 127.0f) qf = 127.0f;
+                            if (qf < -127.0f) qf = -127.0f;
+                            diff[d] = (double)qf * (double)cand_scale - (double)v;
+                        }
+                        double obj = 0.0;
+                        for (uint32_t a = 0; a < 8u; a++) {
+                            for (uint32_t b = 0; b < 8u; b++) {
+                                obj += diff[a] * cov[a * 8u + b] * diff[b];
+                            }
+                        }
+                        if (obj < best_obj) {
+                            best_obj = obj;
+                            chosen_scale = cand_scale;
+                        }
+                    }
+                }
+                slot_scales[code] = chosen_scale;
                 double ss_src = 0.0;
                 double ss_diff = 0.0;
                 for (uint32_t d = 0; d < 8u; d++) {
                     const uint32_t i = code * 8u + d;
                     const float v = ds4_m1r_f16_to_f32(ds4_m1r_u16(cb + (uint64_t)i * 2u));
-                    float qf = roundf(v / scale);
+                    float qf = roundf(v / chosen_scale);
                     if (qf > 127.0f) qf = 127.0f;
                     if (qf < -127.0f) qf = -127.0f;
                     i8_codebooks[i8_offset + i] = (int8_t)qf;
-                    const double recon = (double)((int8_t)qf) * (double)scale;
+                    const double recon = (double)((int8_t)qf) * (double)chosen_scale;
                     const double diff = recon - (double)v;
                     ss_src += (double)v * (double)v;
                     ss_diff += diff * diff;
@@ -49562,7 +49612,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     fprintf(stderr,
             "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s code_mode=%s code_source=%s sidecar_hits=%d rank1_sidecars=%u gather_tile=%u score=%.2f MiB code=%.2f MiB i8_keep=%u/%u pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
             n_experts, rows, n_tokens, rounds, max_k,
-            i8_score_mode ? "f32_i8cb" : (half_score ? "f16" : "f32"),
+            i8_score_mode ? (i8_act_scale ? "f32_i8cb_act" : "f32_i8cb") : (half_score ? "f16" : "f32"),
             native_code_mode ? "native_u16" : "bitpack",
             native_code_mode ? (native_code_sidecar_hits == (int)n_experts ? "sidecar" : "predecode") : "bitpack",
             native_code_sidecar_hits,
