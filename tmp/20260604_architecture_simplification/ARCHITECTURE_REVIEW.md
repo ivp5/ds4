@@ -46,4 +46,4 @@ The clean runtime architecture is a small set of cold-owned organs:
 2. Runtime sidecar scaffold: one default-off owner for CoreML model cache, D8F graph/kernel cache, hidden backing, parallel launch, and merge.
 3. Package cache manifest: record layer package path, compile URL, resident footprint, load state, and validation status in one typed table.
 4. Canary harness library: if more ANE/MPSGraph canaries are added, extract shared CoreML feature/backing helpers instead of copy-pasting per file.
-5. Real D8F Metal baseline: feed H3355 VQ-D8 records/codebooks into the 128-thread packed-index kernel and compare against MPSGraph down E165 and selected-six logs.
+5. Selected-six Metal fusion: extend the real packed down kernel from one H3355 expert to selected-six with route weights, then compare against MPSGraph selected-six and the full ANE+D8F overlap canary.

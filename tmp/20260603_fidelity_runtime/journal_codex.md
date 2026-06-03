@@ -266,3 +266,12 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - Naive one-simdgroup-per-row kernel was correct but slow: `1725.340 us/op`, `bad=0`, `rms=0.000810868`.
 - The 128-thread/four-simdgroup row kernel reached `730.958 us/op`, `bad=0`, `rms=0.000810868`, with packed index traffic `1.573 MB` and codebook `0.066 MB`.
 - This is the first useful memory-floor direction: custom Metal packed VQ-D8 is already near MPSGraph expanded-gather timing while retaining packed 12-bit indices. Next step is a real D8F-record kernel, then fuse selected experts and route weights.
+
+## 2026-06-04T01:16 JST — real H3355 packed VQ-D8 down Metal kernel
+
+- Added `tmp/20260603_mpsgraph_ane/metal_vqd8_real_d8f_down_probe.m`, which opens a real `.d8f`, reads the down record, transposes the real half codebook to `[dim,k]`, consumes the record's packed 12-bit index stream directly on GPU, and validates against CPU `ds4_d8f_code_at`.
+- Generic `bits/k` kernel was correct but slow: E165 L26 down `1629.329 us/op`, `bad=0`.
+- Specializing the kernel to VQ-D8 `bits=12,k=4096` recovered speed: first comparable run brackets were noisy at `1435.558 us/op`, `880.023 us/op`, and `1425.230 us/op`, all `bad=0`, `rms=0.00011823`.
+- Same-window MPSGraph expanded-index E165 r50 was `748.555 us/op`, `bad=0`. The custom Metal packed kernel is not yet a clean speed win, but it is now a correct real-record baseline with packed index traffic `1.573 MB` versus MPSGraph's expanded index materialization.
+- Important correction: the real Metal probe initially seeded synthetic input by expert id; it now matches `ds4_mpsgraph` slot-0 input, and the sample reference matches MPSGraph (`0.174939`).
+- Next step: selected-six fusion and timing distribution. Single-expert packed Metal does not exploit cross-expert reuse or route-weight fusion yet, so it is the floor contact point, not the final architecture.

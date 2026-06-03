@@ -59,3 +59,10 @@ Append-only transaction log. Scope: IVP5 DS4 MPSGraph/ANE runtime architecture, 
 - Added `metal_vqd8_lut_packed_probe.m` as the direct custom-Metal counterpart to the MPSGraph packed-index probe.
 - Finding: one simdgroup per row was too serial (`1725.340 us/op`), but four simdgroups per row with a threadgroup reduction reached `730.958 us/op` with `bad=0`.
 - Architecture update: the packed-index memory-floor path is custom Metal, not MPSGraph. The next useful patch is to feed real D8F records/codebooks into this kernel and compare against `ds4_mpsgraph` down E165 `808.583 us/op`.
+
+## 2026-06-04T01:16 JST — Real D8F down baseline
+
+- Added `metal_vqd8_real_d8f_down_probe.m` and fed it the real H3355 L26/E165 down record.
+- Correctness: all real-record runs passed `bad=0`; after fixing the input seed to match `ds4_mpsgraph`, sample reference is `0.174939`.
+- Performance: specialized packed Metal is noisy but in contact with the right wall: `880-1435 us/op` in comparable r20/r50 runs versus same-window MPSGraph expanded r50 `748.555 us/op`.
+- Decision: single-expert packed Metal is not yet enough; continue by fusing selected-six experts/route weights or improving memory/coalescing. It remains the right path because it preserves packed indices and removes host-expanded gather materialization.
