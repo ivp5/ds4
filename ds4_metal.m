@@ -49157,6 +49157,9 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         uint64_t scale_offset;
         uint32_t scale_bytes;
         uint32_t row_base;
+        uint64_t native_code_offset;
+        uint32_t native_code_bytes;
+        uint32_t native_code_flags;
     } d8f_lut_record_lite;
     typedef struct d8f_lut_sidecar_lite {
         uint32_t rank;
@@ -49241,6 +49244,15 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         dst->scale_offset = (rec.flags & 1u) ? rec.scale_offset : 0ull;
         dst->scale_bytes = rec.scale_bytes;
         dst->row_base = rec.row_block * 128u;
+        ds4_d8f_native_code_record native_rec;
+        if (ds4_d8f_get_down_native_codes(&file, experts[slot], &native_rec) &&
+            native_rec.rows >= rows &&
+            native_rec.groups >= groups &&
+            native_rec.bytes >= rows * groups * sizeof(uint16_t)) {
+            dst->native_code_offset = native_rec.offset;
+            dst->native_code_bytes = native_rec.bytes;
+            dst->native_code_flags = native_rec.flags | 1u;
+        }
     }
     if (max_k == 0) {
         free(recs); ds4_d8f_close(&file);
