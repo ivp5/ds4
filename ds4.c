@@ -53,6 +53,7 @@
 #include "ds4_moe_route_log.h"
 #include "ds4_polar_reader.h"
 #include "ds4_prefix_cache.h"
+#include "ds4_d8f_reader.h"
 #include "ds4_vqb2_pack.h"  /* legacy hot-store coverage masks; not a runtime pack selector */
 #include "ds4_nonrouted_pack.h"  /* silv 2026-05-28 task #771 Phase 1 — --nonrouted-pack engine wiring */
 #if defined(__ARM_NEON)
@@ -8328,6 +8329,8 @@ typedef struct {
 
  uint32_t n_index_comp;
  float *index_comp_kv;
+ int8_t *index_comp_kv_i8;     /* DS4_INT8_INDEXER: int8 keys, 4x smaller; f32 buf NULL when set */
+ float  *index_comp_kv_scale;  /* per-entry symmetric dequant scale (max|k|/127) */
  float *index_state_kv;
  float *index_state_score;
 } ds4_layer_cache;
@@ -8336,6 +8339,19 @@ typedef struct {
  ds4_layer_cache layer[DS4_N_LAYER];
  uint32_t head_dim;
 } ds4_kv_cache;
+
+/* DS4_INT8_INDEXER storage (#677): the current ratio-4 layer's int8 index keys + per-entry dequant scale,
+ * set just before each indexer_allowed_decode_one* call (NULL => f32 path). File-scope globals so the score
+ * fns need no new args (silv 2026-05-31 globals-on-top); CPU indexer decode is per-layer sequential => no race. */
+static int ds4_int8_indexer_enabled(void);
+static const int8_t *g_index_i8 = NULL;
+static const float  *g_index_scale = NULL;
+/* score-loop dot for an int8 key: dot(q_h, scale*k_int8) = scale * sum_d q[d]*k8[d]. */
+static inline float index_dot_i8(const int8_t *k8, float scale, const float *qh, uint32_t dim) {
+ float d = 0.0f;
+ for (uint32_t i = 0; i < dim; i++) d += (float)k8[i] * qh[i];
+ return d * scale;
+}
 
 static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
  uint32_t raw_cap = DS4_N_SWA;
@@ -8524,7 +8540,12 @@ static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_c
  if (ratio == 4) {
  const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
  const uint32_t index_rows = coff * ratio;
+ if (ds4_int8_indexer_enabled()) {
+ cache->layer[il].index_comp_kv_i8 = xmalloc_zeroed((size_t)comp_cap * DS4_N_INDEXER_HEAD_DIM, sizeof(int8_t));
+ cache->layer[il].index_comp_kv_scale = xmalloc_zeroed((size_t)comp_cap, sizeof(float));
+ } else {
  cache->layer[il].index_comp_kv = xmalloc_zeroed((size_t)comp_cap * DS4_N_INDEXER_HEAD_DIM, sizeof(float));
+ }
  cache->layer[il].index_state_kv = xmalloc_zeroed((size_t)index_width * index_rows, sizeof(float));
  cache->layer[il].index_state_score = xmalloc((size_t)index_width * index_rows * sizeof(float));
  for (uint64_t i = 0; i < (uint64_t)index_width * index_rows; i++) {
@@ -8543,6 +8564,8 @@ static void kv_cache_free(ds4_kv_cache *cache) {
  free(cache->layer[il].attn_state_kv);
  free(cache->layer[il].attn_state_score);
  free(cache->layer[il].index_comp_kv);
+ free(cache->layer[il].index_comp_kv_i8);
+ free(cache->layer[il].index_comp_kv_scale);
  free(cache->layer[il].index_state_kv);
  free(cache->layer[il].index_state_score);
  }
@@ -8563,6 +8586,54 @@ static void kv_cache_push_raw(ds4_layer_cache *cache, const float *kv) {
  (size_t)(cache->cap_raw - 1) * DS4_N_HEAD_DIM * sizeof(cache->raw_kv[0]));
  float *dst = cache->raw_kv + (uint64_t)(cache->cap_raw - 1) * DS4_N_HEAD_DIM;
  for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) dst[i] = f16_to_f32(f32_to_f16(kv[i]));
+}
+
+/* ---- DS4_INT8_INDEXER (agent1, 2026-06-03; silv "implement the INT8 indexer") -----------------
+ * In-engine CORRECTNESS test for INT8 indexer keys. The ratio-4 indexer scores every compressed KV
+ * entry c via the multi-head ReLU-gated dot  score_c = sum_h ReLU(q_h . k_c) * w_h  (DS4_N_INDEXER_HEAD
+ * =64 heads, each over the shared DS4_N_INDEXER_HEAD_DIM=128 key) and keeps the top DS4_N_INDEXER_TOP_K
+ * =512 entries. The keys (index_comp_kv) feed ONLY this ranking, so quantizing them to INT8 is
+ * correctness-safe IFF the top-512 set is preserved. Numpy reference (tmp/20260602_codec_general/
+ * int8_indexer_recall.py, real richcalib L22 keys): recall@512 = 1.0000, Spearman = 1.0000.
+ * This validates that on the LIVE engine with no GPU/buffer/signature change: after each key is pushed
+ * we round-trip it through symmetric per-entry INT8 (scale = max|k| / 127) IN PLACE in the existing FP32
+ * buffer, so BOTH the CPU score path (indexer_allowed_decode_one*) AND codex's GPU MSL kernel
+ * (kernel_dsv4_indexer_scores_tiled*) see int8-precision keys. A greedy gen A/B (DS4_INT8_INDEXER=1 vs
+ * unset) then measures whether int8 keys change the model output at all -- identical output confirms the
+ * recall=1.0 prediction end-to-end. This is the CORRECTNESS gate ONLY; it does NOT shrink storage yet.
+ * Deploying the 4x-smaller int8 buffer (336->84 MB @500k tok/layer) + an int8-reading GPU kernel is the
+ * next step (tmp/20260603_agent1_lens_spec/INT8_INDEXER_PATCH.md), gated separately so codex owns the
+ * GPU edit. NB the keys are already FP16-precision here (kv_cache_push_comp f16-round-trips), so a FREE
+ * lossless 2x is also available by storing FP16 instead of FP32 -- see the patch doc. */
+static int ds4_int8_indexer_enabled(void) {
+ static int v = -1;
+ if (v < 0) v = (getenv("DS4_INT8_INDEXER") != NULL) ? 1 : 0;
+ return v;
+}
+/* DS4_INT8_INDEXER: push one 128-dim index key. int8 mode => symmetric-quantize into the int8 buffer +
+ * per-entry scale (4x smaller, no f32 store); else the legacy f16-precision-in-f32 store. */
+static void index_comp_kv_push(ds4_layer_cache *cache, const float *src) {
+ if (cache->n_index_comp >= cache->comp_cap) ds4_die("compressed index KV cache capacity exceeded");
+ const uint32_t c = cache->n_index_comp;
+ const uint32_t dim = DS4_N_INDEXER_HEAD_DIM;
+ if (cache->index_comp_kv_i8) {
+  float amax = 0.0f;
+  for (uint32_t d = 0; d < dim; d++) { float a = fabsf(src[d]); if (a > amax) amax = a; }
+  const float scale = (amax > 0.0f) ? amax / 127.0f : 1.0f;
+  const float inv   = (amax > 0.0f) ? 127.0f / amax : 0.0f;
+  int8_t *dst = cache->index_comp_kv_i8 + (uint64_t)c * dim;
+  for (uint32_t d = 0; d < dim; d++) {
+   float v = src[d] * inv;
+   int q = (int)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+   if (q > 127) q = 127; else if (q < -127) q = -127;
+   dst[d] = (int8_t)q;
+  }
+  cache->index_comp_kv_scale[c] = scale;
+ } else {
+  float *dst = cache->index_comp_kv + (uint64_t)c * dim;
+  for (uint32_t d = 0; d < dim; d++) dst[d] = f16_to_f32(f32_to_f16(src[d]));
+ }
+ cache->n_index_comp++;
 }
 
 static void kv_cache_push_comp(float *rows, uint32_t *n_rows, uint32_t cap_rows, uint32_t row_dim, const float *kv) {
@@ -9133,11 +9204,11 @@ static bool *indexer_allowed_decode_one(
  for (uint32_t h = 0; h < n_head; h++) weights[h] *= scale;
 
  for (uint32_t c = 0; c < n_comp; c++) {
- const float *kv = index_comp + (uint64_t)c * head_dim;
+ const float *kv = index_comp ? index_comp + (uint64_t)c * head_dim : NULL;
  float s = 0.0f;
  for (uint32_t h = 0; h < n_head; h++) {
  const float *qh = q + (uint64_t)h * head_dim;
- float dot = dot_f32(kv, qh, head_dim);
+ float dot = g_index_i8 ? index_dot_i8(g_index_i8 + (uint64_t)c * head_dim, g_index_scale[c], qh, head_dim) : dot_f32(kv, qh, head_dim);
  if (dot < 0.0f) dot = 0.0f;
  s += dot * weights[h];
  }
@@ -9198,11 +9269,11 @@ static bool *indexer_allowed_decode_one_decode_scratch(
  for (uint32_t h = 0; h < n_head; h++) weights[h] *= scale;
 
  for (uint32_t c = 0; c < n_comp; c++) {
- const float *kv = index_comp + (uint64_t)c * head_dim;
+ const float *kv = index_comp ? index_comp + (uint64_t)c * head_dim : NULL;
  float s = 0.0f;
  for (uint32_t h = 0; h < n_head; h++) {
  const float *qh = q + (uint64_t)h * head_dim;
- float dot = dot_f32(kv, qh, head_dim);
+ float dot = g_index_i8 ? index_dot_i8(g_index_i8 + (uint64_t)c * head_dim, g_index_scale[c], qh, head_dim) : dot_f32(kv, qh, head_dim);
  if (dot < 0.0f) dot = 0.0f;
  s += dot * weights[h];
  }
@@ -9300,10 +9371,11 @@ static void layer_attention_raw_swa_one(
  ratio,
  il,
  pos)) {
- kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp, cache->comp_cap, DS4_N_INDEXER_HEAD_DIM, index_comp);
+ index_comp_kv_push(cache, index_comp);
  }
  free(index_comp);
 
+ g_index_i8 = cache->index_comp_kv_i8; g_index_scale = cache->index_comp_kv_scale;
  comp_allowed = indexer_allowed_decode_one(model, layer,
  attn_norm, qr_norm,
  cache->index_comp_kv,
@@ -9535,11 +9607,12 @@ static void layer_attention_raw_swa_batch(
  il,
  pos);
  if (have_index_comp) {
- kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp, cache->comp_cap, DS4_N_INDEXER_HEAD_DIM, index_comp);
+ index_comp_kv_push(cache, index_comp);
  }
  if (profile) t_tl_compress += now_sec() - tx;
 
  tx = profile ? now_sec() : 0.0;
+ g_index_i8 = cache->index_comp_kv_i8; g_index_scale = cache->index_comp_kv_scale;
  comp_allowed = indexer_allowed_decode_one(model, layer,
  attn_norm + (uint64_t)t * DS4_N_EMBD,
  qr_norm + (uint64_t)t * 1024,
@@ -9790,8 +9863,7 @@ static void layer_forward_raw_swa_one(
  il,
  pos,
  scratch)) {
- kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp, cache->comp_cap,
- DS4_N_INDEXER_HEAD_DIM, scratch->index_comp);
+ index_comp_kv_push(cache, scratch->index_comp);
  }
  if (profile) t_compress = now_sec() - t0;
  } else if (profile) {
@@ -9800,6 +9872,7 @@ static void layer_forward_raw_swa_one(
  }
  if (ratio == 4) {
  t0 = profile ? now_sec() : 0.0;
+ g_index_i8 = cache->index_comp_kv_i8; g_index_scale = cache->index_comp_kv_scale;
  comp_allowed = indexer_allowed_decode_one_decode_scratch(model, layer,
  scratch->attn_norm,
  scratch->qr_norm,
@@ -10821,6 +10894,98 @@ static void *cpu_moe_async_worker_fn(void *arg) {
  return NULL;
 }
 
+static bool ds4_env_enabled(const char *name) {
+ const char *v = getenv(name);
+ if (!v) return false;
+ while (isspace((unsigned char)*v)) v++;
+ if (!*v) return true;
+ if (!strcmp(v, "0") || !strcmp(v, "false") || !strcmp(v, "FALSE") ||
+     !strcmp(v, "off") || !strcmp(v, "OFF") ||
+     !strcmp(v, "no") || !strcmp(v, "NO")) return false;
+ return true;
+}
+
+static bool ds4_prime_path_enabled(void) {
+ return ds4_env_enabled("DS4_PRIME_PATH");
+}
+
+static bool ds4_d8f_mtl4_packet_requested(uint32_t n_tokens) {
+  (void)n_tokens;
+  const bool requested = ds4_env_enabled("DS4_D8F_FORCE_MTL4_PACKET");
+  static int warned = 0;
+  if (requested && !warned) {
+   warned = 1;
+   fprintf(stderr,
+    "ds4: DS4_D8F_FORCE_MTL4_PACKET selects the diagnostic graph-exit MTL4 path; "
+    "measured fast MTL4 requires an owned command stream, not per-layer bridging\n");
+  }
+  return requested;
+}
+
+static bool ds4_d8f_pack_path_for_layer_uncached(uint32_t il, char *out, size_t out_cap) {
+ if (!out || out_cap == 0 || il >= DS4_N_LAYER) return false;
+ out[0] = '\0';
+ const char *path = getenv("DS4_D8F_PACK_PATH");
+ const char *path_layer = getenv("DS4_D8F_PACK_LAYER");
+ if (path && path[0]) {
+  if (!path_layer || !path_layer[0]) {
+   snprintf(out, out_cap, "%s", path);
+   return access(out, R_OK) == 0;
+  }
+  char *endp = NULL;
+  unsigned long parsed = strtoul(path_layer, &endp, 10);
+  if (endp && *endp == '\0' && parsed == (unsigned long)il) {
+   snprintf(out, out_cap, "%s", path);
+   return access(out, R_OK) == 0;
+  }
+ }
+ const char *tmpl = getenv("DS4_D8F_PACK_TEMPLATE");
+ if (tmpl && tmpl[0] && strchr(tmpl, '%')) {
+  snprintf(out, out_cap, tmpl, il);
+  return access(out, R_OK) == 0;
+ }
+ const char *dir = getenv("DS4_D8F_PACK_DIR");
+ if (dir && dir[0]) {
+  snprintf(out, out_cap, "%s/ds4_L%02u_gate_up_down_VQD8_noE8_rank1.d8f", dir, il);
+  if (access(out, R_OK) == 0) return true;
+  snprintf(out, out_cap, "%s/ds4_L%02u_gate_up_down_VQD8_noE8_fit131k_i8.d8f", dir, il);
+  if (access(out, R_OK) == 0) return true;
+  snprintf(out, out_cap, "%s/L%02u.d8f", dir, il);
+  if (access(out, R_OK) == 0) return true;
+  snprintf(out, out_cap, "%s/ds4_L%02u.d8f", dir, il);
+  if (access(out, R_OK) == 0) return true;
+ }
+ out[0] = '\0';
+ return false;
+}
+
+static int g_d8f_pack_path_probe_ready[DS4_N_LAYER];
+static int g_d8f_pack_path_probe_found[DS4_N_LAYER];
+static char g_d8f_pack_path_probe_value[DS4_N_LAYER][4096];
+
+static bool ds4_d8f_pack_path_for_layer(uint32_t il, char *out, size_t out_cap) {
+ if (!out || out_cap == 0 || il >= DS4_N_LAYER) return false;
+ if (g_d8f_pack_path_probe_ready[il]) {
+  if (!g_d8f_pack_path_probe_found[il]) {
+   out[0] = '\0';
+   return false;
+  }
+  snprintf(out, out_cap, "%s", g_d8f_pack_path_probe_value[il]);
+  return true;
+ }
+ char candidate[4096];
+ const bool found = ds4_d8f_pack_path_for_layer_uncached(il, candidate, sizeof(candidate));
+ g_d8f_pack_path_probe_found[il] = found ? 1 : 0;
+ snprintf(g_d8f_pack_path_probe_value[il], sizeof(g_d8f_pack_path_probe_value[il]), "%s", found ? candidate : "");
+ g_d8f_pack_path_probe_ready[il] = 1;
+ if (!found) {
+  out[0] = '\0';
+  return false;
+ }
+ snprintf(out, out_cap, "%s", candidate);
+ return true;
+}
+
 /* Spawn the worker that runs `cpu_routed_moe_batch_handoff_prealloc` for the
  * current layer. Returns true on success. Main thread must call
  * `cpu_moe_async_join` before encoding any GPU op that reads
@@ -11791,6 +11956,11 @@ static bool metal_graph_use_reference_qkv_norm(void) {
  return metal_graph_env_flag("DS4_METAL_DISABLE_QKV_NORM_FUSION", &cache);
 }
 
+static bool metal_graph_use_q_head_norm_rope(void) {
+ static int cache = -1;
+ return metal_graph_env_flag("DS4_METAL_ENABLE_Q_HEAD_NORM_ROPE_FUSION", &cache);
+}
+
 static bool metal_graph_use_reference_compressor_pair_proj(void) {
  static int cache = -1;
  return metal_graph_env_flag("DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
@@ -12048,11 +12218,34 @@ static int ds4_routed_moe_apply_full(
  ds4_routed_moe_env_init();
 
  const bool is_cpu_moe_layer = (!force_metal_moe && g->cpu_moe_layer[il]);
+ char d8f_path[4096];
+ const bool has_d8f_pack = ds4_d8f_pack_path_for_layer(il, d8f_path, sizeof(d8f_path));
  const bool has_m1r_pack = getenv("DS4_M1R_PACK_PATH") != NULL;
 
  /* If neither branch applies, return 0 — caller runs default Metal path. */
- if (!is_cpu_moe_layer && !has_m1r_pack) {
+ if (!is_cpu_moe_layer && !has_d8f_pack && !has_m1r_pack) {
   return 0;
+ }
+
+  if (has_d8f_pack) {
+   int dr = -1;
+   if (ds4_d8f_mtl4_packet_requested(1u)) {
+    if (ds4_gpu_end_commands() == 0) return -1;
+    dr = ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(
+     d8f_path, il,
+    g->router_selected, g->router_weights,
+    g->ffn_norm, g->routed_out,
+    1u, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP);
+   if (ds4_gpu_begin_commands() == 0) return -1;
+  }
+  if (dr != 0) {
+   dr = ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+    d8f_path, il,
+    g->router_selected, g->router_weights,
+    g->ffn_norm, g->routed_out,
+    1u, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP);
+  }
+  return dr == 0 ? 1 : -1;
  }
 
  if (has_m1r_pack) {
@@ -12171,6 +12364,7 @@ static uint64_t s_n_storage_dispatch_bf16 = 0;
  * via_tensor effective-type-aware dispatcher (or the via_tensor wrapper
  * isn't called for attn matmuls). */
 static uint64_t s_n_storage_dispatch_fp8 = 0;
+static uint64_t s_n_storage_dispatch_fp8_direct = 0;
 /* silv 2026-05-28 high-resolution review — counter for BF16 storage path
  * SUPPRESSED via env var. When DS4_BF16_STORAGE_DISABLE=1 is set, the F16
  * dispatcher falls through to mmap even when storage.dtype==BF16. This
@@ -12179,6 +12373,146 @@ static uint64_t s_n_storage_dispatch_fp8 = 0;
  * doing real work. If identical → Increment 5 is dormant (kernel-level
  * canary fires but no observable model-level effect). */
 static uint64_t s_n_storage_dispatch_bf16_suppressed = 0;
+
+typedef enum {
+ DS4_DISPATCH_DTYPE_F16 = 0,
+ DS4_DISPATCH_DTYPE_Q8_0,
+ DS4_DISPATCH_DTYPE_BF16,
+ DS4_DISPATCH_DTYPE_FP8,
+ DS4_DISPATCH_DTYPE_FP8_DIRECT,
+ DS4_DISPATCH_DTYPE_COUNT
+} ds4_storage_dispatch_dtype;
+
+typedef enum {
+ DS4_DISPATCH_SITE_ATTN_Q_A = 0,
+ DS4_DISPATCH_SITE_ATTN_KV,
+ DS4_DISPATCH_SITE_ATTN_Q_B,
+ DS4_DISPATCH_SITE_ATTN_OUT_A,
+ DS4_DISPATCH_SITE_ATTN_OUT_B,
+ DS4_DISPATCH_SITE_ATTN_COMPRESSOR,
+ DS4_DISPATCH_SITE_HC_ATTN,
+ DS4_DISPATCH_SITE_HC_FFN,
+ DS4_DISPATCH_SITE_ROUTER,
+ DS4_DISPATCH_SITE_SHARED_GATE,
+ DS4_DISPATCH_SITE_SHARED_UP,
+ DS4_DISPATCH_SITE_SHARED_DOWN,
+ DS4_DISPATCH_SITE_OUTPUT_HC,
+ DS4_DISPATCH_SITE_LM_HEAD,
+ DS4_DISPATCH_SITE_EMBED,
+ DS4_DISPATCH_SITE_MTP,
+ DS4_DISPATCH_SITE_OTHER,
+ DS4_DISPATCH_SITE_COUNT
+} ds4_storage_dispatch_site;
+
+static uint64_t s_storage_dispatch_site[DS4_DISPATCH_DTYPE_COUNT][DS4_DISPATCH_SITE_COUNT];
+
+static const char *ds4_storage_dispatch_dtype_name(ds4_storage_dispatch_dtype dtype) {
+ switch (dtype) {
+ case DS4_DISPATCH_DTYPE_F16: return "f16";
+ case DS4_DISPATCH_DTYPE_Q8_0: return "q8_0";
+ case DS4_DISPATCH_DTYPE_BF16: return "bf16";
+ case DS4_DISPATCH_DTYPE_FP8: return "fp8";
+ case DS4_DISPATCH_DTYPE_FP8_DIRECT: return "fp8_direct";
+ default: return "unknown";
+ }
+}
+
+static const char *ds4_storage_dispatch_site_name(ds4_storage_dispatch_site site) {
+ switch (site) {
+ case DS4_DISPATCH_SITE_ATTN_Q_A: return "attn_q_a";
+ case DS4_DISPATCH_SITE_ATTN_KV: return "attn_kv";
+ case DS4_DISPATCH_SITE_ATTN_Q_B: return "attn_q_b";
+ case DS4_DISPATCH_SITE_ATTN_OUT_A: return "attn_out_a";
+ case DS4_DISPATCH_SITE_ATTN_OUT_B: return "attn_out_b";
+ case DS4_DISPATCH_SITE_ATTN_COMPRESSOR: return "attn_compressor";
+ case DS4_DISPATCH_SITE_HC_ATTN: return "hc_attn";
+ case DS4_DISPATCH_SITE_HC_FFN: return "hc_ffn";
+ case DS4_DISPATCH_SITE_ROUTER: return "router";
+ case DS4_DISPATCH_SITE_SHARED_GATE: return "shared_gate";
+ case DS4_DISPATCH_SITE_SHARED_UP: return "shared_up";
+ case DS4_DISPATCH_SITE_SHARED_DOWN: return "shared_down";
+ case DS4_DISPATCH_SITE_OUTPUT_HC: return "output_hc";
+ case DS4_DISPATCH_SITE_LM_HEAD: return "lm_head";
+ case DS4_DISPATCH_SITE_EMBED: return "embed";
+ case DS4_DISPATCH_SITE_MTP: return "mtp";
+ case DS4_DISPATCH_SITE_OTHER: return "other";
+ default: return "unknown";
+ }
+}
+
+static int ds4_str_contains_cstr(ds4_str haystack, const char *needle) {
+ const size_t n = strlen(needle);
+ if (n == 0 || haystack.len < n) return 0;
+ for (uint64_t i = 0; i + (uint64_t)n <= haystack.len; i++) {
+  if (memcmp(haystack.ptr + i, needle, n) == 0) return 1;
+ }
+ return 0;
+}
+
+static ds4_storage_dispatch_site ds4_storage_dispatch_site_for_tensor(const ds4_tensor *t) {
+ if (!t) return DS4_DISPATCH_SITE_OTHER;
+ const ds4_str name = t->name;
+ if (ds4_str_contains_cstr(name, "mtp.")) return DS4_DISPATCH_SITE_MTP;
+ if (ds4_str_contains_cstr(name, "attn_q_a.weight")) return DS4_DISPATCH_SITE_ATTN_Q_A;
+ if (ds4_str_contains_cstr(name, "attn_kv.weight")) return DS4_DISPATCH_SITE_ATTN_KV;
+ if (ds4_str_contains_cstr(name, "attn_q_b.weight")) return DS4_DISPATCH_SITE_ATTN_Q_B;
+ if (ds4_str_contains_cstr(name, "attn_output_a.weight")) return DS4_DISPATCH_SITE_ATTN_OUT_A;
+ if (ds4_str_contains_cstr(name, "attn_output_b.weight")) return DS4_DISPATCH_SITE_ATTN_OUT_B;
+ if (ds4_str_contains_cstr(name, "attn_compressor_")) return DS4_DISPATCH_SITE_ATTN_COMPRESSOR;
+ if (ds4_str_contains_cstr(name, "hc_attn_")) return DS4_DISPATCH_SITE_HC_ATTN;
+ if (ds4_str_contains_cstr(name, "hc_ffn_")) return DS4_DISPATCH_SITE_HC_FFN;
+ if (ds4_str_contains_cstr(name, "ffn_gate_inp.weight") ||
+     ds4_str_contains_cstr(name, "exp_probs_b.bias")) return DS4_DISPATCH_SITE_ROUTER;
+ if (ds4_str_contains_cstr(name, "ffn_gate_shexp.weight")) return DS4_DISPATCH_SITE_SHARED_GATE;
+ if (ds4_str_contains_cstr(name, "ffn_up_shexp.weight")) return DS4_DISPATCH_SITE_SHARED_UP;
+ if (ds4_str_contains_cstr(name, "ffn_down_shexp.weight")) return DS4_DISPATCH_SITE_SHARED_DOWN;
+ if (ds4_str_contains_cstr(name, "output_hc_")) return DS4_DISPATCH_SITE_OUTPUT_HC;
+ if (ds4_str_contains_cstr(name, "output.weight")) return DS4_DISPATCH_SITE_LM_HEAD;
+ if (ds4_str_contains_cstr(name, "token_embd.weight")) return DS4_DISPATCH_SITE_EMBED;
+ return DS4_DISPATCH_SITE_OTHER;
+}
+
+static bool ds4_storage_dispatch_site_profile_enabled(void) {
+ static int checked = 0;
+ static int enabled = 0;
+ if (!checked) {
+  enabled = ds4_env_enabled("DS4_STORAGE_DISPATCH_SITE_PROFILE") ? 1 : 0;
+  checked = 1;
+  if (enabled) {
+   fprintf(stderr, "ds4: DS4_STORAGE_DISPATCH_SITE_PROFILE=1 — storage-dispatch site attribution enabled\n");
+  }
+ }
+ return enabled != 0;
+}
+
+static void ds4_storage_dispatch_note(ds4_storage_dispatch_dtype dtype,
+                                      const ds4_tensor *t) {
+ if (!ds4_storage_dispatch_site_profile_enabled()) return;
+ if ((unsigned)dtype >= DS4_DISPATCH_DTYPE_COUNT) return;
+ s_storage_dispatch_site[dtype][ds4_storage_dispatch_site_for_tensor(t)]++;
+}
+
+static void ds4_storage_dispatch_print_sites(void) {
+ if (!ds4_storage_dispatch_site_profile_enabled()) return;
+ for (uint32_t dtype = 0; dtype < DS4_DISPATCH_DTYPE_COUNT; dtype++) {
+  uint64_t total = 0;
+  for (uint32_t site = 0; site < DS4_DISPATCH_SITE_COUNT; site++) {
+   total += s_storage_dispatch_site[dtype][site];
+  }
+  if (total == 0) continue;
+  fprintf(stderr, "ds4: storage-dispatch-sites %s total=%llu",
+          ds4_storage_dispatch_dtype_name((ds4_storage_dispatch_dtype)dtype),
+          (unsigned long long)total);
+  for (uint32_t site = 0; site < DS4_DISPATCH_SITE_COUNT; site++) {
+   const uint64_t n = s_storage_dispatch_site[dtype][site];
+   if (n == 0) continue;
+   fprintf(stderr, " %s=%llu",
+           ds4_storage_dispatch_site_name((ds4_storage_dispatch_site)site),
+           (unsigned long long)n);
+  }
+  fputc('\n', stderr);
+ }
+}
 
 /* Read DS4_BF16_STORAGE_DISABLE once and cache. Returns 1 to DISABLE
  * (force mmap fallback even when BF16 storage is set). Default 0 (use
@@ -12215,6 +12549,7 @@ static int ds4_matmul_bf16_via_tensor(ds4_gpu_tensor *dst,
  (void)model;  /* BF16 has no mmap fallback */
  if (t == NULL || t->storage.metal_buffer == NULL) return 0;
  s_n_storage_dispatch_bf16++;
+ ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_BF16, t);
  return ds4_gpu_matmul_bf16_storage(dst, t->storage.metal_buffer,
                                      in_dim, out_dim, src, n_tok);
 }
@@ -12247,6 +12582,7 @@ static int ds4_matmul_q8_0_via_tensor(ds4_gpu_tensor *dst,
 	       t->storage.scale_metal_buffer != NULL &&
 	       t->storage.scale_dtype == DS4_TENSOR_FP8_E8M0) {
 	    s_n_storage_dispatch_fp8++;
+	    ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8, t);
 	    return ds4_gpu_matmul_fp8_e4m3_e8m0_storage(dst,
 	                                                t->storage.metal_buffer,
 	                                                t->storage.scale_metal_buffer,
@@ -12258,11 +12594,13 @@ static int ds4_matmul_q8_0_via_tensor(ds4_gpu_tensor *dst,
 	   }
 	   if (t->storage.dtype == DS4_TENSOR_F16) {
 	    s_n_storage_dispatch_f16++;
+	    ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_F16, t);
 	    return ds4_gpu_matmul_f16_storage(dst, t->storage.metal_buffer,
 	                                      in_dim, out_dim, src, n_tok);
 	   }
 	   if (t->storage.dtype == DS4_TENSOR_BF16 && n_tok == 1) {
 	    s_n_storage_dispatch_bf16++;
+	    ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_BF16, t);
 	    return ds4_gpu_matmul_bf16_storage(dst, t->storage.metal_buffer,
 	                                       in_dim, out_dim, src, n_tok);
 	   }
@@ -12291,6 +12629,7 @@ static int ds4_matmul_q8_0_via_tensor(ds4_gpu_tensor *dst,
 	   return 0;
 	  } else {
    s_n_storage_dispatch_q8_0++;
+   ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_Q8_0, t);
    return ds4_gpu_matmul_q8_0_storage(dst, t->storage.metal_buffer,
                                        in_dim, out_dim, src, n_tok);
   }
@@ -12298,6 +12637,70 @@ static int ds4_matmul_q8_0_via_tensor(ds4_gpu_tensor *dst,
  return ds4_gpu_matmul_q8_0_tensor(dst, model->map, model->size,
                                     t->abs_offset, in_dim, out_dim,
                                     src, n_tok);
+}
+
+static bool ds4_tensor_storage_is_fp8_e8m0(const ds4_tensor *t) {
+ return t != NULL &&
+        t->storage.metal_buffer != NULL &&
+        t->storage.scale_metal_buffer != NULL &&
+        t->storage.dtype == DS4_TENSOR_FP8_E4M3 &&
+        t->storage.scale_dtype == DS4_TENSOR_FP8_E8M0;
+}
+
+static int ds4_matmul_q8_0_pair_fp8_via_tensor(ds4_gpu_tensor *dst0,
+                                               ds4_gpu_tensor *dst1,
+                                               const ds4_tensor *t0,
+                                               const ds4_tensor *t1,
+                                               uint64_t in_dim,
+                                               uint64_t out0_dim,
+                                               uint64_t out1_dim,
+                                               const ds4_gpu_tensor *src,
+                                               uint64_t n_tok) {
+ static int disable_checked = 0;
+ static int disable = 0;
+ if (!disable_checked) {
+  disable = getenv("DS4_METAL_DISABLE_QA_KV_FP8_PAIR") != NULL ? 1 : 0;
+  disable_checked = 1;
+  if (disable) {
+   fprintf(stderr, "ds4: DS4_METAL_DISABLE_QA_KV_FP8_PAIR=1 — q_a/kv FP8 pair fusion disabled\n");
+  }
+ }
+ if (disable) return 0;
+ if (!ds4_tensor_storage_is_fp8_e8m0(t0) ||
+     !ds4_tensor_storage_is_fp8_e8m0(t1)) {
+  return 0;
+ }
+ if (ds4_gpu_matmul_fp8_pair_e4m3_e8m0_storage(dst0,
+                                                dst1,
+                                                t0->storage.metal_buffer,
+                                                t0->storage.scale_metal_buffer,
+                                                t0->storage.scale_length,
+                                                t1->storage.metal_buffer,
+                                                t1->storage.scale_metal_buffer,
+                                                t1->storage.scale_length,
+                                                in_dim,
+                                                out0_dim,
+                                                out1_dim,
+                                                src,
+                                                n_tok) != 0) {
+  s_n_storage_dispatch_fp8 += 2;
+  ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8, t0);
+  ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8, t1);
+  static int logged = 0;
+  if (!logged) {
+   logged = 1;
+   fprintf(stderr,
+           "ds4: q_a/kv FP8 pair fusion active (in=%llu out=%llu/%llu n_tok=%llu)\n",
+           (unsigned long long)in_dim,
+           (unsigned long long)out0_dim,
+           (unsigned long long)out1_dim,
+           (unsigned long long)n_tok);
+  }
+  return 1;
+ }
+ fprintf(stderr,
+         "ds4: q_a/kv FP8 pair fusion was eligible but failed; refusing silent fallback\n");
+ return -1;
 }
 
 static int ds4_matmul_f16_via_tensor(ds4_gpu_tensor *dst,
@@ -12331,13 +12734,15 @@ static int ds4_matmul_f16_via_tensor(ds4_gpu_tensor *dst,
    } else {
     /* Source-exact BF16 substitute for F16-typed tensor. */
     s_n_storage_dispatch_bf16++;
+    ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_BF16, t);
     return ds4_gpu_matmul_bf16_storage(dst, t->storage.metal_buffer,
                                         in_dim, out_dim, src, n_tok);
    }
   } else if (eff == DS4_TENSOR_FP8_E4M3 &&
              t->storage.scale_metal_buffer != NULL &&
              t->storage.scale_dtype == DS4_TENSOR_FP8_E8M0) {
-   s_n_storage_dispatch_q8_0++;
+   s_n_storage_dispatch_fp8++;
+   ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8, t);
    return ds4_gpu_matmul_fp8_e4m3_e8m0_storage(dst,
                                                 t->storage.metal_buffer,
                                                 t->storage.scale_metal_buffer,
@@ -12348,6 +12753,7 @@ static int ds4_matmul_f16_via_tensor(ds4_gpu_tensor *dst,
                                                 n_tok);
   } else if (eff == DS4_TENSOR_F16) {
    s_n_storage_dispatch_f16++;
+   ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_F16, t);
    return ds4_gpu_matmul_f16_storage(dst, t->storage.metal_buffer,
                                       in_dim, out_dim, src, n_tok);
   }
@@ -13037,7 +13443,21 @@ static bool metal_graph_encode_decode_layer(
  if (ok) {
  metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
  }
- if (ok) ok = ds4_matmul_q8_0_via_tensor(g->qr, model,
+ int qkv_fp8_pair = 0;
+ if (ok && qkv_rms_fused) {
+  const int pair_rc = ds4_matmul_q8_0_pair_fp8_via_tensor(g->qr,
+   g->kv_raw,
+   layer->attn_q_a,
+   layer->attn_kv,
+   DS4_N_EMBD,
+   q_rank,
+   DS4_N_HEAD_DIM,
+   g->attn_norm,
+   1);
+  if (pair_rc < 0) ok = false;
+  else qkv_fp8_pair = pair_rc;
+ }
+ if (ok && !qkv_fp8_pair) ok = ds4_matmul_q8_0_via_tensor(g->qr, model,
   layer->attn_q_a,
   DS4_N_EMBD, q_rank,
   g->attn_norm, 1) != 0;
@@ -13045,7 +13465,7 @@ static bool metal_graph_encode_decode_layer(
  metal_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
  }
  if (qkv_rms_fused) {
- if (ok) ok = ds4_matmul_q8_0_via_tensor(g->kv_raw, model,
+ if (ok && !qkv_fp8_pair) ok = ds4_matmul_q8_0_via_tensor(g->kv_raw, model,
   layer->attn_kv,
   DS4_N_EMBD, DS4_N_HEAD_DIM,
   g->attn_norm, 1) != 0;
@@ -13083,7 +13503,23 @@ static bool metal_graph_encode_decode_layer(
  if (ok) {
  metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
  }
- if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+ if (ok && metal_graph_use_q_head_norm_rope()) {
+ ok = ds4_gpu_head_rms_norm_rope_tail_tensor(g->q,
+ 1,
+ DS4_N_HEAD,
+ DS4_N_HEAD_DIM,
+ DS4_N_ROT,
+ pos,
+ compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+ DS4_RMS_EPS,
+ freq_base,
+ freq_scale,
+ ext_factor,
+ attn_factor,
+ DS4_ROPE_YARN_BETA_FAST,
+ DS4_ROPE_YARN_BETA_SLOW) != 0;
+ } else if (ok) {
+ ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
  if (ok) {
  metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
  }
@@ -13092,6 +13528,7 @@ static bool metal_graph_encode_decode_layer(
  compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
  false, freq_base, freq_scale, ext_factor, attn_factor,
  DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+ }
  DS4_METAL_PROFILE_DECODE_STAGE("q_path");
  if (ok) {
  metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
@@ -13472,33 +13909,72 @@ static bool metal_graph_encode_decode_layer(
  layer->attn_output_a->storage.scale_metal_buffer != NULL &&
  layer->attn_output_b->storage.scale_metal_buffer != NULL &&
  layer->attn_output_a->storage.scale_dtype == DS4_TENSOR_FP8_E8M0 &&
- layer->attn_output_b->storage.scale_dtype == DS4_TENSOR_FP8_E8M0;
- const bool fuse_attn_out_hc =
- !metal_graph_directional_steering_attn_enabled(g) &&
- !metal_graph_use_reference_attn_out_hc() &&
- attn_output_q8_native;
- if (ok && attn_output_fp8_storage) {
- ok = ds4_gpu_attention_output_low_fp8_e4m3_e8m0_storage(g->attn_low,
- layer->attn_output_a->storage.metal_buffer,
- layer->attn_output_a->storage.scale_metal_buffer,
- layer->attn_output_a->storage.scale_length,
- group_dim,
- rank,
- n_groups,
- g->heads,
- 1) != 0;
- if (ok) {
- ok = ds4_gpu_matmul_fp8_e4m3_e8m0_storage(g->attn_out,
- layer->attn_output_b->storage.metal_buffer,
- layer->attn_output_b->storage.scale_metal_buffer,
- layer->attn_output_b->storage.scale_length,
- (uint64_t)n_groups * rank,
- DS4_N_EMBD,
- g->attn_low,
- 1) != 0;
- }
- } else if (ok && fuse_attn_out_hc) {
- ok = ds4_gpu_attention_output_low_q8_tensor(g->attn_low,
+  layer->attn_output_b->storage.scale_dtype == DS4_TENSOR_FP8_E8M0;
+  const bool fuse_attn_out_hc =
+  !metal_graph_directional_steering_attn_enabled(g) &&
+  !metal_graph_use_reference_attn_out_hc() &&
+  attn_output_q8_native;
+  static int s_disable_fp8_attn_out_hc_fuse_checked = 0;
+  static int s_disable_fp8_attn_out_hc_fuse = 0;
+  if (!s_disable_fp8_attn_out_hc_fuse_checked) {
+  s_disable_fp8_attn_out_hc_fuse = getenv("DS4_DISABLE_FP8_ATTN_OUT_HC_FUSE") != NULL ? 1 : 0;
+  s_disable_fp8_attn_out_hc_fuse_checked = 1;
+  if (s_disable_fp8_attn_out_hc_fuse) {
+  fprintf(stderr, "ds4: DS4_DISABLE_FP8_ATTN_OUT_HC_FUSE=1 — FP8 attn output HC fusion disabled\n");
+  }
+  }
+  const bool fuse_fp8_attn_out_hc =
+  !s_disable_fp8_attn_out_hc_fuse &&
+  !metal_graph_directional_steering_attn_enabled(g) &&
+  !metal_graph_use_reference_attn_out_hc() &&
+  attn_output_fp8_storage;
+  if (ok && attn_output_fp8_storage) {
+  s_n_storage_dispatch_fp8_direct++;
+  ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8_DIRECT, layer->attn_output_a);
+  s_n_storage_dispatch_fp8_direct++;
+  ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8_DIRECT, layer->attn_output_b);
+  ok = ds4_gpu_attention_output_low_fp8_e4m3_e8m0_storage(g->attn_low,
+  layer->attn_output_a->storage.metal_buffer,
+  layer->attn_output_a->storage.scale_metal_buffer,
+  layer->attn_output_a->storage.scale_length,
+  group_dim,
+  rank,
+  n_groups,
+  g->heads,
+  1) != 0;
+  if (ok) {
+  if (fuse_fp8_attn_out_hc) {
+  const bool store_fp8_attn_out =
+  getenv("DS4_FP8_ATTN_OUT_HC_STORE_BLOCK") != NULL ||
+  metal_graph_debug_wants("attn_out", il, pos);
+  ok = ds4_gpu_matmul_fp8_e4m3_e8m0_hc_expand_tensor_ex(g->after_attn_hc,
+  g->attn_out,
+  layer->attn_output_b->storage.metal_buffer,
+  layer->attn_output_b->storage.scale_metal_buffer,
+  layer->attn_output_b->storage.scale_length,
+  (uint64_t)n_groups * rank,
+  DS4_N_EMBD,
+  g->attn_low,
+  g->cur_hc,
+  g->hc_post,
+  g->hc_comb,
+  DS4_N_EMBD,
+  DS4_N_HC,
+  1,
+  store_fp8_attn_out ? 1 : 0) != 0;
+  } else {
+  ok = ds4_gpu_matmul_fp8_e4m3_e8m0_storage(g->attn_out,
+  layer->attn_output_b->storage.metal_buffer,
+  layer->attn_output_b->storage.scale_metal_buffer,
+  layer->attn_output_b->storage.scale_length,
+  (uint64_t)n_groups * rank,
+  DS4_N_EMBD,
+  g->attn_low,
+  1) != 0;
+  }
+  }
+  } else if (ok && fuse_attn_out_hc) {
+  ok = ds4_gpu_attention_output_low_q8_tensor(g->attn_low,
  model->map,
  model->size,
  layer->attn_output_a->abs_offset,
@@ -13543,7 +14019,7 @@ static bool metal_graph_encode_decode_layer(
  if (ok && metal_graph_directional_steering_attn_enabled(g)) {
  ok = metal_graph_apply_directional_steering_attn(g, g->attn_out, il, 1);
  }
- if (ok && !fuse_attn_out_hc) {
+ if (ok && !fuse_attn_out_hc && !fuse_fp8_attn_out_hc) {
  ok = ds4_gpu_hc_expand_tensor(g->after_attn_hc, g->attn_out, g->cur_hc,
  g->hc_post, g->hc_comb, DS4_N_EMBD, DS4_N_HC) != 0;
  }
@@ -13691,6 +14167,15 @@ static bool metal_graph_encode_decode_layer(
  !g->quality &&
  shared_gate_up_q8_native &&
  getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
+ const bool shared_gate_up_fp8_native =
+ ds4_tensor_storage_is_fp8_e8m0(layer->ffn_gate_shexp) &&
+ ds4_tensor_storage_is_fp8_e8m0(layer->ffn_up_shexp);
+ const bool fuse_shared_gate_up_fp8 =
+ !g->quality &&
+ shared_gate_up_fp8_native &&
+ getenv("DS4_METAL_ENABLE_SHARED_GATE_UP_FP8_SWIGLU_FUSION") != NULL &&
+ getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL &&
+ getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_FP8_SWIGLU_FUSION") == NULL;
  if (ok && fuse_shared_gate_up) {
  ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
  g->shared_up,
@@ -13703,6 +14188,48 @@ static bool metal_graph_encode_decode_layer(
  shared_dim,
  g->ffn_norm,
  DS4_SWIGLU_CLAMP_EXP) != 0;
+ } else if (ok && fuse_shared_gate_up_fp8) {
+ const int fp8_fused_ok = ds4_gpu_shared_gate_up_swiglu_fp8_e4m3_e8m0_tensor(g->shared_gate,
+ g->shared_up,
+ g->shared_mid,
+ layer->ffn_gate_shexp->storage.metal_buffer,
+ layer->ffn_gate_shexp->storage.scale_metal_buffer,
+ layer->ffn_gate_shexp->storage.scale_length,
+ layer->ffn_up_shexp->storage.metal_buffer,
+ layer->ffn_up_shexp->storage.scale_metal_buffer,
+ layer->ffn_up_shexp->storage.scale_length,
+ DS4_N_EMBD,
+ shared_dim,
+ g->ffn_norm,
+ 1,
+ DS4_SWIGLU_CLAMP_EXP);
+ if (fp8_fused_ok) {
+  s_n_storage_dispatch_fp8 += 2;
+  ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8, layer->ffn_gate_shexp);
+  ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8, layer->ffn_up_shexp);
+  static int shared_fp8_logged = 0;
+  if (!shared_fp8_logged) {
+   shared_fp8_logged = 1;
+   fprintf(stderr, "ds4: shared gate/up FP8 fused SwiGLU active\n");
+  }
+ } else {
+  static int shared_fp8_fail_logged = 0;
+  if (!shared_fp8_fail_logged) {
+   shared_fp8_fail_logged = 1;
+   fprintf(stderr, "ds4: shared gate/up FP8 fused SwiGLU failed; falling back to separate FP8 matmuls\n");
+  }
+ }
+ if (ok && !fp8_fused_ok) {
+  ok = ds4_matmul_q8_0_via_tensor(g->shared_gate, model,
+  layer->ffn_gate_shexp,
+  DS4_N_EMBD, shared_dim,
+  g->ffn_norm, 1) != 0;
+  if (ok) ok = ds4_matmul_q8_0_via_tensor(g->shared_up, model,
+  layer->ffn_up_shexp,
+  DS4_N_EMBD, shared_dim,
+  g->ffn_norm, 1) != 0;
+  if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up, shared_dim, 0.0f, 1.0f) != 0;
+ }
  } else {
  if (ok) ok = ds4_matmul_q8_0_via_tensor(g->shared_gate, model,
   layer->ffn_gate_shexp,
@@ -13718,8 +14245,57 @@ static bool metal_graph_encode_decode_layer(
  const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
  const bool shared_down_q8_native =
  tensor_effective_type(layer->ffn_down_shexp) == DS4_TENSOR_Q8_0;
+ const bool shared_down_fp8_storage =
+ layer->ffn_down_shexp &&
+ layer->ffn_down_shexp->storage.dtype == DS4_TENSOR_FP8_E4M3 &&
+ layer->ffn_down_shexp->storage.scale_dtype == DS4_TENSOR_FP8_E8M0 &&
+ layer->ffn_down_shexp->storage.metal_buffer &&
+ layer->ffn_down_shexp->storage.scale_metal_buffer;
  const bool fuse_shared_down_hc =
  !keep_ffn_out && shared_down_q8_native && !metal_graph_use_reference_shared_down_hc();
+ const bool fuse_shared_down_fp8_hc =
+ !keep_ffn_out &&
+ getenv("DS4_METAL_ENABLE_SHARED_DOWN_FP8_HC_FUSION") != NULL &&
+ shared_down_fp8_storage &&
+ getenv("DS4_METAL_DISABLE_SHARED_DOWN_FP8_HC_FUSION") == NULL &&
+ !metal_graph_directional_steering_ffn_enabled(g) &&
+ !metal_graph_use_reference_shared_down_hc();
+ bool fp8_shared_down_hc_fused = false;
+ if (ok && fuse_shared_down_fp8_hc) {
+ const bool store_fp8_shared_down =
+ getenv("DS4_FP8_SHARED_DOWN_HC_STORE_BLOCK") != NULL ||
+ metal_graph_debug_wants("ffn_shexp", il, pos);
+ const int fused_ok = ds4_gpu_shared_down_hc_expand_fp8_e4m3_e8m0_tensor(g->after_ffn_hc,
+ g->shared_out,
+ layer->ffn_down_shexp->storage.metal_buffer,
+ layer->ffn_down_shexp->storage.scale_metal_buffer,
+ layer->ffn_down_shexp->storage.scale_length,
+ shared_dim,
+ DS4_N_EMBD,
+ g->shared_mid,
+ g->routed_out,
+ g->after_attn_hc,
+ g->hc_split,
+ DS4_N_EMBD,
+ DS4_N_HC,
+ store_fp8_shared_down ? 1 : 0);
+ if (fused_ok) {
+ fp8_shared_down_hc_fused = true;
+ s_n_storage_dispatch_fp8++;
+ ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8, layer->ffn_down_shexp);
+ static int shared_down_fp8_logged = 0;
+ if (!shared_down_fp8_logged) {
+ shared_down_fp8_logged = 1;
+ fprintf(stderr, "ds4: shared-down FP8 HC fused path active\n");
+ }
+ } else {
+ static int shared_down_fp8_fail_logged = 0;
+ if (!shared_down_fp8_fail_logged) {
+ shared_down_fp8_fail_logged = 1;
+ fprintf(stderr, "ds4: shared-down FP8 HC fused path failed; falling back to separate FP8 matmul + HC expand\n");
+ }
+ }
+ }
  if (ok && fuse_shared_down_hc) {
  ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
  g->shared_out,
@@ -13734,7 +14310,7 @@ static bool metal_graph_encode_decode_layer(
  g->hc_split,
  DS4_N_EMBD,
  DS4_N_HC) != 0;
- } else if (ok) {
+ } else if (ok && !fp8_shared_down_hc_fused) {
  ok = ds4_matmul_q8_0_via_tensor(g->shared_out, model,
   layer->ffn_down_shexp,
   shared_dim, DS4_N_EMBD,
@@ -13762,7 +14338,7 @@ static bool metal_graph_encode_decode_layer(
  g->hc_comb,
  DS4_N_EMBD,
  DS4_N_HC) != 0;
- } else if (ok && !fuse_shared_down_hc) {
+ } else if (ok && !fuse_shared_down_hc && !fp8_shared_down_hc_fused) {
  ok = ds4_gpu_hc_expand_add_split_tensor(g->after_ffn_hc,
  g->routed_out,
  g->shared_out,
@@ -13786,7 +14362,19 @@ static bool metal_graph_encode_output_head(
  const ds4_weights *weights,
  uint64_t vocab_dim) {
  const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
- bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+ const bool output_stage_profile = getenv("DS4_METAL_OUTPUT_STAGE_PROFILE") != NULL;
+ double output_stage_t0 = output_stage_profile ? now_sec() : 0.0;
+ bool ok = true;
+ if (output_stage_profile) {
+ ok = ds4_gpu_end_commands() != 0 && ds4_gpu_begin_commands() != 0;
+ output_stage_t0 = now_sec();
+ }
+#define DS4_METAL_PROFILE_OUTPUT_STAGE(name) do { \
+ if (ok && output_stage_profile) { \
+ ok = metal_graph_layer_stage_profile_boundary("output", (name), DS4_N_LAYER, 0, 1, &output_stage_t0); \
+ } \
+} while (0)
+ if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
  /* silv 2026-05-28 #796 Increment 2c — first production call site wired
   * to via_tensor dispatcher. When weights->output_hc_fn has been override-
   * filled, this routes through ds4_gpu_matmul_f16_storage (heap path);
@@ -13799,6 +14387,7 @@ static bool metal_graph_encode_output_head(
  DS4_N_HC,
  g->flat_hc,
  1) != 0;
+ DS4_METAL_PROFILE_OUTPUT_STAGE("hc_pre");
  if (ok) {
  metal_graph_debug_dump_tensor("result_hc_pre", g->output_pre, DS4_N_HC, DS4_N_LAYER, 0);
  }
@@ -13810,6 +14399,7 @@ static bool metal_graph_encode_output_head(
  weights->output_hc_base->abs_offset,
  DS4_N_HC,
  DS4_HC_EPS) != 0;
+ DS4_METAL_PROFILE_OUTPUT_STAGE("hc_weights");
  if (ok) {
  metal_graph_debug_dump_tensor("result_hc_weights", g->output_weights, DS4_N_HC, DS4_N_LAYER, 0);
  }
@@ -13818,6 +14408,7 @@ static bool metal_graph_encode_output_head(
  g->output_weights,
  DS4_N_EMBD,
  DS4_N_HC) != 0;
+ DS4_METAL_PROFILE_OUTPUT_STAGE("hc_sum");
  if (ok) {
  metal_graph_debug_dump_tensor("result_hc", g->output_embd, DS4_N_EMBD, DS4_N_LAYER, 0);
  }
@@ -13828,6 +14419,7 @@ static bool metal_graph_encode_output_head(
  weights->output_norm->abs_offset,
  DS4_N_EMBD,
  DS4_RMS_EPS) != 0;
+ DS4_METAL_PROFILE_OUTPUT_STAGE("norm");
  if (ok) {
  metal_graph_debug_dump_tensor("result_norm", g->output_norm, DS4_N_EMBD, DS4_N_LAYER, 0);
  }
@@ -13835,9 +14427,11 @@ static bool metal_graph_encode_output_head(
   weights->output,
   DS4_N_EMBD, vocab_dim,
   g->output_norm, 1) != 0;
+ DS4_METAL_PROFILE_OUTPUT_STAGE("lm_head");
  if (ok) {
  metal_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, DS4_N_LAYER, 0);
  }
+#undef DS4_METAL_PROFILE_OUTPUT_STAGE
  return ok;
 }
 
@@ -14600,6 +15194,9 @@ static int metal_graph_first_token_full_test(
  * flow and their CPU reads stay outside these generation entry points.
  */
 
+static bool ds4_layer_should_skip_decode(uint32_t il);
+static bool ds4_layer_should_skip_prefill(uint32_t il);
+
 /* Encode a full single-token decode step on Metal. This is the generation
  * hot path: update caches, run all layers, then produce logits. */
 static bool metal_graph_encode_token_raw_swa(
@@ -14641,66 +15238,8 @@ static bool metal_graph_encode_token_raw_swa(
  if (end != split_env && v <= DS4_N_LAYER) split_after_layers = (uint32_t)v;
  }
 
- /* Terminal-case experiment: multiple layer-skip policies via env vars.
- * DS4_LAYER_SKIP_MOD=N: skip where il%N != 0 (e.g., MOD=2 keeps evens).
- * DS4_LAYER_KEEP_FIRST=N: keep only il < N (skip the rest).
- * DS4_LAYER_KEEP_LAST=N: keep only il >= DS4_N_LAYER-N.
- * DS4_LAYER_SKIP_RANGE="lo-hi": skip layers in inclusive range. */
- static int cached_skip_mod = -1;
- static int cached_keep_first = -1;
- static int cached_keep_last = -1;
- static int cached_skip_lo = -1, cached_skip_hi = -1;
- if (cached_skip_mod < 0) {
- const char *e = getenv("DS4_LAYER_SKIP_MOD");
- cached_skip_mod = (e && e[0]) ? atoi(e) : 0;
- if (cached_skip_mod < 0) cached_skip_mod = 0;
- }
- if (cached_keep_first < 0) {
- const char *e = getenv("DS4_LAYER_KEEP_FIRST");
- cached_keep_first = (e && e[0]) ? atoi(e) : 0;
- if (cached_keep_first < 0) cached_keep_first = 0;
- }
- if (cached_keep_last < 0) {
- const char *e = getenv("DS4_LAYER_KEEP_LAST");
- cached_keep_last = (e && e[0]) ? atoi(e) : 0;
- if (cached_keep_last < 0) cached_keep_last = 0;
- }
- if (cached_skip_lo < 0) {
- const char *e = getenv("DS4_LAYER_SKIP_RANGE");
- if (e && e[0]) {
- char *dash = strchr((char*)e, '-');
- if (dash) {
- cached_skip_lo = atoi(e);
- cached_skip_hi = atoi(dash + 1);
- }
- }
- if (cached_skip_lo < 0) { cached_skip_lo = 0; cached_skip_hi = -1; }
- }
- /* DS4_LAYER_SKIP_LIST="a,b,c": comma-separated layer indices to skip */
- static int skip_list_initialized = 0;
- static bool skip_layer_mask[DS4_N_LAYER];
- if (!skip_list_initialized) {
- for (uint32_t k = 0; k < DS4_N_LAYER; k++) skip_layer_mask[k] = false;
- const char *e = getenv("DS4_LAYER_SKIP_LIST");
- if (e && e[0]) {
- char buf[1024];
- strncpy(buf, e, sizeof(buf) - 1);
- buf[sizeof(buf) - 1] = '\0';
- char *tok = strtok(buf, ",");
- while (tok) {
- int v = atoi(tok);
- if (v >= 0 && v < (int)DS4_N_LAYER) skip_layer_mask[v] = true;
- tok = strtok(NULL, ",");
- }
- }
- skip_list_initialized = 1;
- }
  for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
- bool skip = (cached_skip_mod > 1) && ((il % cached_skip_mod) != 0);
- if (cached_keep_first > 0 && (int)il >= cached_keep_first) skip = true;
- if (cached_keep_last > 0 && (int)il < (int)(DS4_N_LAYER - cached_keep_last)) skip = true;
- if (cached_skip_hi >= 0 && (int)il >= cached_skip_lo && (int)il <= cached_skip_hi) skip = true;
- if (skip_layer_mask[il]) skip = true;
+ bool skip = ds4_layer_should_skip_decode(il);
  if (!skip) {
  const uint32_t weight_il = ds4_layer_dup_remap(il);
  ok = metal_graph_encode_decode_layer(g,
@@ -15166,7 +15705,21 @@ static bool metal_graph_encode_layer_attention_batch(
  DS4_L1_PROBE("attn_norm", g->batch_attn_norm, DS4_N_EMBD);
  DS4_METAL_PROFILE_ATTN_STAGE("norm");
  DS4_METAL_PROFILE_Q_STAGE("pre_q");
- if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_qr, model,
+ int qkv_fp8_pair = 0;
+ if (ok && qkv_rms_fused) {
+  const int pair_rc = ds4_matmul_q8_0_pair_fp8_via_tensor(g->batch_qr,
+   g->batch_kv_raw,
+   layer->attn_q_a,
+   layer->attn_kv,
+   DS4_N_EMBD,
+   q_rank,
+   DS4_N_HEAD_DIM,
+   g->batch_attn_norm,
+   n_tokens);
+  if (pair_rc < 0) ok = false;
+  else qkv_fp8_pair = pair_rc;
+ }
+ if (ok && !qkv_fp8_pair) ok = ds4_matmul_q8_0_via_tensor(g->batch_qr, model,
   layer->attn_q_a,
   DS4_N_EMBD, q_rank,
   g->batch_attn_norm, n_tokens) != 0;
@@ -15177,7 +15730,7 @@ static bool metal_graph_encode_layer_attention_batch(
  DS4_L1_PROBE("q_lora", g->batch_qr, q_rank);
  DS4_METAL_PROFILE_Q_STAGE("q_a");
  if (qkv_rms_fused) {
- if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_kv_raw, model,
+ if (ok && !qkv_fp8_pair) ok = ds4_matmul_q8_0_via_tensor(g->batch_kv_raw, model,
   layer->attn_kv,
   DS4_N_EMBD, DS4_N_HEAD_DIM,
   g->batch_attn_norm, n_tokens) != 0;
@@ -15225,6 +15778,23 @@ static bool metal_graph_encode_layer_attention_batch(
  (uint64_t)n_tokens * q_dim, il, pos0);
  }
  DS4_METAL_PROFILE_Q_STAGE("q_b");
+ if (ok && metal_graph_use_q_head_norm_rope()) {
+ ok = ds4_gpu_head_rms_norm_rope_tail_tensor(g->batch_q,
+ n_tokens,
+ DS4_N_HEAD,
+ DS4_N_HEAD_DIM,
+ DS4_N_ROT,
+ pos0,
+ compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+ DS4_RMS_EPS,
+ freq_base,
+ freq_scale,
+ ext_factor,
+ attn_factor,
+ DS4_ROPE_YARN_BETA_FAST,
+ DS4_ROPE_YARN_BETA_SLOW) != 0;
+ DS4_METAL_PROFILE_Q_STAGE("head_norm_rope");
+ } else {
  if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
  n_tokens,
  DS4_N_HEAD,
@@ -15249,12 +15819,13 @@ static bool metal_graph_encode_layer_attention_batch(
  attn_factor,
  DS4_ROPE_YARN_BETA_FAST,
  DS4_ROPE_YARN_BETA_SLOW) != 0;
+ DS4_METAL_PROFILE_Q_STAGE("rope");
+ }
  if (ok) {
  metal_graph_debug_dump_tensor("Qcur", g->batch_q,
  (uint64_t)n_tokens * q_dim, il, pos0);
  }
  DS4_L1_PROBE("Qcur(post-RoPE)", g->batch_q, q_dim);
- DS4_METAL_PROFILE_Q_STAGE("rope");
  DS4_METAL_PROFILE_ATTN_STAGE("q_path");
  if (!qkv_rms_fused) {
  if (ok) ok = ds4_matmul_q8_0_via_tensor(g->batch_kv_raw, model,
@@ -16306,31 +16877,35 @@ static bool metal_graph_encode_layer_attention_batch(
  layer->attn_output_a->storage.metal_buffer != NULL &&
  layer->attn_output_b->storage.metal_buffer != NULL &&
  layer->attn_output_a->storage.scale_metal_buffer != NULL &&
- layer->attn_output_b->storage.scale_metal_buffer != NULL &&
- layer->attn_output_a->storage.scale_dtype == DS4_TENSOR_FP8_E8M0 &&
- layer->attn_output_b->storage.scale_dtype == DS4_TENSOR_FP8_E8M0;
- if (ok && attn_output_fp8_storage) {
- ok = ds4_gpu_attention_output_low_fp8_e4m3_e8m0_storage(g->batch_attn_low,
- layer->attn_output_a->storage.metal_buffer,
- layer->attn_output_a->storage.scale_metal_buffer,
- layer->attn_output_a->storage.scale_length,
- group_dim,
- rank,
- n_groups,
- g->batch_heads,
- n_tokens) != 0;
- if (ok) {
- ok = ds4_gpu_matmul_fp8_e4m3_e8m0_storage(g->batch_attn_out,
- layer->attn_output_b->storage.metal_buffer,
- layer->attn_output_b->storage.scale_metal_buffer,
- layer->attn_output_b->storage.scale_length,
- (uint64_t)n_groups * rank,
- DS4_N_EMBD,
- g->batch_attn_low,
- n_tokens) != 0;
- }
- } else if (ok) {
- ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out,
+  layer->attn_output_b->storage.scale_metal_buffer != NULL &&
+  layer->attn_output_a->storage.scale_dtype == DS4_TENSOR_FP8_E8M0 &&
+  layer->attn_output_b->storage.scale_dtype == DS4_TENSOR_FP8_E8M0;
+  if (ok && attn_output_fp8_storage) {
+  s_n_storage_dispatch_fp8_direct++;
+  ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8_DIRECT, layer->attn_output_a);
+  s_n_storage_dispatch_fp8_direct++;
+  ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8_DIRECT, layer->attn_output_b);
+  ok = ds4_gpu_attention_output_low_fp8_e4m3_e8m0_storage(g->batch_attn_low,
+  layer->attn_output_a->storage.metal_buffer,
+  layer->attn_output_a->storage.scale_metal_buffer,
+  layer->attn_output_a->storage.scale_length,
+  group_dim,
+  rank,
+  n_groups,
+  g->batch_heads,
+  n_tokens) != 0;
+  if (ok) {
+  ok = ds4_gpu_matmul_fp8_e4m3_e8m0_storage(g->batch_attn_out,
+  layer->attn_output_b->storage.metal_buffer,
+  layer->attn_output_b->storage.scale_metal_buffer,
+  layer->attn_output_b->storage.scale_length,
+  (uint64_t)n_groups * rank,
+  DS4_N_EMBD,
+  g->batch_attn_low,
+  n_tokens) != 0;
+  }
+  } else if (ok) {
+  ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out,
  g->batch_attn_low,
  g->batch_group_tmp,
  g->batch_low_tmp,
@@ -16585,9 +17160,37 @@ static bool metal_graph_encode_layer_ffn_batch(
  }
  DS4_METAL_PROFILE_FFN_STAGE("router");
 
+	 char d8f_path[4096];
+	 const bool has_d8f_pack = ds4_d8f_pack_path_for_layer(il, d8f_path, sizeof(d8f_path));
 	 const char *m1r_path = getenv("DS4_M1R_PACK_PATH");
 	 const bool has_m1r_pack = m1r_path && m1r_path[0];
-	 if (ok && has_m1r_pack) {
+	 if (ok && has_d8f_pack) {
+	 static int s_d8f_prefill_notice = 0;
+	 if (!s_d8f_prefill_notice) {
+	  s_d8f_prefill_notice = 1;
+	  fprintf(stderr, "ds4: D8F prefill using fused routed organ n_tokens=%u\n", n_tokens);
+	 }
+	 int dr = -1;
+	 if (ds4_d8f_mtl4_packet_requested((uint32_t)n_tokens)) {
+	  ok = (ds4_gpu_end_commands() != 0);
+	  if (ok) {
+	   dr = ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(
+	    d8f_path, il,
+	    g->batch_router_selected, g->batch_router_weights,
+	    g->batch_ffn_norm, g->batch_routed_out,
+	    (uint32_t)n_tokens, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP);
+	  }
+	  if (ds4_gpu_begin_commands() == 0) ok = false;
+	 }
+	 if (ok && dr != 0) {
+	  dr = ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+	   d8f_path, il,
+	   g->batch_router_selected, g->batch_router_weights,
+	   g->batch_ffn_norm, g->batch_routed_out,
+	   (uint32_t)n_tokens, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP);
+	 }
+	 ok = ok && (dr == 0);
+	 } else if (ok && has_m1r_pack) {
 	 ok = (ds4_gpu_end_commands() != 0);
 	 if (ok && n_tokens == 1) {
 	  const int dr = ds4_gpu_mtl4_m1r_routed_organ_dispatch_tensor(
@@ -16687,9 +17290,9 @@ static bool metal_graph_encode_layer_ffn_batch(
  g->cpu_moe_pair_ids);
  }
  }
- }
+	 }
  if (ok) ok = (ds4_gpu_begin_commands() != 0);
- } else if (ok) {
+	 } else if (ok) {
  /* Phase B-2.3c stub: polar hot-path gate. If polar pool + per-layer
   * enable both engaged, give polar dispatcher first chance at this
   * FFN. Stub returns 0 → falls through to FP4 path (body pending
@@ -17314,63 +17917,152 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
  * initialized from DS4_LAYER_SKIP_LIST etc. env vars on first use. */
 static int ds4_skip_init = 0;
 static bool ds4_skip_mask[DS4_N_LAYER];
+static bool ds4_skip_prefill_mask[DS4_N_LAYER];
+static bool ds4_skip_decode_mask[DS4_N_LAYER];
+static bool ds4_skip_decode_confident_mask[DS4_N_LAYER];
+static bool ds4_skip_has_prefill_list = false;
+static bool ds4_skip_has_decode_list = false;
+static bool ds4_skip_has_decode_confident_list = false;
+static bool ds4_skip_decode_confident_active = false;
+static bool ds4_skip_confidence_trace = false;
+static float ds4_skip_confidence_margin = 0.0f;
 static int ds4_skip_mod = 0, ds4_skip_keep_first = 0, ds4_skip_keep_last = 0;
 static int ds4_skip_lo = 0, ds4_skip_hi = -1;
 
+static bool ds4_parse_layer_skip_mask(const char *csv, bool mask[DS4_N_LAYER]) {
+ for (uint32_t k = 0; k < DS4_N_LAYER; k++) mask[k] = false;
+ if (!csv || !csv[0]) return false;
+ char buf[1024];
+ strncpy(buf, csv, sizeof(buf) - 1);
+ buf[sizeof(buf) - 1] = '\0';
+ char *tok = strtok(buf, ",");
+ bool any = false;
+ while (tok) {
+ int v = atoi(tok);
+ if (v >= 0 && v < (int)DS4_N_LAYER) {
+ mask[v] = true;
+ any = true;
+ }
+ tok = strtok(NULL, ",");
+ }
+ return any;
+}
+
 static void ds4_skip_init_from_env(void) {
  for (uint32_t k = 0; k < DS4_N_LAYER; k++) ds4_skip_mask[k] = false;
+ for (uint32_t k = 0; k < DS4_N_LAYER; k++) ds4_skip_prefill_mask[k] = false;
+ for (uint32_t k = 0; k < DS4_N_LAYER; k++) ds4_skip_decode_mask[k] = false;
+ for (uint32_t k = 0; k < DS4_N_LAYER; k++) ds4_skip_decode_confident_mask[k] = false;
+ ds4_skip_has_prefill_list = false;
+ ds4_skip_has_decode_list = false;
+ ds4_skip_has_decode_confident_list = false;
+ ds4_skip_decode_confident_active = false;
+ ds4_skip_confidence_trace = false;
+ ds4_skip_confidence_margin = 0.0f;
  ds4_skip_mod = 0; ds4_skip_keep_first = 0; ds4_skip_keep_last = 0;
  ds4_skip_lo = 0; ds4_skip_hi = -1;
  const char *e = getenv("DS4_LAYER_SKIP_LIST");
+ ds4_parse_layer_skip_mask(e, ds4_skip_mask);
+ e = getenv("DS4_LAYER_SKIP_PREFILL_LIST");
+ ds4_skip_has_prefill_list = ds4_parse_layer_skip_mask(e, ds4_skip_prefill_mask);
+ e = getenv("DS4_LAYER_SKIP_DECODE_LIST");
+ ds4_skip_has_decode_list = ds4_parse_layer_skip_mask(e, ds4_skip_decode_mask);
+ e = getenv("DS4_LAYER_SKIP_DECODE_CONFIDENT_LIST");
+ ds4_skip_has_decode_confident_list = ds4_parse_layer_skip_mask(e, ds4_skip_decode_confident_mask);
+ e = getenv("DS4_LAYER_SKIP_CONFIDENCE_MARGIN");
  if (e && e[0]) {
- char buf[1024];
- strncpy(buf, e, sizeof(buf) - 1);
- buf[sizeof(buf) - 1] = '\0';
- char *tok = strtok(buf, ",");
- while (tok) {
- int v = atoi(tok);
- if (v >= 0 && v < (int)DS4_N_LAYER) ds4_skip_mask[v] = true;
- tok = strtok(NULL, ",");
+  ds4_skip_confidence_margin = strtof(e, NULL);
+  if (ds4_skip_confidence_margin < 0.0f) ds4_skip_confidence_margin = 0.0f;
  }
- }
+ e = getenv("DS4_LAYER_SKIP_CONFIDENCE_TRACE");
+ ds4_skip_confidence_trace = e && e[0];
  e = getenv("DS4_LAYER_SKIP_MOD"); if (e && e[0]) { ds4_skip_mod = atoi(e); if (ds4_skip_mod < 0) ds4_skip_mod = 0; }
  e = getenv("DS4_LAYER_KEEP_FIRST"); if (e && e[0]) { ds4_skip_keep_first = atoi(e); if (ds4_skip_keep_first < 0) ds4_skip_keep_first = 0; }
  e = getenv("DS4_LAYER_KEEP_LAST"); if (e && e[0]) { ds4_skip_keep_last = atoi(e); if (ds4_skip_keep_last < 0) ds4_skip_keep_last = 0; }
  e = getenv("DS4_LAYER_SKIP_RANGE");
  if (e && e[0]) {
- char *dash = strchr((char*)e, '-');
- if (dash) { ds4_skip_lo = atoi(e); ds4_skip_hi = atoi(dash + 1); }
+  char *dash = strchr((char*)e, '-');
+  if (dash) { ds4_skip_lo = atoi(e); ds4_skip_hi = atoi(dash + 1); }
+ }
+ e = getenv("DS4_LAYER_SKIP_DEBUG");
+ if (e && e[0]) {
+  uint32_t common_n = 0, prefill_n = 0, decode_n = 0, confident_n = 0;
+  for (uint32_t k = 0; k < DS4_N_LAYER; k++) {
+   common_n += ds4_skip_mask[k] ? 1u : 0u;
+   prefill_n += ds4_skip_prefill_mask[k] ? 1u : 0u;
+   decode_n += ds4_skip_decode_mask[k] ? 1u : 0u;
+   confident_n += ds4_skip_decode_confident_mask[k] ? 1u : 0u;
+  }
+  fprintf(stderr,
+   "ds4: layer-skip init common=%u prefill=%u decode=%u confident=%u margin=%.6f trace=%d mod=%d range=%d-%d\n",
+   common_n, prefill_n, decode_n, confident_n,
+   (double)ds4_skip_confidence_margin,
+   ds4_skip_confidence_trace ? 1 : 0,
+   ds4_skip_mod, ds4_skip_lo, ds4_skip_hi);
  }
  ds4_skip_init = 1;
 }
 
 /* Public: override skip-list at runtime. csv=NULL or empty clears mask. */
 void ds4_set_skip_list(const char *csv) {
- for (uint32_t k = 0; k < DS4_N_LAYER; k++) ds4_skip_mask[k] = false;
- if (csv && csv[0]) {
- char buf[1024];
- strncpy(buf, csv, sizeof(buf) - 1);
- buf[sizeof(buf) - 1] = '\0';
- char *tok = strtok(buf, ",");
- while (tok) {
- int v = atoi(tok);
- if (v >= 0 && v < (int)DS4_N_LAYER) ds4_skip_mask[v] = true;
- tok = strtok(NULL, ",");
- }
- }
+ ds4_parse_layer_skip_mask(csv, ds4_skip_mask);
+ for (uint32_t k = 0; k < DS4_N_LAYER; k++) ds4_skip_prefill_mask[k] = false;
+ for (uint32_t k = 0; k < DS4_N_LAYER; k++) ds4_skip_decode_mask[k] = false;
+ for (uint32_t k = 0; k < DS4_N_LAYER; k++) ds4_skip_decode_confident_mask[k] = false;
+ ds4_skip_has_prefill_list = false;
+ ds4_skip_has_decode_list = false;
+ ds4_skip_has_decode_confident_list = false;
+ ds4_skip_decode_confident_active = false;
  ds4_skip_init = 1;
 }
 
 /* Read skip state, return true iff this layer should be elided.
- * Used by both decode (metal_graph_encode_decode) and prefill paths. */
-static bool ds4_layer_should_skip(uint32_t il) {
+ * DS4_LAYER_SKIP_LIST remains the legacy common list. Phase-specific lists
+ * override that list for the named phase; mod/keep/range still apply globally. */
+static bool ds4_layer_should_skip_common_policy(uint32_t il) {
  if (!ds4_skip_init) ds4_skip_init_from_env();
- if (ds4_skip_mask[il]) return true;
  if (ds4_skip_mod > 1 && ((int)il % ds4_skip_mod) != 0) return true;
  if (ds4_skip_keep_first > 0 && (int)il >= ds4_skip_keep_first) return true;
  if (ds4_skip_keep_last > 0 && (int)il < (int)(DS4_N_LAYER - ds4_skip_keep_last)) return true;
  if (ds4_skip_hi >= 0 && (int)il >= ds4_skip_lo && (int)il <= ds4_skip_hi) return true;
  return false;
+}
+
+static bool ds4_layer_should_skip_prefill(uint32_t il) {
+ if (!ds4_skip_init) ds4_skip_init_from_env();
+ if (ds4_layer_should_skip_common_policy(il)) return true;
+ if (ds4_skip_has_prefill_list) return ds4_skip_prefill_mask[il];
+ return ds4_skip_mask[il];
+}
+
+static bool ds4_layer_should_skip_decode(uint32_t il) {
+ if (!ds4_skip_init) ds4_skip_init_from_env();
+ if (ds4_layer_should_skip_common_policy(il)) return true;
+ if (ds4_skip_decode_confident_active && ds4_skip_decode_confident_mask[il]) return true;
+ if (ds4_skip_has_decode_list) return ds4_skip_decode_mask[il];
+ return ds4_skip_mask[il];
+}
+
+static bool ds4_skip_confidence_gate_enabled(void) {
+ if (!ds4_skip_init) ds4_skip_init_from_env();
+ return ds4_skip_has_decode_confident_list && ds4_skip_confidence_margin > 0.0f;
+}
+
+static void ds4_skip_update_decode_confidence(float margin, int step, int top0, int top1) {
+ if (!ds4_skip_init) ds4_skip_init_from_env();
+ ds4_skip_decode_confident_active = ds4_skip_has_decode_confident_list &&
+  ds4_skip_confidence_margin > 0.0f &&
+  margin >= ds4_skip_confidence_margin;
+ if (ds4_skip_confidence_trace && ds4_skip_has_decode_confident_list) {
+  fprintf(stderr,
+   "ds4: confidence-skip step=%d margin=%.6f threshold=%.6f active=%d top0=%d top1=%d\n",
+   step, (double)margin, (double)ds4_skip_confidence_margin,
+   ds4_skip_decode_confident_active ? 1 : 0, top0, top1);
+ }
+}
+
+static void ds4_skip_clear_decode_confidence(void) {
+ ds4_skip_decode_confident_active = false;
 }
 
 /* Layer-duplication (amplification test). DS4_LAYER_DUP="34=33,35=33,36=33"
@@ -17559,7 +18251,7 @@ static bool metal_graph_prefill_layer_major(
                                                      n_tokens);
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-            if (ds4_layer_should_skip(il)) {
+            if (ds4_layer_should_skip_prefill(il)) {
                 if (show_progress) {
                     fprintf(stderr,
                             "ds4: gpu layer-major prefill layer %u/%u (SKIPPED)\r",
@@ -17708,7 +18400,7 @@ static bool metal_graph_prefill_layer_major(
     }
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        if (ds4_layer_should_skip(il)) {
+        if (ds4_layer_should_skip_prefill(il)) {
             if (show_progress) {
                 fprintf(stderr,
                         "ds4: gpu layer-major prefill layer %u/%u (SKIPPED)\r",
@@ -18025,7 +18717,7 @@ static bool metal_graph_prefill_chunked_range(
  double chunk_execute_s = 0.0;
 
  for (uint32_t il = phase_start_layer; ok && il < phase_end_layer; il++) {
- if (ds4_layer_should_skip(il)) {
+ if (ds4_layer_should_skip_prefill(il)) {
  if (show_progress) {
  fprintf(stderr, "ds4: gpu chunked prefill layer %u/%u (SKIPPED)\r",
  il + 1, (uint32_t)DS4_N_LAYER);
@@ -18287,8 +18979,11 @@ static bool metal_graph_verify_decode2_exact(
  uint32_t start,
  int *top0,
  float *logits0,
+ int *top1,
  float *logits1) {
- if (!g || !top0 || !logits1 || g->raw_cap == 0) return false;
+ if (!g || !top0 || (!top1 && !logits1) || g->raw_cap == 0) return false;
+ const bool cache_logits0_on_device = logits0 == NULL;
+ if (cache_logits0_on_device && !g->spec_logits) return false;
 
  const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
  ds4_gpu_tensor *cur0 = metal_graph_tensor_row_view(g->batch_cur_hc, 0, hc_dim);
@@ -18374,6 +19069,13 @@ static bool metal_graph_verify_decode2_exact(
  DS4_N_VOCAB,
  1,
  1) != 0;
+ if (ok && cache_logits0_on_device) {
+ ok = ds4_gpu_tensor_copy(g->spec_logits,
+ 0,
+ g->logits,
+ 0,
+ (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+ }
  if (ok) ok = ds4_gpu_end_commands() != 0;
  else (void)ds4_gpu_synchronize();
  g->cur_hc = saved_cur;
@@ -18390,14 +19092,24 @@ static bool metal_graph_verify_decode2_exact(
  g->cur_hc = cur1;
  ok = ds4_gpu_begin_commands() != 0;
  if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+ if (ok && top1) {
+ ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
+ g->logits,
+ DS4_N_VOCAB,
+ 1,
+ 1) != 0;
+ }
  if (ok) ok = ds4_gpu_end_commands() != 0;
  else (void)ds4_gpu_synchronize();
  g->cur_hc = saved_cur;
+ if (ok && top1) ok = ds4_gpu_tensor_read(g->comp_selected, 0, top1, sizeof(*top1)) != 0;
  if (ok) {
+ if (logits1) {
  ok = ds4_gpu_tensor_read(g->logits,
  0,
  logits1,
  (uint64_t)DS4_N_VOCAB * sizeof(logits1[0])) != 0;
+ }
  }
  }
  g->cur_hc = saved_cur;
@@ -18850,7 +19562,7 @@ static int metal_graph_prompt_logits_test(
  free(gpu_comp);
 
  const uint32_t n_index = cpu_cache.layer[il].n_index_comp;
- if (n_index != 0 && g.layer_index_comp_cache[il]) {
+ if (n_index != 0 && g.layer_index_comp_cache[il] && cpu_cache.layer[il].index_comp_kv) {
  const uint64_t ni = (uint64_t)n_index * DS4_N_INDEXER_HEAD_DIM;
  float *gpu_index = xmalloc((size_t)ni * sizeof(float));
  if (ds4_gpu_tensor_read(g.layer_index_comp_cache[il], 0, gpu_index, ni * sizeof(float)) != 0) {
@@ -19906,6 +20618,9 @@ static void print_top_logits(
  }
 }
 
+static void ds4_apply_head_demote(float *logits);
+static int ds4_head_demote_active(void);
+
 /* CPU generation entry point. It runs layer-major prefill once, then decodes
  * one token at a time using the persistent KV cache and scratch arena. */
 static int generate_raw_swa_cpu(
@@ -19962,6 +20677,7 @@ static int generate_raw_swa_cpu(
  }
  fprintf(stderr, "ds4: wrote CPU prefill logits to %s\n", dump_prefill_logits);
  }
+ ds4_apply_head_demote(logits);
 
  int n_generated = 0;
  int n_decode_eval = 0;
@@ -19983,11 +20699,11 @@ static int generate_raw_swa_cpu(
  }
  }
  for (int i = 0; i < n_predict && pos < ctx_size; i++) {
- if (trace_top) {
- char label[64];
- snprintf(label, sizeof(label), "step %d", i);
- print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
- }
+  if (trace_top) {
+  char label[64];
+  snprintf(label, sizeof(label), "step %d", i);
+  print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
+  }
 
  int token = sample_argmax(logits, DS4_N_VOCAB);
  if (token == vocab->eos_id) break;
@@ -20039,6 +20755,7 @@ static int generate_raw_swa_cpu(
  directional_steering_attn,
  directional_steering_ffn,
  &decode_scratch);
+ ds4_apply_head_demote(logits);
  ds4_alloc_guard_end();
  if (token_timing) {
  const double t_eval1 = now_sec();
@@ -20148,6 +20865,7 @@ static int generate_metal_graph_raw_swa(
  }
  fprintf(stderr, "ds4: wrote GPU prefill logits to %s\n", dump_prefill_logits);
  }
+ ds4_apply_head_demote(logits);
 
  int pos = prompt->len;
  int n_generated = 0;
@@ -20180,13 +20898,24 @@ static int generate_metal_graph_raw_swa(
  }
  }
  for (int i = 0; i < n_predict && pos < ctx_size; i++) {
+ const bool confidence_gate = ds4_skip_confidence_gate_enabled();
+ int top0 = -1;
+ int top1 = -1;
+ float top0_v = 0.0f;
+ float top1_v = 0.0f;
  if (trace_top) {
  char label[64];
  snprintf(label, sizeof(label), "step %d", i);
  print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
  }
 
- int token = sample_argmax(logits, DS4_N_VOCAB);
+ int token;
+ if (confidence_gate) {
+ logits_top2(logits, DS4_N_VOCAB, &top0, &top0_v, &top1, &top1_v);
+ token = top0;
+ } else {
+ token = sample_argmax(logits, DS4_N_VOCAB);
+ }
  if (token == vocab->eos_id) break;
 
  if (emit) emit(emit_ud, token);
@@ -20224,10 +20953,16 @@ static int generate_metal_graph_raw_swa(
 
  if (skip_this_step) {
  /* A.1c: model eval bypassed; pos advances, n_decode_eval does NOT. */
+ ds4_skip_clear_decode_confidence();
  pos++;
  continue;
  }
 
+ if (confidence_gate) {
+ ds4_skip_update_decode_confidence(top0_v - top1_v, i, top0, top1);
+ } else {
+ ds4_skip_clear_decode_confidence();
+ }
  const double t_eval0 = token_timing ? now_sec() : 0.0;
  ok = metal_graph_eval_token_raw_swa(&g,
  model,
@@ -20235,7 +20970,9 @@ static int generate_metal_graph_raw_swa(
  (uint32_t)token,
  (uint32_t)pos,
  logits);
+ ds4_skip_clear_decode_confidence();
  if (!ok) break;
+ ds4_apply_head_demote(logits);
  if (token_timing) {
  const double t_eval1 = now_sec();
  fprintf(stderr, "ds4: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
@@ -20415,6 +21152,7 @@ struct ds4_session {
  float *mtp_verify_logits0;
  int *mtp_verify_tops;
  int mtp_draft_token;
+ int logits_argmax_token;
  uint64_t mtp_probe_total;
  uint64_t mtp_probe_hit;
  ds4_session_progress_fn progress;
@@ -20426,6 +21164,8 @@ struct ds4_session {
  int ctx_size;
  bool checkpoint_valid;
  bool mtp_draft_valid;
+ bool logits_host_valid;
+ bool logits_argmax_valid;
 };
 
 /* =========================================================================
@@ -20705,6 +21445,80 @@ static bool ds4_session_is_cpu(const ds4_session *s) {
  return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
 }
 
+static void ds4_session_note_host_logits(ds4_session *s) {
+ if (!s) return;
+ s->logits_host_valid = true;
+ s->logits_argmax_valid = false;
+}
+
+static void ds4_session_note_gpu_argmax(ds4_session *s, int token) {
+ if (!s) return;
+ s->logits_host_valid = false;
+ s->logits_argmax_valid = token >= 0;
+ s->logits_argmax_token = token;
+}
+
+/* silv 2026-06-02: BAKED head -inf bias. Load token ids from DS4_HEAD_DEMOTE_FILE (binary, int32
+ * little-endian) ONCE and force those logits to DS4_NEG_INF at every logit finalization. This is a
+ * fixed bias on fixed vocab rows (a baked head modification = the model cannot emit them), NOT
+ * input-dependent masking. Off unless the env is set => zero effect on normal runs. */
+static int    *s_head_demote_ids = NULL;
+static size_t  s_head_demote_n = 0;
+static int     s_head_demote_loaded = 0;
+static void ds4_head_demote_load_once(void) {
+ if (!s_head_demote_loaded) {
+  s_head_demote_loaded = 1;
+  const char *path = getenv("DS4_HEAD_DEMOTE_FILE");
+  if (path && path[0]) {
+   FILE *fp = fopen(path, "rb");
+   if (fp) {
+    fseek(fp, 0, SEEK_END); long bytes = ftell(fp); fseek(fp, 0, SEEK_SET);
+    if (bytes > 0 && (bytes % 4) == 0) {
+     size_t n = (size_t)bytes / 4;
+     int *ids = (int *)xmalloc(n * sizeof(int));
+     if (fread(ids, 4, n, fp) == n) { s_head_demote_ids = ids; s_head_demote_n = n; }
+     else free(ids);
+    }
+    fclose(fp);
+    fprintf(stderr, "ds4: head-demote BAKED -inf on %zu vocab ids from %s\n", s_head_demote_n, path);
+   }
+  }
+ }
+}
+
+static int ds4_head_demote_active(void) {
+ ds4_head_demote_load_once();
+ return s_head_demote_ids && s_head_demote_n > 0;
+}
+
+static void ds4_apply_head_demote(float *logits) {
+ ds4_head_demote_load_once();
+ if (!logits) return;
+ if (!s_head_demote_ids) return;
+ for (size_t i = 0; i < s_head_demote_n; i++) {
+  int id = s_head_demote_ids[i];
+  if (id >= 0 && id < (int)DS4_N_VOCAB) logits[id] = DS4_NEG_INF;
+ }
+}
+
+static bool ds4_session_ensure_host_logits(ds4_session *s) {
+ if (!s || !s->logits) return false;
+ if (s->logits_host_valid) { ds4_apply_head_demote(s->logits); return true; }
+#ifndef DS4_NO_GPU
+ if (!ds4_session_is_cpu(s) && s->graph.logits) {
+ if (ds4_gpu_tensor_read(s->graph.logits,
+ 0,
+ s->logits,
+ (uint64_t)DS4_N_VOCAB * sizeof(s->logits[0])) != 0) {
+ s->logits_host_valid = true;
+ ds4_apply_head_demote(s->logits);
+ return true;
+ }
+ }
+#endif
+ return false;
+}
+
 static uint32_t session_cpu_raw_live_rows(const ds4_session *s) {
  if (!s || !s->checkpoint_valid) return 0;
  uint32_t rows = ds4_default_raw_cap((uint32_t)s->ctx_size);
@@ -20932,6 +21746,10 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
  for (int i = 0; i < s->checkpoint.len; i++) {
  if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
  }
+ if (!ds4_session_ensure_host_logits(s)) {
+ payload_set_err(err, errlen, "session logits are not available on host");
+ return 1;
+ }
  if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
  for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
  if (payload_write_u32(fp, s->cpu_cache.layer[il].n_comp, err, errlen) != 0) return 1;
@@ -20961,7 +21779,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
  if (payload_write_bytes(fp, layer->attn_state_kv, layer_attn_state_bytes(ratio), err, errlen) != 0) return 1;
  if (payload_write_bytes(fp, layer->attn_state_score, layer_attn_state_bytes(ratio), err, errlen) != 0) return 1;
  if (ratio == 4) {
- if (payload_write_bytes(fp,
+ if (layer->index_comp_kv && payload_write_bytes(fp,
  layer->index_comp_kv,
  (uint64_t)layer->n_index_comp * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
  err,
@@ -21009,6 +21827,10 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
  }
  for (int i = 0; i < s->checkpoint.len; i++) {
  if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
+ }
+ if (!ds4_session_ensure_host_logits(s)) {
+ payload_set_err(err, errlen, "session logits are not available on host");
+ return 1;
  }
  if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
  for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -21173,6 +21995,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
  token_vec_free(&new_checkpoint);
  return 1;
  }
+ ds4_session_note_host_logits(s);
  uint32_t n_comp[DS4_N_LAYER];
  uint32_t n_index_comp[DS4_N_LAYER];
  for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -21231,12 +22054,12 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
  return 1;
  }
  if (ratio == 4) {
- if (payload_read_bytes(fp,
+ if ((layer->index_comp_kv && payload_read_bytes(fp,
  layer->index_comp_kv,
  (uint64_t)n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
  &remaining,
  err,
- errlen) != 0 ||
+ errlen) != 0) ||
  payload_read_bytes(fp, layer->index_state_kv, layer_index_state_bytes(ratio), &remaining, err, errlen) != 0 ||
  payload_read_bytes(fp, layer->index_state_score, layer_index_state_bytes(ratio), &remaining, err, errlen) != 0)
  {
@@ -21312,6 +22135,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
  token_vec_free(&new_checkpoint);
  return 1;
  }
+ ds4_session_note_host_logits(s);
  uint32_t n_comp[DS4_N_LAYER];
  uint32_t n_index_comp[DS4_N_LAYER];
  for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -22017,9 +22841,22 @@ int ds4_mem_would_overcommit(uint64_t add_bytes) {
  const uint64_t phys = ds4_physical_ram_bytes();
  if (phys == 0) return 0;
  const uint64_t wired = ds4_current_wired_bytes();
+ static uint64_t s_initial_wired = 0;
+ static int s_auto_reserve_logged = 0;
+ if (s_initial_wired == 0) s_initial_wired = wired;
  uint64_t reserve = (uint64_t)6 << 30;
  const char *r = getenv("DS4_WIRE_RESERVE_MIB");
- if (r && r[0]) reserve = (uint64_t)strtoull(r, NULL, 10) << 20;
+ if (r && r[0]) {
+  reserve = (uint64_t)strtoull(r, NULL, 10) << 20;
+ } else if (s_initial_wired >= ((uint64_t)8 << 30)) {
+  reserve = (uint64_t)24 << 30;
+  if (!s_auto_reserve_logged) {
+   s_auto_reserve_logged = 1;
+   fprintf(stderr,
+           "ds4: auto wire reserve raised to 24576 MiB because initial wired memory is %.2f GB\n",
+           (double)s_initial_wired / 1e9);
+  }
+ }
  const uint64_t avail = (phys > wired + reserve) ? (phys - wired - reserve) : 0;
  return add_bytes > avail ? 1 : 0;
 }
@@ -22065,6 +22902,15 @@ static bool engine_has_external_m1r_routed_pack(void) {
  return p && p[0];
 }
 
+static bool engine_has_external_d8f_routed_pack(void) {
+ const char *path = getenv("DS4_D8F_PACK_PATH");
+ const char *layer = getenv("DS4_D8F_PACK_LAYER");
+ const char *tmpl = getenv("DS4_D8F_PACK_TEMPLATE");
+ const char *dir = getenv("DS4_D8F_PACK_DIR");
+ return (path && path[0]) || (layer && layer[0]) ||
+        (tmpl && tmpl[0]) || (dir && dir[0]);
+}
+
 /* Resolve `--prefill-metal-phases auto` into a concrete N in [1, DS4_N_LAYER].
  *
  * Budget model:
@@ -22082,13 +22928,20 @@ static bool engine_has_external_m1r_routed_pack(void) {
 static uint32_t engine_resolve_auto_phases(const ds4_engine *e) {
  const uint64_t total = engine_compute_phase_max_routed_bytes(e, 1);
  if (total == 0) {
- if (engine_has_external_m1r_routed_pack()) {
+  if (engine_has_external_m1r_routed_pack()) {
  fprintf(stderr,
  "ds4: --prefill-metal-phases auto: routed experts supplied by external "
  "M1R pack; no GGUF routed residency to phase, using N=1\n");
- return 1;
- }
- fprintf(stderr,
+  return 1;
+  }
+ if (engine_has_external_d8f_routed_pack()) {
+  fprintf(stderr,
+  "ds4: --prefill-metal-phases auto: routed experts supplied by external "
+  "D8F pack; no GGUF routed residency to phase, using phase-free "
+  "GPU runtime\n");
+  return 1;
+  }
+  fprintf(stderr,
  "ds4: --prefill-metal-phases auto: routed expert bytes are zero, "
  "cannot auto-size; specify an explicit N\n");
  return 0;
@@ -22173,14 +23026,20 @@ static uint32_t engine_resolve_auto_phases(const ds4_engine *e) {
  return (uint32_t)n;
 }
 
-/* Layer range covered by phase `phase_idx` when the prefill is split into
- * `phases` evenly-sized buckets. The last phase absorbs the remainder if
- * DS4_N_LAYER is not divisible by `phases`. */
+/* Layer range covered by phase `phase_idx` when prefill is split into
+ * `phases` balanced buckets. Do not dump the whole remainder into the final
+ * phase: for 43 layers / 16 phases that old rule made the final phase 13
+ * layers wide and the safety check falsely grew with larger N. */
 static void ds4_phase_layer_range(uint32_t phases, uint32_t phase_idx,
  uint32_t *start, uint32_t *end) {
- const uint32_t per_phase = DS4_N_LAYER / phases;
- *start = phase_idx * per_phase;
- *end = (phase_idx == phases - 1) ? DS4_N_LAYER : (phase_idx + 1) * per_phase;
+ if (phases == 0) {
+  *start = 0;
+  *end = 0;
+  return;
+ }
+ if (phase_idx >= phases) phase_idx = phases - 1;
+ *start = (uint32_t)(((uint64_t)phase_idx * DS4_N_LAYER) / phases);
+ *end = (uint32_t)((((uint64_t)phase_idx + 1u) * DS4_N_LAYER) / phases);
 }
 
 /* Sum of routed-expert tensor bytes (gate + up + down) in the largest
@@ -22190,6 +23049,7 @@ static uint64_t engine_compute_phase_max_routed_bytes(const ds4_engine *e,
  uint32_t phases) {
  if (phases == 0) return 0;
  if (engine_has_external_m1r_routed_pack()) return 0;
+ if (engine_has_external_d8f_routed_pack()) return 0;
  uint64_t max_bytes = 0;
  for (uint32_t p = 0; p < phases; p++) {
  uint32_t start = 0, end = 0;
@@ -22277,6 +23137,9 @@ static size_t engine_collect_cpu_moe_routed_ranges(const ds4_engine *e,
  * routed-range list (used elsewhere); we just don't use it to restrict
  * views. Print the byte count for observability. */
 static bool engine_map_metal_views_with_routed_holes(ds4_engine *e) {
+ if (e->model.no_tensor_data) {
+  return true;
+ }
  ds4_byte_range *routed = xmalloc((size_t)DS4_N_LAYER * 3 * sizeof(*routed));
  size_t nm = engine_collect_cpu_moe_routed_ranges(e, routed);
  uint64_t routed_bytes = 0;
@@ -22353,9 +23216,10 @@ static bool engine_activate_prefill_phase(ds4_engine *e, ds4_gpu_graph *g,
  return true;
 }
 
-/* Restore the gen-time routing state after prefill completes: all routed
- * MoE flows through the CPU path so the OS page cache is free to hold as
- * many routed expert pages as fit, supporting decode latency. */
+/* Restore the gen-time routing state after prefill completes. GGUF-routed
+ * phase prefill sends all routed MoE through the CPU path so the OS page
+ * cache can hold as many routed expert pages as fit. External D8F auto/N=1
+ * is normalized to phase-free runtime before this function is reached. */
 static bool engine_restore_gen_routing(ds4_engine *e, ds4_gpu_graph *g) {
  if (!e || e->prefill_metal_phases == 0) return true;
 
@@ -22599,13 +23463,18 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  * The legacy --cpu-moe flag means "all layers". Either flag enables the
  * CPU-side mmap. Range is validated at the top of this function.
  *
- * --prefill-metal-phases N implies "cpu-moe for all layers during gen",
- * because the routed expert pages only need to be in the OS page cache
- * for decode; the prefill path itself does its own Metal residency
- * management per phase. */
+ * --prefill-metal-phases N implies "cpu-moe for all layers during gen"
+ * for GGUF-routed experts, because the routed expert pages only need to
+ * be in the OS page cache for decode; the prefill path itself does its
+ * own Metal residency management per phase. External D8F auto/N=1 is a
+ * different artifact: no GGUF routed residency is being swapped, and H2766
+ * shows phase-free GPU runtime is the faster path. */
  int n_cpu = opt->n_cpu_moe_layers;
  if (opt->cpu_moe && n_cpu == 0) n_cpu = DS4_N_LAYER;
- if (opt->prefill_metal_phases != 0) n_cpu = DS4_N_LAYER;
+ const bool d8f_external_single_phase =
+ engine_has_external_d8f_routed_pack() &&
+ (opt->prefill_metal_phases == -1 || opt->prefill_metal_phases == 1);
+ if (opt->prefill_metal_phases != 0 && !d8f_external_single_phase) n_cpu = DS4_N_LAYER;
 
  e->cpu_moe = (n_cpu > 0) && (opt->backend == DS4_BACKEND_METAL);
  /* Resolve --prefill-metal-phases. -1 means "auto": compute N from the
@@ -22619,10 +23488,22 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  *out = NULL;
  return 1;
  }
- e->prefill_metal_phases = auto_n;
+ e->prefill_metal_phases = (d8f_external_single_phase && auto_n <= 1) ? 0 : auto_n;
+ if (d8f_external_single_phase && auto_n <= 1) {
+ fprintf(stderr,
+ "ds4: --prefill-metal-phases auto: external D8F normalized to phase-free "
+ "GPU runtime\n");
+ }
  } else {
- e->prefill_metal_phases =
+ const uint32_t explicit_phases =
  (uint32_t)(opt->prefill_metal_phases > 0 ? opt->prefill_metal_phases : 0);
+ e->prefill_metal_phases =
+ (d8f_external_single_phase && explicit_phases <= 1) ? 0 : explicit_phases;
+ if (d8f_external_single_phase && explicit_phases == 1) {
+ fprintf(stderr,
+ "ds4: --prefill-metal-phases 1: external D8F normalized to phase-free "
+ "GPU runtime\n");
+ }
  }
  for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
  e->cpu_moe_layer[il] = e->cpu_moe && (il < (uint32_t)n_cpu);
@@ -22757,18 +23638,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
  opt->mtp_path,
  e->mtp_draft_tokens);
- } else if (getenv("DS4_MTP_EMBED") && e->mtp_draft_tokens > 1 &&
+ } else if (!getenv("DS4_MTP_EMBED_DISABLE") && e->mtp_draft_tokens > 1 &&
             model_find_tensor(&e->model, "mtp.0.hc_head_base.weight")) {
- /* #674 path-2 probe: drive spec-decode off the EMBEDDED mtp.0.* head (pack-direct,
-  * no separate GGUF). Alias mtp_model=model (shares map+descriptors; close-guarded by
-  * mtp_model_aliased) + bind the embedded head. Guarded by DS4_MTP_EMBED (default off):
-  * empirically tests whether the draft forward works off pack-served weights or needs
-  * the bytes-path fix (DECODE_PROFILE_REAL_BOTTLENECK_2026_05_29.md). */
+ /* Default path: drive spec-decode off the embedded mtp.0.* head when present.
+  * Alias mtp_model=model (shares map+descriptors; close-guarded by
+  * mtp_model_aliased) + bind the embedded head. Set DS4_MTP_EMBED_DISABLE=1
+  * to keep the old single-token path without allocating MTP/spec scratch. */
  e->mtp_model = e->model;
  e->mtp_model_aliased = true;
  mtp_weights_bind(&e->mtp_weights, &e->model);
  e->mtp_ready = true;
- fprintf(stderr, "ds4: MTP embedded-head spec-decode enabled (DS4_MTP_EMBED, draft=%d) — pack-direct probe\n",
+ fprintf(stderr, "ds4: MTP embedded-head available (draft=%d; spec policy is CLI/runtime gated)\n",
  e->mtp_draft_tokens);
  }
 
@@ -22799,6 +23679,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  return 1;
  }
  ds4_gpu_set_quality(e->quality);
+ if (ds4_prime_path_enabled()) {
+  fprintf(stderr,
+         "ds4: PRIME path active — D8F classic in-graph packet ICB is primary; "
+          "external MTL4 packet dispatch remains force-only to avoid graph exit\n");
+ }
  (void)ds4_gpu_set_model_fd(e->model.fd);
  bool mapped_ok = false;
  if (e->model.no_tensor_data) {
@@ -23729,6 +24614,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             "(storage tensors now resolvable via wrap_model_range)\n",
             (unsigned long long)n_views);
    }
+   if (!e->mtp_ready && !getenv("DS4_MTP_EMBED_DISABLE") && e->mtp_draft_tokens > 1 &&
+       model_find_tensor(&e->model, "mtp.0.hc_head_base.weight")) {
+    e->mtp_model = e->model;
+    e->mtp_model_aliased = true;
+    mtp_weights_bind(&e->mtp_weights, &e->model);
+    e->mtp_ready = true;
+    fprintf(stderr,
+            "ds4: MTP embedded-head available after nonrouted-pack registration "
+            "(draft=%d; spec policy is CLI/runtime gated)\n",
+            e->mtp_draft_tokens);
+   }
   }
  }
 
@@ -23806,9 +24702,14 @@ void ds4_engine_close(ds4_engine *e) {
   * dispatcher". With the new pack having 375 FP8 attn tensors, a healthy
   * decode should produce 43 layers × N attn matmuls = O(thousands). Zero
   * = caller-routing bug. Nonzero = at least some FP8 path fires; bug is
-  * downstream (kernel arithmetic). */
+ * downstream (kernel arithmetic). */
  fprintf(stderr, "ds4: storage-dispatch fp8 — heap=%llu (zero = via_tensor not called for FP8 attn weights)\n",
          (unsigned long long)s_n_storage_dispatch_fp8);
+ if (s_n_storage_dispatch_fp8_direct > 0) {
+  fprintf(stderr, "ds4: storage-dispatch fp8-direct — heap=%llu\n",
+          (unsigned long long)s_n_storage_dispatch_fp8_direct);
+ }
+ ds4_storage_dispatch_print_sites();
  /* silv 2026-05-27 Phase 2: dump prefix cache stats if any activity, then free */
  if (e->prefix_cache.stat_lookups > 0 || e->prefix_cache.stat_stores > 0) {
    char statbuf[256];
@@ -23986,6 +24887,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
  e->directional_steering_attn_scale,
  e->directional_steering_ffn_scale,
  &s->cpu_scratch);
+ ds4_session_note_host_logits(s);
  token_vec_push(&s->checkpoint, prompt->v[i]);
  if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
  }
@@ -24002,6 +24904,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
  e->directional_steering_dirs,
  e->directional_steering_attn_scale,
  e->directional_steering_ffn_scale);
+ ds4_session_note_host_logits(s);
  ds4_tokens_copy(&s->checkpoint, prompt);
  s->checkpoint_valid = true;
  s->mtp_draft_valid = false;
@@ -24049,6 +24952,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
  s->checkpoint_valid = false;
  return 1;
  }
+ ds4_session_note_host_logits(s);
  ds4_tokens_copy(&s->checkpoint, prompt);
  s->checkpoint_valid = true;
  /* Match the full-prefill branch below: release the Metal residency
@@ -24071,6 +24975,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
  s->checkpoint_valid = false;
  return 1;
  }
+ ds4_session_note_host_logits(s);
  token_vec_push(&s->checkpoint, prompt->v[i]);
  }
  return 0;
@@ -24138,6 +25043,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
  s->checkpoint_valid = false;
  return 1;
  }
+ ds4_session_note_host_logits(s);
  metal_graph_shrink_cpu_moe_scratch(&s->graph);
  /* Restore the gen-time routing (all routed MoE on CPU) and reconfigure
  * Metal residency so the OS page cache can hold expert pages for the
@@ -24224,11 +25130,15 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 }
 
 int ds4_session_argmax(ds4_session *s) {
+ if (!s) return -1;
+ if (s->logits_argmax_valid && !ds4_head_demote_active()) return s->logits_argmax_token;
+ if (!ds4_session_ensure_host_logits(s)) return -1;
  return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
  if (!s || !s->logits) return -1;
+ if (!ds4_session_ensure_host_logits(s)) return -1;
  int best = -1;
  float best_logit = DS4_NEG_INF;
  for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -24243,7 +25153,49 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+ if (!s) return -1;
+ if (temperature <= 0.0f && s->logits_argmax_valid && !ds4_head_demote_active()) return s->logits_argmax_token;
+ if (!ds4_session_ensure_host_logits(s)) return -1;
  return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
+}
+
+static float *ds4_presence_penalty_logits_scratch;
+static uint32_t *ds4_presence_penalty_token_stamp;
+static uint32_t ds4_presence_penalty_epoch;
+
+int ds4_session_sample_with_presence_penalty(ds4_session *s, float temperature,
+                                             int top_k, float top_p, float min_p,
+                                             float presence_penalty, uint64_t *rng) {
+ if (!s) return -1;
+ if (presence_penalty <= 0.0f) return ds4_session_sample(s, temperature, top_k, top_p, min_p, rng);
+ if (!ds4_session_ensure_host_logits(s)) return -1;
+ if (!ds4_presence_penalty_logits_scratch) {
+  ds4_presence_penalty_logits_scratch = xmalloc((size_t)DS4_N_VOCAB * sizeof(ds4_presence_penalty_logits_scratch[0]));
+ }
+ if (!ds4_presence_penalty_token_stamp) {
+  ds4_presence_penalty_token_stamp = xcalloc((size_t)DS4_N_VOCAB, sizeof(ds4_presence_penalty_token_stamp[0]));
+ }
+ memcpy(ds4_presence_penalty_logits_scratch, s->logits,
+        (size_t)DS4_N_VOCAB * sizeof(ds4_presence_penalty_logits_scratch[0]));
+ ds4_presence_penalty_epoch++;
+ if (ds4_presence_penalty_epoch == 0) {
+  memset(ds4_presence_penalty_token_stamp, 0,
+         (size_t)DS4_N_VOCAB * sizeof(ds4_presence_penalty_token_stamp[0]));
+  ds4_presence_penalty_epoch = 1;
+ }
+ const uint32_t epoch = ds4_presence_penalty_epoch;
+ const token_vec *history = &s->checkpoint;
+ for (int i = 0; i < history->len; i++) {
+  const int token = history->v[i];
+  if (token < 0 || token >= DS4_N_VOCAB) continue;
+  if (ds4_presence_penalty_token_stamp[token] == epoch) continue;
+  ds4_presence_penalty_token_stamp[token] = epoch;
+  if (isfinite(ds4_presence_penalty_logits_scratch[token])) {
+   ds4_presence_penalty_logits_scratch[token] -= presence_penalty;
+  }
+ }
+ return sample_top_p_min_p(ds4_presence_penalty_logits_scratch, DS4_N_VOCAB,
+                           temperature, top_k, top_p, min_p, rng);
 }
 
 /* Substrate inspection: extract raw KV state at (layer, position) from the
@@ -24285,12 +25237,14 @@ int ds4_session_dump_kv_raw(ds4_session *s, uint32_t layer, uint32_t position,
 int ds4_session_dump_logits(ds4_session *s, float *out, size_t out_n) {
  if (!s || !out || !s->logits) return 0;
  if (out_n != (size_t)DS4_N_VOCAB) return 0;
+ if (!ds4_session_ensure_host_logits(s)) return 0;
  memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
  return 1;
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
  if (!s || !out || k <= 0) return 0;
+ if (!ds4_session_ensure_host_logits(s)) return 0;
  if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
  for (int i = 0; i < k; i++) {
  out[i].id = -1;
@@ -24328,6 +25282,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
  if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+ if (!ds4_session_ensure_host_logits(s)) return 0;
 
  float max_logit = DS4_NEG_INF;
  for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -24363,6 +25318,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
  e->directional_steering_attn_scale,
  e->directional_steering_ffn_scale,
  &s->cpu_scratch);
+ ds4_session_note_host_logits(s);
  token_vec_push(&s->checkpoint, token);
  s->checkpoint_valid = true;
  s->mtp_draft_valid = false;
@@ -24378,8 +25334,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 #else
  ds4_engine *e = s->engine;
  const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
+ const bool mtp_d8f_forced = getenv("DS4_MTP_SPEC_FORCE") != NULL;
+ const bool mtp_d8f_default_off =
+ engine_has_external_d8f_routed_pack() && !mtp_d8f_forced && !mtp_probe_log;
  const bool mtp_should_draft =
- probe_mtp && e->mtp_ready && s->mtp_logits &&
+ probe_mtp && !mtp_d8f_default_off && e->mtp_ready && s->mtp_logits &&
  (e->mtp_draft_tokens > 1 || mtp_probe_log);
  if (probe_mtp && s->mtp_draft_valid) {
  if (mtp_probe_log) {
@@ -24394,15 +25353,26 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
  }
  s->mtp_draft_valid = false;
  }
+ if (ds4_skip_confidence_gate_enabled()) {
+ int top0 = -1, top1 = -1;
+ float top0_v = 0.0f, top1_v = 0.0f;
+ logits_top2(s->logits, DS4_N_VOCAB, &top0, &top0_v, &top1, &top1_v);
+ ds4_skip_update_decode_confidence(top0_v - top1_v, s->checkpoint.len, top0, top1);
+ } else {
+ ds4_skip_clear_decode_confidence();
+ }
  if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
  (uint32_t)token,
  (uint32_t)s->checkpoint.len,
  s->logits))
  {
+ ds4_skip_clear_decode_confidence();
  snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
  s->checkpoint_valid = false;
  return 1;
  }
+ ds4_skip_clear_decode_confidence();
+ ds4_session_note_host_logits(s);
  token_vec_push(&s->checkpoint, token);
  if (mtp_should_draft) {
  int mtp_top = -1;
@@ -24521,7 +25491,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  * this point there is no suffix to verify, so the exact behavior is to emit
  * only first_token and skip all speculative work.
  */
- if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) {
+ const int target_first = ds4_session_argmax(s);
+ if (target_first != drafts[0]) {
  if (getenv("DS4_MTP_SPEC_LOG")) {
  fprintf(stderr, "ds4: mtp spec miss first draft=%d\n", drafts[0]);
  }
@@ -24601,6 +25572,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  return -1;
  }
  memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+ ds4_session_note_host_logits(s);
  token_vec_push(&s->checkpoint, drafts[0]);
  accepted[n_accept++] = drafts[0];
  s->checkpoint_valid = true;
@@ -24635,12 +25607,22 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  memset(&frontier, 0, sizeof(frontier));
  float *row_logits = s->mtp_verify_logits;
  float *row0_logits = s->mtp_verify_logits0;
+ const bool decode2_host_row0 = getenv("DS4_MTP_DECODE2_HOST_ROW0") != NULL;
+ const bool decode2_host_final_logits = getenv("DS4_MTP_DECODE2_HOST_FINAL") != NULL;
+ const bool decode2_snapshot =
+ getenv("DS4_MTP_DECODE2_SNAPSHOT") != NULL ||
+ getenv("DS4_MTP_FORCE_SNAPSHOT") != NULL;
  const int start = s->checkpoint.len;
  int row0_top = -1;
+ int row1_top = -1;
  const double snapshot_t0 = mtp_timing ? now_sec() : 0.0;
- bool have_frontier = spec_frontier_snapshot(&frontier, s);
+ bool have_frontier = false;
+ bool ok = true;
+ if (decode2_snapshot) {
+ have_frontier = spec_frontier_snapshot(&frontier, s);
+ ok = have_frontier;
+ }
  const double snapshot_done = mtp_timing ? now_sec() : 0.0;
- bool ok = have_frontier;
  if (ok) {
  ok = metal_graph_verify_decode2_exact(&s->graph,
  &e->model,
@@ -24649,12 +25631,18 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  drafts[1],
  (uint32_t)start,
  &row0_top,
- row0_logits,
- row_logits);
+ decode2_host_row0 ? row0_logits : NULL,
+ &row1_top,
+ decode2_host_final_logits ? row_logits : NULL);
  }
  const double verify_done = mtp_timing ? now_sec() : 0.0;
  if (ok && row0_top == drafts[1]) {
+ if (decode2_host_final_logits) {
  memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+ ds4_session_note_host_logits(s);
+ } else {
+ ds4_session_note_gpu_argmax(s, row1_top);
+ }
  token_vec_push(&s->checkpoint, drafts[0]);
  token_vec_push(&s->checkpoint, drafts[1]);
  accepted[n_accept++] = drafts[0];
@@ -24678,7 +25666,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  s->checkpoint.len = start;
  ok = spec_frontier_commit_prefix1(s);
  }
- if (ok) memcpy(s->logits, row0_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+ if (ok && !decode2_host_row0) {
+ ok = metal_graph_read_spec_logits_row(&s->graph, 0, row0_logits);
+ }
+ if (ok) {
+ memcpy(s->logits, row0_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+ ds4_session_note_host_logits(s);
+ }
  if (ok) {
  token_vec_push(&s->checkpoint, drafts[0]);
  accepted[n_accept++] = drafts[0];
@@ -24701,6 +25695,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  if (have_frontier) {
  s->checkpoint.len = start;
  (void)spec_frontier_restore(&frontier, s);
+ } else {
+ snprintf(err, errlen, "MTP decode2 verifier failed without snapshot");
+ s->checkpoint_valid = false;
+ DS4_MTP_KEEP_ACCEPTED(0);
+ spec_frontier_free(&frontier);
+ return -1;
  }
  spec_frontier_free(&frontier);
  if (getenv("DS4_MTP_SPEC_LOG")) {
@@ -24811,6 +25811,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  }
  if (ok) {
  memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+ ds4_session_note_host_logits(s);
  for (int i = 0; i < replayed && n_accept < accepted_cap; i++) {
  accepted[n_accept++] = drafts[i];
  if (drafts[i] == eos_token) break;
@@ -24830,6 +25831,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  row_logits);
  if (ok) {
  memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+ ds4_session_note_host_logits(s);
  for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
  accepted[n_accept++] = drafts[i];
  if (drafts[i] == eos_token) break;
@@ -24860,6 +25862,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  if (ok) ok = metal_graph_read_spec_logits_row(&s->graph, 0, row_logits);
  if (ok) {
  memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+ ds4_session_note_host_logits(s);
  accepted[n_accept++] = drafts[0];
  s->checkpoint_valid = true;
  s->mtp_draft_valid = false;
@@ -24892,6 +25895,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  row_logits);
  if (ok) {
  memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+ ds4_session_note_host_logits(s);
  accepted[n_accept++] = drafts[0];
  s->checkpoint_valid = true;
  s->mtp_draft_valid = false;
@@ -24929,6 +25933,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  row_logits);
  if (ok) {
  memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+ ds4_session_note_host_logits(s);
  for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
  accepted[n_accept++] = drafts[i];
  if (drafts[i] == eos_token) break;
@@ -24979,7 +25984,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  * during normal --mtp operation.
  */
  int verified = 0;
- int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
+ int target_top = ds4_session_argmax(s);
  bool logits_on_host = true;
  const double seq_t0 = mtp_timing ? now_sec() : 0.0;
  for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
@@ -25024,6 +26029,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  return -1;
  }
  logits_on_host = true;
+ ds4_session_note_host_logits(s);
  }
  (void)logits_on_host;
  DS4_MTP_KEEP_ACCEPTED(verified);
@@ -25059,6 +26065,8 @@ void ds4_session_invalidate(ds4_session *s) {
  s->checkpoint_valid = false;
  s->checkpoint.len = 0;
  s->mtp_draft_valid = false;
+ s->logits_host_valid = false;
+ s->logits_argmax_valid = false;
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
@@ -25066,6 +26074,8 @@ void ds4_session_rewind(ds4_session *s, int pos) {
  if (pos > s->checkpoint.len) pos = s->checkpoint.len;
  s->checkpoint.len = pos;
  s->mtp_draft_valid = false;
+ s->logits_host_valid = false;
+ s->logits_argmax_valid = false;
 }
 
 int ds4_session_pos(ds4_session *s) {
@@ -25084,6 +26094,7 @@ int ds4_engine_vocab_size(ds4_engine *e) {
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
  if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
+ if (!ds4_session_ensure_host_logits(s)) return 0;
  memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
  return (int)DS4_N_VOCAB;
 }

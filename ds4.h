@@ -64,7 +64,7 @@ typedef struct {
     float logprob;
 } ds4_token_score;
 
-#define DS4_DEFAULT_TEMPERATURE 1.0f
+#define DS4_DEFAULT_TEMPERATURE 0.0f
 #define DS4_DEFAULT_TOP_P 1.0f
 #define DS4_DEFAULT_MIN_P 0.05f
 
@@ -94,8 +94,11 @@ typedef struct {
     /* Prefill the model in N phases, each Metal-resident.  Mutually
      * exclusive with --cpu-moe / --n-cpu-moe.  When != 0 the prefill path
      * splits layers evenly across N phases, swapping Metal residency
-     * between phases.  Generation always falls back to cpu-moe so the
-     * routed expert pages stay in the OS page cache for decode.  Range:
+     * between phases.  GGUF-routed generation falls back to cpu-moe so the
+     * routed expert pages stay in the OS page cache for decode; external D8F
+     * auto/N=1 has no routed GGUF residency to swap and becomes phase-free
+     * GPU runtime.
+     * Range:
      *   -1  = auto (engine sizes N from sysctl iogpu.wired_limit_mb so
      *          each phase fits the Metal wired-memory cap)
      *    0  = disabled
@@ -257,6 +260,9 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+int ds4_session_sample_with_presence_penalty(ds4_session *s, float temperature,
+                                             int top_k, float top_p, float min_p,
+                                             float presence_penalty, uint64_t *rng);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 /* Substrate inspection: dump the raw KV state at (layer, position) from the

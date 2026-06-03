@@ -10915,6 +10915,8 @@ static void set_client_socket_nonblocking(int fd) {
 
 typedef struct {
     ds4_engine_options engine;
+    char *flat_pack_model_owned;
+    char *flat_pack_nonrouted_owned;
     const char *host;
     int port;
     int ctx_size;
@@ -10977,6 +10979,49 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     return argv[++(*i)];
 }
 
+static char *flat_pack_join_path(const char *dir, const char *name, const char *opt) {
+    size_t dir_len = strlen(dir);
+    size_t name_len = strlen(name);
+    bool slash = dir_len > 0 && dir[dir_len - 1] == '/';
+    char *path = malloc(dir_len + (slash ? 0 : 1) + name_len + 1);
+    if (!path) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to allocate path for %s", opt);
+        exit(2);
+    }
+    memcpy(path, dir, dir_len);
+    size_t pos = dir_len;
+    if (!slash) path[pos++] = '/';
+    memcpy(path + pos, name, name_len + 1);
+    return path;
+}
+
+static void apply_flat_pack_dir(server_config *cfg, const char *dir, const char *opt) {
+    free(cfg->flat_pack_model_owned);
+    free(cfg->flat_pack_nonrouted_owned);
+    cfg->flat_pack_model_owned = flat_pack_join_path(
+        dir,
+        "DeepSeek-V4-Flash.metadata-only.full-tensor-manifest.zero-tensor-data.pack-direct.gguf",
+        opt);
+    cfg->flat_pack_nonrouted_owned = flat_pack_join_path(
+        dir,
+        "ds4v4_nonrouted.i32_normf32_bf16matf16.pack",
+        opt);
+    cfg->engine.model_path = cfg->flat_pack_model_owned;
+    cfg->engine.nonrouted_pack_path = cfg->flat_pack_nonrouted_owned;
+    setenv("DS4_D8F_PACK_DIR", dir, 1);
+    setenv("DS4_PRIME_PATH", "1", 0);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: --flat-pack %s (metadata, nonrouted, D8F root; DS4_D8F_PACK_DIR set)",
+               dir);
+}
+
+static void server_config_free(server_config *cfg) {
+    free(cfg->flat_pack_model_owned);
+    free(cfg->flat_pack_nonrouted_owned);
+    cfg->flat_pack_model_owned = NULL;
+    cfg->flat_pack_nonrouted_owned = NULL;
+}
+
 static void log_context_memory(ds4_backend backend, int ctx_size) {
     ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
     server_log(DS4_LOG_DEFAULT,
@@ -11016,6 +11061,9 @@ static void usage(FILE *fp) {
         "Model and runtime:\n"
         "  -m, --model FILE\n"
         "      GGUF model path. Default: ds4flash.gguf\n"
+        "  --flat-pack DIR\n"
+        "      Flat DS4 root containing DeepSeek-V4-Flash.metadata-only.full-tensor-manifest.zero-tensor-data.pack-direct.gguf,\n"
+        "      ds4v4_nonrouted.i32_normf32_bf16matf16.pack, and per-layer D8F files.\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
         "  --mtp-draft N\n"
@@ -11168,6 +11216,8 @@ static server_config parse_options(int argc, char **argv) {
             exit(0);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--flat-pack")) {
+            apply_flat_pack_dir(&c, need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -11282,11 +11332,15 @@ int main(int argc, char **argv) {
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to chdir to %s: %s",
                    cfg.chdir_path, strerror(errno));
+        server_config_free(&cfg);
         return 1;
     }
 
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+    if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+        server_config_free(&cfg);
+        return 1;
+    }
 
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
 
@@ -11295,6 +11349,7 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
                    ds4_backend_name(cfg.engine.backend));
         ds4_engine_close(engine);
+        server_config_free(&cfg);
         return 1;
     }
 
@@ -11325,6 +11380,7 @@ int main(int argc, char **argv) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: failed to open trace file %s: %s",
                        cfg.trace_path, strerror(errno));
             server_close_resources(&s);
+            server_config_free(&cfg);
             return 1;
         }
         setvbuf(s.trace, NULL, _IONBF, 0);
@@ -11343,6 +11399,7 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&s.mu);
         pthread_join(worker, NULL);
         server_close_resources(&s);
+        server_config_free(&cfg);
         return 1;
     }
     g_listen_fd = lfd;
@@ -11403,6 +11460,7 @@ int main(int argc, char **argv) {
         kv_cache_store_current(&s, "shutdown");
     }
     server_close_resources(&s);
+    server_config_free(&cfg);
     return 0;
 }
 #else

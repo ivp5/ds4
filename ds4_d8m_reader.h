@@ -14,6 +14,9 @@ typedef struct {
     uint64_t index_offset;
     uint32_t codebook_bytes;
     uint32_t index_bytes;
+    uint64_t scale_offset;
+    uint32_t scale_bytes;
+    uint32_t flags;
 } ds4_d8m_record;
 
 typedef struct {
@@ -22,6 +25,8 @@ typedef struct {
     int fd;
     uint32_t version;
     uint32_t header_json_bytes;
+    uint32_t record_bytes;
+    uint32_t table_offset;
     ds4_d8m_record records[256];
 } ds4_d8m_file;
 

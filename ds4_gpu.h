@@ -46,6 +46,9 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+int ds4_gpu_mtl4_begin_commands(void);
+int ds4_gpu_mtl4_end_commands(void);
+int ds4_gpu_mtl4_commands_active(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
@@ -193,6 +196,86 @@ int ds4_gpu_matmul_fp8_e4m3_e8m0_storage(
  uint64_t out_dim,
  const ds4_gpu_tensor *x,
  uint64_t n_tok);
+
+int ds4_gpu_matmul_fp8_e4m3_e8m0_hc_expand_tensor(
+ ds4_gpu_tensor *out_hc,
+ ds4_gpu_tensor *block_out,
+ void *weight_buf,
+ void *scale_buf,
+ uint64_t scale_bytes,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ const ds4_gpu_tensor *residual_hc,
+ const ds4_gpu_tensor *post,
+ const ds4_gpu_tensor *comb,
+ uint32_t n_embd,
+ uint32_t n_hc,
+ uint64_t n_tok);
+
+int ds4_gpu_matmul_fp8_e4m3_e8m0_hc_expand_tensor_ex(
+ ds4_gpu_tensor *out_hc,
+ ds4_gpu_tensor *block_out,
+ void *weight_buf,
+ void *scale_buf,
+ uint64_t scale_bytes,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ const ds4_gpu_tensor *residual_hc,
+ const ds4_gpu_tensor *post,
+ const ds4_gpu_tensor *comb,
+ uint32_t n_embd,
+ uint32_t n_hc,
+ uint64_t n_tok,
+ int store_block_out);
+
+int ds4_gpu_shared_down_hc_expand_fp8_e4m3_e8m0_tensor(
+ ds4_gpu_tensor *out_hc,
+ ds4_gpu_tensor *shared_out,
+ void *weight_buf,
+ void *scale_buf,
+ uint64_t scale_bytes,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *shared_mid,
+ const ds4_gpu_tensor *routed_out,
+ const ds4_gpu_tensor *residual_hc,
+ const ds4_gpu_tensor *split,
+ uint32_t n_embd,
+ uint32_t n_hc,
+ int store_shared_out);
+
+int ds4_gpu_matmul_fp8_pair_e4m3_e8m0_storage(
+ ds4_gpu_tensor *out0,
+ ds4_gpu_tensor *out1,
+ void *weight0_buf,
+ void *scale0_buf,
+ uint64_t scale0_bytes,
+ void *weight1_buf,
+ void *scale1_buf,
+ uint64_t scale1_bytes,
+ uint64_t in_dim,
+ uint64_t out0_dim,
+ uint64_t out1_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok);
+
+int ds4_gpu_shared_gate_up_swiglu_fp8_e4m3_e8m0_tensor(
+ ds4_gpu_tensor *gate,
+ ds4_gpu_tensor *up,
+ ds4_gpu_tensor *mid,
+ void *gate_weight_buf,
+ void *gate_scale_buf,
+ uint64_t gate_scale_bytes,
+ void *up_weight_buf,
+ void *up_scale_buf,
+ uint64_t up_scale_bytes,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok,
+ float clamp);
 
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
  ds4_gpu_tensor *gate,
@@ -346,6 +429,22 @@ int ds4_gpu_rope_tail_tensor(
  uint32_t pos0,
  uint32_t n_ctx_orig,
  bool inverse,
+ float freq_base,
+ float freq_scale,
+ float ext_factor,
+ float attn_factor,
+ float beta_fast,
+ float beta_slow);
+
+int ds4_gpu_head_rms_norm_rope_tail_tensor(
+ ds4_gpu_tensor *x,
+ uint32_t n_tok,
+ uint32_t n_head,
+ uint32_t head_dim,
+ uint32_t n_rot,
+ uint32_t pos0,
+ uint32_t n_ctx_orig,
+ float eps,
  float freq_base,
  float freq_scale,
  float ext_factor,
@@ -1031,6 +1130,19 @@ int ds4_gpu_mtl4_polar_dot_canary(uint32_t packets, uint32_t pairs);
 int ds4_gpu_dense_matvec_icb_canary(uint32_t M, uint32_t N);
 /* ICB dense-path speed bench (task #822) — A/B ms/forward, direct vs ICB cached-replay, no model. */
 int ds4_gpu_dense_matvec_icb_bench(uint32_t M, uint32_t N, uint32_t n_gemv, uint32_t n_iter);
+/* FP8 attention-output ICB canary — direct A→B vs ICB replay, no model load. */
+int ds4_gpu_fp8_attn_out_icb_canary(uint32_t group_dim,
+                                    uint32_t rank,
+                                    uint32_t n_groups,
+                                    uint32_t out_dim,
+                                    uint32_t n_tokens,
+                                    uint32_t rounds,
+                                    uint32_t mode);
+/* FP8 B-matmul + HC expand fused canary — tests launch/materialization removal, no model load. */
+int ds4_gpu_fp8_hc_fuse_canary(uint32_t in_dim,
+                               uint32_t out_dim,
+                               uint32_t n_tokens,
+                               uint32_t rounds);
 /* MTL4 canary: record a compute command into classic MTLICB, replay it from an MTL4 compute encoder. */
 int ds4_gpu_mtl4_icb_execute_canary(uint32_t n_floats, uint32_t rounds);
 
@@ -1826,6 +1938,64 @@ int ds4_gpu_mtl4_d8m_down_selected_batch_canary(const char *d8m_path,
                                                 uint32_t rows,
                                                 uint32_t n_tokens,
                                                 uint32_t rounds);
+int ds4_gpu_mtl4_d8f_gateup_selected_canary(const char *d8f_path,
+                                            const uint32_t *experts,
+                                            uint32_t n_experts,
+                                            uint32_t rows,
+                                            uint32_t rounds,
+                                            float swiglu_limit);
+int ds4_gpu_mtl4_d8f_down_selected_canary(const char *d8f_path,
+                                          const uint32_t *experts,
+                                          uint32_t n_experts,
+                                          uint32_t rows,
+                                          uint32_t rounds);
+int ds4_gpu_mtl4_d8f_organ_selected_canary(const char *d8f_path,
+                                           const uint32_t *experts,
+                                           uint32_t n_experts,
+                                           uint32_t rows,
+                                           uint32_t rounds,
+                                           float swiglu_limit);
+int ds4_gpu_mtl4_d8f_organ_selected_batch_canary(const char *d8f_path,
+                                                 const uint32_t *experts,
+                                                 uint32_t n_experts,
+                                                 uint32_t rows,
+                                                 uint32_t n_tokens,
+                                                 uint32_t rounds,
+                                                 float swiglu_limit);
+int ds4_gpu_d8f_prefix_graph_canary(const char *d8f_dir,
+                                    const uint32_t *experts,
+                                    uint32_t n_experts,
+                                    uint32_t first_layer,
+                                    uint32_t n_layers,
+                                    uint32_t n_tokens,
+                                    uint32_t rounds,
+                                    float swiglu_limit);
+int ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor(const char *d8f_path,
+                                                  uint32_t layer,
+                                                  ds4_gpu_tensor *selected_experts,
+                                                  ds4_gpu_tensor *route_weights,
+                                                  ds4_gpu_tensor *input,
+                                                  ds4_gpu_tensor *output,
+                                                  uint32_t n_experts,
+                                                  float swiglu_limit);
+int ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(const char *d8f_path,
+                                                        uint32_t layer,
+                                                        ds4_gpu_tensor *selected_experts,
+                                                        ds4_gpu_tensor *route_weights,
+                                                        ds4_gpu_tensor *input,
+                                                        ds4_gpu_tensor *output,
+                                                        uint32_t n_tokens,
+                                                        uint32_t n_experts,
+                                                        float swiglu_limit);
+int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
+                                                          uint32_t layer,
+                                                          ds4_gpu_tensor *selected_experts,
+                                                          ds4_gpu_tensor *route_weights,
+                                                          ds4_gpu_tensor *input,
+                                                          ds4_gpu_tensor *output,
+                                                          uint32_t n_tokens,
+                                                          uint32_t n_experts,
+                                                          float swiglu_limit);
 int ds4_gpu_mtl4_m1r_d8m_routed_organ_canary(const char *m1r_path,
                                              const char *d8m_path,
                                              uint32_t layer,

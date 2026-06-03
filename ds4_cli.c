@@ -3,6 +3,7 @@
 #include "ds4_polar_reader.h"
 #include "ds4_nonrouted_pack.h"
 #include "ds4_d8m_reader.h"
+#include "ds4_d8f_reader.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -35,7 +36,9 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    float presence_penalty;
     uint64_t seed;
+    bool raw_prompt;
     bool dump_tokens;
     const char *dump_logits_path;
     const char *dump_logprobs_path;
@@ -45,6 +48,8 @@ typedef struct {
     const char *imatrix_output_path;
     int imatrix_max_prompts;
     int imatrix_max_tokens;
+    bool stop_repeat_sentence;
+    int stop_repeat_sentence_min_chars;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
@@ -57,6 +62,8 @@ typedef struct {
     ds4_engine_options engine;
     cli_generation_options gen;
     char *prompt_owned;
+    char *flat_pack_model_owned;
+    char *flat_pack_nonrouted_owned;
     bool inspect;
 } cli_config;
 
@@ -93,7 +100,7 @@ static void usage(FILE *fp) {
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
         "  --mtp-draft N\n"
-        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
+        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 2\n"
         "  --mtp-margin F\n"
         "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
         "  -c, --ctx N\n"
@@ -135,7 +142,8 @@ static void usage(FILE *fp) {
         "      packed dispatch + IQ2_XXS dequant pending (see ds4_metal.m).\n"
         "  --prefill-metal-phases auto|N\n"
         "      Run prefill on Metal in N evenly-split phases, swapping the routed\n"
-        "      expert residency between phases. Generation falls back to cpu-moe.\n"
+        "      expert residency between phases. Generation falls back to cpu-moe\n"
+        "      for GGUF-routed weights; external D8F auto/N=1 becomes phase-free GPU runtime.\n"
         "      \"auto\" sizes N from sysctl iogpu.wired_limit_mb (bounded by\n"
         "      hw.memsize) so each phase fits the Metal wired-memory cap.\n"
         "      Mutually exclusive with --cpu-moe / --n-cpu-moe. Metal backend only.\n"
@@ -145,10 +153,19 @@ static void usage(FILE *fp) {
         "      for single-shot chat to fall back to cpu-moe on short prompts).\n"
         "  --nonrouted-pack FILE\n"
         "      Open a DS4NRPK1 non-routed pack for attention/embed/output/router tensors.\n"
+        "  --flat-pack DIR\n"
+        "      Use a flat DS4 pack directory: metadata GGUF, non-routed pack, and\n"
+        "      ds4_L%%02u_gate_up_down_VQD8_noE8_rank1.d8f files all in DIR.\n"
         "  --m1r-pack FILE\n"
         "      Open the M1R fixed-plane routed-FFN pack.\n"
         "  --d8m-down-template TEMPLATE\n"
         "      Use per-layer D8M down packs with printf-style layer substitution.\n"
+        "  DS4_PRIME_PATH=1\n"
+        "      Runtime profile: prefer D8F classic in-graph packet ICB;\n"
+        "      external MTL4 packet dispatch remains force-only.\n"
+        "      Embedded MTP stays available when policy permits. D8F spec-decode is\n"
+        "      disabled by default after H2758/H2759 measured verifier slower than baseline;\n"
+        "      set DS4_MTP_SPEC_FORCE=1 to force it.\n"
         "  --power N\n"
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
@@ -157,16 +174,23 @@ static void usage(FILE *fp) {
         "      Prompt to generate from.\n"
         "  --prompt-file FILE\n"
         "      Read the prompt text from FILE.\n"
+        "  --raw-prompt\n"
+        "      Tokenize -p/--prompt-file as plain text for logits/diagnostic traces,\n"
+        "      without wrapping it in the DeepSeek chat template.\n"
         "  -sys, --system TEXT\n"
         "      System prompt. Empty string disables the default. Default: You are a helpful assistant\n"
         "  -n, --tokens N\n"
         "      Maximum tokens to generate. Default: 50000\n"
         "  --temp F\n"
-        "      Sampling temperature. 0 is greedy/deterministic. Default: 1\n"
+        "      Sampling temperature. 0 is greedy/deterministic. Default: 0\n"
         "  --top-p F\n"
         "      Nucleus sampling probability. Default: 1\n"
         "  --min-p F\n"
         "      Keep tokens scoring at least F times the top token. Default: 0.05\n"
+        "  --presence-penalty F\n"
+        "      Subtract F once from each prior token's logit. Default: 0\n"
+        "  --stop-repeat-sentence\n"
+        "      Stop generation when an answer sentence repeats. Off by default.\n"
         "  --seed N\n"
         "      Sampling seed for reproducible non-greedy runs. Default: time-based\n"
         "  --think\n"
@@ -499,12 +523,163 @@ static void print_generated_token(void *ud, int token) {
 }
 
 static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, ds4_tokens *out) {
-    if (is_rendered_chat_prompt(gen->prompt)) {
+    if (gen->raw_prompt) {
+        ds4_tokenize_text(engine, gen->prompt, out);
+    } else if (is_rendered_chat_prompt(gen->prompt)) {
         ds4_tokenize_rendered_chat(engine, gen->prompt, out);
     } else {
         ds4_encode_chat_prompt(engine, gen->system, gen->prompt,
                                cli_effective_think_mode(gen), out);
     }
+}
+
+typedef struct {
+    char *text;
+    size_t len;
+    size_t cap;
+    char **seen;
+    size_t seen_len;
+    size_t seen_cap;
+    int min_chars;
+    bool tripped;
+    char reason[320];
+} repeat_sentence_guard;
+
+static void repeat_guard_free(repeat_sentence_guard *g) {
+    if (!g) return;
+    free(g->text);
+    for (size_t i = 0; i < g->seen_len; i++) free(g->seen[i]);
+    free(g->seen);
+    memset(g, 0, sizeof(*g));
+}
+
+static bool repeat_guard_append_bytes(repeat_sentence_guard *g, const char *text, size_t len) {
+    if (!g || !text || len == 0 || g->tripped) return true;
+    if (g->len + len + 1 > g->cap) {
+        size_t nc = g->cap ? g->cap * 2 : 4096;
+        while (nc < g->len + len + 1) nc *= 2;
+        char *p = realloc(g->text, nc);
+        if (!p) return false;
+        g->text = p;
+        g->cap = nc;
+    }
+    memcpy(g->text + g->len, text, len);
+    g->len += len;
+    g->text[g->len] = '\0';
+    return true;
+}
+
+static bool sentence_delim(char c) {
+    return c == '.' || c == '!' || c == '?' || c == '\n';
+}
+
+static char *normalize_sentence(const char *s, size_t n, int min_chars) {
+    while (n && isspace((unsigned char)*s)) {
+        s++;
+        n--;
+    }
+    while (n && isspace((unsigned char)s[n - 1])) n--;
+    if ((int)n < min_chars) return NULL;
+    char *out = malloc(n + 1);
+    if (!out) return NULL;
+    size_t j = 0;
+    bool last_space = true;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (isspace(c)) {
+            if (!last_space) out[j++] = ' ';
+            last_space = true;
+        } else {
+            out[j++] = (char)tolower(c);
+            last_space = false;
+        }
+    }
+    while (j && out[j - 1] == ' ') j--;
+    out[j] = '\0';
+    if ((int)j < min_chars) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
+static bool repeat_guard_note_sentence(repeat_sentence_guard *g, const char *sentence) {
+    for (size_t i = 0; i < g->seen_len; i++) {
+        if (!strcmp(g->seen[i], sentence)) {
+            g->tripped = true;
+            snprintf(g->reason, sizeof(g->reason),
+                     "repeated sentence stop: %.240s", sentence);
+            return true;
+        }
+    }
+    if (g->seen_len + 1 > g->seen_cap) {
+        size_t nc = g->seen_cap ? g->seen_cap * 2 : 32;
+        char **p = realloc(g->seen, nc * sizeof(*g->seen));
+        if (!p) return false;
+        g->seen = p;
+        g->seen_cap = nc;
+    }
+    g->seen[g->seen_len++] = (char *)sentence;
+    return true;
+}
+
+static bool repeat_guard_scan(repeat_sentence_guard *g) {
+    if (!g || g->tripped || !g->text) return true;
+    size_t start = 0;
+    for (size_t i = 0; i < g->len; i++) {
+        if (!sentence_delim(g->text[i])) continue;
+        size_t end = i + 1;
+        char *norm = normalize_sentence(g->text + start, end - start, g->min_chars);
+        if (norm) {
+            bool ok = repeat_guard_note_sentence(g, norm);
+            if (!ok) {
+                free(norm);
+                return false;
+            }
+            if (g->tripped) {
+                free(norm);
+                return true;
+            }
+        }
+        start = end;
+    }
+    if (start > 0) {
+        memmove(g->text, g->text + start, g->len - start);
+        g->len -= start;
+        g->text[g->len] = '\0';
+    }
+    return true;
+}
+
+static bool cli_env_enabled(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static bool cli_d8f_pack_env_present(void) {
+    return cli_env_enabled("DS4_D8F_PACK_DIR") ||
+           cli_env_enabled("DS4_D8F_PACK_PATH") ||
+           cli_env_enabled("DS4_D8F_PACK_TEMPLATE");
+}
+
+static bool cli_mtp_spec_allowed(ds4_engine *engine, const cli_generation_options *gen) {
+    if (gen->temperature > 0.0f) return false;
+    if (gen->presence_penalty > 0.0f) return false;
+    if (ds4_engine_mtp_draft_tokens(engine) <= 1) return false;
+    if (cli_env_enabled("DS4_MTP_SPEC_DISABLE")) return false;
+    if (cli_env_enabled("DS4_MTP_SPEC_FORCE")) return true;
+    if (cli_d8f_pack_env_present()) {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr,
+                    "ds4: MTP spec disabled on D8F pack path; H2758/H2759 "
+                    "measured verifier slower than baseline. Set "
+                    "DS4_MTP_SPEC_FORCE=1 to force.\n");
+            warned = true;
+        }
+        return false;
+    }
+    return true;
 }
 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
@@ -523,6 +698,9 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         .in_think = ds4_think_mode_enabled(think_mode),
         .use_color = isatty(fileno(stdout)) != 0,
         .last_output_newline = true,
+    };
+    repeat_sentence_guard repeat_guard = {
+        .min_chars = cfg->gen.stop_repeat_sentence_min_chars,
     };
     cli_prefill_progress progress = {
         .base_tokens = 0,
@@ -556,14 +734,18 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     int generated = 0;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
-        int token = ds4_session_sample(session, cfg->gen.temperature, 0,
-                                       cfg->gen.top_p, cfg->gen.min_p, &rng);
+        int token = ds4_session_sample_with_presence_penalty(session,
+                                                             cfg->gen.temperature,
+                                                             0,
+                                                             cfg->gen.top_p,
+                                                             cfg->gen.min_p,
+                                                             cfg->gen.presence_penalty,
+                                                             &rng);
         if (token == ds4_token_eos(engine)) break;
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if (cli_mtp_spec_allowed(engine, &cfg->gen)) {
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
@@ -597,14 +779,31 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             char *piece = ds4_token_text(engine, toks[j], &piece_len);
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
+            if (cfg->gen.stop_repeat_sentence) {
+                if (!repeat_guard_append_bytes(&repeat_guard, piece, piece_len) ||
+                    !repeat_guard_scan(&repeat_guard)) {
+                    free(piece);
+                    fprintf(stderr, "\nds4: repeat-sentence stop failed (out of memory)\n");
+                    repeat_guard_free(&repeat_guard);
+                    ds4_session_free(session);
+                    return 1;
+                }
+                if (repeat_guard.tripped) {
+                    stop = true;
+                }
+            }
             free(piece);
             generated++;
-            if (generated >= max_tokens) break;
+            if (generated >= max_tokens || stop) break;
         }
         if (stop) break;
     }
     const double t_decode1 = cli_now_sec();
     generation_done(&printer);
+    if (repeat_guard.tripped) {
+        fprintf(stderr, "ds4: %s\n", repeat_guard.reason);
+    }
+    repeat_guard_free(&repeat_guard);
     if (cli_interrupt_requested()) cli_interrupt_clear();
 
     const double prefill_s = t_prefill1 - t_prefill0;
@@ -983,7 +1182,9 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1) {
+    } else if (cfg->gen.temperature > 0.0f ||
+               cfg->gen.presence_penalty > 0.0f ||
+               ds4_engine_mtp_draft_tokens(engine) > 1) {
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
@@ -1200,18 +1401,18 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     int generated = 0;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
-        int token = ds4_session_sample(chat->session,
-                                       cfg->gen.temperature,
-                                       0,
-                                       cfg->gen.top_p,
-                                       cfg->gen.min_p,
-                                       &rng);
+        int token = ds4_session_sample_with_presence_penalty(chat->session,
+                                                             cfg->gen.temperature,
+                                                             0,
+                                                             cfg->gen.top_p,
+                                                             cfg->gen.min_p,
+                                                             cfg->gen.presence_penalty,
+                                                             &rng);
         if (token == ds4_token_eos(engine)) break;
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if (cli_mtp_spec_allowed(engine, &cfg->gen)) {
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
                                                        max_tokens - generated,
@@ -1441,12 +1642,56 @@ static char *read_prompt_file(const char *path, bool fatal) {
     return buf;
 }
 
+static char *flat_pack_join_path(const char *dir, const char *name, const char *opt) {
+    const size_t dir_len = strlen(dir);
+    const size_t name_len = strlen(name);
+    const bool needs_slash = dir_len > 0 && dir[dir_len - 1] != '/';
+    const size_t total = dir_len + (needs_slash ? 1u : 0u) + name_len + 1u;
+    char *path = malloc(total);
+    if (!path) {
+        fprintf(stderr, "ds4: out of memory resolving %s\n", opt);
+        exit(2);
+    }
+    snprintf(path, total, "%s%s%s", dir, needs_slash ? "/" : "", name);
+    return path;
+}
+
+static void apply_flat_pack_dir(cli_config *cfg, const char *dir, const char *opt) {
+    free(cfg->flat_pack_model_owned);
+    free(cfg->flat_pack_nonrouted_owned);
+    cfg->flat_pack_model_owned = flat_pack_join_path(
+        dir,
+        "DeepSeek-V4-Flash.metadata-only.full-tensor-manifest.zero-tensor-data.pack-direct.gguf",
+        opt);
+    cfg->flat_pack_nonrouted_owned = flat_pack_join_path(
+        dir,
+        "ds4v4_nonrouted.i32_normf32_bf16matf16.pack",
+        opt);
+    cfg->engine.model_path = cfg->flat_pack_model_owned;
+    cfg->engine.nonrouted_pack_path = cfg->flat_pack_nonrouted_owned;
+    setenv("DS4_D8F_PACK_DIR", dir, 1);
+    setenv("DS4_PRIME_PATH", "1", 0);
+    fprintf(stderr,
+            "ds4: --flat-pack %s (metadata, nonrouted, D8F root; DS4_D8F_PACK_DIR set)\n",
+            dir);
+}
+
+static void cli_config_free(cli_config *cfg) {
+    if (!cfg) return;
+    free(cfg->prompt_owned);
+    free(cfg->flat_pack_model_owned);
+    free(cfg->flat_pack_nonrouted_owned);
+    cfg->prompt_owned = NULL;
+    cfg->flat_pack_model_owned = NULL;
+    cfg->flat_pack_nonrouted_owned = NULL;
+}
+
 static cli_config parse_options(int argc, char **argv) {
     cli_config c = {
         .engine = {
             .model_path = "ds4flash.gguf",
             .backend = default_backend(),
-            .mtp_draft_tokens = 1,
+            .mtp_draft_tokens = 2,
             .mtp_draft_tree_width = 1,  /* silv 2026-05-27: spec-tree default linear */
             .mtp_margin = 3.0f,
         },
@@ -1459,6 +1704,7 @@ static cli_config parse_options(int argc, char **argv) {
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
             .dump_logprobs_top_k = 20,
+            .stop_repeat_sentence_min_chars = 24,
             .think_mode = DS4_THINK_HIGH,
         },
     };
@@ -1482,6 +1728,8 @@ static cli_config parse_options(int argc, char **argv) {
             }
             c.prompt_owned = read_prompt_file(need_arg(&i, argc, argv, arg), true);
             c.gen.prompt = c.prompt_owned;
+        } else if (!strcmp(arg, "--raw-prompt")) {
+            c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
@@ -1505,6 +1753,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+        } else if (!strcmp(arg, "--presence-penalty")) {
+            c.gen.presence_penalty = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+        } else if (!strcmp(arg, "--stop-repeat-sentence")) {
+            c.gen.stop_repeat_sentence = true;
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
@@ -1555,6 +1807,8 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--nonrouted-pack")) {
             c.engine.nonrouted_pack_path = need_arg(&i, argc, argv, arg);
             fprintf(stderr, "ds4: --nonrouted-pack %s\n", c.engine.nonrouted_pack_path);
+        } else if (!strcmp(arg, "--flat-pack")) {
+            apply_flat_pack_dir(&c, need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--m1r-pack")) {
             c.engine.m1r_pack_path = need_arg(&i, argc, argv, arg);
             fprintf(stderr, "ds4: --m1r-pack %s\n", c.engine.m1r_pack_path);
@@ -1880,6 +2134,30 @@ int main(int argc, char **argv) {
         const uint32_t n_gemv = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 258;
         const uint32_t n_iter = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 30;
         return ds4_gpu_dense_matvec_icb_bench(M, N, n_gemv, n_iter) ? 0 : 1;
+    }
+    /* --fp8-attn-out-icb-canary [group_dim [rank [n_groups [out_dim [n_tokens [rounds [mode]]]]]]]
+     * Mode 0 preserves direct A-then-B command-buffer boundaries through ICB replay.
+     * Mode 1 executes A and B in one command buffer with an in-encoder barrier. */
+    if (argc >= 2 && !strcmp(argv[1], "--fp8-attn-out-icb-canary")) {
+        const uint32_t group_dim = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
+        const uint32_t rank      = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
+        const uint32_t n_groups  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
+        const uint32_t out_dim   = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 512;
+        const uint32_t n_tokens  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1;
+        const uint32_t rounds    = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 20;
+        const uint32_t mode      = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 0;
+        return ds4_gpu_fp8_attn_out_icb_canary(group_dim, rank, n_groups, out_dim, n_tokens, rounds, mode) ? 0 : 1;
+    }
+    /* --fp8-hc-fuse-canary [in_dim [out_dim [n_tokens [rounds]]]]
+     * Tests the real next seam after H2937: eliminate the FP8 B output
+     * materialization→separate HC-expand launch by expanding HC in the
+     * row-final thread of the FP8 B matmul. Defaults to actual decode shape. */
+    if (argc >= 2 && !strcmp(argv[1], "--fp8-hc-fuse-canary")) {
+        const uint32_t in_dim   = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8192u;
+        const uint32_t out_dim  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 4096u;
+        const uint32_t n_tokens = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 1u;
+        const uint32_t rounds   = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
+        return ds4_gpu_fp8_hc_fuse_canary(in_dim, out_dim, n_tokens, rounds) ? 0 : 1;
     }
     /* --mtl4-icb-execute-canary [n_floats [rounds]] : proves the MTL4 encoder can replay
      * a classic MTLICB command when the MTL4 pipeline was compiled with ICB support. */
@@ -2632,6 +2910,46 @@ int main(int argc, char **argv) {
         ds4_d8m_close(&p);
         return 0;
     }
+    if (argc >= 3 && !strcmp(argv[1], "--d8f-inspect")) {
+        ds4_d8f_file p;
+        if (!ds4_d8f_open(argv[2], &p)) {
+            fprintf(stderr, "ds4: --d8f-inspect failed to open %s\n", argv[2]);
+            return 1;
+        }
+        ds4_d8f_print_summary(&p);
+        for (uint32_t projection = 0; projection < DS4_D8F_PROJECTION_COUNT; projection++) {
+            const char *name = projection == DS4_D8F_GATE ? "gate" : (projection == DS4_D8F_UP ? "up" : "down");
+            for (uint32_t expert = 0; expert < 256u; expert += 64u) {
+                ds4_d8f_record rec;
+                if (!ds4_d8f_get_record(&p, (ds4_d8f_projection)projection, expert, &rec)) continue;
+                const uint32_t c0 = ds4_d8f_code_at(&p, &rec, 0);
+                const uint32_t c1 = ds4_d8f_code_at(&p, &rec, 1);
+                fprintf(stderr,
+                        "  %-4s expert=%3u K=%4u bits=%2u cb_off=%llu idx_off=%llu scale_off=%llu flags=%u first_codes=%u,%u\n",
+                        name, expert, rec.k, rec.bits,
+                        (unsigned long long)rec.codebook_offset,
+                        (unsigned long long)rec.index_offset,
+                        (unsigned long long)rec.scale_offset,
+                        rec.flags, c0, c1);
+            }
+        }
+        if (ds4_d8f_down_sidecar_count(&p)) {
+            uint32_t printed = 0;
+            for (uint32_t expert = 0; expert < 256u && printed < 12u; expert++) {
+                ds4_d8f_sidecar_record rec;
+                if (!ds4_d8f_get_down_sidecar(&p, expert, &rec)) continue;
+                fprintf(stderr,
+                        "  sidecar down expert=%3u rank=%u eff_rank=%.3f gain=%.3f aa_frac=%.3f u_off=%llu a_off=%llu bytes=%u,%u\n",
+                        expert, rec.rank, rec.eff_rank, rec.gain, rec.aa_frac,
+                        (unsigned long long)rec.u_offset,
+                        (unsigned long long)rec.a_offset,
+                        rec.u_bytes, rec.a_bytes);
+                printed++;
+            }
+        }
+        ds4_d8f_close(&p);
+        return 0;
+    }
     if (argc >= 3 && !strcmp(argv[1], "--d8m-down-selected-canary")) {
         enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *d8m_path = argv[2];
@@ -2684,6 +3002,143 @@ int main(int argc, char **argv) {
         const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20u;
         return ds4_gpu_mtl4_d8m_down_selected_batch_canary(
             d8m_path, experts, n_experts, rows, tokens, rounds) ? 0 : 1;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--d8f-gateup-selected-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *d8f_path = argv[2];
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t n_experts = 3;
+        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-gateup-selected-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
+        const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
+        const float clamp = (argc >= 7) ? strtof(argv[6], NULL) : 10.0f;
+        return ds4_gpu_mtl4_d8f_gateup_selected_canary(
+            d8f_path, experts, n_experts, rows, rounds, clamp) ? 0 : 1;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--d8f-down-selected-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *d8f_path = argv[2];
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t n_experts = 3;
+        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-down-selected-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
+        const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
+        return ds4_gpu_mtl4_d8f_down_selected_canary(
+            d8f_path, experts, n_experts, rows, rounds) ? 0 : 1;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--d8f-organ-selected-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *d8f_path = argv[2];
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t n_experts = 3;
+        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-organ-selected-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
+        const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
+        const float clamp = (argc >= 7) ? strtof(argv[6], NULL) : 10.0f;
+        return ds4_gpu_mtl4_d8f_organ_selected_canary(
+            d8f_path, experts, n_experts, rows, rounds, clamp) ? 0 : 1;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--d8f-organ-selected-batch-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *d8f_path = argv[2];
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t n_experts = 3;
+        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-organ-selected-batch-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8u;
+        const uint32_t tokens = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2u;
+        const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1u;
+        const float clamp = (argc >= 8) ? strtof(argv[7], NULL) : 10.0f;
+        return ds4_gpu_mtl4_d8f_organ_selected_batch_canary(
+            d8f_path, experts, n_experts, rows, tokens, rounds, clamp) ? 0 : 1;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--d8f-prefix-graph-canary")) {
+        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
+        const char *d8f_dir = argv[2];
+        const uint32_t first_layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 0u;
+        const uint32_t n_layers = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 10u;
+        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t n_experts = 3;
+        if (argc >= 6 && argv[5] && argv[5][0] && strcmp(argv[5], "-")) {
+            char tmp[256];
+            snprintf(tmp, sizeof(tmp), "%s", argv[5]);
+            n_experts = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(tmp, ",", &save);
+                 tok && n_experts < ds4_cli_selected_expert_cap;
+                 tok = strtok_r(NULL, ",", &save)) {
+                long v = strtol(tok, NULL, 10);
+                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
+            }
+            if (n_experts == 0) {
+                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-prefix-graph-canary\n");
+                return 1;
+            }
+        }
+        const uint32_t tokens = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1u;
+        const uint32_t rounds = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 4u;
+        const float clamp = (argc >= 9) ? strtof(argv[8], NULL) : 10.0f;
+        return ds4_gpu_d8f_prefix_graph_canary(
+            d8f_dir, experts, n_experts, first_layer, n_layers, tokens, rounds, clamp) ? 0 : 1;
     }
     /* --m1r-d8m-routed-organ-canary M1R_PACK D8M_PACK [LAYER [EXPERTS_CSV [ROWS [ROUNDS [CLAMP]]]]]
      * Runs hybrid routed organ: M1R gate/up -> D8M down in one MTL4 command buffer. */
@@ -2882,19 +3337,19 @@ int main(int argc, char **argv) {
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
             fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
-            free(cfg.prompt_owned);
+            cli_config_free(&cfg);
             return 2;
         }
         int rc = ds4_dump_text_tokenization(cfg.engine.model_path,
                                             cfg.gen.prompt,
                                             stdout);
-        free(cfg.prompt_owned);
+        cli_config_free(&cfg);
         return rc;
     }
     cfg.engine.inspect_only = cfg.inspect;
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {
-        free(cfg.prompt_owned);
+        cli_config_free(&cfg);
         return 1;
     }
     if (!cfg.inspect) {
@@ -2919,6 +3374,6 @@ int main(int argc, char **argv) {
         rc = run_generation(engine, &cfg);
     }
     ds4_engine_close(engine);
-    free(cfg.prompt_owned);
+    cli_config_free(&cfg);
     return rc;
 }

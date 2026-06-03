@@ -35,8 +35,8 @@ METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal $(JOURNAL_LIB)
 # entrypoints against them.
 LEGACY_CODEC_OBJS = ds4_metal_vqb2_fp16.o ds4_vqb2_reader.o ds4_vqb2_pack.o ds4_cdx3_reader.o
 LEGACY_CODEC_CPU_OBJS = ds4_vqb2_reader.o ds4_vqb2_pack.o ds4_cdx3_reader.o
-CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_metal.o ds4_expert_table.o ds4_inflight.o ds4_moe_route_log.o ds4_polar_reader.o ds4_vqb1_reader.o $(LEGACY_CODEC_OBJS) ds4_watersic_pack.o ds4_ridgegptq_reader.o ds4_nonrouted_pack.o ds4_d8m_reader.o ds4_prefix_cache.o $(JOURNAL_OBJ)
-CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_inflight.o ds4_polar_reader.o ds4_vqb1_reader.o $(LEGACY_CODEC_CPU_OBJS) ds4_watersic_pack.o ds4_ridgegptq_reader.o ds4_nonrouted_pack.o ds4_d8m_reader.o ds4_prefix_cache.o $(JOURNAL_OBJ)
+CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_metal.o ds4_expert_table.o ds4_inflight.o ds4_moe_route_log.o ds4_polar_reader.o ds4_vqb1_reader.o $(LEGACY_CODEC_OBJS) ds4_watersic_pack.o ds4_ridgegptq_reader.o ds4_nonrouted_pack.o ds4_d8m_reader.o ds4_d8f_reader.o ds4_prefix_cache.o $(JOURNAL_OBJ)
+CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_inflight.o ds4_polar_reader.o ds4_vqb1_reader.o $(LEGACY_CODEC_CPU_OBJS) ds4_watersic_pack.o ds4_ridgegptq_reader.o ds4_nonrouted_pack.o ds4_d8m_reader.o ds4_d8f_reader.o ds4_prefix_cache.o $(JOURNAL_OBJ)
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -48,8 +48,8 @@ endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 LEGACY_CODEC_CPU_OBJS = ds4_cdx3_reader.o
-CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_cuda.o ds4_polar_reader.o ds4_vqb1_reader.o ds4_ridgegptq_reader.o ds4_d8m_reader.o $(LEGACY_CODEC_CPU_OBJS)
-CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_polar_reader.o ds4_vqb1_reader.o ds4_ridgegptq_reader.o ds4_d8m_reader.o $(LEGACY_CODEC_CPU_OBJS)
+CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_cuda.o ds4_polar_reader.o ds4_vqb1_reader.o ds4_ridgegptq_reader.o ds4_d8m_reader.o ds4_d8f_reader.o $(LEGACY_CODEC_CPU_OBJS)
+CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_polar_reader.o ds4_vqb1_reader.o ds4_ridgegptq_reader.o ds4_d8m_reader.o ds4_d8f_reader.o $(LEGACY_CODEC_CPU_OBJS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
@@ -174,7 +174,7 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
 
-ds4.o: ds4.c ds4.h ds4_gpu.h ds4_neon_i8mm.h ds4_quant_blocks.h
+ds4.o: ds4.c ds4.h ds4_gpu.h ds4_neon_i8mm.h ds4_quant_blocks.h ds4_d8f_reader.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_neon_i8mm.o: ds4_neon_i8mm.c ds4_neon_i8mm.h ds4_quant_blocks.h
@@ -186,10 +186,13 @@ ds4_ridgegptq_reader.o: ds4_ridgegptq_reader.c ds4_ridgegptq_reader.h
 ds4_d8m_reader.o: ds4_d8m_reader.c ds4_d8m_reader.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_d8m_reader.c
 
+ds4_d8f_reader.o: ds4_d8f_reader.c ds4_d8f_reader.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_d8f_reader.c
+
 ds4_cdx3_reader.o: ds4_cdx3_reader.c ds4_cdx3_reader.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cdx3_reader.c
 
-ds4_cli.o: ds4_cli.c ds4.h linenoise.h
+ds4_cli.o: ds4_cli.c ds4.h linenoise.h ds4_d8f_reader.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
 ds4_server.o: ds4_server.c ds4.h ds4_kvstore.h rax.h
@@ -222,7 +225,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_gpu.h ds4_neon_i8mm.h ds4_quant_blocks.h
+ds4_cpu.o: ds4.c ds4.h ds4_gpu.h ds4_neon_i8mm.h ds4_quant_blocks.h ds4_d8f_reader.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h linenoise.h
@@ -240,7 +243,10 @@ ds4_eval_cpu.o: ds4_eval.c ds4.h
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
 
-ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
+ds4_metal_embedded_sources.inc: $(METAL_SRCS) tools/embed_metal_sources.py
+	python3 tools/embed_metal_sources.py > $@
+
+ds4_metal.o: ds4_metal.m ds4_gpu.h ds4_d8f_reader.h ds4_metal_embedded_sources.inc $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc

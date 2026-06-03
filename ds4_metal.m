@@ -26,6 +26,7 @@
 #include "ds4_expert_table.h"  /* ds4_hot_store_get_active, ds4_hot_expert_store */
 #include "ds4_cdx3_reader.h"
 #include "ds4_d8m_reader.h"
+#include "ds4_d8f_reader.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -429,6 +430,14 @@ static id<MTLBuffer> g_flash_attn_mask_buffer;
 #include <stdatomic.h>
 static _Atomic uint64_t g_ds4_cb_create_count = 0;
 static _Atomic uint64_t g_ds4_forward_count = 0;
+static _Atomic uint64_t g_ds4_d8f_inline_count = 0;
+static _Atomic uint64_t g_ds4_d8f_external_mtl4_count = 0;
+static _Atomic uint64_t g_ds4_d8f_rank1_count = 0;
+static _Atomic uint64_t g_ds4_d8f_no_sidecar_count = 0;
+static _Atomic uint64_t g_ds4_d8f_packet_icb_hit_count = 0;
+static _Atomic uint64_t g_ds4_d8f_packet_icb_miss_count = 0;
+static _Atomic uint64_t g_ds4_d8f_mtl4_batch_append_count = 0;
+static _Atomic uint64_t g_ds4_d8f_mtl4_batch_commit_count = 0;
 static inline id<MTLCommandBuffer> ds4_gpu_create_cb_counted(void) {
  atomic_fetch_add_explicit(&g_ds4_cb_create_count, 1, memory_order_relaxed);
  return [g_queue commandBuffer];
@@ -840,6 +849,7 @@ static uint64_t round_up_u64(uint64_t v, uint64_t align) {
 }
 
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
+static void ds4_d8f_packet_icb_reset(void);
 static int ds4_gpu_warm_model_views(void);
 
 /* task #560: ICB record→replay for kernel_dsv4_router_weights_one. Defined
@@ -1314,6 +1324,195 @@ static int ds4_gpu_env_bool(const char *name) {
  g_mpp_invalid_env_reported = 1;
  }
  return 1;
+}
+
+static int ds4_gpu_d8m_down_tile8_enabled(void) {
+ const int forced_off = ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE8_DISABLE") > 0;
+ if (forced_off) return 0;
+ const int explicit_tile8 = ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE8");
+ if (explicit_tile8 >= 0) return explicit_tile8 > 0;
+ const int explicit_tile4 = ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE4");
+ if (explicit_tile4 > 0) return 0;
+ return 1;
+}
+
+static int ds4_gpu_d8m_down_tile16_enabled(uint32_t token_count) {
+ const int forced_off = ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE16_DISABLE") > 0;
+ if (forced_off) return 0;
+ const int explicit_tile16 = ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE16");
+ if (explicit_tile16 >= 0) return explicit_tile16 > 0;
+ if (ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE8_DISABLE") > 0) return 0;
+ if (ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE8") >= 0) return 0;
+ if (ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE4") > 0) return 0;
+ return token_count > 0 && token_count <= 4;
+}
+
+static int ds4_gpu_d8f_down_tile8_enabled(void) {
+ const int forced_off = ds4_gpu_env_bool("DS4_D8F_DOWN_ROW_TILE8_DISABLE") > 0;
+ if (forced_off) return 0;
+ const int explicit_tile8 = ds4_gpu_env_bool("DS4_D8F_DOWN_ROW_TILE8");
+ if (explicit_tile8 >= 0) return explicit_tile8 > 0;
+ return 1;
+}
+
+typedef struct {
+ int initialized;
+ int down_tile8_disable;
+ int down_tile8;
+ int down_tile16_disable;
+ int down_tile16;
+ int gateup_tile4_disable;
+ int gateup_tile4;
+ int preweight_mid_disable;
+ int preweight_mid;
+ int recbuf_disable;
+ int half_mid;
+ int half_mid_decode;
+ int classic_packet_icb;
+ int mtl4_packet_icb;
+} ds4_d8f_env_cache_t;
+
+static ds4_d8f_env_cache_t g_ds4_d8f_env;
+
+static void ds4_gpu_d8f_env_init(void) {
+ if (g_ds4_d8f_env.initialized) return;
+ g_ds4_d8f_env.down_tile8_disable = ds4_gpu_env_bool("DS4_D8F_DOWN_ROW_TILE8_DISABLE");
+ g_ds4_d8f_env.down_tile8 = ds4_gpu_env_bool("DS4_D8F_DOWN_ROW_TILE8");
+ g_ds4_d8f_env.down_tile16_disable = ds4_gpu_env_bool("DS4_D8F_DOWN_ROW_TILE16_DISABLE");
+ g_ds4_d8f_env.down_tile16 = ds4_gpu_env_bool("DS4_D8F_DOWN_ROW_TILE16");
+ g_ds4_d8f_env.gateup_tile4_disable = ds4_gpu_env_bool("DS4_D8F_GATEUP_ROW_TILE4_DISABLE");
+ g_ds4_d8f_env.gateup_tile4 = ds4_gpu_env_bool("DS4_D8F_GATEUP_ROW_TILE4");
+ g_ds4_d8f_env.preweight_mid_disable = ds4_gpu_env_bool("DS4_D8F_PREWEIGHT_MID_DISABLE");
+ g_ds4_d8f_env.preweight_mid = ds4_gpu_env_bool("DS4_D8F_PREWEIGHT_MID");
+ g_ds4_d8f_env.recbuf_disable = ds4_gpu_env_bool("DS4_D8F_DISABLE_RECBUF");
+ g_ds4_d8f_env.half_mid = ds4_gpu_env_bool("DS4_D8F_HALF_MID");
+ g_ds4_d8f_env.half_mid_decode = ds4_gpu_env_bool("DS4_D8F_HALF_MID_DECODE");
+ g_ds4_d8f_env.classic_packet_icb = ds4_gpu_env_bool("DS4_D8F_CLASSIC_PACKET_ICB");
+ g_ds4_d8f_env.mtl4_packet_icb = ds4_gpu_env_bool("DS4_D8F_MTL4_PACKET_ICB");
+ if (ds4_gpu_env_bool("DS4_PRIME_PATH") > 0) {
+  if (g_ds4_d8f_env.classic_packet_icb < 0) g_ds4_d8f_env.classic_packet_icb = 1;
+  if (g_ds4_d8f_env.mtl4_packet_icb < 0) g_ds4_d8f_env.mtl4_packet_icb = 0;
+ }
+ g_ds4_d8f_env.initialized = 1;
+}
+
+static int ds4_gpu_d8f_down_tile16_enabled(uint32_t token_count) {
+  ds4_gpu_d8f_env_init();
+  const int forced_off = g_ds4_d8f_env.down_tile16_disable > 0;
+  if (forced_off) return 0;
+  const int explicit_tile16 = g_ds4_d8f_env.down_tile16;
+  if (explicit_tile16 >= 0) return explicit_tile16 > 0;
+  if (g_ds4_d8f_env.half_mid > 0 && token_count > 1u) return 1;
+  if (g_ds4_d8f_env.down_tile8_disable > 0) return 0;
+  if (g_ds4_d8f_env.down_tile8 >= 0) return 0;
+  return token_count > 0 && token_count <= 8;
+}
+
+static int ds4_gpu_d8f_gateup_tile4_enabled(void) {
+  ds4_gpu_d8f_env_init();
+  const int forced_off = g_ds4_d8f_env.gateup_tile4_disable > 0;
+  if (forced_off) return 0;
+  const int explicit_tile4 = g_ds4_d8f_env.gateup_tile4;
+  if (explicit_tile4 >= 0) return explicit_tile4 > 0;
+  return 1;
+}
+
+static int ds4_gpu_d8f_preweight_mid_enabled(uint32_t token_count) {
+  ds4_gpu_d8f_env_init();
+  const int forced_off = g_ds4_d8f_env.preweight_mid_disable > 0;
+  if (forced_off) return 0;
+  const int explicit_preweight = g_ds4_d8f_env.preweight_mid;
+  if (explicit_preweight >= 0) return explicit_preweight > 0;
+  (void)token_count;
+  return 0;
+}
+
+static int ds4_gpu_d8f_recbuf_enabled(void) {
+ ds4_gpu_d8f_env_init();
+ return g_ds4_d8f_env.recbuf_disable <= 0;
+}
+
+static uint64_t ds4_gpu_d8f_layer_mask_from_csv(const char *csv) {
+ uint64_t mask = 0;
+ const char *p = csv;
+ while (p && *p) {
+  char *end = NULL;
+  const unsigned long v = strtoul(p, &end, 10);
+  if (end != p && v < 64ul) mask |= 1ull << v;
+  p = end;
+  while (*p == ',' || *p == ' ' || *p == ';' || *p == ':') p++;
+  if (end == p && *p) p++;
+ }
+ return mask;
+}
+
+static int ds4_gpu_d8f_rank1_sidecar_enabled_for_layer(uint32_t layer) {
+ const int global = ds4_gpu_env_bool("DS4_D8F_RANK1_SIDECAR");
+ if (global == 0) return 0;
+ static int parsed = 0;
+ static int has_allow = 0;
+ static int has_disable = 0;
+ static uint64_t allow_mask = 0;
+ static uint64_t disable_mask = 0;
+ if (!parsed) {
+  const char *allow_csv = getenv("DS4_D8F_RANK1_SIDECAR_LAYERS");
+  const char *disable_csv = getenv("DS4_D8F_RANK1_SIDECAR_DISABLE_LAYERS");
+  has_allow = (allow_csv && allow_csv[0]) ? 1 : 0;
+  has_disable = (disable_csv && disable_csv[0]) ? 1 : 0;
+  allow_mask = has_allow ? ds4_gpu_d8f_layer_mask_from_csv(allow_csv) : 0ull;
+  disable_mask = has_disable ? ds4_gpu_d8f_layer_mask_from_csv(disable_csv) : 0ull;
+  parsed = 1;
+ }
+ if (layer >= 64u) return 0;
+ if (has_allow) return ((allow_mask >> layer) & 1ull) != 0ull;
+ if (has_disable && ((disable_mask >> layer) & 1ull)) return 0;
+ return 1;
+}
+
+static int ds4_gpu_d8f_down_tile32_enabled_for_layer(uint32_t layer,
+                                                     int rank1_sidecar_active) {
+ const int explicit_tile32 = ds4_gpu_env_bool("DS4_D8F_DOWN_ROW_TILE32");
+ if (explicit_tile32 >= 0) return explicit_tile32 > 0;
+ static int parsed = 0;
+ static int has_layer_env = 0;
+ static uint64_t layer_env_mask = 0;
+ if (!parsed) {
+  const char *csv = getenv("DS4_D8F_DOWN_ROW_TILE32_LAYERS");
+  has_layer_env = (csv && csv[0]) ? 1 : 0;
+  layer_env_mask = has_layer_env ? ds4_gpu_d8f_layer_mask_from_csv(csv) : 0ull;
+  parsed = 1;
+ }
+ if (has_layer_env) return layer < 64u && ((layer_env_mask >> layer) & 1ull);
+ if (rank1_sidecar_active) return 1;
+ /* H2916 falsified the H2913 organ-only mask in a full decode: answer was
+  * preserved but generation collapsed to 0.18 t/s. Keep tile32 explicit. */
+ return 0;
+}
+
+static int ds4_gpu_d8f_half_mid_enabled(void) {
+ ds4_gpu_d8f_env_init();
+ return g_ds4_d8f_env.half_mid > 0;
+}
+
+static int ds4_gpu_d8f_half_mid_decode_enabled(uint32_t token_count) {
+ ds4_gpu_d8f_env_init();
+ if (token_count != 1u) return 0;
+ if (g_ds4_d8f_env.half_mid == 0) return 0;
+ return g_ds4_d8f_env.half_mid_decode > 0;
+}
+
+static int ds4_gpu_d8f_half_mid_kernel_needed(void) {
+ return ds4_gpu_d8f_half_mid_enabled() || ds4_gpu_d8f_half_mid_decode_enabled(1u);
+}
+
+static int ds4_gpu_d8f_classic_packet_icb_enabled(void) {
+ ds4_gpu_d8f_env_init();
+ return g_ds4_d8f_env.classic_packet_icb != 0;
+}
+
+static int ds4_gpu_d8f_mtl4_packet_icb_enabled(void) {
+ ds4_gpu_d8f_env_init();
+ return g_ds4_d8f_env.mtl4_packet_icb > 0;
 }
 
 static int ds4_gpu_mpp_available(void) {
@@ -2069,6 +2268,8 @@ static const char *ds4_gpu_source =
 "\n"
 "\n";
 
+#include "ds4_metal_embedded_sources.inc"
+
 static NSString *ds4_gpu_full_source(void) {
  NSString *base = [NSString stringWithUTF8String:ds4_gpu_source];
  NSFileManager *fm = [NSFileManager defaultManager];
@@ -2098,6 +2299,7 @@ static NSString *ds4_gpu_full_source(void) {
  @[@"DS4_METAL_BIN_SOURCE", @"metal/bin.metal"],
  @[@"DS4_METAL_SET_ROWS_SOURCE", @"metal/set_rows.metal"],
  @[@"DS4_METAL_HADAMARD_SOURCE", @"metal/hadamard.metal"],
+ @[@"DS4_METAL_D8F_SOURCE", @"metal/d8f.metal"],
  ];
 
  NSMutableString *source = [NSMutableString stringWithString:base];
@@ -2128,15 +2330,20 @@ static NSString *ds4_gpu_full_source(void) {
  break;
  }
 
- if (!loaded) {
- fprintf(stderr,
- "ds4: Metal source %s not found (set %s to override)\n",
- [spec[1] UTF8String], [spec[0] UTF8String]);
- return nil;
- }
- [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];
- }
- return source;
+  if (!loaded) {
+  loaded = ds4_gpu_embedded_metal_source(spec[1]);
+  if (loaded) {
+  loaded_path = [NSString stringWithFormat:@"%@ (compiled-in)", spec[1]];
+  } else {
+  fprintf(stderr,
+  "ds4: Metal source %s not found and no compiled-in fallback exists (set %s to override)\n",
+  [spec[1] UTF8String], [spec[0] UTF8String]);
+  return nil;
+  }
+  }
+  [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];
+  }
+  return source;
 }
 
 typedef struct {
@@ -5168,6 +5375,37 @@ void ds4_gpu_cleanup(void) {
  }
  }
 
+ if (getenv("DS4_D8F_COUNT")) {
+ const uint64_t inline_count = atomic_load_explicit(&g_ds4_d8f_inline_count,
+ memory_order_relaxed);
+ const uint64_t external_mtl4_count = atomic_load_explicit(&g_ds4_d8f_external_mtl4_count,
+ memory_order_relaxed);
+ const uint64_t rank1_count = atomic_load_explicit(&g_ds4_d8f_rank1_count,
+ memory_order_relaxed);
+ const uint64_t no_sidecar_count = atomic_load_explicit(&g_ds4_d8f_no_sidecar_count,
+ memory_order_relaxed);
+ const uint64_t packet_icb_hit_count = atomic_load_explicit(&g_ds4_d8f_packet_icb_hit_count,
+ memory_order_relaxed);
+ const uint64_t packet_icb_miss_count = atomic_load_explicit(&g_ds4_d8f_packet_icb_miss_count,
+ memory_order_relaxed);
+ const uint64_t mtl4_batch_append_count = atomic_load_explicit(&g_ds4_d8f_mtl4_batch_append_count,
+ memory_order_relaxed);
+ const uint64_t mtl4_batch_commit_count = atomic_load_explicit(&g_ds4_d8f_mtl4_batch_commit_count,
+ memory_order_relaxed);
+ fprintf(stderr,
+ "ds4: d8f_count: inline %llu external_mtl4 %llu rank1 %llu "
+ "no_sidecar %llu packet_icb_hit %llu packet_icb_miss %llu "
+ "mtl4_batch_append %llu mtl4_batch_commit %llu\n",
+ (unsigned long long)inline_count,
+ (unsigned long long)external_mtl4_count,
+ (unsigned long long)rank1_count,
+ (unsigned long long)no_sidecar_count,
+ (unsigned long long)packet_icb_hit_count,
+ (unsigned long long)packet_icb_miss_count,
+ (unsigned long long)mtl4_batch_append_count,
+ (unsigned long long)mtl4_batch_commit_count);
+ }
+
  @autoreleasepool {
  if (g_batch_cb) {
  ds4_gpu_close_batch_encoder();
@@ -5250,8 +5488,9 @@ void ds4_gpu_cleanup(void) {
  g_route_remap_icb_env_checked = 0;
  g_route_remap_icb_env_active = 0;
  /* Cycle 9d: reset Phase 6 (route_weights_one) ICB slot to discard
-  * stale MTLICB after device reset. */
+ * stale MTLICB after device reset. */
  ds4_icb_slot_reset(&g_route_weights_one_slot);
+ ds4_d8f_packet_icb_reset();
  g_dsv4_hc_expand4_pipeline = nil;
  g_flash_attn_mask_buffer = nil;
  g_flash_attn_pad_buffer = nil;
@@ -8034,6 +8273,205 @@ int ds4_gpu_rope_tail_tensor(
  }
 
  if (!ds4_gpu_finish_command_buffer(cb, owned, "RoPE tail")) return 0;
+ }
+
+ return 1;
+}
+
+static id<MTLComputePipelineState> g_head_norm_rope_tail_pipeline;
+static int g_head_norm_rope_tail_init_attempted;
+static int g_head_norm_rope_tail_init_ok;
+
+static int ds4_head_norm_rope_tail_pipeline_init(void) {
+    if (g_head_norm_rope_tail_init_attempted) return g_head_norm_rope_tail_init_ok;
+    g_head_norm_rope_tail_init_attempted = 1;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "static float hnr_rope_yarn_ramp(const float low, const float high, const int i0) {\n"
+         "  const float y = (i0 / 2 - low) / max(0.001f, high - low);\n"
+         "  return 1.0f - min(1.0f, max(0.0f, y));\n"
+         "}\n"
+         "static void hnr_rope_yarn(float theta_extrap, float freq_scale, float corr_dims[2], int i0, float ext_factor, float mscale, thread float *cos_theta, thread float *sin_theta) {\n"
+         "  float theta_interp = freq_scale * theta_extrap;\n"
+         "  float theta = theta_interp;\n"
+         "  if (ext_factor != 0.0f) {\n"
+         "    float ramp_mix = hnr_rope_yarn_ramp(corr_dims[0], corr_dims[1], i0) * ext_factor;\n"
+         "    theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;\n"
+         "    mscale *= 1.0f + 0.1f * log(1.0f / freq_scale);\n"
+         "  }\n"
+         "  *cos_theta = cos(theta) * mscale;\n"
+         "  *sin_theta = sin(theta) * mscale;\n"
+         "}\n"
+         "static float hnr_rope_yarn_corr_factor(int n_dims, int n_ctx_orig, float n_rot, float base) {\n"
+         "  return n_dims * log(n_ctx_orig / (n_rot * 2.0f * M_PI_F)) / (2.0f * log(base));\n"
+         "}\n"
+         "static void hnr_rope_yarn_corr_dims(int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow, float dims[2]) {\n"
+         "  dims[0] = max(0.0f, floor(hnr_rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_fast, freq_base)));\n"
+         "  dims[1] = min(n_dims - 1.0f, ceil(hnr_rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_slow, freq_base)));\n"
+         "}\n"
+         "struct hnr_args {\n"
+         "  uint32_t n_tok;\n"
+         "  uint32_t n_head;\n"
+         "  uint32_t head_dim;\n"
+         "  uint32_t n_rot;\n"
+         "  uint32_t pos0;\n"
+         "  uint32_t n_ctx_orig;\n"
+         "  float eps;\n"
+         "  float freq_base;\n"
+         "  float freq_scale;\n"
+         "  float ext_factor;\n"
+         "  float attn_factor;\n"
+         "  float beta_fast;\n"
+         "  float beta_slow;\n"
+         "};\n"
+         "kernel void head_norm_rope_tail_f32(\n"
+         "    device const hnr_args *args [[buffer(0)]],\n"
+         "    device float *x [[buffer(1)]],\n"
+         "    threadgroup float *scratch [[threadgroup(0)]],\n"
+         "    uint3 tg [[threadgroup_position_in_grid]],\n"
+         "    ushort3 tid3 [[thread_position_in_threadgroup]],\n"
+         "    ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+         "    ushort tiisg [[thread_index_in_simdgroup]],\n"
+         "    ushort3 ntg3 [[threads_per_threadgroup]]) {\n"
+         "  const uint head = tg.x;\n"
+         "  const uint tok = tg.y;\n"
+         "  const uint tid = tid3.x;\n"
+         "  const uint ntg = ntg3.x;\n"
+         "  if (head >= args->n_head || tok >= args->n_tok) return;\n"
+         "  device float *row = x + ((uint64_t)tok * args->n_head + head) * args->head_dim;\n"
+         "  if (sgitg == 0) scratch[tiisg] = 0.0f;\n"
+         "  float sumf = 0.0f;\n"
+         "  for (uint i = tid; i < args->head_dim; i += ntg) {\n"
+         "    const float v = row[i];\n"
+         "    sumf += v * v;\n"
+         "  }\n"
+         "  sumf = simd_sum(sumf);\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  if (tiisg == 0) scratch[sgitg] = sumf;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  sumf = scratch[tiisg];\n"
+         "  sumf = simd_sum(sumf);\n"
+         "  const float scale = 1.0f / sqrt(sumf / float(args->head_dim) + args->eps);\n"
+         "  const uint n_nope = args->head_dim - args->n_rot;\n"
+         "  for (uint i = tid; i < n_nope; i += ntg) row[i] = row[i] * scale;\n"
+         "  if (args->n_rot == 0) return;\n"
+         "  float corr_dims[2];\n"
+         "  hnr_rope_yarn_corr_dims(int(args->n_rot), int(args->n_ctx_orig), args->freq_base, args->beta_fast, args->beta_slow, corr_dims);\n"
+         "  const float theta_base = float(args->pos0 + tok);\n"
+         "  const float inv_ndims = -1.0f / float(args->n_rot);\n"
+         "  const uint n_pair = args->n_rot >> 1u;\n"
+         "  for (uint pair = tid; pair < n_pair; pair += ntg) {\n"
+         "    const uint r = pair << 1u;\n"
+         "    const float theta = theta_base * pow(args->freq_base, inv_ndims * float(r));\n"
+         "    float cos_theta;\n"
+         "    float sin_theta;\n"
+         "    hnr_rope_yarn(theta, args->freq_scale, corr_dims, int(r), args->ext_factor, args->attn_factor, &cos_theta, &sin_theta);\n"
+         "    const uint j0 = n_nope + r;\n"
+         "    const uint j1 = j0 + 1u;\n"
+         "    const float x0 = row[j0] * scale;\n"
+         "    const float x1 = row[j1] * scale;\n"
+         "    row[j0] = x0 * cos_theta - x1 * sin_theta;\n"
+         "    row[j1] = x0 * sin_theta + x1 * cos_theta;\n"
+         "  }\n"
+         "}\n";
+
+    NSError *error = nil;
+    id<MTLLibrary> library = [g_device newLibraryWithSource:source options:nil error:&error];
+    if (!library) {
+        fprintf(stderr, "ds4: head_norm_rope_tail_f32 library compile failed: %s\n",
+                error ? [[error localizedDescription] UTF8String] : "(no error)");
+        g_head_norm_rope_tail_init_ok = 0;
+        return 0;
+    }
+    id<MTLFunction> fn = [library newFunctionWithName:@"head_norm_rope_tail_f32"];
+    if (!fn) {
+        fprintf(stderr, "ds4: head_norm_rope_tail_f32 function not found\n");
+        g_head_norm_rope_tail_init_ok = 0;
+        return 0;
+    }
+    g_head_norm_rope_tail_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (!g_head_norm_rope_tail_pipeline) {
+        fprintf(stderr, "ds4: head_norm_rope_tail_f32 pipeline failed: %s\n",
+                error ? [[error localizedDescription] UTF8String] : "(no error)");
+    }
+    g_head_norm_rope_tail_init_ok = (g_head_norm_rope_tail_pipeline != nil) ? 1 : 0;
+    return g_head_norm_rope_tail_init_ok;
+}
+
+int ds4_gpu_head_rms_norm_rope_tail_tensor(
+ ds4_gpu_tensor *x,
+ uint32_t n_tok,
+ uint32_t n_head,
+ uint32_t head_dim,
+ uint32_t n_rot,
+ uint32_t pos0,
+ uint32_t n_ctx_orig,
+ float eps,
+ float freq_base,
+ float freq_scale,
+ float ext_factor,
+ float attn_factor,
+ float beta_fast,
+ float beta_slow) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (!ds4_head_norm_rope_tail_pipeline_init()) return 0;
+ if (!x || n_tok == 0 || n_head == 0 || head_dim == 0 || n_rot > head_dim || (n_rot & 1u) != 0) {
+ return 0;
+ }
+
+ @autoreleasepool {
+ id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+ const uint64_t bytes = (uint64_t)n_tok * n_head * head_dim * sizeof(float);
+ if (!xbuf || ds4_gpu_tensor_bytes(x) < bytes) {
+ fprintf(stderr, "ds4: Metal fused head RMS/RoPE received undersized activation buffer\n");
+ return 0;
+ }
+
+ struct {
+  uint32_t n_tok;
+  uint32_t n_head;
+  uint32_t head_dim;
+  uint32_t n_rot;
+  uint32_t pos0;
+  uint32_t n_ctx_orig;
+  float eps;
+  float freq_base;
+  float freq_scale;
+  float ext_factor;
+  float attn_factor;
+  float beta_fast;
+  float beta_slow;
+ } args = {
+  .n_tok = n_tok,
+  .n_head = n_head,
+  .head_dim = head_dim,
+  .n_rot = n_rot,
+  .pos0 = pos0,
+  .n_ctx_orig = n_ctx_orig,
+  .eps = eps,
+  .freq_base = freq_base,
+  .freq_scale = freq_scale,
+  .ext_factor = ext_factor,
+  .attn_factor = attn_factor,
+  .beta_fast = beta_fast,
+  .beta_slow = beta_slow,
+ };
+
+ int owned = 0;
+ id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+ if (!cb) return 0;
+
+ id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+ [enc setComputePipelineState:g_head_norm_rope_tail_pipeline];
+ [enc setBytes:&args length:sizeof(args) atIndex:0];
+ [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+ [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+ [enc dispatchThreadgroups:MTLSizeMake(n_head, n_tok, 1)
+ threadsPerThreadgroup:MTLSizeMake(head_dim < 256u ? head_dim : 256u, 1, 1)];
+ ds4_gpu_end_compute_encoder(cb, enc);
+
+ if (!ds4_gpu_finish_command_buffer(cb, owned, "fused head RMS norm + RoPE tail")) return 0;
  }
 
  return 1;
@@ -17227,6 +17665,21 @@ static id<MTL4CommandQueue> g_polar_queue;
 static int g_polar_init_attempted;
 static int g_polar_init_ok;
 
+#define DS4_MTL4_BATCH_HELD_AT_MAX 4096u
+static id<MTL4CommandBuffer> g_mtl4_batch_cb;
+static id<MTL4ComputeCommandEncoder> g_mtl4_batch_enc;
+static id<MTL4ArgumentTable> g_mtl4_batch_held_at[DS4_MTL4_BATCH_HELD_AT_MAX];
+static NSUInteger g_mtl4_batch_held_bindings[DS4_MTL4_BATCH_HELD_AT_MAX];
+static uint32_t g_mtl4_batch_held_count;
+static int g_mtl4_batch_error;
+static id<MTLBuffer> g_mtl4_batch_args_buf;
+static id<MTLResidencySet> g_mtl4_batch_args_rs;
+static NSUInteger g_mtl4_batch_args_capacity;
+static NSUInteger g_mtl4_batch_args_used;
+static NSUInteger g_mtl4_batch_packet_cmd_used;
+static id<MTL4ArgumentTable> ds4_mtl4_pool_acquire(NSUInteger n_bindings);
+static void ds4_mtl4_pool_release(id<MTL4ArgumentTable> at, NSUInteger n_bindings);
+
 static int ds4_polar_pipeline_init(void) {
     if (g_polar_init_attempted) return g_polar_init_ok;
     g_polar_init_attempted = 1;
@@ -17319,6 +17772,166 @@ static int ds4_polar_pipeline_init(void) {
             (unsigned long)g_polar_pipeline.maxTotalThreadsPerThreadgroup);
     g_polar_init_ok = 1;
     return 1;
+}
+
+int ds4_gpu_mtl4_commands_active(void) {
+    return g_mtl4_batch_cb != nil && g_mtl4_batch_enc != nil && !g_mtl4_batch_error;
+}
+
+static int ds4_gpu_mtl4_batch_hold_arg_table(id<MTL4ArgumentTable> at,
+                                             NSUInteger n_bindings) {
+    if (!at) return 1;
+    if (g_mtl4_batch_held_count >= DS4_MTL4_BATCH_HELD_AT_MAX) {
+        g_mtl4_batch_error = 1;
+        fprintf(stderr,
+                "ds4: MTL4 batch argument-table hold overflow (%u); "
+                "reduce batch span or raise DS4_MTL4_BATCH_HELD_AT_MAX\n",
+                DS4_MTL4_BATCH_HELD_AT_MAX);
+        return 0;
+    }
+    g_mtl4_batch_held_at[g_mtl4_batch_held_count] = at;
+    g_mtl4_batch_held_bindings[g_mtl4_batch_held_count] = n_bindings;
+    g_mtl4_batch_held_count++;
+    return 1;
+}
+
+static void ds4_gpu_mtl4_batch_release_held_arg_tables(void) {
+    for (uint32_t i = 0; i < g_mtl4_batch_held_count; i++) {
+        ds4_mtl4_pool_release(g_mtl4_batch_held_at[i],
+                              g_mtl4_batch_held_bindings[i]);
+        g_mtl4_batch_held_at[i] = nil;
+        g_mtl4_batch_held_bindings[i] = 0;
+    }
+    g_mtl4_batch_held_count = 0;
+}
+
+static int ds4_gpu_mtl4_batch_args_prepare(NSUInteger bytes) {
+    if (bytes == 0) bytes = 1;
+    if (g_mtl4_batch_args_buf && g_mtl4_batch_args_rs &&
+        g_mtl4_batch_args_capacity >= bytes) {
+        g_mtl4_batch_args_used = 0;
+        return 1;
+    }
+    if (g_mtl4_batch_args_rs) {
+        [g_polar_queue removeResidencySet:g_mtl4_batch_args_rs];
+        [g_mtl4_batch_args_rs endResidency];
+    }
+    g_mtl4_batch_args_buf = nil;
+    g_mtl4_batch_args_rs = nil;
+    g_mtl4_batch_args_capacity = 0;
+    g_mtl4_batch_args_used = 0;
+
+    g_mtl4_batch_args_buf = [g_device newBufferWithLength:bytes
+                                                  options:MTLResourceStorageModeShared];
+    if (!g_mtl4_batch_args_buf) return 0;
+    MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+    rsDesc.initialCapacity = 1;
+    NSError *err = nil;
+    g_mtl4_batch_args_rs = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+    if (!g_mtl4_batch_args_rs) {
+        fprintf(stderr, "ds4: MTL4 batch args residency failed: %s\n",
+                err.localizedDescription.UTF8String);
+        g_mtl4_batch_args_buf = nil;
+        return 0;
+    }
+    id<MTLAllocation> alloc = g_mtl4_batch_args_buf;
+    [g_mtl4_batch_args_rs addAllocation:alloc];
+    [g_mtl4_batch_args_rs commit];
+    ds4_residency_request_checked(g_mtl4_batch_args_rs, __func__);
+    [g_polar_queue addResidencySet:g_mtl4_batch_args_rs];
+    g_mtl4_batch_args_capacity = bytes;
+    return 1;
+}
+
+static int ds4_gpu_mtl4_batch_copy_args(const void *src,
+                                        NSUInteger bytes,
+                                        id<MTLBuffer> *out_buf,
+                                        NSUInteger *out_off,
+                                        uint64_t *out_addr) {
+    if (!src || bytes == 0 || !out_buf || !out_off || !out_addr ||
+        !g_mtl4_batch_args_buf) return 0;
+    const NSUInteger aligned = (g_mtl4_batch_args_used + 255u) & ~(NSUInteger)255u;
+    if (aligned > g_mtl4_batch_args_capacity ||
+        bytes > g_mtl4_batch_args_capacity - aligned) {
+        g_mtl4_batch_error = 1;
+        fprintf(stderr,
+                "ds4: MTL4 batch args arena overflow used=%lu need=%lu cap=%lu\n",
+                (unsigned long)g_mtl4_batch_args_used,
+                (unsigned long)bytes,
+                (unsigned long)g_mtl4_batch_args_capacity);
+        return 0;
+    }
+    memcpy((uint8_t *)g_mtl4_batch_args_buf.contents + aligned, src, bytes);
+    g_mtl4_batch_args_used = aligned + bytes;
+    *out_buf = g_mtl4_batch_args_buf;
+    *out_off = aligned;
+    *out_addr = g_mtl4_batch_args_buf.gpuAddress + aligned;
+    return 1;
+}
+
+int ds4_gpu_mtl4_begin_commands(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_polar_pipeline_init()) return 0;
+    if (g_mtl4_batch_cb || g_mtl4_batch_enc) return ds4_gpu_mtl4_commands_active();
+    g_mtl4_batch_error = 0;
+    g_mtl4_batch_held_count = 0;
+    g_mtl4_batch_packet_cmd_used = 0;
+    if (!ds4_gpu_mtl4_batch_args_prepare(1u << 20)) return 0;
+
+    g_mtl4_batch_cb = [g_device newCommandBuffer];
+    if (!g_mtl4_batch_cb) return 0;
+    [g_mtl4_batch_cb beginCommandBufferWithAllocator:g_polar_allocator];
+    [g_mtl4_batch_cb useResidencySet:g_mtl4_batch_args_rs];
+    g_mtl4_batch_enc = [g_mtl4_batch_cb computeCommandEncoder];
+    if (!g_mtl4_batch_enc) {
+        [g_mtl4_batch_cb endCommandBuffer];
+        g_mtl4_batch_cb = nil;
+        g_mtl4_batch_error = 1;
+        return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_mtl4_end_commands(void) {
+    if (!g_mtl4_batch_cb && !g_mtl4_batch_enc) return 1;
+
+    id<MTL4CommandBuffer> cb = g_mtl4_batch_cb;
+    id<MTL4ComputeCommandEncoder> enc = g_mtl4_batch_enc;
+    const int had_error = g_mtl4_batch_error;
+    g_mtl4_batch_cb = nil;
+    g_mtl4_batch_enc = nil;
+    g_mtl4_batch_error = 0;
+
+    if (enc) [enc endEncoding];
+    if (cb) [cb endCommandBuffer];
+
+    int ok = !had_error && cb != nil;
+    if (ok) {
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block NSError *fbErr = nil;
+        MTL4CommitOptions *opts = [MTL4CommitOptions new];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+            fbErr = fb.error;
+            dispatch_semaphore_signal(sem);
+        }];
+        id<MTL4CommandBuffer> bufs[1] = { cb };
+        [g_polar_queue commit:bufs count:1 options:opts];
+        atomic_fetch_add_explicit(&g_ds4_d8f_mtl4_batch_commit_count, 1,
+                                  memory_order_relaxed);
+        const long wait_rc =
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
+                                                       30LL * NSEC_PER_SEC));
+        if (wait_rc != 0) {
+            fprintf(stderr, "ds4: MTL4 batch dispatch timed out\n");
+            ok = 0;
+        } else if (fbErr) {
+            fprintf(stderr, "ds4: MTL4 batch feedback error: %s\n",
+                    fbErr.localizedDescription.UTF8String);
+            ok = 0;
+        }
+    }
+    ds4_gpu_mtl4_batch_release_held_arg_tables();
+    return ok;
 }
 
 /* ============================================================ */
@@ -23045,6 +23658,863 @@ int ds4_gpu_matmul_fp8_e4m3_e8m0_storage(
     return 1;
 }
 
+static id<MTLComputePipelineState> g_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_pipeline;
+static int g_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_init_attempted;
+static int g_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_init_ok;
+
+static int ds4_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_pipeline_init(void) {
+    if (g_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_init_attempted)
+        return g_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_init_ok;
+    g_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_init_attempted = 1;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "constant float dsv4_fp8hc_e4m3_exp_scale[16] = {\n"
+         "  0.0f, 0.015625f, 0.03125f, 0.0625f,\n"
+         "  0.125f, 0.25f, 0.5f, 1.0f,\n"
+         "  2.0f, 4.0f, 8.0f, 16.0f,\n"
+         "  32.0f, 64.0f, 128.0f, 256.0f,\n"
+         "};\n"
+         "static inline float dsv4_fp8hc_e4m3fn_byte(uchar raw) {\n"
+         "  const int sign = (raw & 0x80) != 0 ? -1 : 1;\n"
+         "  int mag = int(raw & 0x7f);\n"
+         "  mag = min(mag, 126);\n"
+         "  const int exp_ = (mag >> 3) & 0x0f;\n"
+         "  const int mant = mag & 0x07;\n"
+         "  const float val = exp_ == 0\n"
+         "    ? float(mant) * 0.001953125f\n"
+         "    : (1.0f + float(mant) * 0.125f) * dsv4_fp8hc_e4m3_exp_scale[exp_];\n"
+         "  return sign < 0 ? -val : val;\n"
+         "}\n"
+         "static inline float dsv4_fp8hc_e8m0_byte(uchar raw) {\n"
+         "  return exp2(float(raw) - 127.0f);\n"
+         "}\n"
+         "struct fp8hc_args {\n"
+         "  uint in_dim;\n"
+         "  uint out_dim;\n"
+         "  uint scale_cols;\n"
+         "  uint n_tok;\n"
+         "  uint store_block_out;\n"
+         "};\n"
+         "kernel void matmul_fp8_e4m3_e8m0_hc_expand4_mtl4(\n"
+         "    device const fp8hc_args *args [[buffer(0)]],\n"
+         "    device const uchar *weight [[buffer(1)]],\n"
+         "    device const uchar *scale [[buffer(2)]],\n"
+         "    device const float *x [[buffer(3)]],\n"
+         "    device float *block_out [[buffer(4)]],\n"
+         "    device const float *residual [[buffer(5)]],\n"
+         "    device const float *post [[buffer(6)]],\n"
+         "    device const float *comb [[buffer(7)]],\n"
+         "    device float *dst [[buffer(8)]],\n"
+         "    threadgroup float *scratch [[threadgroup(0)]],\n"
+         "    uint3 tg [[threadgroup_position_in_grid]],\n"
+         "    uint3 thread_xyz [[thread_position_in_threadgroup]],\n"
+         "    uint3 threads_xyz [[threads_per_threadgroup]]) {\n"
+         "  const uint row = tg.x;\n"
+         "  const uint tok = tg.y;\n"
+         "  const uint tid = thread_xyz.x;\n"
+         "  const uint ntg = threads_xyz.x;\n"
+         "  if (row >= args->out_dim || tok >= args->n_tok) return;\n"
+         "  float sum = 0.0f;\n"
+         "  const uint scale_row = row >> 7u;\n"
+         "  for (uint col = tid; col < args->in_dim; col += ntg) {\n"
+         "    const uint scale_col = col >> 7u;\n"
+         "    const float tile_scale = dsv4_fp8hc_e8m0_byte(scale[scale_row * args->scale_cols + scale_col]);\n"
+         "    const float w = dsv4_fp8hc_e4m3fn_byte(weight[(ulong)row * args->in_dim + col]) * tile_scale;\n"
+         "    sum += w * x[(ulong)tok * args->in_dim + col];\n"
+         "  }\n"
+         "  scratch[tid] = sum;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {\n"
+         "    if (tid < stride) scratch[tid] += scratch[tid + stride];\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  if (tid == 0u) {\n"
+         "    const float block_v = scratch[0];\n"
+         "    if (args->store_block_out != 0u) block_out[(ulong)tok * args->out_dim + row] = block_v;\n"
+         "    const ulong hc_plane = (ulong)4u * args->out_dim;\n"
+         "    const ulong res_base = (ulong)tok * hc_plane + row;\n"
+         "    const float r0 = residual[res_base + (ulong)0u * args->out_dim];\n"
+         "    const float r1 = residual[res_base + (ulong)1u * args->out_dim];\n"
+         "    const float r2 = residual[res_base + (ulong)2u * args->out_dim];\n"
+         "    const float r3 = residual[res_base + (ulong)3u * args->out_dim];\n"
+         "    const ulong post_base = (ulong)tok * 4u;\n"
+         "    const ulong comb_base = (ulong)tok * 16u;\n"
+         "    const ulong dst_base = (ulong)tok * hc_plane + row;\n"
+         "    for (uint dst_hc = 0; dst_hc < 4u; ++dst_hc) {\n"
+         "      float acc = block_v * post[post_base + dst_hc];\n"
+         "      acc += comb[comb_base + dst_hc + 0u * 4u] * r0;\n"
+         "      acc += comb[comb_base + dst_hc + 1u * 4u] * r1;\n"
+         "      acc += comb[comb_base + dst_hc + 2u * 4u] * r2;\n"
+         "      acc += comb[comb_base + dst_hc + 3u * 4u] * r3;\n"
+         "      dst[dst_base + (ulong)dst_hc * args->out_dim] = acc;\n"
+         "    }\n"
+         "  }\n"
+         "}\n";
+
+    g_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source,
+        @"ds4_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4",
+        @"matmul_fp8_e4m3_e8m0_hc_expand4_mtl4",
+        128,
+        NULL,
+        0);
+    g_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_init_ok =
+        (g_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_pipeline != nil) ? 1 : 0;
+    return g_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_init_ok;
+}
+
+int ds4_gpu_matmul_fp8_e4m3_e8m0_hc_expand_tensor_ex(
+    ds4_gpu_tensor *out_hc,
+    ds4_gpu_tensor *block_out,
+    void *weight_buf,
+    void *scale_buf,
+    uint64_t scale_bytes,
+    uint64_t in_dim,
+    uint64_t out_dim,
+    const ds4_gpu_tensor *x,
+    const ds4_gpu_tensor *residual_hc,
+    const ds4_gpu_tensor *post,
+    const ds4_gpu_tensor *comb,
+    uint32_t n_embd,
+    uint32_t n_hc,
+    uint64_t n_tok,
+    int store_block_out) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_pipeline_init()) return 0;
+    if (!out_hc || !block_out || !weight_buf || !scale_buf || !x || !residual_hc ||
+        !post || !comb || n_hc != 4 || n_embd == 0 || (uint64_t)n_embd != out_dim ||
+        in_dim == 0 || out_dim == 0 || n_tok == 0 ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
+        return 0;
+    }
+
+    const uint64_t scale_cols = (in_dim + 127u) / 128u;
+    const uint64_t scale_rows = (out_dim + 127u) / 128u;
+    const uint64_t expected_scale_bytes = scale_cols * scale_rows;
+    const uint64_t expected_weight_bytes = in_dim * out_dim;
+    if (scale_bytes < expected_scale_bytes) {
+        fprintf(stderr,
+                "ds4: FP8 HC fusion scale buffer too small (%llu < %llu)\n",
+                (unsigned long long)scale_bytes,
+                (unsigned long long)expected_scale_bytes);
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> wbuf = (__bridge id<MTLBuffer>)weight_buf;
+        id<MTLBuffer> sbuf = (__bridge id<MTLBuffer>)scale_buf;
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> blockbuf = ds4_gpu_tensor_buffer(block_out);
+        id<MTLBuffer> resbuf = ds4_gpu_tensor_buffer(residual_hc);
+        id<MTLBuffer> postbuf = ds4_gpu_tensor_buffer(post);
+        id<MTLBuffer> combbuf = ds4_gpu_tensor_buffer(comb);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out_hc);
+        if (!wbuf || !sbuf || !xbuf || !blockbuf || !resbuf || !postbuf || !combbuf || !outbuf) return 0;
+        if ((uint64_t)wbuf.length < expected_weight_bytes) {
+            fprintf(stderr,
+                    "ds4: FP8 HC fusion weight buffer too small (%llu < %llu)\n",
+                    (unsigned long long)wbuf.length,
+                    (unsigned long long)expected_weight_bytes);
+            return 0;
+        }
+
+        const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+        const uint64_t block_bytes = n_tok * out_dim * sizeof(float);
+        const uint64_t hc_bytes = n_tok * (uint64_t)n_hc * out_dim * sizeof(float);
+        const uint64_t post_bytes = n_tok * (uint64_t)n_hc * sizeof(float);
+        const uint64_t comb_bytes = n_tok * (uint64_t)n_hc * (uint64_t)n_hc * sizeof(float);
+        if (ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(block_out) < block_bytes ||
+            ds4_gpu_tensor_bytes(residual_hc) < hc_bytes ||
+            ds4_gpu_tensor_bytes(post) < post_bytes ||
+            ds4_gpu_tensor_bytes(comb) < comb_bytes ||
+            ds4_gpu_tensor_bytes(out_hc) < hc_bytes) {
+            fprintf(stderr, "ds4: FP8 HC fusion received undersized buffers\n");
+            return 0;
+        }
+
+        struct {
+            uint32_t in_dim;
+            uint32_t out_dim;
+            uint32_t scale_cols;
+            uint32_t n_tok;
+            uint32_t store_block_out;
+        } args;
+        args.in_dim = (uint32_t)in_dim;
+        args.out_dim = (uint32_t)out_dim;
+        args.scale_cols = (uint32_t)scale_cols;
+        args.n_tok = (uint32_t)n_tok;
+        args.store_block_out = store_block_out ? 1u : 0u;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:0 atIndex:1];
+        [enc setBuffer:sbuf offset:0 atIndex:2];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
+        [enc setBuffer:blockbuf offset:ds4_gpu_tensor_offset(block_out) atIndex:4];
+        [enc setBuffer:resbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:5];
+        [enc setBuffer:postbuf offset:ds4_gpu_tensor_offset(post) atIndex:6];
+        [enc setBuffer:combbuf offset:ds4_gpu_tensor_offset(comb) atIndex:7];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_hc) atIndex:8];
+        [enc setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, (NSUInteger)n_tok, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "FP8_E4M3/E8M0 HC expand fused")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_matmul_fp8_e4m3_e8m0_hc_expand_tensor(
+    ds4_gpu_tensor *out_hc,
+    ds4_gpu_tensor *block_out,
+    void *weight_buf,
+    void *scale_buf,
+    uint64_t scale_bytes,
+    uint64_t in_dim,
+    uint64_t out_dim,
+    const ds4_gpu_tensor *x,
+    const ds4_gpu_tensor *residual_hc,
+    const ds4_gpu_tensor *post,
+    const ds4_gpu_tensor *comb,
+    uint32_t n_embd,
+    uint32_t n_hc,
+    uint64_t n_tok) {
+    return ds4_gpu_matmul_fp8_e4m3_e8m0_hc_expand_tensor_ex(out_hc,
+        block_out,
+        weight_buf,
+        scale_buf,
+        scale_bytes,
+        in_dim,
+        out_dim,
+        x,
+        residual_hc,
+        post,
+        comb,
+        n_embd,
+        n_hc,
+        n_tok,
+        1);
+}
+
+static id<MTLComputePipelineState> g_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4_pipeline;
+static int g_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4_init_attempted;
+static int g_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4_init_ok;
+
+static int ds4_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4_pipeline_init(void) {
+    if (g_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4_init_attempted)
+        return g_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4_init_ok;
+    g_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4_init_attempted = 1;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "constant float dsv4_fp8sd_e4m3_exp_scale[16] = {\n"
+        "  0.0f, 0.015625f, 0.03125f, 0.0625f,\n"
+        "  0.125f, 0.25f, 0.5f, 1.0f,\n"
+        "  2.0f, 4.0f, 8.0f, 16.0f,\n"
+        "  32.0f, 64.0f, 128.0f, 256.0f\n"
+        "};\n"
+        "static inline float dsv4_fp8sd_e4m3fn_byte(uchar raw) {\n"
+        "  const int sign = (raw & 0x80) ? -1 : 1;\n"
+        "  int mag = int(raw & 0x7f);\n"
+        "  mag = min(mag, 126);\n"
+        "  const int exp_ = (mag >> 3) & 0x0f;\n"
+        "  const int mant = mag & 0x07;\n"
+        "  const float val = exp_ == 0\n"
+        "    ? float(mant) * 0.001953125f\n"
+        "    : (1.0f + float(mant) * 0.125f) * dsv4_fp8sd_e4m3_exp_scale[exp_];\n"
+        "  return sign < 0 ? -val : val;\n"
+        "}\n"
+        "static inline float dsv4_fp8sd_e8m0_byte(uchar raw) {\n"
+        "  return exp2(float(raw) - 127.0f);\n"
+        "}\n"
+        "struct fp8_shared_down_hc_args {\n"
+        "  uint in_dim;\n"
+        "  uint out_dim;\n"
+        "  uint scale_cols;\n"
+        "  uint store_shared_out;\n"
+        "};\n"
+        "kernel void shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4(\n"
+        "    device const fp8_shared_down_hc_args *args [[buffer(0)]],\n"
+        "    device const uchar *weight [[buffer(1)]],\n"
+        "    device const uchar *scale [[buffer(2)]],\n"
+        "    device const float *shared_mid [[buffer(3)]],\n"
+        "    device float *shared_out [[buffer(4)]],\n"
+        "    device const float *routed_out [[buffer(5)]],\n"
+        "    device const float *residual [[buffer(6)]],\n"
+        "    device const float *split [[buffer(7)]],\n"
+        "    device float *dst [[buffer(8)]],\n"
+        "    threadgroup float *scratch [[threadgroup(0)]],\n"
+        "    uint3 tg [[threadgroup_position_in_grid]],\n"
+        "    uint3 thread_xyz [[thread_position_in_threadgroup]],\n"
+        "    uint3 threads_xyz [[threads_per_threadgroup]]) {\n"
+        "  const uint row = tg.x;\n"
+        "  const uint tid = thread_xyz.x;\n"
+        "  const uint ntg = threads_xyz.x;\n"
+        "  if (row >= args->out_dim) return;\n"
+        "  float sum = 0.0f;\n"
+        "  const uint scale_row = row >> 7u;\n"
+        "  for (uint col = tid; col < args->in_dim; col += ntg) {\n"
+        "    const uint scale_col = col >> 7u;\n"
+        "    const float tile_scale = dsv4_fp8sd_e8m0_byte(scale[scale_row * args->scale_cols + scale_col]);\n"
+        "    const float w = dsv4_fp8sd_e4m3fn_byte(weight[(ulong)row * args->in_dim + col]) * tile_scale;\n"
+        "    sum += w * shared_mid[col];\n"
+        "  }\n"
+        "  scratch[tid] = sum;\n"
+        "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "  for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {\n"
+        "    if (tid < stride) scratch[tid] += scratch[tid + stride];\n"
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "  }\n"
+        "  if (tid == 0u) {\n"
+        "    const float shared_v = scratch[0];\n"
+        "    if (args->store_shared_out != 0u) shared_out[row] = shared_v;\n"
+        "    const float block_v = shared_v + routed_out[row];\n"
+        "    const float r0 = residual[row + (ulong)0u * args->out_dim];\n"
+        "    const float r1 = residual[row + (ulong)1u * args->out_dim];\n"
+        "    const float r2 = residual[row + (ulong)2u * args->out_dim];\n"
+        "    const float r3 = residual[row + (ulong)3u * args->out_dim];\n"
+        "    device const float *post = split + 4u;\n"
+        "    device const float *comb = split + 8u;\n"
+        "    for (uint dst_hc = 0; dst_hc < 4u; ++dst_hc) {\n"
+        "      float acc = block_v * post[dst_hc];\n"
+        "      acc += comb[dst_hc + 0u * 4u] * r0;\n"
+        "      acc += comb[dst_hc + 1u * 4u] * r1;\n"
+        "      acc += comb[dst_hc + 2u * 4u] * r2;\n"
+        "      acc += comb[dst_hc + 3u * 4u] * r3;\n"
+        "      dst[row + (ulong)dst_hc * args->out_dim] = acc;\n"
+        "    }\n"
+        "  }\n"
+        "}\n";
+    g_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source,
+        @"ds4_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4",
+        @"shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4",
+        128,
+        NULL,
+        0);
+    g_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4_init_ok =
+        (g_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4_pipeline != nil) ? 1 : 0;
+    return g_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4_init_ok;
+}
+
+int ds4_gpu_shared_down_hc_expand_fp8_e4m3_e8m0_tensor(
+    ds4_gpu_tensor *out_hc,
+    ds4_gpu_tensor *shared_out,
+    void *weight_buf,
+    void *scale_buf,
+    uint64_t scale_bytes,
+    uint64_t in_dim,
+    uint64_t out_dim,
+    const ds4_gpu_tensor *shared_mid,
+    const ds4_gpu_tensor *routed_out,
+    const ds4_gpu_tensor *residual_hc,
+    const ds4_gpu_tensor *split,
+    uint32_t n_embd,
+    uint32_t n_hc,
+    int store_shared_out) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4_pipeline_init()) return 0;
+    if (!out_hc || !shared_out || !weight_buf || !scale_buf || !shared_mid || !routed_out ||
+        !residual_hc || !split || n_hc != 4 || n_embd == 0 || (uint64_t)n_embd != out_dim ||
+        in_dim == 0 || out_dim == 0 || in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
+        return 0;
+    }
+
+    const uint64_t scale_cols = (in_dim + 127u) / 128u;
+    const uint64_t scale_rows = (out_dim + 127u) / 128u;
+    const uint64_t expected_scale_bytes = scale_cols * scale_rows;
+    const uint64_t expected_weight_bytes = in_dim * out_dim;
+    if (scale_bytes < expected_scale_bytes) {
+        fprintf(stderr,
+                "ds4: FP8 shared-down HC fusion scale buffer too small (%llu < %llu)\n",
+                (unsigned long long)scale_bytes,
+                (unsigned long long)expected_scale_bytes);
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> wbuf = (__bridge id<MTLBuffer>)weight_buf;
+        id<MTLBuffer> sbuf = (__bridge id<MTLBuffer>)scale_buf;
+        id<MTLBuffer> midbuf = ds4_gpu_tensor_buffer(shared_mid);
+        id<MTLBuffer> sharedbuf = ds4_gpu_tensor_buffer(shared_out);
+        id<MTLBuffer> routedbuf = ds4_gpu_tensor_buffer(routed_out);
+        id<MTLBuffer> resbuf = ds4_gpu_tensor_buffer(residual_hc);
+        id<MTLBuffer> splitbuf = ds4_gpu_tensor_buffer(split);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out_hc);
+        if (!wbuf || !sbuf || !midbuf || !sharedbuf || !routedbuf || !resbuf || !splitbuf || !outbuf) return 0;
+        if ((uint64_t)wbuf.length < expected_weight_bytes) {
+            fprintf(stderr,
+                    "ds4: FP8 shared-down HC fusion weight buffer too small (%llu < %llu)\n",
+                    (unsigned long long)wbuf.length,
+                    (unsigned long long)expected_weight_bytes);
+            return 0;
+        }
+
+        const uint64_t mid_bytes = in_dim * sizeof(float);
+        const uint64_t embd_bytes = out_dim * sizeof(float);
+        const uint64_t hc_bytes = (uint64_t)n_hc * out_dim * sizeof(float);
+        const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+        const uint64_t split_bytes = mix_hc * sizeof(float);
+        if (ds4_gpu_tensor_bytes(shared_mid) < mid_bytes ||
+            ds4_gpu_tensor_bytes(shared_out) < embd_bytes ||
+            ds4_gpu_tensor_bytes(routed_out) < embd_bytes ||
+            ds4_gpu_tensor_bytes(residual_hc) < hc_bytes ||
+            ds4_gpu_tensor_bytes(split) < split_bytes ||
+            ds4_gpu_tensor_bytes(out_hc) < hc_bytes) {
+            fprintf(stderr, "ds4: FP8 shared-down HC fusion received undersized buffers\n");
+            return 0;
+        }
+
+        struct {
+            uint32_t in_dim;
+            uint32_t out_dim;
+            uint32_t scale_cols;
+            uint32_t store_shared_out;
+        } args;
+        args.in_dim = (uint32_t)in_dim;
+        args.out_dim = (uint32_t)out_dim;
+        args.scale_cols = (uint32_t)scale_cols;
+        args.store_shared_out = store_shared_out ? 1u : 0u;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_shared_down_fp8_e4m3_e8m0_hc_expand4_mtl4_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:0 atIndex:1];
+        [enc setBuffer:sbuf offset:0 atIndex:2];
+        [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(shared_mid) atIndex:3];
+        [enc setBuffer:sharedbuf offset:ds4_gpu_tensor_offset(shared_out) atIndex:4];
+        [enc setBuffer:routedbuf offset:ds4_gpu_tensor_offset(routed_out) atIndex:5];
+        [enc setBuffer:resbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:6];
+        [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) atIndex:7];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_hc) atIndex:8];
+        [enc setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "shared-down FP8 HC expand fused")) return 0;
+    }
+    return 1;
+}
+
+static id<MTLComputePipelineState> g_matmul_fp8_pair_e4m3_e8m0_storage_pipeline;
+static int g_matmul_fp8_pair_e4m3_e8m0_storage_init_attempted;
+static int g_matmul_fp8_pair_e4m3_e8m0_storage_init_ok;
+
+static int ds4_matmul_fp8_pair_e4m3_e8m0_storage_pipeline_init(void) {
+    if (g_matmul_fp8_pair_e4m3_e8m0_storage_init_attempted)
+        return g_matmul_fp8_pair_e4m3_e8m0_storage_init_ok;
+    g_matmul_fp8_pair_e4m3_e8m0_storage_init_attempted = 1;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "constant float dsv4_pair_e4m3_exp_scale[16] = {\n"
+         "  0.0f, 0.015625f, 0.03125f, 0.0625f,\n"
+         "  0.125f, 0.25f, 0.5f, 1.0f,\n"
+         "  2.0f, 4.0f, 8.0f, 16.0f,\n"
+         "  32.0f, 64.0f, 128.0f, 256.0f,\n"
+         "};\n"
+         "static inline float dsv4_pair_e4m3_byte(uchar raw) {\n"
+         "  const int sign = (raw & 0x80) != 0 ? -1 : 1;\n"
+         "  int mag = int(raw & 0x7f);\n"
+         "  mag = min(mag, 126);\n"
+         "  const int exp_ = (mag >> 3) & 0x0f;\n"
+         "  const int mant = mag & 0x07;\n"
+         "  const float val = exp_ == 0\n"
+         "    ? float(mant) * 0.001953125f\n"
+         "    : (1.0f + float(mant) * 0.125f) * dsv4_pair_e4m3_exp_scale[exp_];\n"
+         "  return sign < 0 ? -val : val;\n"
+         "}\n"
+         "static inline float dsv4_pair_e8m0_byte(uchar raw) {\n"
+         "  return exp2(float(raw) - 127.0f);\n"
+         "}\n"
+         "struct fp8pair_args {\n"
+         "  uint in_dim;\n"
+         "  uint out0_dim;\n"
+         "  uint out1_dim;\n"
+         "  uint scale0_cols;\n"
+         "  uint scale1_cols;\n"
+         "  uint n_tok;\n"
+         "};\n"
+         "kernel void matmul_fp8_pair_e4m3_e8m0_storage(\n"
+         "    device const fp8pair_args *args [[buffer(0)]],\n"
+         "    device const uchar *weight0 [[buffer(1)]],\n"
+         "    device const uchar *scale0 [[buffer(2)]],\n"
+         "    device const uchar *weight1 [[buffer(3)]],\n"
+         "    device const uchar *scale1 [[buffer(4)]],\n"
+         "    device const float *x [[buffer(5)]],\n"
+         "    device float *out0 [[buffer(6)]],\n"
+         "    device float *out1 [[buffer(7)]],\n"
+         "    threadgroup float *scratch [[threadgroup(0)]],\n"
+         "    uint3 tg [[threadgroup_position_in_grid]],\n"
+         "    uint3 thread_xyz [[thread_position_in_threadgroup]],\n"
+         "    uint3 threads_xyz [[threads_per_threadgroup]]) {\n"
+         "  const uint row = tg.x;\n"
+         "  const uint which = tg.y;\n"
+         "  const uint tok = tg.z;\n"
+         "  const uint tid = thread_xyz.x;\n"
+         "  const uint ntg = threads_xyz.x;\n"
+         "  const bool first = which == 0u;\n"
+         "  const uint out_dim = first ? args->out0_dim : args->out1_dim;\n"
+         "  if (which > 1u || row >= out_dim || tok >= args->n_tok) return;\n"
+         "  device const uchar *weight = first ? weight0 : weight1;\n"
+         "  device const uchar *scale = first ? scale0 : scale1;\n"
+         "  const uint scale_cols = first ? args->scale0_cols : args->scale1_cols;\n"
+         "  float sum = 0.0f;\n"
+         "  const uint scale_row = row >> 7u;\n"
+         "  for (uint col = tid; col < args->in_dim; col += ntg) {\n"
+         "    const uint scale_col = col >> 7u;\n"
+         "    const float tile_scale = dsv4_pair_e8m0_byte(scale[scale_row * scale_cols + scale_col]);\n"
+         "    const float w = dsv4_pair_e4m3_byte(weight[(ulong)row * args->in_dim + col]) * tile_scale;\n"
+         "    sum += w * x[(ulong)tok * args->in_dim + col];\n"
+         "  }\n"
+         "  scratch[tid] = sum;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {\n"
+         "    if (tid < stride) scratch[tid] += scratch[tid + stride];\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  if (tid == 0u) {\n"
+         "    if (first) out0[(ulong)tok * args->out0_dim + row] = scratch[0];\n"
+         "    else out1[(ulong)tok * args->out1_dim + row] = scratch[0];\n"
+         "  }\n"
+         "}\n";
+
+    g_matmul_fp8_pair_e4m3_e8m0_storage_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source,
+        @"ds4_matmul_fp8_pair_e4m3_e8m0_storage",
+        @"matmul_fp8_pair_e4m3_e8m0_storage",
+        128,
+        NULL,
+        0);
+    g_matmul_fp8_pair_e4m3_e8m0_storage_init_ok =
+        (g_matmul_fp8_pair_e4m3_e8m0_storage_pipeline != nil) ? 1 : 0;
+    return g_matmul_fp8_pair_e4m3_e8m0_storage_init_ok;
+}
+
+int ds4_gpu_matmul_fp8_pair_e4m3_e8m0_storage(
+    ds4_gpu_tensor *out0,
+    ds4_gpu_tensor *out1,
+    void *weight0_buf,
+    void *scale0_buf,
+    uint64_t scale0_bytes,
+    void *weight1_buf,
+    void *scale1_buf,
+    uint64_t scale1_bytes,
+    uint64_t in_dim,
+    uint64_t out0_dim,
+    uint64_t out1_dim,
+    const ds4_gpu_tensor *x,
+    uint64_t n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_matmul_fp8_pair_e4m3_e8m0_storage_pipeline_init()) return 0;
+    if (!out0 || !out1 || !x || !weight0_buf || !scale0_buf || !weight1_buf || !scale1_buf) return 0;
+    if (in_dim == 0 || out0_dim == 0 || out1_dim == 0 ||
+        in_dim > UINT32_MAX || out0_dim > UINT32_MAX ||
+        out1_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
+
+    const uint64_t scale_cols = (in_dim + 127u) / 128u;
+    const uint64_t scale0_rows = (out0_dim + 127u) / 128u;
+    const uint64_t scale1_rows = (out1_dim + 127u) / 128u;
+    const uint64_t expected_scale0 = scale_cols * scale0_rows;
+    const uint64_t expected_scale1 = scale_cols * scale1_rows;
+    const uint64_t expected_weight0 = in_dim * out0_dim;
+    const uint64_t expected_weight1 = in_dim * out1_dim;
+    if (scale0_bytes < expected_scale0 || scale1_bytes < expected_scale1) {
+        fprintf(stderr,
+                "ds4: fp8 pair matmul scale buffer too small (%llu/%llu need %llu/%llu)\n",
+                (unsigned long long)scale0_bytes,
+                (unsigned long long)scale1_bytes,
+                (unsigned long long)expected_scale0,
+                (unsigned long long)expected_scale1);
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> w0buf = (__bridge id<MTLBuffer>)weight0_buf;
+        id<MTLBuffer> s0buf = (__bridge id<MTLBuffer>)scale0_buf;
+        id<MTLBuffer> w1buf = (__bridge id<MTLBuffer>)weight1_buf;
+        id<MTLBuffer> s1buf = (__bridge id<MTLBuffer>)scale1_buf;
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> out0buf = ds4_gpu_tensor_buffer(out0);
+        id<MTLBuffer> out1buf = ds4_gpu_tensor_buffer(out1);
+        if (!w0buf || !s0buf || !w1buf || !s1buf || !xbuf || !out0buf || !out1buf) return 0;
+        if ((uint64_t)w0buf.length < expected_weight0 ||
+            (uint64_t)w1buf.length < expected_weight1) {
+            fprintf(stderr,
+                    "ds4: fp8 pair matmul weight buffer too small (%llu/%llu need %llu/%llu)\n",
+                    (unsigned long long)w0buf.length,
+                    (unsigned long long)w1buf.length,
+                    (unsigned long long)expected_weight0,
+                    (unsigned long long)expected_weight1);
+            return 0;
+        }
+        const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+        const uint64_t out0_bytes = n_tok * out0_dim * sizeof(float);
+        const uint64_t out1_bytes = n_tok * out1_dim * sizeof(float);
+        if (ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(out0) < out0_bytes ||
+            ds4_gpu_tensor_bytes(out1) < out1_bytes) {
+            fprintf(stderr, "ds4: fp8 pair matmul received undersized activation buffers\n");
+            return 0;
+        }
+
+        struct {
+            uint32_t in_dim;
+            uint32_t out0_dim;
+            uint32_t out1_dim;
+            uint32_t scale0_cols;
+            uint32_t scale1_cols;
+            uint32_t n_tok;
+        } args = {
+            .in_dim = (uint32_t)in_dim,
+            .out0_dim = (uint32_t)out0_dim,
+            .out1_dim = (uint32_t)out1_dim,
+            .scale0_cols = (uint32_t)scale_cols,
+            .scale1_cols = (uint32_t)scale_cols,
+            .n_tok = (uint32_t)n_tok,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_matmul_fp8_pair_e4m3_e8m0_storage_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:w0buf offset:0 atIndex:1];
+        [enc setBuffer:s0buf offset:0 atIndex:2];
+        [enc setBuffer:w1buf offset:0 atIndex:3];
+        [enc setBuffer:s1buf offset:0 atIndex:4];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:5];
+        [enc setBuffer:out0buf offset:ds4_gpu_tensor_offset(out0) atIndex:6];
+        [enc setBuffer:out1buf offset:ds4_gpu_tensor_offset(out1) atIndex:7];
+        [enc setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)MAX(out0_dim, out1_dim), 2, (NSUInteger)n_tok)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "FP8_E4M3/E8M0 pair matmul")) return 0;
+    }
+    return 1;
+}
+
+static id<MTLComputePipelineState> g_shared_gate_up_swiglu_fp8_e4m3_e8m0_pipeline;
+static int g_shared_gate_up_swiglu_fp8_e4m3_e8m0_init_attempted;
+static int g_shared_gate_up_swiglu_fp8_e4m3_e8m0_init_ok;
+
+static int ds4_shared_gate_up_swiglu_fp8_e4m3_e8m0_pipeline_init(void) {
+    if (g_shared_gate_up_swiglu_fp8_e4m3_e8m0_init_attempted)
+        return g_shared_gate_up_swiglu_fp8_e4m3_e8m0_init_ok;
+    g_shared_gate_up_swiglu_fp8_e4m3_e8m0_init_attempted = 1;
+    NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "constant float dsv4_shared_fp8_exp_scale[16] = {\n"
+         "  0.0f, 0.015625f, 0.03125f, 0.0625f,\n"
+         "  0.125f, 0.25f, 0.5f, 1.0f,\n"
+         "  2.0f, 4.0f, 8.0f, 16.0f,\n"
+         "  32.0f, 64.0f, 128.0f, 256.0f,\n"
+         "};\n"
+         "static inline float dsv4_shared_e4m3_byte(uchar raw) {\n"
+         "  const int sign = (raw & 0x80) != 0 ? -1 : 1;\n"
+         "  int mag = int(raw & 0x7f);\n"
+         "  mag = min(mag, 126);\n"
+         "  const int exp_ = (mag >> 3) & 0x0f;\n"
+         "  const int mant = mag & 0x07;\n"
+         "  const float val = exp_ == 0\n"
+         "    ? float(mant) * 0.001953125f\n"
+         "    : (1.0f + float(mant) * 0.125f) * dsv4_shared_fp8_exp_scale[exp_];\n"
+         "  return sign < 0 ? -val : val;\n"
+         "}\n"
+         "static inline float dsv4_shared_e8m0_byte(uchar raw) {\n"
+         "  return exp2(float(raw) - 127.0f);\n"
+         "}\n"
+         "struct shared_fp8_args {\n"
+         "  uint in_dim;\n"
+         "  uint out_dim;\n"
+         "  uint gate_scale_cols;\n"
+         "  uint up_scale_cols;\n"
+         "  uint n_tok;\n"
+         "  float clamp_value;\n"
+         "};\n"
+         "kernel void shared_gate_up_swiglu_fp8_e4m3_e8m0(\n"
+         "    device const shared_fp8_args *args [[buffer(0)]],\n"
+         "    device const uchar *gate_weight [[buffer(1)]],\n"
+         "    device const uchar *gate_scale [[buffer(2)]],\n"
+         "    device const uchar *up_weight [[buffer(3)]],\n"
+         "    device const uchar *up_scale [[buffer(4)]],\n"
+         "    device const float *x [[buffer(5)]],\n"
+         "    device float *gate_out [[buffer(6)]],\n"
+         "    device float *up_out [[buffer(7)]],\n"
+         "    device float *mid_out [[buffer(8)]],\n"
+         "    threadgroup float *scratch [[threadgroup(0)]],\n"
+         "    uint3 tg [[threadgroup_position_in_grid]],\n"
+         "    uint3 thread_xyz [[thread_position_in_threadgroup]],\n"
+         "    uint3 threads_xyz [[threads_per_threadgroup]]) {\n"
+         "  const uint row = tg.x;\n"
+         "  const uint tok = tg.y;\n"
+         "  const uint tid = thread_xyz.x;\n"
+         "  const uint ntg = threads_xyz.x;\n"
+         "  if (row >= args->out_dim || tok >= args->n_tok) return;\n"
+         "  float gate_sum = 0.0f;\n"
+         "  float up_sum = 0.0f;\n"
+         "  const uint scale_row = row >> 7u;\n"
+         "  for (uint col = tid; col < args->in_dim; col += ntg) {\n"
+         "    const uint scale_col = col >> 7u;\n"
+         "    const float xv = x[(ulong)tok * args->in_dim + col];\n"
+         "    const float gs = dsv4_shared_e8m0_byte(gate_scale[scale_row * args->gate_scale_cols + scale_col]);\n"
+         "    const float us = dsv4_shared_e8m0_byte(up_scale[scale_row * args->up_scale_cols + scale_col]);\n"
+         "    gate_sum += dsv4_shared_e4m3_byte(gate_weight[(ulong)row * args->in_dim + col]) * gs * xv;\n"
+         "    up_sum += dsv4_shared_e4m3_byte(up_weight[(ulong)row * args->in_dim + col]) * us * xv;\n"
+         "  }\n"
+         "  threadgroup float *gate_scratch = scratch;\n"
+         "  threadgroup float *up_scratch = scratch + ntg;\n"
+         "  gate_scratch[tid] = gate_sum;\n"
+         "  up_scratch[tid] = up_sum;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {\n"
+         "    if (tid < stride) {\n"
+         "      gate_scratch[tid] += gate_scratch[tid + stride];\n"
+         "      up_scratch[tid] += up_scratch[tid + stride];\n"
+         "    }\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  if (tid == 0u) {\n"
+         "    const ulong out_index = (ulong)tok * args->out_dim + row;\n"
+         "    const float gate = gate_scratch[0];\n"
+         "    const float up = up_scratch[0];\n"
+         "    gate_out[out_index] = gate;\n"
+         "    up_out[out_index] = up;\n"
+         "    float g = gate;\n"
+         "    float u = up;\n"
+         "    const float cv = args->clamp_value;\n"
+         "    if (cv > 1.0e-6f) { g = min(g, cv); u = clamp(u, -cv, cv); }\n"
+         "    mid_out[out_index] = (g / (1.0f + exp(-g))) * u;\n"
+         "  }\n"
+         "}\n";
+
+    g_shared_gate_up_swiglu_fp8_e4m3_e8m0_pipeline = ds4_mtl4_build_kernel_pipeline(
+        source,
+        @"ds4_shared_gate_up_swiglu_fp8_e4m3_e8m0",
+        @"shared_gate_up_swiglu_fp8_e4m3_e8m0",
+        128,
+        NULL,
+        0);
+    g_shared_gate_up_swiglu_fp8_e4m3_e8m0_init_ok =
+        (g_shared_gate_up_swiglu_fp8_e4m3_e8m0_pipeline != nil) ? 1 : 0;
+    return g_shared_gate_up_swiglu_fp8_e4m3_e8m0_init_ok;
+}
+
+int ds4_gpu_shared_gate_up_swiglu_fp8_e4m3_e8m0_tensor(
+    ds4_gpu_tensor *gate,
+    ds4_gpu_tensor *up,
+    ds4_gpu_tensor *mid,
+    void *gate_weight_buf,
+    void *gate_scale_buf,
+    uint64_t gate_scale_bytes,
+    void *up_weight_buf,
+    void *up_scale_buf,
+    uint64_t up_scale_bytes,
+    uint64_t in_dim,
+    uint64_t out_dim,
+    const ds4_gpu_tensor *x,
+    uint64_t n_tok,
+    float clamp) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_shared_gate_up_swiglu_fp8_e4m3_e8m0_pipeline_init()) return 0;
+    if (!gate || !up || !mid || !x ||
+        !gate_weight_buf || !gate_scale_buf || !up_weight_buf || !up_scale_buf ||
+        in_dim == 0 || out_dim == 0 || n_tok == 0 ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX ||
+        !isfinite(clamp) || clamp < 0.0f) return 0;
+
+    const uint64_t scale_cols = (in_dim + 127u) / 128u;
+    const uint64_t scale_rows = (out_dim + 127u) / 128u;
+    const uint64_t expected_scale = scale_cols * scale_rows;
+    const uint64_t expected_weight = in_dim * out_dim;
+    if (gate_scale_bytes < expected_scale || up_scale_bytes < expected_scale) {
+        fprintf(stderr,
+                "ds4: shared FP8 gate/up scale buffers too small (%llu/%llu need %llu)\n",
+                (unsigned long long)gate_scale_bytes,
+                (unsigned long long)up_scale_bytes,
+                (unsigned long long)expected_scale);
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> gateW = (__bridge id<MTLBuffer>)gate_weight_buf;
+        id<MTLBuffer> gateS = (__bridge id<MTLBuffer>)gate_scale_buf;
+        id<MTLBuffer> upW = (__bridge id<MTLBuffer>)up_weight_buf;
+        id<MTLBuffer> upS = (__bridge id<MTLBuffer>)up_scale_buf;
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> gatebuf = ds4_gpu_tensor_buffer(gate);
+        id<MTLBuffer> upbuf = ds4_gpu_tensor_buffer(up);
+        id<MTLBuffer> midbuf = ds4_gpu_tensor_buffer(mid);
+        if (!gateW || !gateS || !upW || !upS || !xbuf || !gatebuf || !upbuf || !midbuf) return 0;
+        if ((uint64_t)gateW.length < expected_weight || (uint64_t)upW.length < expected_weight) {
+            fprintf(stderr,
+                    "ds4: shared FP8 gate/up weight buffers too small (%llu/%llu need %llu)\n",
+                    (unsigned long long)gateW.length,
+                    (unsigned long long)upW.length,
+                    (unsigned long long)expected_weight);
+            return 0;
+        }
+        const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+        if (ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(gate) < out_bytes ||
+            ds4_gpu_tensor_bytes(up) < out_bytes ||
+            ds4_gpu_tensor_bytes(mid) < out_bytes) {
+            fprintf(stderr, "ds4: shared FP8 gate/up received undersized activation buffers\n");
+            return 0;
+        }
+
+        struct {
+            uint32_t in_dim;
+            uint32_t out_dim;
+            uint32_t gate_scale_cols;
+            uint32_t up_scale_cols;
+            uint32_t n_tok;
+            float clamp_value;
+        } args = {
+            .in_dim = (uint32_t)in_dim,
+            .out_dim = (uint32_t)out_dim,
+            .gate_scale_cols = (uint32_t)scale_cols,
+            .up_scale_cols = (uint32_t)scale_cols,
+            .n_tok = (uint32_t)n_tok,
+            .clamp_value = clamp,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_shared_gate_up_swiglu_fp8_e4m3_e8m0_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:gateW offset:0 atIndex:1];
+        [enc setBuffer:gateS offset:0 atIndex:2];
+        [enc setBuffer:upW offset:0 atIndex:3];
+        [enc setBuffer:upS offset:0 atIndex:4];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:5];
+        [enc setBuffer:gatebuf offset:ds4_gpu_tensor_offset(gate) atIndex:6];
+        [enc setBuffer:upbuf offset:ds4_gpu_tensor_offset(up) atIndex:7];
+        [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:8];
+        [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, (NSUInteger)n_tok, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "shared FP8 fused gate/up/SwiGLU")) return 0;
+    }
+    return 1;
+}
+
 static id<MTLComputePipelineState> g_attn_low_fp8_e4m3_e8m0_storage_mtl4_pipeline;
 static int g_attn_low_fp8_e4m3_e8m0_storage_mtl4_init_attempted;
 static int g_attn_low_fp8_e4m3_e8m0_storage_mtl4_init_ok;
@@ -23229,6 +24699,458 @@ int ds4_gpu_attention_output_low_fp8_e4m3_e8m0_storage(
         }
     }
     return 1;
+}
+
+typedef struct {
+    uint32_t group_dim;
+    uint32_t rank;
+    uint32_t n_groups;
+    uint32_t n_tokens;
+    uint32_t scale_cols;
+} ds4_fp8_attn_low_icb_args;
+
+typedef struct {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t scale_cols;
+    uint32_t n_tok;
+} ds4_fp8_matmul_icb_args;
+
+static void *ds4_fp8_icb_page_alloc(uint64_t used_bytes, uint64_t *padded_bytes_out) {
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t padded_bytes = (used_bytes + page - 1u) & ~(page - 1u);
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, (size_t)page, (size_t)padded_bytes) != 0 || !ptr) return NULL;
+    memset(ptr, 0, (size_t)padded_bytes);
+    if (padded_bytes_out) *padded_bytes_out = padded_bytes;
+    return ptr;
+}
+
+static void ds4_fp8_icb_fill_bytes(uint8_t *dst, uint64_t bytes, uint32_t salt) {
+    for (uint64_t i = 0; i < bytes; i++) {
+        dst[i] = (uint8_t)(0x20u + ((uint32_t)i * 17u + salt * 29u) % 0x3fu);
+    }
+}
+
+int ds4_gpu_fp8_attn_out_icb_canary(uint32_t group_dim,
+                                    uint32_t rank,
+                                    uint32_t n_groups,
+                                    uint32_t out_dim,
+                                    uint32_t n_tokens,
+                                    uint32_t rounds,
+                                    uint32_t mode) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_attn_low_fp8_e4m3_e8m0_storage_mtl4_pipeline_init()) return 0;
+    if (!ds4_matmul_fp8_e4m3_e8m0_storage_mtl4_pipeline_init()) return 0;
+    if (group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0) return 0;
+    if (rounds == 0) rounds = 1;
+    if (mode > 1) mode = 0;
+
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t a_weight_bytes = low_dim * group_dim;
+    const uint64_t a_scale_cols = ((uint64_t)group_dim + 127u) / 128u;
+    const uint64_t a_scale_rows = (low_dim + 127u) / 128u;
+    const uint64_t a_scale_bytes = a_scale_rows * a_scale_cols;
+    const uint64_t b_weight_bytes = (uint64_t)out_dim * low_dim;
+    const uint64_t b_scale_cols = (low_dim + 127u) / 128u;
+    const uint64_t b_scale_rows = ((uint64_t)out_dim + 127u) / 128u;
+    const uint64_t b_scale_bytes = b_scale_rows * b_scale_cols;
+    const uint64_t heads_count = (uint64_t)n_tokens * n_groups * group_dim;
+    const uint64_t low_count = (uint64_t)n_tokens * low_dim;
+    const uint64_t out_count = (uint64_t)n_tokens * out_dim;
+    if (low_dim > UINT32_MAX || heads_count > UINT32_MAX || low_count > UINT32_MAX || out_count > UINT32_MAX) return 0;
+
+    uint64_t a_weight_padded = 0, a_scale_padded = 0, b_weight_padded = 0, b_scale_padded = 0;
+    void *a_weight_host = ds4_fp8_icb_page_alloc(a_weight_bytes, &a_weight_padded);
+    void *a_scale_host = ds4_fp8_icb_page_alloc(a_scale_bytes, &a_scale_padded);
+    void *b_weight_host = ds4_fp8_icb_page_alloc(b_weight_bytes, &b_weight_padded);
+    void *b_scale_host = ds4_fp8_icb_page_alloc(b_scale_bytes, &b_scale_padded);
+    float *heads_host = (float *)calloc((size_t)heads_count, sizeof(float));
+    float *direct_host = (float *)calloc((size_t)out_count, sizeof(float));
+    float *icb_host = (float *)calloc((size_t)out_count, sizeof(float));
+    if (!a_weight_host || !a_scale_host || !b_weight_host || !b_scale_host ||
+        !heads_host || !direct_host || !icb_host) {
+        free(a_weight_host); free(a_scale_host); free(b_weight_host); free(b_scale_host);
+        free(heads_host); free(direct_host); free(icb_host);
+        return 0;
+    }
+    ds4_fp8_icb_fill_bytes((uint8_t *)a_weight_host, a_weight_bytes, 1);
+    ds4_fp8_icb_fill_bytes((uint8_t *)b_weight_host, b_weight_bytes, 2);
+    memset(a_scale_host, 127, (size_t)a_scale_bytes);
+    memset(b_scale_host, 127, (size_t)b_scale_bytes);
+    for (uint64_t i = 0; i < heads_count; i++) {
+        heads_host[i] = ((float)((int)(i % 17u)) - 8.0f) * 0.03125f;
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        void *a_weight_opaque = ds4_gpu_wrap_heap_bytes(a_weight_host, a_weight_padded);
+        void *a_scale_opaque = ds4_gpu_wrap_heap_bytes(a_scale_host, a_scale_padded);
+        void *b_weight_opaque = ds4_gpu_wrap_heap_bytes(b_weight_host, b_weight_padded);
+        void *b_scale_opaque = ds4_gpu_wrap_heap_bytes(b_scale_host, b_scale_padded);
+        id<MTLBuffer> a_weight_buf = (__bridge id<MTLBuffer>)a_weight_opaque;
+        id<MTLBuffer> a_scale_buf = (__bridge id<MTLBuffer>)a_scale_opaque;
+        id<MTLBuffer> b_weight_buf = (__bridge id<MTLBuffer>)b_weight_opaque;
+        id<MTLBuffer> b_scale_buf = (__bridge id<MTLBuffer>)b_scale_opaque;
+        ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(heads_count * sizeof(float));
+        ds4_gpu_tensor *direct_low = ds4_gpu_tensor_alloc(low_count * sizeof(float));
+        ds4_gpu_tensor *icb_low = ds4_gpu_tensor_alloc(low_count * sizeof(float));
+        ds4_gpu_tensor *direct_out = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+        ds4_gpu_tensor *icb_out = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+        id<MTLBuffer> args_buf = [g_device newBufferWithLength:512 options:MTLResourceStorageModeShared];
+        fprintf(stderr,
+                "ds4: FP8-attn-out ICB canary START group_dim=%u rank=%u n_groups=%u out_dim=%u n_tokens=%u rounds=%u mode=%s\n",
+                group_dim, rank, n_groups, out_dim, n_tokens, rounds, mode == 0 ? "separate-cb" : "one-cb-barrier");
+        if (a_weight_buf && a_scale_buf && b_weight_buf && b_scale_buf &&
+            heads && direct_low && icb_low && direct_out && icb_out && args_buf &&
+            ds4_gpu_tensor_write(heads, 0, heads_host, heads_count * sizeof(float)) > 0) {
+            ds4_fp8_attn_low_icb_args low_args = {
+                .group_dim = group_dim,
+                .rank = rank,
+                .n_groups = n_groups,
+                .n_tokens = n_tokens,
+                .scale_cols = (uint32_t)a_scale_cols,
+            };
+            ds4_fp8_matmul_icb_args out_args = {
+                .in_dim = (uint32_t)low_dim,
+                .out_dim = out_dim,
+                .scale_cols = (uint32_t)b_scale_cols,
+                .n_tok = n_tokens,
+            };
+            memcpy((uint8_t *)args_buf.contents + 0, &low_args, sizeof(low_args));
+            memcpy((uint8_t *)args_buf.contents + 256, &out_args, sizeof(out_args));
+
+            ds4_icb_slot_t slot;
+            memset((void *)&slot, 0, sizeof(slot));
+            if (ds4_icb_slot_acquire(&slot, 2, 5)) {
+                id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
+                id<MTLBuffer> lowbuf = ds4_gpu_tensor_buffer(icb_low);
+                id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(icb_out);
+                __unsafe_unretained id<MTLBuffer> low_bindings[5] = { args_buf, a_weight_buf, a_scale_buf, headsbuf, lowbuf };
+                NSUInteger low_offsets[5] = { 0, 0, 0, ds4_gpu_tensor_offset(heads), ds4_gpu_tensor_offset(icb_low) };
+                __unsafe_unretained id<MTLBuffer> out_bindings[5] = { args_buf, b_weight_buf, b_scale_buf, lowbuf, outbuf };
+                NSUInteger out_offsets[5] = { 256, 0, 0, ds4_gpu_tensor_offset(icb_low), ds4_gpu_tensor_offset(icb_out) };
+                uint64_t low_extras[5] = { group_dim, rank, n_groups, n_tokens, low_dim };
+                uint64_t out_extras[5] = { low_dim, out_dim, n_tokens, b_scale_cols, 0 };
+                const int low_ready = ds4_icb_slot_record_command(
+                    &slot, 0, g_attn_low_fp8_e4m3_e8m0_storage_mtl4_pipeline,
+                    low_bindings, low_offsets, 5,
+                    MTLSizeMake((NSUInteger)low_dim, (NSUInteger)n_tokens, 1),
+                    MTLSizeMake(128, 1, 1),
+                    128u * sizeof(float), low_extras, 5);
+                const int out_ready = ds4_icb_slot_record_command(
+                    &slot, 1, g_matmul_fp8_e4m3_e8m0_storage_mtl4_pipeline,
+                    out_bindings, out_offsets, 5,
+                    MTLSizeMake((NSUInteger)out_dim, (NSUInteger)n_tokens, 1),
+                    MTLSizeMake(128, 1, 1),
+                    128u * sizeof(float), out_extras, 5);
+
+                int direct_ok = low_ready && out_ready;
+                const double direct_start_ms = ds4_gpu_now_ms();
+                for (uint32_t iter = 0; direct_ok && iter < rounds; iter++) {
+                    direct_ok = ds4_gpu_attention_output_low_fp8_e4m3_e8m0_storage(
+                                    direct_low, a_weight_opaque, a_scale_opaque, a_scale_bytes,
+                                    group_dim, rank, n_groups, heads, n_tokens) != 0;
+                    if (direct_ok) {
+                        direct_ok = ds4_gpu_matmul_fp8_e4m3_e8m0_storage(
+                                        direct_out, b_weight_opaque, b_scale_opaque, b_scale_bytes,
+                                        low_dim, out_dim, direct_low, n_tokens) != 0;
+                    }
+                }
+                const double direct_ms = ds4_gpu_now_ms() - direct_start_ms;
+
+                int icb_ok = direct_ok;
+                const double icb_start_ms = ds4_gpu_now_ms();
+                for (uint32_t iter = 0; icb_ok && iter < rounds; iter++) {
+                    if (mode == 0) {
+                        int owned_low = 0;
+                        id<MTLCommandBuffer> cb_low = ds4_gpu_command_buffer(&owned_low);
+                        id<MTLComputeCommandEncoder> enc_low = cb_low ? ds4_gpu_compute_encoder(cb_low) : nil;
+                        if (!enc_low) { icb_ok = 0; break; }
+                        ds4_icb_slot_use_resources(&slot, enc_low, 0, 1, MTLResourceUsageRead | MTLResourceUsageWrite);
+                        icb_ok = ds4_icb_slot_execute(&slot, enc_low, 0, 1);
+                        ds4_gpu_end_compute_encoder(cb_low, enc_low);
+                        if (icb_ok) icb_ok = ds4_gpu_finish_command_buffer(cb_low, owned_low, "fp8 attn low icb canary");
+                        if (!icb_ok) break;
+                        int owned_out = 0;
+                        id<MTLCommandBuffer> cb_out = ds4_gpu_command_buffer(&owned_out);
+                        id<MTLComputeCommandEncoder> enc_out = cb_out ? ds4_gpu_compute_encoder(cb_out) : nil;
+                        if (!enc_out) { icb_ok = 0; break; }
+                        ds4_icb_slot_use_resources(&slot, enc_out, 1, 1, MTLResourceUsageRead | MTLResourceUsageWrite);
+                        icb_ok = ds4_icb_slot_execute(&slot, enc_out, 1, 1);
+                        ds4_gpu_end_compute_encoder(cb_out, enc_out);
+                        if (icb_ok) icb_ok = ds4_gpu_finish_command_buffer(cb_out, owned_out, "fp8 attn out icb canary");
+                    } else {
+                        int owned = 0;
+                        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+                        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+                        if (!enc) { icb_ok = 0; break; }
+                        ds4_icb_slot_use_resources(&slot, enc, 0, 1, MTLResourceUsageRead | MTLResourceUsageWrite);
+                        icb_ok = ds4_icb_slot_execute(&slot, enc, 0, 1);
+                        if (icb_ok) {
+                            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                            ds4_icb_slot_use_resources(&slot, enc, 1, 1, MTLResourceUsageRead | MTLResourceUsageWrite);
+                            icb_ok = ds4_icb_slot_execute(&slot, enc, 1, 1);
+                        }
+                        ds4_gpu_end_compute_encoder(cb, enc);
+                        if (icb_ok) icb_ok = ds4_gpu_finish_command_buffer(cb, owned, "fp8 attn out icb barrier canary");
+                    }
+                }
+                const double icb_ms = ds4_gpu_now_ms() - icb_start_ms;
+
+                if (direct_ok && icb_ok &&
+                    ds4_gpu_tensor_read(direct_out, 0, direct_host, out_count * sizeof(float)) > 0 &&
+                    ds4_gpu_tensor_read(icb_out, 0, icb_host, out_count * sizeof(float)) > 0) {
+                    uint64_t mismatches = 0;
+                    float max_abs_delta = 0.0f;
+                    for (uint64_t i = 0; i < out_count; i++) {
+                        const float delta = fabsf(direct_host[i] - icb_host[i]);
+                        if (delta > max_abs_delta) max_abs_delta = delta;
+                        if (delta > 1e-5f) mismatches++;
+                    }
+                    const double direct_per = direct_ms / (double)rounds;
+                    const double icb_per = icb_ms / (double)rounds;
+                    fprintf(stderr,
+                            "ds4: FP8-attn-out ICB canary direct=%.3f ms/round icb=%.3f ms/round speedup=%.2fx max_abs_delta=%.3e mismatches=%llu/%llu %s\n",
+                            direct_per, icb_per, icb_per > 0.0 ? direct_per / icb_per : 0.0,
+                            (double)max_abs_delta,
+                            (unsigned long long)mismatches,
+                            (unsigned long long)out_count,
+                            mismatches == 0 ? "PASS" : "DIVERGE");
+                    rc = (mismatches == 0);
+                } else {
+                    fprintf(stderr,
+                            "ds4: FP8-attn-out ICB canary failed direct_ok=%d icb_ok=%d low_ready=%d out_ready=%d\n",
+                            direct_ok, icb_ok, low_ready, out_ready);
+                }
+            }
+        }
+        ds4_gpu_tensor_free(heads);
+        ds4_gpu_tensor_free(direct_low);
+        ds4_gpu_tensor_free(icb_low);
+        ds4_gpu_tensor_free(direct_out);
+        ds4_gpu_tensor_free(icb_out);
+        ds4_gpu_release_heap_buffer(a_weight_opaque);
+        ds4_gpu_release_heap_buffer(a_scale_opaque);
+        ds4_gpu_release_heap_buffer(b_weight_opaque);
+        ds4_gpu_release_heap_buffer(b_scale_opaque);
+    }
+    free(a_weight_host);
+    free(a_scale_host);
+    free(b_weight_host);
+    free(b_scale_host);
+    free(heads_host);
+    free(direct_host);
+    free(icb_host);
+    return rc;
+}
+
+int ds4_gpu_fp8_hc_fuse_canary(uint32_t in_dim,
+                               uint32_t out_dim,
+                               uint32_t n_tokens,
+                               uint32_t rounds) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_matmul_fp8_e4m3_e8m0_storage_mtl4_pipeline_init()) return 0;
+    if (!ds4_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4_pipeline_init()) return 0;
+    if (in_dim == 0 || out_dim == 0 || n_tokens == 0) return 0;
+    if (rounds == 0) rounds = 1;
+
+    const uint32_t n_hc = 4;
+    const uint64_t weight_bytes = (uint64_t)out_dim * in_dim;
+    const uint64_t scale_cols = ((uint64_t)in_dim + 127u) / 128u;
+    const uint64_t scale_rows = ((uint64_t)out_dim + 127u) / 128u;
+    const uint64_t scale_bytes = scale_cols * scale_rows;
+    const uint64_t input_count = (uint64_t)n_tokens * in_dim;
+    const uint64_t block_count = (uint64_t)n_tokens * out_dim;
+    const uint64_t hc_count = (uint64_t)n_tokens * n_hc * out_dim;
+    const uint64_t post_count = (uint64_t)n_tokens * n_hc;
+    const uint64_t comb_count = (uint64_t)n_tokens * n_hc * n_hc;
+    if (input_count == 0 || block_count == 0 || hc_count == 0 ||
+        weight_bytes == 0 || scale_bytes == 0) {
+        return 0;
+    }
+
+    uint64_t weight_padded = 0, scale_padded = 0;
+    void *weight_host = ds4_fp8_icb_page_alloc(weight_bytes, &weight_padded);
+    void *scale_host = ds4_fp8_icb_page_alloc(scale_bytes, &scale_padded);
+    float *input_host = (float *)calloc((size_t)input_count, sizeof(float));
+    float *residual_host = (float *)calloc((size_t)hc_count, sizeof(float));
+    float *post_host = (float *)calloc((size_t)post_count, sizeof(float));
+    float *comb_host = (float *)calloc((size_t)comb_count, sizeof(float));
+    float *direct_block_host = (float *)calloc((size_t)block_count, sizeof(float));
+    float *fused_block_host = (float *)calloc((size_t)block_count, sizeof(float));
+    float *direct_hc_host = (float *)calloc((size_t)hc_count, sizeof(float));
+    float *fused_hc_host = (float *)calloc((size_t)hc_count, sizeof(float));
+    float *nostore_hc_host = (float *)calloc((size_t)hc_count, sizeof(float));
+    if (!weight_host || !scale_host || !input_host || !residual_host ||
+        !post_host || !comb_host || !direct_block_host || !fused_block_host ||
+        !direct_hc_host || !fused_hc_host || !nostore_hc_host) {
+        free(weight_host); free(scale_host); free(input_host); free(residual_host);
+        free(post_host); free(comb_host); free(direct_block_host); free(fused_block_host);
+        free(direct_hc_host); free(fused_hc_host); free(nostore_hc_host);
+        return 0;
+    }
+
+    ds4_fp8_icb_fill_bytes((uint8_t *)weight_host, weight_bytes, 3);
+    memset(scale_host, 127, (size_t)scale_bytes);
+    for (uint64_t i = 0; i < input_count; i++) {
+        input_host[i] = ((float)((int)(i % 23u)) - 11.0f) * 0.015625f;
+    }
+    for (uint64_t i = 0; i < hc_count; i++) {
+        residual_host[i] = ((float)((int)(i % 19u)) - 9.0f) * 0.01f;
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            post_host[(uint64_t)t * n_hc + dst_hc] = 0.5f / (float)(dst_hc + 1u);
+        }
+        for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+            for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+                comb_host[(uint64_t)t * n_hc * n_hc + dst_hc + src_hc * n_hc] =
+                    (dst_hc == src_hc ? 0.125f : -0.03125f * (float)(dst_hc + src_hc + 1u));
+            }
+        }
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        void *weight_opaque = ds4_gpu_wrap_heap_bytes(weight_host, weight_padded);
+        void *scale_opaque = ds4_gpu_wrap_heap_bytes(scale_host, scale_padded);
+        ds4_gpu_tensor *input = ds4_gpu_tensor_alloc(input_count * sizeof(float));
+        ds4_gpu_tensor *residual = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+        ds4_gpu_tensor *post = ds4_gpu_tensor_alloc(post_count * sizeof(float));
+        ds4_gpu_tensor *comb = ds4_gpu_tensor_alloc(comb_count * sizeof(float));
+        ds4_gpu_tensor *direct_block = ds4_gpu_tensor_alloc(block_count * sizeof(float));
+        ds4_gpu_tensor *fused_block = ds4_gpu_tensor_alloc(block_count * sizeof(float));
+        ds4_gpu_tensor *nostore_block = ds4_gpu_tensor_alloc(block_count * sizeof(float));
+        ds4_gpu_tensor *direct_hc = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+        ds4_gpu_tensor *fused_hc = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+        ds4_gpu_tensor *nostore_hc = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+
+        fprintf(stderr,
+                "ds4: FP8-HC fuse canary START in_dim=%u out_dim=%u n_tokens=%u rounds=%u weight=%.2f MiB\n",
+                in_dim, out_dim, n_tokens, rounds, (double)weight_bytes / 1048576.0);
+
+        int setup_ok = weight_opaque && scale_opaque && input && residual && post && comb &&
+                       direct_block && fused_block && nostore_block && direct_hc && fused_hc && nostore_hc;
+        if (setup_ok) setup_ok = ds4_gpu_tensor_write(input, 0, input_host, input_count * sizeof(float)) > 0;
+        if (setup_ok) setup_ok = ds4_gpu_tensor_write(residual, 0, residual_host, hc_count * sizeof(float)) > 0;
+        if (setup_ok) setup_ok = ds4_gpu_tensor_write(post, 0, post_host, post_count * sizeof(float)) > 0;
+        if (setup_ok) setup_ok = ds4_gpu_tensor_write(comb, 0, comb_host, comb_count * sizeof(float)) > 0;
+
+        int direct_ok = setup_ok;
+        const double direct_start_ms = ds4_gpu_now_ms();
+        for (uint32_t iter = 0; direct_ok && iter < rounds; iter++) {
+            direct_ok = ds4_gpu_matmul_fp8_e4m3_e8m0_storage(
+                            direct_block, weight_opaque, scale_opaque, scale_bytes,
+                            in_dim, out_dim, input, n_tokens) != 0;
+            if (direct_ok) {
+                direct_ok = ds4_gpu_hc_expand_tensor(
+                                direct_hc, direct_block, residual, post, comb,
+                                out_dim, n_hc) != 0;
+            }
+        }
+        const double direct_ms = ds4_gpu_now_ms() - direct_start_ms;
+
+        int fused_ok = setup_ok;
+        const double fused_start_ms = ds4_gpu_now_ms();
+        for (uint32_t iter = 0; fused_ok && iter < rounds; iter++) {
+            fused_ok = ds4_gpu_matmul_fp8_e4m3_e8m0_hc_expand_tensor(
+                           fused_hc, fused_block, weight_opaque, scale_opaque, scale_bytes,
+                           in_dim, out_dim, input, residual, post, comb,
+                           out_dim, n_hc, n_tokens) != 0;
+        }
+        const double fused_ms = ds4_gpu_now_ms() - fused_start_ms;
+
+        int nostore_ok = setup_ok;
+        const double nostore_start_ms = ds4_gpu_now_ms();
+        for (uint32_t iter = 0; nostore_ok && iter < rounds; iter++) {
+            nostore_ok = ds4_gpu_matmul_fp8_e4m3_e8m0_hc_expand_tensor_ex(
+                           nostore_hc, nostore_block, weight_opaque, scale_opaque, scale_bytes,
+                           in_dim, out_dim, input, residual, post, comb,
+                           out_dim, n_hc, n_tokens, 0) != 0;
+        }
+        const double nostore_ms = ds4_gpu_now_ms() - nostore_start_ms;
+
+        if (direct_ok && fused_ok && nostore_ok &&
+            ds4_gpu_tensor_read(direct_block, 0, direct_block_host, block_count * sizeof(float)) > 0 &&
+            ds4_gpu_tensor_read(fused_block, 0, fused_block_host, block_count * sizeof(float)) > 0 &&
+            ds4_gpu_tensor_read(direct_hc, 0, direct_hc_host, hc_count * sizeof(float)) > 0 &&
+            ds4_gpu_tensor_read(fused_hc, 0, fused_hc_host, hc_count * sizeof(float)) > 0 &&
+            ds4_gpu_tensor_read(nostore_hc, 0, nostore_hc_host, hc_count * sizeof(float)) > 0) {
+            uint64_t block_mismatches = 0, hc_mismatches = 0;
+            float block_max_abs_delta = 0.0f, hc_max_abs_delta = 0.0f;
+            for (uint64_t i = 0; i < block_count; i++) {
+                const float delta = fabsf(direct_block_host[i] - fused_block_host[i]);
+                if (delta > block_max_abs_delta) block_max_abs_delta = delta;
+                if (delta > 1e-5f) block_mismatches++;
+            }
+            for (uint64_t i = 0; i < hc_count; i++) {
+                const float delta = fabsf(direct_hc_host[i] - fused_hc_host[i]);
+                if (delta > hc_max_abs_delta) hc_max_abs_delta = delta;
+                if (delta > 1e-5f) hc_mismatches++;
+            }
+            uint64_t nostore_hc_mismatches = 0;
+            float nostore_hc_max_abs_delta = 0.0f;
+            for (uint64_t i = 0; i < hc_count; i++) {
+                const float delta = fabsf(direct_hc_host[i] - nostore_hc_host[i]);
+                if (delta > nostore_hc_max_abs_delta) nostore_hc_max_abs_delta = delta;
+                if (delta > 1e-5f) nostore_hc_mismatches++;
+            }
+            const double direct_per = direct_ms / (double)rounds;
+            const double fused_per = fused_ms / (double)rounds;
+            const double nostore_per = nostore_ms / (double)rounds;
+            fprintf(stderr,
+                    "ds4: FP8-HC fuse canary direct=%.3f ms/round fused_store=%.3f ms/round fused_nostore=%.3f ms/round "
+                    "speedup_store=%.2fx speedup_nostore=%.2fx nostore_vs_store=%.2fx "
+                    "block_max_abs=%.3e block_mismatch=%llu/%llu hc_max_abs=%.3e hc_mismatch=%llu/%llu "
+                    "nostore_hc_max_abs=%.3e nostore_hc_mismatch=%llu/%llu %s\n",
+                    direct_per, fused_per, nostore_per,
+                    fused_per > 0.0 ? direct_per / fused_per : 0.0,
+                    nostore_per > 0.0 ? direct_per / nostore_per : 0.0,
+                    nostore_per > 0.0 ? fused_per / nostore_per : 0.0,
+                    (double)block_max_abs_delta,
+                    (unsigned long long)block_mismatches,
+                    (unsigned long long)block_count,
+                    (double)hc_max_abs_delta,
+                    (unsigned long long)hc_mismatches,
+                    (unsigned long long)hc_count,
+                    (double)nostore_hc_max_abs_delta,
+                    (unsigned long long)nostore_hc_mismatches,
+                    (unsigned long long)hc_count,
+                    (block_mismatches == 0 && hc_mismatches == 0 && nostore_hc_mismatches == 0) ? "PASS" : "DIVERGE");
+            rc = (block_mismatches == 0 && hc_mismatches == 0 && nostore_hc_mismatches == 0);
+        } else {
+            fprintf(stderr,
+                    "ds4: FP8-HC fuse canary failed setup_ok=%d direct_ok=%d fused_ok=%d nostore_ok=%d\n",
+                    setup_ok, direct_ok, fused_ok, nostore_ok);
+        }
+
+        ds4_gpu_tensor_free(input);
+        ds4_gpu_tensor_free(residual);
+        ds4_gpu_tensor_free(post);
+        ds4_gpu_tensor_free(comb);
+        ds4_gpu_tensor_free(direct_block);
+        ds4_gpu_tensor_free(fused_block);
+        ds4_gpu_tensor_free(nostore_block);
+        ds4_gpu_tensor_free(direct_hc);
+        ds4_gpu_tensor_free(fused_hc);
+        ds4_gpu_tensor_free(nostore_hc);
+        ds4_gpu_release_heap_buffer(weight_opaque);
+        ds4_gpu_release_heap_buffer(scale_opaque);
+    }
+
+    free(weight_host);
+    free(scale_host);
+    free(input_host);
+    free(residual_host);
+    free(post_host);
+    free(comb_host);
+    free(direct_block_host);
+    free(fused_block_host);
+    free(direct_hc_host);
+    free(fused_hc_host);
+    free(nostore_hc_host);
+    return rc;
 }
 
 /* ============================================================ */
@@ -31904,6 +33826,7 @@ int ds4_gpu_mtl4_mul_mv_f16_f32_canary(uint32_t M, uint32_t N) {
     }
 
     int rc = 0;
+    double gpu_ms = -1.0;
     @autoreleasepool {
         NSError *err = nil;
         id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
@@ -31969,8 +33892,10 @@ int ds4_gpu_mtl4_mul_mv_f16_f32_canary(uint32_t M, uint32_t N) {
                 MTL4CommitOptions *opts = [MTL4CommitOptions new];
                 [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
                 id<MTL4CommandBuffer> bufs[1] = {cb};
+                const double gpu_t0 = ds4_gpu_now_ms();
                 [g_polar_queue commit:bufs count:1 options:opts];
                 long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                gpu_ms = ds4_gpu_now_ms() - gpu_t0;
                 [residency endResidency];
                 if (waitRes == 0) {
                     memcpy(host_dst, dstBuf.contents, M * sizeof(float));
@@ -31991,9 +33916,9 @@ int ds4_gpu_mtl4_mul_mv_f16_f32_canary(uint32_t M, uint32_t N) {
         if (rel > 1e-4) mismatch++;
     }
     fprintf(stderr,
-        "ds4: mul_mv_f16_f32 MTL4 canary M=%u N=%u "
+        "ds4: mul_mv_f16_f32 MTL4 canary M=%u N=%u gpu_ms=%.3f "
         "dst[0]=%.5f (ref=%.5f) dst[end]=%.5f (ref=%.5f) mismatch=%d max_rel=%.4e\n",
-        M, N,
+        M, N, gpu_ms,
         (double)host_dst[0], (double)expected[0],
         (double)host_dst[M - 1], (double)expected[M - 1],
         mismatch, max_rel);
@@ -32157,6 +34082,7 @@ int ds4_gpu_mtl4_mul_mv_bf16_f32_canary(uint32_t M, uint32_t N) {
     }
 
     int rc = 0;
+    double gpu_ms = -1.0;
     @autoreleasepool {
         NSError *err = nil;
         id<MTLBuffer> argsBuf = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
@@ -32222,8 +34148,10 @@ int ds4_gpu_mtl4_mul_mv_bf16_f32_canary(uint32_t M, uint32_t N) {
                 MTL4CommitOptions *opts = [MTL4CommitOptions new];
                 [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
                 id<MTL4CommandBuffer> bufs[1] = {cb};
+                const double gpu_t0 = ds4_gpu_now_ms();
                 [g_polar_queue commit:bufs count:1 options:opts];
                 long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+                gpu_ms = ds4_gpu_now_ms() - gpu_t0;
                 [residency endResidency];
                 if (waitRes == 0) {
                     memcpy(host_dst, dstBuf.contents, M * sizeof(float));
@@ -32244,9 +34172,9 @@ int ds4_gpu_mtl4_mul_mv_bf16_f32_canary(uint32_t M, uint32_t N) {
         if (rel > 1e-4) mismatch++;
     }
     fprintf(stderr,
-        "ds4: mul_mv_bf16_f32 MTL4 canary M=%u N=%u "
+        "ds4: mul_mv_bf16_f32 MTL4 canary M=%u N=%u gpu_ms=%.3f "
         "dst[0]=%.5f (ref=%.5f) dst[end]=%.5f (ref=%.5f) mismatch=%d max_rel=%.4e\n",
-        M, N,
+        M, N, gpu_ms,
         (double)host_dst[0], (double)expected[0],
         (double)host_dst[M - 1], (double)expected[M - 1],
         mismatch, max_rel);
@@ -33696,6 +35624,33 @@ int ds4_gpu_mtl4_mul_mm_f16_f32_canary(uint32_t M, uint32_t N, uint32_t K) {
                 id<MTL4CommandBuffer> bufs[1] = {cb};
                 [g_polar_queue commit:bufs count:1 options:opts];
                 long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+                if (getenv("DS4_LENS_TIME")) {  /* agent1 2026-06-03: env-gated GPU-dispatch timing; reuses argTable/residency, no default-path change */
+                    const int _R = 12;
+                    struct timespec _t0, _t1; clock_gettime(CLOCK_MONOTONIC, &_t0);
+                    for (int _r = 0; _r < _R; _r++) {
+                        id<MTL4CommandBuffer> _cb = [g_device newCommandBuffer];
+                        [_cb beginCommandBufferWithAllocator:g_polar_allocator];
+                        [_cb useResidencySet:residency];
+                        id<MTL4ComputeCommandEncoder> _enc = [_cb computeCommandEncoder];
+                        [_enc setComputePipelineState:g_mul_mm_f16_f32_mtl4_pipeline];
+                        [_enc setArgumentTable:argTable];
+                        [_enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
+                        [_enc dispatchThreadgroups:MTLSizeMake(N / 32, M / 64, 1)
+                            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                        [_enc endEncoding];
+                        [_cb endCommandBuffer];
+                        dispatch_semaphore_t _sem = dispatch_semaphore_create(0);
+                        MTL4CommitOptions *_opts = [MTL4CommitOptions new];
+                        [_opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(_sem); }];
+                        id<MTL4CommandBuffer> _bufs[1] = {_cb};
+                        [g_polar_queue commit:_bufs count:1 options:_opts];
+                        dispatch_semaphore_wait(_sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+                    }
+                    clock_gettime(CLOCK_MONOTONIC, &_t1);
+                    double _ms = ((_t1.tv_sec - _t0.tv_sec) * 1e3 + (_t1.tv_nsec - _t0.tv_nsec) / 1e6) / _R;
+                    double _tf = 2.0 * (double)M * (double)N * (double)K / (_ms / 1e3) / 1e12;
+                    fprintf(stderr, "ds4: LENS_TIME M=%u N=%u K=%u %.3f ms/dispatch %.2f TFLOP/s\n", M, N, K, _ms, _tf);
+                }
                 [residency endResidency];
                 if (waitRes == 0) {
                     memcpy(host_c, cBuf.contents, c_total * sizeof(float));
@@ -46169,6 +48124,17 @@ static uint16_t ds4_m1r_u16(const uint8_t *p) {
     return (uint16_t)p[0] | (uint16_t)((uint16_t)p[1] << 8);
 }
 
+static float ds4_d8m_ref_mid_at(const ds4_d8m_file *file,
+                                const ds4_d8m_record *rec,
+                                const float *mid,
+                                uint32_t index) {
+    if (file && rec && (rec->flags & 1u) && rec->scale_offset && rec->scale_bytes >= (index + 1u) * 2u) {
+        const uint8_t *half = file->map + rec->scale_offset + (uint64_t)index * 2u;
+        return mid[index] * ds4_m1r_f16_to_f32(ds4_m1r_u16(half));
+    }
+    return mid[index];
+}
+
 static uint32_t ds4_m1r_u32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -46324,6 +48290,17 @@ static NSString * const k_d8m_down_sum_selected_mtl4_msl =
      "static ulong d8m_u64(device const uchar *p) {\n"
      "  return ulong(d8m_u32(p)) | (ulong(d8m_u32(p + 4)) << 32ul);\n"
      "}\n"
+     "static ulong d8m_scale_offset(device const uchar *rec, uint record_bytes) {\n"
+     "  if (record_bytes < 56u) return 0ul;\n"
+     "  const uint flags = d8m_u32(rec + 52);\n"
+     "  if ((flags & 1u) == 0u) return 0ul;\n"
+     "  return d8m_u64(rec + 40);\n"
+     "}\n"
+     "static float d8m_mid_value(device const uchar *pack, ulong scale_off, device const float *slot_mid, uint idx) {\n"
+     "  if (scale_off == 0ul) return slot_mid[idx];\n"
+     "  const device half *inv_scale = (const device half *)(pack + scale_off);\n"
+     "  return slot_mid[idx] * float(inv_scale[idx]);\n"
+     "}\n"
      "struct D8MDownArgs { uint rows; uint in_dim; uint n_selected; uint table_offset; uint record_bytes; uint mid_slot_stride; };\n"
      "kernel void d8m_down_sum_selected(\n"
      "  device const uchar *pack     [[buffer(0)]],\n"
@@ -46346,6 +48323,7 @@ static NSString * const k_d8m_down_sum_selected_mtl4_msl =
      "    const uint bits = d8m_u32(rec + 8);\n"
      "    const ulong cb_off = d8m_u64(rec + 16);\n"
      "    const ulong ix_off = d8m_u64(rec + 24);\n"
+     "    const ulong scale_off = d8m_scale_offset(rec, args.record_bytes);\n"
      "    if (k == 0u || bits == 0u) continue;\n"
      "    const uint mask = (1u << bits) - 1u;\n"
      "    const device float *slot_mid = mid + ulong(slot) * ulong(args.mid_slot_stride);\n"
@@ -46360,10 +48338,10 @@ static NSString * const k_d8m_down_sum_selected_mtl4_msl =
      "      if (code >= k) continue;\n"
      "      const device half *cb = (const device half *)(pack + cb_off + ulong(code) * 16ul);\n"
      "      const uint x_base = block_col << 3;\n"
-     "      acc += float(cb[0]) * slot_mid[x_base + 0] + float(cb[1]) * slot_mid[x_base + 1] +\n"
-     "             float(cb[2]) * slot_mid[x_base + 2] + float(cb[3]) * slot_mid[x_base + 3] +\n"
-     "             float(cb[4]) * slot_mid[x_base + 4] + float(cb[5]) * slot_mid[x_base + 5] +\n"
-     "             float(cb[6]) * slot_mid[x_base + 6] + float(cb[7]) * slot_mid[x_base + 7];\n"
+     "      acc += float(cb[0]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 0) + float(cb[1]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 1) +\n"
+     "             float(cb[2]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 2) + float(cb[3]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 3) +\n"
+     "             float(cb[4]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 4) + float(cb[5]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 5) +\n"
+     "             float(cb[6]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 6) + float(cb[7]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 7);\n"
      "    }\n"
      "  }\n"
      "  acc = simd_sum(acc);\n"
@@ -46399,6 +48377,7 @@ static NSString * const k_d8m_down_sum_selected_mtl4_msl =
      "    const uint bits = d8m_u32(rec + 8);\n"
      "    const ulong cb_off = d8m_u64(rec + 16);\n"
      "    const ulong ix_off = d8m_u64(rec + 24);\n"
+     "    const ulong scale_off = d8m_scale_offset(rec, args.record_bytes);\n"
      "    if (k == 0u || bits == 0u) continue;\n"
      "    const uint mask = (1u << bits) - 1u;\n"
      "    const device float *slot_mid = mid + ulong(token) * ulong(args.mid_token_stride) + ulong(slot) * ulong(args.mid_slot_stride);\n"
@@ -46413,10 +48392,10 @@ static NSString * const k_d8m_down_sum_selected_mtl4_msl =
      "      if (code >= k) continue;\n"
      "      const device half *cb = (const device half *)(pack + cb_off + ulong(code) * 16ul);\n"
      "      const uint x_base = block_col << 3;\n"
-     "      acc += float(cb[0]) * slot_mid[x_base + 0] + float(cb[1]) * slot_mid[x_base + 1] +\n"
-     "             float(cb[2]) * slot_mid[x_base + 2] + float(cb[3]) * slot_mid[x_base + 3] +\n"
-     "             float(cb[4]) * slot_mid[x_base + 4] + float(cb[5]) * slot_mid[x_base + 5] +\n"
-     "             float(cb[6]) * slot_mid[x_base + 6] + float(cb[7]) * slot_mid[x_base + 7];\n"
+     "      acc += float(cb[0]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 0) + float(cb[1]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 1) +\n"
+     "             float(cb[2]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 2) + float(cb[3]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 3) +\n"
+     "             float(cb[4]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 4) + float(cb[5]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 5) +\n"
+     "             float(cb[6]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 6) + float(cb[7]) * d8m_mid_value(pack, scale_off, slot_mid, x_base + 7);\n"
      "    }\n"
      "  }\n"
      "  acc = simd_sum(acc);\n"
@@ -46452,19 +48431,20 @@ static NSString * const k_d8m_down_sum_selected_mtl4_msl =
      "    const uint bits = d8m_u32(rec + 8);\n"
      "    const ulong cb_off = d8m_u64(rec + 16);\n"
      "    const ulong ix_off = d8m_u64(rec + 24);\n"
+     "    const ulong scale_off = d8m_scale_offset(rec, args.record_bytes);\n"
      "    if (k == 0u || bits == 0u) continue;\n"
      "    const uint mask = (1u << bits) - 1u;\n"
      "    const device float *slot_mid = mid + ulong(token) * ulong(args.mid_token_stride) + ulong(slot) * ulong(args.mid_slot_stride);\n"
      "    for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {\n"
      "      const uint x_base = block_col << 3;\n"
-     "      const float m0 = slot_mid[x_base + 0];\n"
-     "      const float m1 = slot_mid[x_base + 1];\n"
-     "      const float m2 = slot_mid[x_base + 2];\n"
-     "      const float m3 = slot_mid[x_base + 3];\n"
-     "      const float m4 = slot_mid[x_base + 4];\n"
-     "      const float m5 = slot_mid[x_base + 5];\n"
-     "      const float m6 = slot_mid[x_base + 6];\n"
-     "      const float m7 = slot_mid[x_base + 7];\n"
+     "      const float m0 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 0);\n"
+     "      const float m1 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 1);\n"
+     "      const float m2 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 2);\n"
+     "      const float m3 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 3);\n"
+     "      const float m4 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 4);\n"
+     "      const float m5 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 5);\n"
+     "      const float m6 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 6);\n"
+     "      const float m7 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 7);\n"
      "      for (uint rr = 0u; rr < 4u; rr++) {\n"
      "        const uint row = row_base + rr;\n"
      "        if (row >= args.rows) continue;\n"
@@ -46499,6 +48479,152 @@ static NSString * const k_d8m_down_sum_selected_mtl4_msl =
      "      }\n"
      "    }\n"
      "  }\n"
+     "}\n"
+     "kernel void d8m_down_sum_selected_batch_tile8(\n"
+     "  device const uchar *pack     [[buffer(0)]],\n"
+     "  device const float *mid      [[buffer(1)]],\n"
+     "  device const uint  *selected [[buffer(2)]],\n"
+     "  device float       *out      [[buffer(3)]],\n"
+     "  constant D8MDownBatchArgs &args [[buffer(4)]],\n"
+     "  threadgroup float *partial   [[threadgroup(0)]],\n"
+     "  uint tid [[thread_index_in_threadgroup]],\n"
+     "  ushort tiisg [[thread_index_in_simdgroup]],\n"
+     "  ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+     "  uint2 pos [[threadgroup_position_in_grid]]) {\n"
+     "  const uint row_base = pos.x << 3;\n"
+     "  const uint token = pos.y;\n"
+     "  if (token >= args.n_tokens) return;\n"
+     "  const uint blocks_per_row = args.in_dim >> 3;\n"
+     "  float acc[8];\n"
+     "  for (uint rr = 0u; rr < 8u; rr++) acc[rr] = 0.0f;\n"
+     "  for (uint slot = 0u; slot < args.n_selected; slot++) {\n"
+     "    const uint expert = selected[token * args.n_selected + slot];\n"
+     "    device const uchar *rec = pack + args.table_offset + expert * args.record_bytes;\n"
+     "    const uint k = d8m_u32(rec + 4);\n"
+     "    const uint bits = d8m_u32(rec + 8);\n"
+     "    const ulong cb_off = d8m_u64(rec + 16);\n"
+     "    const ulong ix_off = d8m_u64(rec + 24);\n"
+     "    const ulong scale_off = d8m_scale_offset(rec, args.record_bytes);\n"
+     "    if (k == 0u || bits == 0u) continue;\n"
+     "    const uint mask = (1u << bits) - 1u;\n"
+     "    const device float *slot_mid = mid + ulong(token) * ulong(args.mid_token_stride) + ulong(slot) * ulong(args.mid_slot_stride);\n"
+     "    for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {\n"
+     "      const uint x_base = block_col << 3;\n"
+     "      const float m0 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 0);\n"
+     "      const float m1 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 1);\n"
+     "      const float m2 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 2);\n"
+     "      const float m3 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 3);\n"
+     "      const float m4 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 4);\n"
+     "      const float m5 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 5);\n"
+     "      const float m6 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 6);\n"
+     "      const float m7 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 7);\n"
+     "      for (uint rr = 0u; rr < 8u; rr++) {\n"
+     "        const uint row = row_base + rr;\n"
+     "        if (row >= args.rows) continue;\n"
+     "        const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);\n"
+     "        const ulong bit_off = block_index * ulong(bits);\n"
+     "        const ulong byte_off = bit_off >> 3;\n"
+     "        const uint shift = uint(bit_off & 7ul);\n"
+     "        device const uchar *ix = pack + ix_off + byte_off;\n"
+     "        const uint w = uint(ix[0]) | (uint(ix[1]) << 8u) | (uint(ix[2]) << 16u) | (uint(ix[3]) << 24u);\n"
+     "        const uint code = (w >> shift) & mask;\n"
+     "        if (code >= k) continue;\n"
+     "        const device half *cb = (const device half *)(pack + cb_off + ulong(code) * 16ul);\n"
+     "        acc[rr] += float(cb[0]) * m0 + float(cb[1]) * m1 +\n"
+     "                   float(cb[2]) * m2 + float(cb[3]) * m3 +\n"
+     "                   float(cb[4]) * m4 + float(cb[5]) * m5 +\n"
+     "                   float(cb[6]) * m6 + float(cb[7]) * m7;\n"
+     "      }\n"
+     "    }\n"
+     "  }\n"
+     "  for (uint rr = 0u; rr < 8u; rr++) {\n"
+     "    acc[rr] = simd_sum(acc[rr]);\n"
+     "    if (tiisg == 0u) partial[rr * 8u + sgitg] = acc[rr];\n"
+     "  }\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  if (tid == 0u) {\n"
+     "    for (uint rr = 0u; rr < 8u; rr++) {\n"
+     "      const uint row = row_base + rr;\n"
+     "      if (row < args.rows) {\n"
+     "        float total = 0.0f;\n"
+     "        for (uint sg = 0u; sg < 8u; sg++) total += partial[rr * 8u + sg];\n"
+     "        out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] = total;\n"
+     "      }\n"
+     "    }\n"
+     "  }\n"
+     "}\n"
+     "kernel void d8m_down_sum_selected_batch_tile16(\n"
+     "  device const uchar *pack     [[buffer(0)]],\n"
+     "  device const float *mid      [[buffer(1)]],\n"
+     "  device const uint  *selected [[buffer(2)]],\n"
+     "  device float       *out      [[buffer(3)]],\n"
+     "  constant D8MDownBatchArgs &args [[buffer(4)]],\n"
+     "  threadgroup float *partial   [[threadgroup(0)]],\n"
+     "  uint tid [[thread_index_in_threadgroup]],\n"
+     "  ushort tiisg [[thread_index_in_simdgroup]],\n"
+     "  ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+     "  uint2 pos [[threadgroup_position_in_grid]]) {\n"
+     "  const uint row_base = pos.x << 4;\n"
+     "  const uint token = pos.y;\n"
+     "  if (token >= args.n_tokens) return;\n"
+     "  const uint blocks_per_row = args.in_dim >> 3;\n"
+     "  float acc[16];\n"
+     "  for (uint rr = 0u; rr < 16u; rr++) acc[rr] = 0.0f;\n"
+     "  for (uint slot = 0u; slot < args.n_selected; slot++) {\n"
+     "    const uint expert = selected[token * args.n_selected + slot];\n"
+     "    device const uchar *rec = pack + args.table_offset + expert * args.record_bytes;\n"
+     "    const uint k = d8m_u32(rec + 4);\n"
+     "    const uint bits = d8m_u32(rec + 8);\n"
+     "    const ulong cb_off = d8m_u64(rec + 16);\n"
+     "    const ulong ix_off = d8m_u64(rec + 24);\n"
+     "    const ulong scale_off = d8m_scale_offset(rec, args.record_bytes);\n"
+     "    if (k == 0u || bits == 0u) continue;\n"
+     "    const uint mask = (1u << bits) - 1u;\n"
+     "    const device float *slot_mid = mid + ulong(token) * ulong(args.mid_token_stride) + ulong(slot) * ulong(args.mid_slot_stride);\n"
+     "    for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {\n"
+     "      const uint x_base = block_col << 3;\n"
+     "      const float m0 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 0);\n"
+     "      const float m1 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 1);\n"
+     "      const float m2 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 2);\n"
+     "      const float m3 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 3);\n"
+     "      const float m4 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 4);\n"
+     "      const float m5 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 5);\n"
+     "      const float m6 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 6);\n"
+     "      const float m7 = d8m_mid_value(pack, scale_off, slot_mid, x_base + 7);\n"
+     "      for (uint rr = 0u; rr < 16u; rr++) {\n"
+     "        const uint row = row_base + rr;\n"
+     "        if (row >= args.rows) continue;\n"
+     "        const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);\n"
+     "        const ulong bit_off = block_index * ulong(bits);\n"
+     "        const ulong byte_off = bit_off >> 3;\n"
+     "        const uint shift = uint(bit_off & 7ul);\n"
+     "        device const uchar *ix = pack + ix_off + byte_off;\n"
+     "        const uint w = uint(ix[0]) | (uint(ix[1]) << 8u) | (uint(ix[2]) << 16u) | (uint(ix[3]) << 24u);\n"
+     "        const uint code = (w >> shift) & mask;\n"
+     "        if (code >= k) continue;\n"
+     "        const device half *cb = (const device half *)(pack + cb_off + ulong(code) * 16ul);\n"
+     "        acc[rr] += float(cb[0]) * m0 + float(cb[1]) * m1 +\n"
+     "                   float(cb[2]) * m2 + float(cb[3]) * m3 +\n"
+     "                   float(cb[4]) * m4 + float(cb[5]) * m5 +\n"
+     "                   float(cb[6]) * m6 + float(cb[7]) * m7;\n"
+     "      }\n"
+     "    }\n"
+     "  }\n"
+     "  for (uint rr = 0u; rr < 16u; rr++) {\n"
+     "    acc[rr] = simd_sum(acc[rr]);\n"
+     "    if (tiisg == 0u) partial[rr * 8u + sgitg] = acc[rr];\n"
+     "  }\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  if (tid == 0u) {\n"
+     "    for (uint rr = 0u; rr < 16u; rr++) {\n"
+     "      const uint row = row_base + rr;\n"
+     "      if (row < args.rows) {\n"
+     "        float total = 0.0f;\n"
+     "        for (uint sg = 0u; sg < 8u; sg++) total += partial[rr * 8u + sg];\n"
+     "        out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] = total;\n"
+     "      }\n"
+     "    }\n"
+     "  }\n"
      "}\n";
 
 static id<MTLComputePipelineState> g_d8m_down_sum_selected_mtl4_pipeline;
@@ -46508,6 +48634,8 @@ static id<MTLComputePipelineState> g_d8m_down_sum_selected_batch_mtl4_pipeline;
 static int g_d8m_down_sum_selected_batch_mtl4_init_attempted;
 static int g_d8m_down_sum_selected_batch_mtl4_init_ok;
 static id<MTLComputePipelineState> g_d8m_down_sum_selected_batch_tile4_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8m_down_sum_selected_batch_tile8_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8m_down_sum_selected_batch_tile16_mtl4_pipeline;
 
 static int ds4_d8m_down_sum_selected_mtl4_pipeline_init(void) {
     if (g_d8m_down_sum_selected_mtl4_init_attempted)
@@ -46536,9 +48664,20 @@ static int ds4_d8m_down_sum_selected_batch_mtl4_pipeline_init(void) {
         @"ds4_d8m_down_sum_selected_batch_tile4_mtl4",
         @"d8m_down_sum_selected_batch_tile4",
         256, NULL, 0);
+    g_d8m_down_sum_selected_batch_tile8_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_d8m_down_sum_selected_mtl4_msl,
+        @"ds4_d8m_down_sum_selected_batch_tile8_mtl4",
+        @"d8m_down_sum_selected_batch_tile8",
+        256, NULL, 0);
+    g_d8m_down_sum_selected_batch_tile16_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_d8m_down_sum_selected_mtl4_msl,
+        @"ds4_d8m_down_sum_selected_batch_tile16_mtl4",
+        @"d8m_down_sum_selected_batch_tile16",
+        256, NULL, 0);
     g_d8m_down_sum_selected_batch_mtl4_init_ok =
         (g_d8m_down_sum_selected_batch_mtl4_pipeline &&
-         g_d8m_down_sum_selected_batch_tile4_mtl4_pipeline) ? 1 : 0;
+         g_d8m_down_sum_selected_batch_tile4_mtl4_pipeline &&
+         g_d8m_down_sum_selected_batch_tile8_mtl4_pipeline) ? 1 : 0;
     return g_d8m_down_sum_selected_batch_mtl4_init_ok;
 }
 
@@ -46588,15 +48727,15 @@ int ds4_gpu_mtl4_d8m_down_selected_canary(const char *d8m_path,
                 const uint32_t code = ds4_d8m_code_at(&file, &rec, block_index);
                 if (code >= rec.k) continue;
                 const uint8_t *half = file.map + rec.codebook_offset + (uint64_t)code * 16u;
-                const float *xb = slot_mid + (uint64_t)block_col * 8u;
-                sum += ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 0u)) * xb[0] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 2u)) * xb[1] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 4u)) * xb[2] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 6u)) * xb[3] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 8u)) * xb[4] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 10u)) * xb[5] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * xb[6] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * xb[7];
+                const uint32_t x_base = block_col * 8u;
+                sum += ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 0u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 0u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 2u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 1u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 4u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 2u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 6u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 3u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 8u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 4u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 10u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 5u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 6u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 7u);
             }
         }
         ref[row] = (float)sum;
@@ -46625,7 +48764,7 @@ int ds4_gpu_mtl4_d8m_down_selected_canary(const char *d8m_path,
                                                      options:MTLResourceStorageModeShared];
         struct args_t {
             uint32_t rows, in_dim, n_selected, table_offset, record_bytes, mid_slot_stride;
-        } args = { rows, ds4_down_in_dim, n_experts, 4096u, 40u, ds4_down_in_dim };
+        } args = { rows, ds4_down_in_dim, n_experts, file.table_offset, file.record_bytes, ds4_down_in_dim };
         id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args) options:MTLResourceStorageModeShared];
         id<MTLResidencySet> rs = nil;
         if (packBuf && midBuf && selBuf && outBuf && argsBuf) {
@@ -46775,15 +48914,15 @@ int ds4_gpu_mtl4_d8m_down_selected_batch_canary(const char *d8m_path,
                     const uint32_t code = ds4_d8m_code_at(&file, &rec, block_index);
                     if (code >= rec.k) continue;
                     const uint8_t *half = file.map + rec.codebook_offset + (uint64_t)code * 16u;
-                    const float *xb = slot_mid + (uint64_t)block_col * 8u;
-                    sum += ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 0u)) * xb[0] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 2u)) * xb[1] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 4u)) * xb[2] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 6u)) * xb[3] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 8u)) * xb[4] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 10u)) * xb[5] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * xb[6] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * xb[7];
+                    const uint32_t x_base = block_col * 8u;
+                    sum += ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 0u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 0u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 2u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 1u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 4u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 2u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 6u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 3u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 8u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 4u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 10u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 5u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 6u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * ds4_d8m_ref_mid_at(&file, &rec, slot_mid, x_base + 7u);
                 }
             }
             ref[(uint64_t)token * rows + row] = (float)sum;
@@ -46799,7 +48938,9 @@ int ds4_gpu_mtl4_d8m_down_selected_batch_canary(const char *d8m_path,
     double timed_ms = 0.0;
     float dbg_ref[4] = {0};
     float dbg_gpu[4] = {0};
-    const int down_tile4 = ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE4") > 0;
+    const int down_tile16 = ds4_gpu_d8m_down_tile16_enabled(n_tokens) && g_d8m_down_sum_selected_batch_tile16_mtl4_pipeline;
+    const int down_tile8 = !down_tile16 && ds4_gpu_d8m_down_tile8_enabled();
+    const int down_tile4 = !down_tile16 && !down_tile8 && ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE4") > 0;
     @autoreleasepool {
         id<MTLBuffer> packBuf = [g_device newBufferWithBytesNoCopy:(void *)file.map
                                                             length:file.size
@@ -46815,7 +48956,7 @@ int ds4_gpu_mtl4_d8m_down_selected_batch_canary(const char *d8m_path,
                                                      options:MTLResourceStorageModeShared];
         struct args_t {
             uint32_t rows, in_dim, n_selected, n_tokens, table_offset, record_bytes, mid_token_stride, mid_slot_stride, out_token_stride;
-        } args = { rows, ds4_down_in_dim, n_experts, n_tokens, 4096u, 40u,
+        } args = { rows, ds4_down_in_dim, n_experts, n_tokens, file.table_offset, file.record_bytes,
                    n_experts * ds4_down_in_dim, ds4_down_in_dim, rows };
         id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args) options:MTLResourceStorageModeShared];
         id<MTLResidencySet> rs = nil;
@@ -46845,11 +48986,13 @@ int ds4_gpu_mtl4_d8m_down_selected_batch_canary(const char *d8m_path,
                 [at setAddress:outBuf.gpuAddress atIndex:3];
                 [at setAddress:argsBuf.gpuAddress atIndex:4];
                 [enc setComputePipelineState:
+                    down_tile16 ? g_d8m_down_sum_selected_batch_tile16_mtl4_pipeline :
+                    down_tile8 ? g_d8m_down_sum_selected_batch_tile8_mtl4_pipeline :
                     down_tile4 ? g_d8m_down_sum_selected_batch_tile4_mtl4_pipeline
                                : g_d8m_down_sum_selected_batch_mtl4_pipeline];
                 [enc setArgumentTable:at];
-                [enc setThreadgroupMemoryLength:(down_tile4 ? 32u : 8u) * sizeof(float) atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(down_tile4 ? ((rows + 3u) >> 2) : rows, n_tokens, 1)
+                [enc setThreadgroupMemoryLength:(down_tile16 ? 128u : (down_tile8 ? 64u : (down_tile4 ? 32u : 8u))) * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(down_tile16 ? ((rows + 15u) >> 4) : (down_tile8 ? ((rows + 7u) >> 3) : (down_tile4 ? ((rows + 3u) >> 2) : rows)), n_tokens, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
                 [cb endCommandBuffer];
@@ -46892,8 +49035,8 @@ int ds4_gpu_mtl4_d8m_down_selected_batch_canary(const char *d8m_path,
         }
     }
     fprintf(stderr,
-            "ds4: d8m_down_selected_batch_canary nsel=%u tokens=%u rows=%u rounds=%u down_tile4=%d pack=%.2f MiB gpu %.3f ms total (%.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
-            n_experts, n_tokens, rows, rounds, down_tile4, (double)file.size / 1048576.0, timed_ms,
+            "ds4: d8m_down_selected_batch_canary nsel=%u tokens=%u rows=%u rounds=%u down_tile4=%d down_tile8=%d down_tile16=%d pack=%.2f MiB gpu %.3f ms total (%.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
+            n_experts, n_tokens, rows, rounds, down_tile4, down_tile8, down_tile16, (double)file.size / 1048576.0, timed_ms,
             timed_ms * 1000.0 / ((double)n_tokens * (double)rows * (double)rounds),
             mismatch, gpu_zero, gpu_sentinel, max_abs, max_rel, ok);
     for (uint32_t i = 0; i < 4u && i < out_count; i++) {
@@ -46907,6 +49050,3815 @@ int ds4_gpu_mtl4_d8m_down_selected_batch_canary(const char *d8m_path,
     free(selected_batch);
     ds4_d8m_close(&file);
     return ok;
+}
+
+static NSString * const k_d8f_gateup_swiglu_selected_mtl4_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "static uint d8f_u32(device const uchar *p) {\n"
+     "  return uint(p[0]) | (uint(p[1]) << 8u) | (uint(p[2]) << 16u) | (uint(p[3]) << 24u);\n"
+     "}\n"
+     "static ulong d8f_u64(device const uchar *p) {\n"
+     "  return ulong(d8f_u32(p)) | (ulong(d8f_u32(p + 4)) << 32ul);\n"
+     "}\n"
+     "struct D8FGateUpArgs { uint rows; uint in_dim; uint n_selected; uint table_offset; uint record_bytes; uint mid_slot_stride; float clamp; };\n"
+     "kernel void d8f_gateup_swiglu_selected(\n"
+     "  device const uchar *pack     [[buffer(0)]],\n"
+     "  device const float *x        [[buffer(1)]],\n"
+     "  device const uint  *selected [[buffer(2)]],\n"
+     "  device float       *mid      [[buffer(3)]],\n"
+     "  constant D8FGateUpArgs &args [[buffer(4)]],\n"
+     "  threadgroup float *partial   [[threadgroup(0)]],\n"
+     "  uint tid [[thread_index_in_threadgroup]],\n"
+     "  ushort tiisg [[thread_index_in_simdgroup]],\n"
+     "  ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+     "  uint2 pos [[threadgroup_position_in_grid]]) {\n"
+     "  const uint row = pos.x;\n"
+     "  const uint slot = pos.y;\n"
+     "  if (row >= args.rows || slot >= args.n_selected) return;\n"
+     "  const uint expert = selected[slot];\n"
+     "  const uint blocks_per_row = args.in_dim >> 3;\n"
+     "  device const uchar *gate_rec = pack + args.table_offset + (expert) * args.record_bytes;\n"
+     "  device const uchar *up_rec = pack + args.table_offset + (256u + expert) * args.record_bytes;\n"
+     "  const uint gate_k = d8f_u32(gate_rec + 8);\n"
+     "  const uint gate_bits = d8f_u32(gate_rec + 12);\n"
+     "  const ulong gate_cb_off = d8f_u64(gate_rec + 24);\n"
+     "  const ulong gate_ix_off = d8f_u64(gate_rec + 32);\n"
+     "  const uint up_k = d8f_u32(up_rec + 8);\n"
+     "  const uint up_bits = d8f_u32(up_rec + 12);\n"
+     "  const ulong up_cb_off = d8f_u64(up_rec + 24);\n"
+     "  const ulong up_ix_off = d8f_u64(up_rec + 32);\n"
+     "  if (gate_k == 0u || up_k == 0u || gate_bits == 0u || up_bits == 0u) return;\n"
+     "  const uint gate_mask = (1u << gate_bits) - 1u;\n"
+     "  const uint up_mask = (1u << up_bits) - 1u;\n"
+     "  float gate_acc = 0.0f;\n"
+     "  float up_acc = 0.0f;\n"
+     "  for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {\n"
+     "    const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);\n"
+     "    const uint x_base = block_col << 3;\n"
+     "    const float x0 = x[x_base + 0u];\n"
+     "    const float x1 = x[x_base + 1u];\n"
+     "    const float x2 = x[x_base + 2u];\n"
+     "    const float x3 = x[x_base + 3u];\n"
+     "    const float x4 = x[x_base + 4u];\n"
+     "    const float x5 = x[x_base + 5u];\n"
+     "    const float x6 = x[x_base + 6u];\n"
+     "    const float x7 = x[x_base + 7u];\n"
+     "    const ulong gate_bit_off = block_index * ulong(gate_bits);\n"
+     "    const ulong gate_byte_off = gate_bit_off >> 3;\n"
+     "    const uint gate_shift = uint(gate_bit_off & 7ul);\n"
+     "    device const uchar *gate_ix = pack + gate_ix_off + gate_byte_off;\n"
+     "    const uint gate_w = uint(gate_ix[0]) | (uint(gate_ix[1]) << 8u) | (uint(gate_ix[2]) << 16u) | (uint(gate_ix[3]) << 24u);\n"
+     "    const uint gate_code = (gate_w >> gate_shift) & gate_mask;\n"
+     "    if (gate_code < gate_k) {\n"
+     "      const device half *cb = (const device half *)(pack + gate_cb_off + ulong(gate_code) * 16ul);\n"
+     "      gate_acc += float(cb[0]) * x0 + float(cb[1]) * x1 + float(cb[2]) * x2 + float(cb[3]) * x3 +\n"
+     "                  float(cb[4]) * x4 + float(cb[5]) * x5 + float(cb[6]) * x6 + float(cb[7]) * x7;\n"
+     "    }\n"
+     "    const ulong up_bit_off = block_index * ulong(up_bits);\n"
+     "    const ulong up_byte_off = up_bit_off >> 3;\n"
+     "    const uint up_shift = uint(up_bit_off & 7ul);\n"
+     "    device const uchar *up_ix = pack + up_ix_off + up_byte_off;\n"
+     "    const uint up_w = uint(up_ix[0]) | (uint(up_ix[1]) << 8u) | (uint(up_ix[2]) << 16u) | (uint(up_ix[3]) << 24u);\n"
+     "    const uint up_code = (up_w >> up_shift) & up_mask;\n"
+     "    if (up_code < up_k) {\n"
+     "      const device half *cb = (const device half *)(pack + up_cb_off + ulong(up_code) * 16ul);\n"
+     "      up_acc += float(cb[0]) * x0 + float(cb[1]) * x1 + float(cb[2]) * x2 + float(cb[3]) * x3 +\n"
+     "                float(cb[4]) * x4 + float(cb[5]) * x5 + float(cb[6]) * x6 + float(cb[7]) * x7;\n"
+     "    }\n"
+     "  }\n"
+     "  gate_acc = simd_sum(gate_acc);\n"
+     "  up_acc = simd_sum(up_acc);\n"
+     "  if (tiisg == 0u) {\n"
+     "    partial[sgitg] = gate_acc;\n"
+     "    partial[8u + sgitg] = up_acc;\n"
+     "  }\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  if (tid == 0u) {\n"
+     "    float gate_total = 0.0f;\n"
+     "    float up_total = 0.0f;\n"
+     "    for (uint sg = 0u; sg < 8u; sg++) {\n"
+     "      gate_total += partial[sg];\n"
+     "      up_total += partial[8u + sg];\n"
+     "    }\n"
+     "    gate_total = min(gate_total, args.clamp);\n"
+     "    up_total = clamp(up_total, -args.clamp, args.clamp);\n"
+     "    mid[ulong(slot) * ulong(args.mid_slot_stride) + ulong(row)] = (gate_total / (1.0f + exp(-gate_total))) * up_total;\n"
+     "  }\n"
+     "}\n"
+     "struct D8FGateUpBatchArgs { uint rows; uint in_dim; uint n_selected; uint n_tokens; uint table_offset; uint record_bytes; uint mid_slot_stride; uint mid_token_stride; uint x_token_stride; uint selected_token_stride; float clamp; };\n"
+     "kernel void d8f_gateup_swiglu_selected_batch(\n"
+     "  device const uchar *pack          [[buffer(0)]],\n"
+     "  device const float *x_base_all    [[buffer(1)]],\n"
+     "  device const uint  *selected      [[buffer(2)]],\n"
+     "  device float       *mid           [[buffer(3)]],\n"
+     "  constant D8FGateUpBatchArgs &args [[buffer(4)]],\n"
+     "  threadgroup float *partial        [[threadgroup(0)]],\n"
+     "  uint tid [[thread_index_in_threadgroup]],\n"
+     "  ushort tiisg [[thread_index_in_simdgroup]],\n"
+     "  ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+     "  uint3 pos [[threadgroup_position_in_grid]]) {\n"
+     "  const uint row = pos.x;\n"
+     "  const uint slot = pos.y;\n"
+     "  const uint token = pos.z;\n"
+     "  if (row >= args.rows || slot >= args.n_selected || token >= args.n_tokens) return;\n"
+     "  device const float *x = x_base_all + ulong(token) * ulong(args.x_token_stride);\n"
+     "  const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];\n"
+     "  const uint blocks_per_row = args.in_dim >> 3;\n"
+     "  device const uchar *gate_rec = pack + args.table_offset + (expert) * args.record_bytes;\n"
+     "  device const uchar *up_rec = pack + args.table_offset + (256u + expert) * args.record_bytes;\n"
+     "  const uint gate_k = d8f_u32(gate_rec + 8);\n"
+     "  const uint gate_bits = d8f_u32(gate_rec + 12);\n"
+     "  const ulong gate_cb_off = d8f_u64(gate_rec + 24);\n"
+     "  const ulong gate_ix_off = d8f_u64(gate_rec + 32);\n"
+     "  const uint up_k = d8f_u32(up_rec + 8);\n"
+     "  const uint up_bits = d8f_u32(up_rec + 12);\n"
+     "  const ulong up_cb_off = d8f_u64(up_rec + 24);\n"
+     "  const ulong up_ix_off = d8f_u64(up_rec + 32);\n"
+     "  if (gate_k == 0u || up_k == 0u || gate_bits == 0u || up_bits == 0u) return;\n"
+     "  const uint gate_mask = (1u << gate_bits) - 1u;\n"
+     "  const uint up_mask = (1u << up_bits) - 1u;\n"
+     "  float gate_acc = 0.0f;\n"
+     "  float up_acc = 0.0f;\n"
+     "  for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {\n"
+     "    const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);\n"
+     "    const uint x_base = block_col << 3;\n"
+     "    const float x0 = x[x_base + 0u];\n"
+     "    const float x1 = x[x_base + 1u];\n"
+     "    const float x2 = x[x_base + 2u];\n"
+     "    const float x3 = x[x_base + 3u];\n"
+     "    const float x4 = x[x_base + 4u];\n"
+     "    const float x5 = x[x_base + 5u];\n"
+     "    const float x6 = x[x_base + 6u];\n"
+     "    const float x7 = x[x_base + 7u];\n"
+     "    const ulong gate_bit_off = block_index * ulong(gate_bits);\n"
+     "    const ulong gate_byte_off = gate_bit_off >> 3;\n"
+     "    const uint gate_shift = uint(gate_bit_off & 7ul);\n"
+     "    device const uchar *gate_ix = pack + gate_ix_off + gate_byte_off;\n"
+     "    const uint gate_w = uint(gate_ix[0]) | (uint(gate_ix[1]) << 8u) | (uint(gate_ix[2]) << 16u) | (uint(gate_ix[3]) << 24u);\n"
+     "    const uint gate_code = (gate_w >> gate_shift) & gate_mask;\n"
+     "    if (gate_code < gate_k) {\n"
+     "      const device half *cb = (const device half *)(pack + gate_cb_off + ulong(gate_code) * 16ul);\n"
+     "      gate_acc += float(cb[0]) * x0 + float(cb[1]) * x1 + float(cb[2]) * x2 + float(cb[3]) * x3 +\n"
+     "                  float(cb[4]) * x4 + float(cb[5]) * x5 + float(cb[6]) * x6 + float(cb[7]) * x7;\n"
+     "    }\n"
+     "    const ulong up_bit_off = block_index * ulong(up_bits);\n"
+     "    const ulong up_byte_off = up_bit_off >> 3;\n"
+     "    const uint up_shift = uint(up_bit_off & 7ul);\n"
+     "    device const uchar *up_ix = pack + up_ix_off + up_byte_off;\n"
+     "    const uint up_w = uint(up_ix[0]) | (uint(up_ix[1]) << 8u) | (uint(up_ix[2]) << 16u) | (uint(up_ix[3]) << 24u);\n"
+     "    const uint up_code = (up_w >> up_shift) & up_mask;\n"
+     "    if (up_code < up_k) {\n"
+     "      const device half *cb = (const device half *)(pack + up_cb_off + ulong(up_code) * 16ul);\n"
+     "      up_acc += float(cb[0]) * x0 + float(cb[1]) * x1 + float(cb[2]) * x2 + float(cb[3]) * x3 +\n"
+     "                float(cb[4]) * x4 + float(cb[5]) * x5 + float(cb[6]) * x6 + float(cb[7]) * x7;\n"
+     "    }\n"
+     "  }\n"
+     "  gate_acc = simd_sum(gate_acc);\n"
+     "  up_acc = simd_sum(up_acc);\n"
+     "  if (tiisg == 0u) { partial[sgitg] = gate_acc; partial[8u + sgitg] = up_acc; }\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  if (tid == 0u) {\n"
+     "    float gate_total = 0.0f;\n"
+     "    float up_total = 0.0f;\n"
+     "    for (uint sg = 0u; sg < 8u; sg++) { gate_total += partial[sg]; up_total += partial[8u + sg]; }\n"
+     "    gate_total = min(gate_total, args.clamp);\n"
+     "    up_total = clamp(up_total, -args.clamp, args.clamp);\n"
+     "    mid[ulong(token) * ulong(args.mid_token_stride) + ulong(slot) * ulong(args.mid_slot_stride) + ulong(row)] = (gate_total / (1.0f + exp(-gate_total))) * up_total;\n"
+     "  }\n"
+     "}\n"
+     "kernel void d8f_gateup_swiglu_selected_batch_tile4(\n"
+     "  device const uchar *pack          [[buffer(0)]],\n"
+     "  device const float *x_base_all    [[buffer(1)]],\n"
+     "  device const uint  *selected      [[buffer(2)]],\n"
+     "  device float       *mid           [[buffer(3)]],\n"
+     "  constant D8FGateUpBatchArgs &args [[buffer(4)]],\n"
+     "  threadgroup float *partial        [[threadgroup(0)]],\n"
+     "  uint tid [[thread_index_in_threadgroup]],\n"
+     "  ushort tiisg [[thread_index_in_simdgroup]],\n"
+     "  ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+     "  uint3 pos [[threadgroup_position_in_grid]]) {\n"
+     "  const uint row_base = pos.x << 2;\n"
+     "  const uint slot = pos.y;\n"
+     "  const uint token = pos.z;\n"
+     "  if (row_base >= args.rows || slot >= args.n_selected || token >= args.n_tokens) return;\n"
+     "  device const float *x = x_base_all + ulong(token) * ulong(args.x_token_stride);\n"
+     "  const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];\n"
+     "  const uint blocks_per_row = args.in_dim >> 3;\n"
+     "  device const uchar *gate_rec = pack + args.table_offset + (expert) * args.record_bytes;\n"
+     "  device const uchar *up_rec = pack + args.table_offset + (256u + expert) * args.record_bytes;\n"
+     "  const uint gate_k = d8f_u32(gate_rec + 8);\n"
+     "  const uint gate_bits = d8f_u32(gate_rec + 12);\n"
+     "  const ulong gate_cb_off = d8f_u64(gate_rec + 24);\n"
+     "  const ulong gate_ix_off = d8f_u64(gate_rec + 32);\n"
+     "  const uint up_k = d8f_u32(up_rec + 8);\n"
+     "  const uint up_bits = d8f_u32(up_rec + 12);\n"
+     "  const ulong up_cb_off = d8f_u64(up_rec + 24);\n"
+     "  const ulong up_ix_off = d8f_u64(up_rec + 32);\n"
+     "  if (gate_k == 0u || up_k == 0u || gate_bits == 0u || up_bits == 0u) return;\n"
+     "  const uint gate_mask = (1u << gate_bits) - 1u;\n"
+     "  const uint up_mask = (1u << up_bits) - 1u;\n"
+     "  float gate_acc[4];\n"
+     "  float up_acc[4];\n"
+     "  for (uint rr = 0u; rr < 4u; rr++) { gate_acc[rr] = 0.0f; up_acc[rr] = 0.0f; }\n"
+     "  for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {\n"
+     "    const uint x_base = block_col << 3;\n"
+     "    const float x0 = x[x_base + 0u];\n"
+     "    const float x1 = x[x_base + 1u];\n"
+     "    const float x2 = x[x_base + 2u];\n"
+     "    const float x3 = x[x_base + 3u];\n"
+     "    const float x4 = x[x_base + 4u];\n"
+     "    const float x5 = x[x_base + 5u];\n"
+     "    const float x6 = x[x_base + 6u];\n"
+     "    const float x7 = x[x_base + 7u];\n"
+     "    for (uint rr = 0u; rr < 4u; rr++) {\n"
+     "      const uint row = row_base + rr;\n"
+     "      if (row >= args.rows) continue;\n"
+     "      const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);\n"
+     "      const ulong gate_bit_off = block_index * ulong(gate_bits);\n"
+     "      const ulong gate_byte_off = gate_bit_off >> 3;\n"
+     "      const uint gate_shift = uint(gate_bit_off & 7ul);\n"
+     "      device const uchar *gate_ix = pack + gate_ix_off + gate_byte_off;\n"
+     "      const uint gate_w = uint(gate_ix[0]) | (uint(gate_ix[1]) << 8u) | (uint(gate_ix[2]) << 16u) | (uint(gate_ix[3]) << 24u);\n"
+     "      const uint gate_code = (gate_w >> gate_shift) & gate_mask;\n"
+     "      if (gate_code < gate_k) {\n"
+     "        const device half *cb = (const device half *)(pack + gate_cb_off + ulong(gate_code) * 16ul);\n"
+     "        gate_acc[rr] += float(cb[0]) * x0 + float(cb[1]) * x1 + float(cb[2]) * x2 + float(cb[3]) * x3 +\n"
+     "                        float(cb[4]) * x4 + float(cb[5]) * x5 + float(cb[6]) * x6 + float(cb[7]) * x7;\n"
+     "      }\n"
+     "      const ulong up_bit_off = block_index * ulong(up_bits);\n"
+     "      const ulong up_byte_off = up_bit_off >> 3;\n"
+     "      const uint up_shift = uint(up_bit_off & 7ul);\n"
+     "      device const uchar *up_ix = pack + up_ix_off + up_byte_off;\n"
+     "      const uint up_w = uint(up_ix[0]) | (uint(up_ix[1]) << 8u) | (uint(up_ix[2]) << 16u) | (uint(up_ix[3]) << 24u);\n"
+     "      const uint up_code = (up_w >> up_shift) & up_mask;\n"
+     "      if (up_code < up_k) {\n"
+     "        const device half *cb = (const device half *)(pack + up_cb_off + ulong(up_code) * 16ul);\n"
+     "        up_acc[rr] += float(cb[0]) * x0 + float(cb[1]) * x1 + float(cb[2]) * x2 + float(cb[3]) * x3 +\n"
+     "                      float(cb[4]) * x4 + float(cb[5]) * x5 + float(cb[6]) * x6 + float(cb[7]) * x7;\n"
+     "      }\n"
+     "    }\n"
+     "  }\n"
+     "  for (uint rr = 0u; rr < 4u; rr++) {\n"
+     "    gate_acc[rr] = simd_sum(gate_acc[rr]);\n"
+     "    up_acc[rr] = simd_sum(up_acc[rr]);\n"
+     "    if (tiisg == 0u) { partial[rr * 16u + sgitg] = gate_acc[rr]; partial[rr * 16u + 8u + sgitg] = up_acc[rr]; }\n"
+     "  }\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  if (tid == 0u) {\n"
+     "    for (uint rr = 0u; rr < 4u; rr++) {\n"
+     "      const uint row = row_base + rr;\n"
+     "      if (row >= args.rows) continue;\n"
+     "      float gate_total = 0.0f;\n"
+     "      float up_total = 0.0f;\n"
+     "      for (uint sg = 0u; sg < 8u; sg++) { gate_total += partial[rr * 16u + sg]; up_total += partial[rr * 16u + 8u + sg]; }\n"
+     "      gate_total = min(gate_total, args.clamp);\n"
+     "      up_total = clamp(up_total, -args.clamp, args.clamp);\n"
+     "      mid[ulong(token) * ulong(args.mid_token_stride) + ulong(slot) * ulong(args.mid_slot_stride) + ulong(row)] = (gate_total / (1.0f + exp(-gate_total))) * up_total;\n"
+     "    }\n"
+     "  }\n"
+     "}\n"
+     "kernel void d8f_gateup_swiglu_selected_batch_weighted(\n"
+     "  device const uchar *pack          [[buffer(0)]],\n"
+     "  device const float *x_base_all    [[buffer(1)]],\n"
+     "  device const uint  *selected      [[buffer(2)]],\n"
+     "  device float       *mid           [[buffer(3)]],\n"
+     "  constant D8FGateUpBatchArgs &args [[buffer(4)]],\n"
+     "  device const float *route_weights [[buffer(5)]],\n"
+     "  threadgroup float *partial        [[threadgroup(0)]],\n"
+     "  uint tid [[thread_index_in_threadgroup]],\n"
+     "  ushort tiisg [[thread_index_in_simdgroup]],\n"
+     "  ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+     "  uint3 pos [[threadgroup_position_in_grid]]) {\n"
+     "  const uint row = pos.x;\n"
+     "  const uint slot = pos.y;\n"
+     "  const uint token = pos.z;\n"
+     "  if (row >= args.rows || slot >= args.n_selected || token >= args.n_tokens) return;\n"
+     "  device const float *x = x_base_all + ulong(token) * ulong(args.x_token_stride);\n"
+     "  const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];\n"
+     "  const float route_weight = route_weights[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];\n"
+     "  const uint blocks_per_row = args.in_dim >> 3;\n"
+     "  device const uchar *gate_rec = pack + args.table_offset + (expert) * args.record_bytes;\n"
+     "  device const uchar *up_rec = pack + args.table_offset + (256u + expert) * args.record_bytes;\n"
+     "  const uint gate_k = d8f_u32(gate_rec + 8);\n"
+     "  const uint gate_bits = d8f_u32(gate_rec + 12);\n"
+     "  const ulong gate_cb_off = d8f_u64(gate_rec + 24);\n"
+     "  const ulong gate_ix_off = d8f_u64(gate_rec + 32);\n"
+     "  const uint up_k = d8f_u32(up_rec + 8);\n"
+     "  const uint up_bits = d8f_u32(up_rec + 12);\n"
+     "  const ulong up_cb_off = d8f_u64(up_rec + 24);\n"
+     "  const ulong up_ix_off = d8f_u64(up_rec + 32);\n"
+     "  if (route_weight == 0.0f || gate_k == 0u || up_k == 0u || gate_bits == 0u || up_bits == 0u) { mid[ulong(token) * ulong(args.mid_token_stride) + ulong(slot) * ulong(args.mid_slot_stride) + ulong(row)] = 0.0f; return; }\n"
+     "  const uint gate_mask = (1u << gate_bits) - 1u;\n"
+     "  const uint up_mask = (1u << up_bits) - 1u;\n"
+     "  float gate_acc = 0.0f;\n"
+     "  float up_acc = 0.0f;\n"
+     "  for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {\n"
+     "    const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);\n"
+     "    const uint x_base = block_col << 3;\n"
+     "    const float x0 = x[x_base + 0u]; const float x1 = x[x_base + 1u]; const float x2 = x[x_base + 2u]; const float x3 = x[x_base + 3u];\n"
+     "    const float x4 = x[x_base + 4u]; const float x5 = x[x_base + 5u]; const float x6 = x[x_base + 6u]; const float x7 = x[x_base + 7u];\n"
+     "    const ulong gate_bit_off = block_index * ulong(gate_bits); const ulong gate_byte_off = gate_bit_off >> 3; const uint gate_shift = uint(gate_bit_off & 7ul);\n"
+     "    device const uchar *gate_ix = pack + gate_ix_off + gate_byte_off;\n"
+     "    const uint gate_w = uint(gate_ix[0]) | (uint(gate_ix[1]) << 8u) | (uint(gate_ix[2]) << 16u) | (uint(gate_ix[3]) << 24u);\n"
+     "    const uint gate_code = (gate_w >> gate_shift) & gate_mask;\n"
+     "    if (gate_code < gate_k) { const device half *cb = (const device half *)(pack + gate_cb_off + ulong(gate_code) * 16ul); gate_acc += float(cb[0]) * x0 + float(cb[1]) * x1 + float(cb[2]) * x2 + float(cb[3]) * x3 + float(cb[4]) * x4 + float(cb[5]) * x5 + float(cb[6]) * x6 + float(cb[7]) * x7; }\n"
+     "    const ulong up_bit_off = block_index * ulong(up_bits); const ulong up_byte_off = up_bit_off >> 3; const uint up_shift = uint(up_bit_off & 7ul);\n"
+     "    device const uchar *up_ix = pack + up_ix_off + up_byte_off;\n"
+     "    const uint up_w = uint(up_ix[0]) | (uint(up_ix[1]) << 8u) | (uint(up_ix[2]) << 16u) | (uint(up_ix[3]) << 24u);\n"
+     "    const uint up_code = (up_w >> up_shift) & up_mask;\n"
+     "    if (up_code < up_k) { const device half *cb = (const device half *)(pack + up_cb_off + ulong(up_code) * 16ul); up_acc += float(cb[0]) * x0 + float(cb[1]) * x1 + float(cb[2]) * x2 + float(cb[3]) * x3 + float(cb[4]) * x4 + float(cb[5]) * x5 + float(cb[6]) * x6 + float(cb[7]) * x7; }\n"
+     "  }\n"
+     "  gate_acc = simd_sum(gate_acc); up_acc = simd_sum(up_acc);\n"
+     "  if (tiisg == 0u) { partial[sgitg] = gate_acc; partial[8u + sgitg] = up_acc; }\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  if (tid == 0u) { float gate_total = 0.0f; float up_total = 0.0f; for (uint sg = 0u; sg < 8u; sg++) { gate_total += partial[sg]; up_total += partial[8u + sg]; } gate_total = min(gate_total, args.clamp); up_total = clamp(up_total, -args.clamp, args.clamp); mid[ulong(token) * ulong(args.mid_token_stride) + ulong(slot) * ulong(args.mid_slot_stride) + ulong(row)] = route_weight * (gate_total / (1.0f + exp(-gate_total))) * up_total; }\n"
+     "}\n";
+
+static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_tile4_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_weighted_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_recbuf_mtl4_pipeline;
+static int g_d8f_gateup_swiglu_selected_mtl4_init_attempted;
+static int g_d8f_gateup_swiglu_selected_mtl4_init_ok;
+
+static int ds4_d8f_gateup_swiglu_selected_mtl4_pipeline_init(void) {
+    if (g_d8f_gateup_swiglu_selected_mtl4_init_attempted)
+        return g_d8f_gateup_swiglu_selected_mtl4_init_ok;
+    g_d8f_gateup_swiglu_selected_mtl4_init_attempted = 1;
+    g_d8f_gateup_swiglu_selected_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_d8f_gateup_swiglu_selected_mtl4_msl,
+        @"ds4_d8f_gateup_swiglu_selected_mtl4",
+        @"d8f_gateup_swiglu_selected",
+        256, NULL, 0);
+    g_d8f_gateup_swiglu_selected_batch_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_d8f_gateup_swiglu_selected_mtl4_msl,
+        @"ds4_d8f_gateup_swiglu_selected_batch_mtl4",
+        @"d8f_gateup_swiglu_selected_batch",
+        256, NULL, 0);
+    g_d8f_gateup_swiglu_selected_batch_tile4_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_d8f_gateup_swiglu_selected_mtl4_msl,
+        @"ds4_d8f_gateup_swiglu_selected_batch_tile4_mtl4",
+        @"d8f_gateup_swiglu_selected_batch_tile4",
+        256, NULL, 0);
+    if (ds4_gpu_env_bool("DS4_D8F_PREWEIGHT_MID") > 0) {
+        g_d8f_gateup_swiglu_selected_batch_weighted_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+            k_d8f_gateup_swiglu_selected_mtl4_msl,
+            @"ds4_d8f_gateup_swiglu_selected_batch_weighted_mtl4",
+            @"d8f_gateup_swiglu_selected_batch_weighted",
+            256, NULL, 0);
+    }
+    NSString *d8f_embedded = ds4_gpu_embedded_metal_source(@"metal/d8f.metal");
+    if (d8f_embedded) {
+        g_d8f_gateup_swiglu_selected_batch_recbuf_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+            d8f_embedded,
+            @"ds4_d8f_gateup_swiglu_selected_batch_recbuf_mtl4",
+            @"d8f_gateup_swiglu_selected_batch_recbuf",
+            256, NULL, 0);
+    }
+    g_d8f_gateup_swiglu_selected_mtl4_init_ok =
+        (g_d8f_gateup_swiglu_selected_mtl4_pipeline &&
+         g_d8f_gateup_swiglu_selected_batch_mtl4_pipeline) ? 1 : 0;
+    return g_d8f_gateup_swiglu_selected_mtl4_init_ok;
+}
+
+static float ds4_d8f_ref_dot(const ds4_d8f_file *file,
+                             const ds4_d8f_record *rec,
+                             const float *x,
+                             uint32_t row,
+                             uint32_t in_dim) {
+    if (!file || !rec || !x || rec->k == 0u || rec->bits == 0u || in_dim == 0u || (in_dim & 7u)) return 0.0f;
+    const uint32_t blocks_per_row = in_dim >> 3;
+    uint32_t local_row = row;
+    if (rec->row_block != 0u) {
+        const uint32_t row_base = rec->row_block * 128u;
+        if (row < row_base || row >= row_base + 128u) return 0.0f;
+        local_row = row - row_base;
+    }
+    double sum = 0.0;
+    for (uint32_t block_col = 0; block_col < blocks_per_row; block_col++) {
+        const uint64_t block_index = (uint64_t)local_row * (uint64_t)blocks_per_row + (uint64_t)block_col;
+        const uint32_t code = ds4_d8f_code_at(file, rec, block_index);
+        if (code >= rec->k) continue;
+        const uint8_t *half = file->map + rec->codebook_offset + (uint64_t)code * 16u;
+        const uint32_t x_base = block_col << 3;
+        sum += ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 0u)) * x[x_base + 0u] +
+               ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 2u)) * x[x_base + 1u] +
+               ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 4u)) * x[x_base + 2u] +
+               ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 6u)) * x[x_base + 3u] +
+               ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 8u)) * x[x_base + 4u] +
+               ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 10u)) * x[x_base + 5u] +
+               ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * x[x_base + 6u] +
+               ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * x[x_base + 7u];
+    }
+    return (float)sum;
+}
+
+int ds4_gpu_mtl4_d8f_gateup_selected_canary(const char *d8f_path,
+                                            const uint32_t *experts,
+                                            uint32_t n_experts,
+                                            uint32_t rows,
+                                            uint32_t rounds,
+                                            float swiglu_limit) {
+    enum { ds4_selected_expert_cap = 6, ds4_gateup_in_dim = 4096, ds4_gateup_out_dim = 2048, ds4_d8f_table_offset = 4096 };
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_d8f_gateup_swiglu_selected_mtl4_pipeline_init()) return 0;
+    if (!d8f_path || !experts || n_experts == 0 || n_experts > ds4_selected_expert_cap) return 0;
+    if (rows == 0 || rows > ds4_gateup_out_dim) rows = 128u;
+    if (rounds == 0) rounds = 1u;
+    if (!(swiglu_limit > 0.0f)) swiglu_limit = 10.0f;
+    ds4_d8f_file file;
+    if (!ds4_d8f_open(d8f_path, &file)) return 0;
+    const uint32_t blocks_per_row = ds4_gateup_in_dim >> 3;
+    for (uint32_t slot = 0; slot < n_experts; slot++) {
+        ds4_d8f_record gate, up;
+        if (!ds4_d8f_get_record(&file, DS4_D8F_GATE, experts[slot], &gate) ||
+            !ds4_d8f_get_record(&file, DS4_D8F_UP, experts[slot], &up)) {
+            fprintf(stderr, "ds4_d8f: selected gate/up expert %u missing\n", experts[slot]);
+            ds4_d8f_close(&file);
+            return 0;
+        }
+        const uint64_t gate_blocks = ((uint64_t)gate.index_bytes * 8ull) / (uint64_t)gate.bits;
+        const uint64_t up_blocks = ((uint64_t)up.index_bytes * 8ull) / (uint64_t)up.bits;
+        if (gate.block != 8u || up.block != 8u ||
+            gate_blocks < (uint64_t)rows * blocks_per_row ||
+            up_blocks < (uint64_t)rows * blocks_per_row) {
+            fprintf(stderr, "ds4_d8f: selected gate/up expert %u too short for rows=%u\n", experts[slot], rows);
+            ds4_d8f_close(&file);
+            return 0;
+        }
+    }
+    float *x = (float *)malloc((size_t)ds4_gateup_in_dim * sizeof(float));
+    float *ref = (float *)malloc((size_t)n_experts * rows * sizeof(float));
+    if (!x || !ref) {
+        free(ref); free(x); ds4_d8f_close(&file);
+        return 0;
+    }
+    for (uint32_t i = 0; i < ds4_gateup_in_dim; i++) {
+        x[i] = 0.35f * sinf((float)i * 0.011f) + 0.17f * cosf((float)i * 0.019f);
+    }
+    for (uint32_t slot = 0; slot < n_experts; slot++) {
+        ds4_d8f_record gate, up;
+        ds4_d8f_get_record(&file, DS4_D8F_GATE, experts[slot], &gate);
+        ds4_d8f_get_record(&file, DS4_D8F_UP, experts[slot], &up);
+        for (uint32_t row = 0; row < rows; row++) {
+            ds4_d8f_record gate_overlay, up_overlay;
+            const uint32_t row_block = row >> 7;
+            const ds4_d8f_record *gate_ref =
+                ds4_d8f_get_gateup_overlay_record(&file, DS4_D8F_GATE, experts[slot], row_block, &gate_overlay)
+                ? &gate_overlay : &gate;
+            const ds4_d8f_record *up_ref =
+                ds4_d8f_get_gateup_overlay_record(&file, DS4_D8F_UP, experts[slot], row_block, &up_overlay)
+                ? &up_overlay : &up;
+            float gv = ds4_d8f_ref_dot(&file, gate_ref, x, row, ds4_gateup_in_dim);
+            float uv = ds4_d8f_ref_dot(&file, up_ref, x, row, ds4_gateup_in_dim);
+            if (gv > swiglu_limit) gv = swiglu_limit;
+            if (uv > swiglu_limit) uv = swiglu_limit;
+            if (uv < -swiglu_limit) uv = -swiglu_limit;
+            ref[(uint64_t)slot * rows + row] = (gv / (1.0f + expf(-gv))) * uv;
+        }
+    }
+    int ok = 0;
+    int mismatch = 0;
+    int gpu_zero = 0;
+    int gpu_sentinel = 0;
+    double max_abs = 0.0;
+    double max_rel = 0.0;
+    double timed_ms = 0.0;
+    float dbg_ref[4] = {0};
+    float dbg_gpu[4] = {0};
+    @autoreleasepool {
+        id<MTLBuffer> packBuf = [g_device newBufferWithBytesNoCopy:(void *)file.map
+                                                            length:file.size
+                                                           options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
+        id<MTLBuffer> xBuf = [g_device newBufferWithBytes:x
+                                                   length:(NSUInteger)ds4_gateup_in_dim * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf = [g_device newBufferWithBytes:experts
+                                                     length:(NSUInteger)n_experts * sizeof(uint32_t)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> midBuf = [g_device newBufferWithLength:(NSUInteger)n_experts * rows * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        struct args_t {
+            uint32_t rows, in_dim, n_selected, table_offset, record_bytes, mid_slot_stride;
+            float clamp;
+        } args = { rows, ds4_gateup_in_dim, n_experts, ds4_d8f_table_offset, file.record_bytes, rows, swiglu_limit };
+        id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args) options:MTLResourceStorageModeShared];
+        id<MTLResidencySet> rs = nil;
+        if (packBuf && xBuf && selBuf && midBuf && argsBuf) {
+            MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+            rsDesc.initialCapacity = 5;
+            NSError *err = nil;
+            rs = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        }
+        if (rs) {
+            id<MTLAllocation> allocs[5] = { packBuf, xBuf, selBuf, midBuf, argsBuf };
+            [rs addAllocations:allocs count:5];
+            [rs commit];
+            ds4_residency_request_checked(rs, __func__);
+            [g_polar_queue addResidencySet:rs];
+            float *mid_init = (float *)midBuf.contents;
+            for (uint64_t i = 0; i < (uint64_t)n_experts * rows; i++) mid_init[i] = -1234567.0f;
+            void (^dispatch_once)(void) = ^{
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:rs];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(5);
+                [at setAddress:packBuf.gpuAddress atIndex:0];
+                [at setAddress:xBuf.gpuAddress atIndex:1];
+                [at setAddress:selBuf.gpuAddress atIndex:2];
+                [at setAddress:midBuf.gpuAddress atIndex:3];
+                [at setAddress:argsBuf.gpuAddress atIndex:4];
+                [enc setComputePipelineState:g_d8f_gateup_swiglu_selected_mtl4_pipeline];
+                [enc setArgumentTable:at];
+                [enc setThreadgroupMemoryLength:16u * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(rows, n_experts, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+                ds4_mtl4_pool_release(at, 5);
+            };
+            dispatch_once();
+            mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+            const uint64_t t0 = mach_absolute_time();
+            for (uint32_t r = 0; r < rounds; r++) dispatch_once();
+            const uint64_t t1 = mach_absolute_time();
+            timed_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+            const float *gpu = (const float *)midBuf.contents;
+            const uint64_t count = (uint64_t)n_experts * rows;
+            for (uint64_t i = 0; i < count; i++) {
+                if (i < 4u) {
+                    dbg_ref[i] = ref[i];
+                    dbg_gpu[i] = gpu[i];
+                }
+                if (gpu[i] == 0.0f) gpu_zero++;
+                if (gpu[i] == -1234567.0f) gpu_sentinel++;
+                const double err_abs = fabs((double)gpu[i] - (double)ref[i]);
+                const double denom = fabs((double)ref[i]) > 1e-4 ? fabs((double)ref[i]) : 1e-4;
+                const double err_rel = err_abs / denom;
+                if (err_abs > max_abs) max_abs = err_abs;
+                if (err_rel > max_rel) max_rel = err_rel;
+                if (err_abs > 1e-3 && err_rel > 1e-3) mismatch++;
+            }
+            ok = (mismatch == 0);
+        } else {
+            fprintf(stderr, "ds4_d8f: gateup Metal buffer or residency allocation failed\n");
+        }
+        if (rs) {
+            [g_polar_queue removeResidencySet:rs];
+            [rs endResidency];
+        }
+    }
+    fprintf(stderr,
+            "ds4: d8f_gateup_selected_canary nsel=%u rows=%u rounds=%u clamp=%.1f pack=%.2f MiB gpu %.3f ms total (%.3f us/row-slot-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
+            n_experts, rows, rounds, swiglu_limit, (double)file.size / 1048576.0, timed_ms,
+            timed_ms * 1000.0 / ((double)rows * (double)n_experts * (double)rounds),
+            mismatch, gpu_zero, gpu_sentinel, max_abs, max_rel, ok);
+    for (uint32_t i = 0; i < rows * n_experts && i < 4u; i++) {
+        fprintf(stderr, " mid%u_ref=%.7g mid%u_gpu=%.7g", i, dbg_ref[i], i, dbg_gpu[i]);
+    }
+    fprintf(stderr, " experts=");
+    for (uint32_t slot = 0; slot < n_experts; slot++) fprintf(stderr, "%s%u", slot ? "," : "", experts[slot]);
+    fprintf(stderr, "\n");
+    free(ref);
+    free(x);
+    ds4_d8f_close(&file);
+    return ok;
+}
+
+static NSString * const k_d8f_down_sum_selected_mtl4_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "static uint d8f_u32(device const uchar *p) {\n"
+     "  return uint(p[0]) | (uint(p[1]) << 8u) | (uint(p[2]) << 16u) | (uint(p[3]) << 24u);\n"
+     "}\n"
+     "static ulong d8f_u64(device const uchar *p) {\n"
+     "  return ulong(d8f_u32(p)) | (ulong(d8f_u32(p + 4)) << 32ul);\n"
+     "}\n"
+     "static ulong d8f_scale_offset(device const uchar *rec) {\n"
+     "  const uint flags = d8f_u32(rec + 60);\n"
+     "  if ((flags & 1u) == 0u) return 0ul;\n"
+     "  return d8f_u64(rec + 40);\n"
+     "}\n"
+     "static float d8f_mid_value(device const uchar *pack, ulong scale_off, device const float *slot_mid, uint idx) {\n"
+     "  if (scale_off == 0ul) return slot_mid[idx];\n"
+     "  const device half *inv_scale = (const device half *)(pack + scale_off);\n"
+     "  return slot_mid[idx] * float(inv_scale[idx]);\n"
+     "}\n"
+     "struct D8FDownArgs { uint rows; uint in_dim; uint n_selected; uint table_offset; uint record_bytes; uint mid_slot_stride; };\n"
+     "kernel void d8f_down_sum_selected(\n"
+     "  device const uchar *pack     [[buffer(0)]],\n"
+     "  device const float *mid      [[buffer(1)]],\n"
+     "  device const uint  *selected [[buffer(2)]],\n"
+     "  device float       *out      [[buffer(3)]],\n"
+     "  constant D8FDownArgs &args   [[buffer(4)]],\n"
+     "  threadgroup float *partial   [[threadgroup(0)]],\n"
+     "  uint tid [[thread_index_in_threadgroup]],\n"
+     "  ushort tiisg [[thread_index_in_simdgroup]],\n"
+     "  ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+     "  uint row [[threadgroup_position_in_grid]]) {\n"
+     "  if (row >= args.rows) return;\n"
+     "  const uint blocks_per_row = args.in_dim >> 3;\n"
+     "  float acc = 0.0f;\n"
+     "  for (uint slot = 0u; slot < args.n_selected; slot++) {\n"
+     "    const uint expert = selected[slot];\n"
+     "    device const uchar *rec = pack + args.table_offset + (512u + expert) * args.record_bytes;\n"
+     "    const uint k = d8f_u32(rec + 8);\n"
+     "    const uint bits = d8f_u32(rec + 12);\n"
+     "    const ulong cb_off = d8f_u64(rec + 24);\n"
+     "    const ulong ix_off = d8f_u64(rec + 32);\n"
+     "    const ulong scale_off = d8f_scale_offset(rec);\n"
+     "    if (k == 0u || bits == 0u) continue;\n"
+     "    const uint mask = (1u << bits) - 1u;\n"
+     "    const device float *slot_mid = mid + ulong(slot) * ulong(args.mid_slot_stride);\n"
+     "    for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {\n"
+     "      const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);\n"
+     "      const ulong bit_off = block_index * ulong(bits);\n"
+     "      const ulong byte_off = bit_off >> 3;\n"
+     "      const uint shift = uint(bit_off & 7ul);\n"
+     "      device const uchar *ix = pack + ix_off + byte_off;\n"
+     "      const uint w = uint(ix[0]) | (uint(ix[1]) << 8u) | (uint(ix[2]) << 16u) | (uint(ix[3]) << 24u);\n"
+     "      const uint code = (w >> shift) & mask;\n"
+     "      if (code >= k) continue;\n"
+     "      const device half *cb = (const device half *)(pack + cb_off + ulong(code) * 16ul);\n"
+     "      const uint x_base = block_col << 3;\n"
+     "      acc += float(cb[0]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 0u) +\n"
+     "             float(cb[1]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 1u) +\n"
+     "             float(cb[2]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 2u) +\n"
+     "             float(cb[3]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 3u) +\n"
+     "             float(cb[4]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 4u) +\n"
+     "             float(cb[5]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 5u) +\n"
+     "             float(cb[6]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 6u) +\n"
+     "             float(cb[7]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 7u);\n"
+     "    }\n"
+     "  }\n"
+     "  acc = simd_sum(acc);\n"
+     "  if (tiisg == 0u) partial[sgitg] = acc;\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  if (tid == 0u) {\n"
+     "    float total = 0.0f;\n"
+     "    for (uint sg = 0u; sg < 8u; sg++) total += partial[sg];\n"
+     "    out[row] = total;\n"
+     "  }\n"
+     "}\n"
+     "kernel void d8f_down_sum_selected_weighted(\n"
+     "  device const uchar *pack          [[buffer(0)]],\n"
+     "  device const float *mid           [[buffer(1)]],\n"
+     "  device const uint  *selected      [[buffer(2)]],\n"
+     "  device float       *out           [[buffer(3)]],\n"
+     "  constant D8FDownArgs &args        [[buffer(4)]],\n"
+     "  device const float *route_weights [[buffer(5)]],\n"
+     "  threadgroup float *partial        [[threadgroup(0)]],\n"
+     "  uint tid [[thread_index_in_threadgroup]],\n"
+     "  ushort tiisg [[thread_index_in_simdgroup]],\n"
+     "  ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+     "  uint row [[threadgroup_position_in_grid]]) {\n"
+     "  if (row >= args.rows) return;\n"
+     "  const uint blocks_per_row = args.in_dim >> 3;\n"
+     "  float acc = 0.0f;\n"
+     "  for (uint slot = 0u; slot < args.n_selected; slot++) {\n"
+     "    const float rw = route_weights[slot];\n"
+     "    const uint expert = selected[slot];\n"
+     "    device const uchar *rec = pack + args.table_offset + (512u + expert) * args.record_bytes;\n"
+     "    const uint k = d8f_u32(rec + 8);\n"
+     "    const uint bits = d8f_u32(rec + 12);\n"
+     "    const ulong cb_off = d8f_u64(rec + 24);\n"
+     "    const ulong ix_off = d8f_u64(rec + 32);\n"
+     "    const ulong scale_off = d8f_scale_offset(rec);\n"
+     "    if (rw == 0.0f || k == 0u || bits == 0u) continue;\n"
+     "    const uint mask = (1u << bits) - 1u;\n"
+     "    const device float *slot_mid = mid + ulong(slot) * ulong(args.mid_slot_stride);\n"
+     "    for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {\n"
+     "      const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);\n"
+     "      const ulong bit_off = block_index * ulong(bits);\n"
+     "      const ulong byte_off = bit_off >> 3;\n"
+     "      const uint shift = uint(bit_off & 7ul);\n"
+     "      device const uchar *ix = pack + ix_off + byte_off;\n"
+     "      const uint w = uint(ix[0]) | (uint(ix[1]) << 8u) | (uint(ix[2]) << 16u) | (uint(ix[3]) << 24u);\n"
+     "      const uint code = (w >> shift) & mask;\n"
+     "      if (code >= k) continue;\n"
+     "      const device half *cb = (const device half *)(pack + cb_off + ulong(code) * 16ul);\n"
+     "      const uint x_base = block_col << 3;\n"
+     "      const float block_acc = float(cb[0]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 0u) +\n"
+     "                              float(cb[1]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 1u) +\n"
+     "                              float(cb[2]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 2u) +\n"
+     "                              float(cb[3]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 3u) +\n"
+     "                              float(cb[4]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 4u) +\n"
+     "                              float(cb[5]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 5u) +\n"
+     "                              float(cb[6]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 6u) +\n"
+     "                              float(cb[7]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 7u);\n"
+     "      acc += rw * block_acc;\n"
+     "    }\n"
+     "  }\n"
+     "  acc = simd_sum(acc);\n"
+     "  if (tiisg == 0u) partial[sgitg] = acc;\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  if (tid == 0u) {\n"
+     "    float total = 0.0f;\n"
+     "    for (uint sg = 0u; sg < 8u; sg++) total += partial[sg];\n"
+     "    out[row] = total;\n"
+     "  }\n"
+     "}\n"
+     "struct D8FDownBatchArgs { uint rows; uint in_dim; uint n_selected; uint n_tokens; uint table_offset; uint record_bytes; uint mid_slot_stride; uint mid_token_stride; uint out_token_stride; uint route_token_stride; uint selected_token_stride; };\n"
+     "kernel void d8f_down_sum_selected_weighted_batch(\n"
+     "  device const uchar *pack               [[buffer(0)]],\n"
+     "  device const float *mid                [[buffer(1)]],\n"
+     "  device const uint  *selected           [[buffer(2)]],\n"
+     "  device float       *out                [[buffer(3)]],\n"
+     "  constant D8FDownBatchArgs &args        [[buffer(4)]],\n"
+     "  device const float *route_weights      [[buffer(5)]],\n"
+     "  threadgroup float *partial             [[threadgroup(0)]],\n"
+     "  uint tid [[thread_index_in_threadgroup]],\n"
+     "  ushort tiisg [[thread_index_in_simdgroup]],\n"
+     "  ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+     "  uint2 pos [[threadgroup_position_in_grid]]) {\n"
+     "  const uint row = pos.x;\n"
+     "  const uint token = pos.y;\n"
+     "  if (row >= args.rows || token >= args.n_tokens) return;\n"
+     "  const uint blocks_per_row = args.in_dim >> 3;\n"
+     "  float acc = 0.0f;\n"
+     "  device const float *token_mid = mid + ulong(token) * ulong(args.mid_token_stride);\n"
+     "  device const float *token_weights = route_weights + ulong(token) * ulong(args.route_token_stride);\n"
+     "  for (uint slot = 0u; slot < args.n_selected; slot++) {\n"
+     "    const float rw = token_weights[slot];\n"
+     "    const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];\n"
+     "    device const uchar *rec = pack + args.table_offset + (512u + expert) * args.record_bytes;\n"
+     "    const uint k = d8f_u32(rec + 8);\n"
+     "    const uint bits = d8f_u32(rec + 12);\n"
+     "    const ulong cb_off = d8f_u64(rec + 24);\n"
+     "    const ulong ix_off = d8f_u64(rec + 32);\n"
+     "    const ulong scale_off = d8f_scale_offset(rec);\n"
+     "    if (rw == 0.0f || k == 0u || bits == 0u) continue;\n"
+     "    const uint mask = (1u << bits) - 1u;\n"
+     "    const device float *slot_mid = token_mid + ulong(slot) * ulong(args.mid_slot_stride);\n"
+     "    for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {\n"
+     "      const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);\n"
+     "      const ulong bit_off = block_index * ulong(bits);\n"
+     "      const ulong byte_off = bit_off >> 3;\n"
+     "      const uint shift = uint(bit_off & 7ul);\n"
+     "      device const uchar *ix = pack + ix_off + byte_off;\n"
+     "      const uint w = uint(ix[0]) | (uint(ix[1]) << 8u) | (uint(ix[2]) << 16u) | (uint(ix[3]) << 24u);\n"
+     "      const uint code = (w >> shift) & mask;\n"
+     "      if (code >= k) continue;\n"
+     "      const device half *cb = (const device half *)(pack + cb_off + ulong(code) * 16ul);\n"
+     "      const uint x_base = block_col << 3;\n"
+     "      const float block_acc = float(cb[0]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 0u) +\n"
+     "                              float(cb[1]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 1u) +\n"
+     "                              float(cb[2]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 2u) +\n"
+     "                              float(cb[3]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 3u) +\n"
+     "                              float(cb[4]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 4u) +\n"
+     "                              float(cb[5]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 5u) +\n"
+     "                              float(cb[6]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 6u) +\n"
+     "                              float(cb[7]) * d8f_mid_value(pack, scale_off, slot_mid, x_base + 7u);\n"
+     "      acc += rw * block_acc;\n"
+     "    }\n"
+     "  }\n"
+     "  acc = simd_sum(acc);\n"
+     "  if (tiisg == 0u) partial[sgitg] = acc;\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  if (tid == 0u) {\n"
+     "    float total = 0.0f;\n"
+     "    for (uint sg = 0u; sg < 8u; sg++) total += partial[sg];\n"
+     "    out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] = total;\n"
+     "  }\n"
+     "}\n"
+     "kernel void d8f_down_sum_selected_weighted_batch_tile8(\n"
+     "  device const uchar *pack               [[buffer(0)]],\n"
+     "  device const float *mid                [[buffer(1)]],\n"
+     "  device const uint  *selected           [[buffer(2)]],\n"
+     "  device float       *out                [[buffer(3)]],\n"
+     "  constant D8FDownBatchArgs &args        [[buffer(4)]],\n"
+     "  device const float *route_weights      [[buffer(5)]],\n"
+     "  threadgroup float *partial             [[threadgroup(0)]],\n"
+     "  uint tid [[thread_index_in_threadgroup]],\n"
+     "  ushort tiisg [[thread_index_in_simdgroup]],\n"
+     "  ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+     "  uint2 pos [[threadgroup_position_in_grid]]) {\n"
+     "  const uint row_base = pos.x << 3;\n"
+     "  const uint token = pos.y;\n"
+     "  if (token >= args.n_tokens) return;\n"
+     "  const uint blocks_per_row = args.in_dim >> 3;\n"
+     "  device const float *token_mid = mid + ulong(token) * ulong(args.mid_token_stride);\n"
+     "  device const float *token_weights = route_weights + ulong(token) * ulong(args.route_token_stride);\n"
+     "  float acc[8];\n"
+     "  for (uint rr = 0u; rr < 8u; rr++) acc[rr] = 0.0f;\n"
+     "  for (uint slot = 0u; slot < args.n_selected; slot++) {\n"
+     "    const float rw = token_weights[slot];\n"
+     "    const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];\n"
+     "    device const uchar *rec = pack + args.table_offset + (512u + expert) * args.record_bytes;\n"
+     "    const uint k = d8f_u32(rec + 8);\n"
+     "    const uint bits = d8f_u32(rec + 12);\n"
+     "    const ulong cb_off = d8f_u64(rec + 24);\n"
+     "    const ulong ix_off = d8f_u64(rec + 32);\n"
+     "    const ulong scale_off = d8f_scale_offset(rec);\n"
+     "    if (rw == 0.0f || k == 0u || bits == 0u) continue;\n"
+     "    const uint mask = (1u << bits) - 1u;\n"
+     "    const device float *slot_mid = token_mid + ulong(slot) * ulong(args.mid_slot_stride);\n"
+     "    for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {\n"
+     "      const uint x_base = block_col << 3;\n"
+     "      const float m0 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 0u);\n"
+     "      const float m1 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 1u);\n"
+     "      const float m2 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 2u);\n"
+     "      const float m3 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 3u);\n"
+     "      const float m4 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 4u);\n"
+     "      const float m5 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 5u);\n"
+     "      const float m6 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 6u);\n"
+     "      const float m7 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 7u);\n"
+     "      for (uint rr = 0u; rr < 8u; rr++) {\n"
+     "        const uint row = row_base + rr;\n"
+     "        if (row >= args.rows) continue;\n"
+     "        const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);\n"
+     "        const ulong bit_off = block_index * ulong(bits);\n"
+     "        const ulong byte_off = bit_off >> 3;\n"
+     "        const uint shift = uint(bit_off & 7ul);\n"
+     "        device const uchar *ix = pack + ix_off + byte_off;\n"
+     "        const uint w = uint(ix[0]) | (uint(ix[1]) << 8u) | (uint(ix[2]) << 16u) | (uint(ix[3]) << 24u);\n"
+     "        const uint code = (w >> shift) & mask;\n"
+     "        if (code >= k) continue;\n"
+     "        const device half *cb = (const device half *)(pack + cb_off + ulong(code) * 16ul);\n"
+     "        acc[rr] += rw * (float(cb[0]) * m0 + float(cb[1]) * m1 +\n"
+     "                         float(cb[2]) * m2 + float(cb[3]) * m3 +\n"
+     "                         float(cb[4]) * m4 + float(cb[5]) * m5 +\n"
+     "                         float(cb[6]) * m6 + float(cb[7]) * m7);\n"
+     "      }\n"
+     "    }\n"
+     "  }\n"
+     "  for (uint rr = 0u; rr < 8u; rr++) {\n"
+     "    acc[rr] = simd_sum(acc[rr]);\n"
+     "    if (tiisg == 0u) partial[rr * 8u + sgitg] = acc[rr];\n"
+     "  }\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  if (tid == 0u) {\n"
+     "    for (uint rr = 0u; rr < 8u; rr++) {\n"
+     "      const uint row = row_base + rr;\n"
+     "      if (row < args.rows) {\n"
+     "        float total = 0.0f;\n"
+     "        for (uint sg = 0u; sg < 8u; sg++) total += partial[rr * 8u + sg];\n"
+     "        out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] = total;\n"
+     "      }\n"
+     "    }\n"
+     "  }\n"
+     "}\n"
+     "kernel void d8f_down_sum_selected_weighted_batch_tile16(\n"
+     "  device const uchar *pack               [[buffer(0)]],\n"
+     "  device const float *mid                [[buffer(1)]],\n"
+     "  device const uint  *selected           [[buffer(2)]],\n"
+     "  device float       *out                [[buffer(3)]],\n"
+     "  constant D8FDownBatchArgs &args        [[buffer(4)]],\n"
+     "  device const float *route_weights      [[buffer(5)]],\n"
+     "  threadgroup float *partial             [[threadgroup(0)]],\n"
+     "  uint tid [[thread_index_in_threadgroup]],\n"
+     "  ushort tiisg [[thread_index_in_simdgroup]],\n"
+     "  ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+     "  uint2 pos [[threadgroup_position_in_grid]]) {\n"
+     "  const uint row_base = pos.x << 4;\n"
+     "  const uint token = pos.y;\n"
+     "  if (token >= args.n_tokens) return;\n"
+     "  const uint blocks_per_row = args.in_dim >> 3;\n"
+     "  device const float *token_mid = mid + ulong(token) * ulong(args.mid_token_stride);\n"
+     "  device const float *token_weights = route_weights + ulong(token) * ulong(args.route_token_stride);\n"
+     "  float acc[16];\n"
+     "  for (uint rr = 0u; rr < 16u; rr++) acc[rr] = 0.0f;\n"
+     "  for (uint slot = 0u; slot < args.n_selected; slot++) {\n"
+     "    const float rw = token_weights[slot];\n"
+     "    const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];\n"
+     "    device const uchar *rec = pack + args.table_offset + (512u + expert) * args.record_bytes;\n"
+     "    const uint k = d8f_u32(rec + 8);\n"
+     "    const uint bits = d8f_u32(rec + 12);\n"
+     "    const ulong cb_off = d8f_u64(rec + 24);\n"
+     "    const ulong ix_off = d8f_u64(rec + 32);\n"
+     "    const ulong scale_off = d8f_scale_offset(rec);\n"
+     "    if (rw == 0.0f || k == 0u || bits == 0u) continue;\n"
+     "    const uint mask = (1u << bits) - 1u;\n"
+     "    const device float *slot_mid = token_mid + ulong(slot) * ulong(args.mid_slot_stride);\n"
+     "    for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {\n"
+     "      const uint x_base = block_col << 3;\n"
+     "      const float m0 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 0u);\n"
+     "      const float m1 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 1u);\n"
+     "      const float m2 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 2u);\n"
+     "      const float m3 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 3u);\n"
+     "      const float m4 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 4u);\n"
+     "      const float m5 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 5u);\n"
+     "      const float m6 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 6u);\n"
+     "      const float m7 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 7u);\n"
+     "      for (uint rr = 0u; rr < 16u; rr++) {\n"
+     "        const uint row = row_base + rr;\n"
+     "        if (row >= args.rows) continue;\n"
+     "        const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col);\n"
+     "        const ulong bit_off = block_index * ulong(bits);\n"
+     "        const ulong byte_off = bit_off >> 3;\n"
+     "        const uint shift = uint(bit_off & 7ul);\n"
+     "        device const uchar *ix = pack + ix_off + byte_off;\n"
+     "        const uint w = uint(ix[0]) | (uint(ix[1]) << 8u) | (uint(ix[2]) << 16u) | (uint(ix[3]) << 24u);\n"
+     "        const uint code = (w >> shift) & mask;\n"
+     "        if (code >= k) continue;\n"
+     "        const device half *cb = (const device half *)(pack + cb_off + ulong(code) * 16ul);\n"
+     "        acc[rr] += rw * (float(cb[0]) * m0 + float(cb[1]) * m1 +\n"
+     "                         float(cb[2]) * m2 + float(cb[3]) * m3 +\n"
+     "                         float(cb[4]) * m4 + float(cb[5]) * m5 +\n"
+     "                         float(cb[6]) * m6 + float(cb[7]) * m7);\n"
+     "      }\n"
+     "    }\n"
+     "  }\n"
+     "  for (uint rr = 0u; rr < 16u; rr++) {\n"
+     "    acc[rr] = simd_sum(acc[rr]);\n"
+     "    if (tiisg == 0u) partial[rr * 8u + sgitg] = acc[rr];\n"
+     "  }\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  if (tid == 0u) {\n"
+     "    for (uint rr = 0u; rr < 16u; rr++) {\n"
+     "      const uint row = row_base + rr;\n"
+     "      if (row < args.rows) {\n"
+     "        float total = 0.0f;\n"
+     "        for (uint sg = 0u; sg < 8u; sg++) total += partial[rr * 8u + sg];\n"
+     "        out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] = total;\n"
+     "      }\n"
+     "    }\n"
+     "  }\n"
+     "}\n"
+     "kernel void d8f_down_sum_selected_preweighted_batch_tile16(\n"
+     "  device const uchar *pack               [[buffer(0)]],\n"
+     "  device const float *mid                [[buffer(1)]],\n"
+     "  device const uint  *selected           [[buffer(2)]],\n"
+     "  device float       *out                [[buffer(3)]],\n"
+     "  constant D8FDownBatchArgs &args        [[buffer(4)]],\n"
+     "  threadgroup float *partial             [[threadgroup(0)]],\n"
+     "  uint tid [[thread_index_in_threadgroup]],\n"
+     "  ushort tiisg [[thread_index_in_simdgroup]],\n"
+     "  ushort sgitg [[simdgroup_index_in_threadgroup]],\n"
+     "  uint2 pos [[threadgroup_position_in_grid]]) {\n"
+     "  const uint row_base = pos.x << 4;\n"
+     "  const uint token = pos.y;\n"
+     "  if (token >= args.n_tokens) return;\n"
+     "  const uint blocks_per_row = args.in_dim >> 3;\n"
+     "  device const float *token_mid = mid + ulong(token) * ulong(args.mid_token_stride);\n"
+     "  float acc[16];\n"
+     "  for (uint rr = 0u; rr < 16u; rr++) acc[rr] = 0.0f;\n"
+     "  for (uint slot = 0u; slot < args.n_selected; slot++) {\n"
+     "    const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];\n"
+     "    device const uchar *rec = pack + args.table_offset + (512u + expert) * args.record_bytes;\n"
+     "    const uint k = d8f_u32(rec + 8); const uint bits = d8f_u32(rec + 12); const ulong cb_off = d8f_u64(rec + 24); const ulong ix_off = d8f_u64(rec + 32); const ulong scale_off = d8f_scale_offset(rec);\n"
+     "    if (k == 0u || bits == 0u) continue;\n"
+     "    const uint mask = (1u << bits) - 1u;\n"
+     "    const device float *slot_mid = token_mid + ulong(slot) * ulong(args.mid_slot_stride);\n"
+     "    for (uint block_col = tid; block_col < blocks_per_row; block_col += 256u) {\n"
+     "      const uint x_base = block_col << 3;\n"
+     "      const float m0 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 0u); const float m1 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 1u); const float m2 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 2u); const float m3 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 3u);\n"
+     "      const float m4 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 4u); const float m5 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 5u); const float m6 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 6u); const float m7 = d8f_mid_value(pack, scale_off, slot_mid, x_base + 7u);\n"
+     "      for (uint rr = 0u; rr < 16u; rr++) {\n"
+     "        const uint row = row_base + rr; if (row >= args.rows) continue;\n"
+     "        const ulong block_index = ulong(row) * ulong(blocks_per_row) + ulong(block_col); const ulong bit_off = block_index * ulong(bits); const ulong byte_off = bit_off >> 3; const uint shift = uint(bit_off & 7ul);\n"
+     "        device const uchar *ix = pack + ix_off + byte_off; const uint w = uint(ix[0]) | (uint(ix[1]) << 8u) | (uint(ix[2]) << 16u) | (uint(ix[3]) << 24u); const uint code = (w >> shift) & mask;\n"
+     "        if (code >= k) continue; const device half *cb = (const device half *)(pack + cb_off + ulong(code) * 16ul);\n"
+     "        acc[rr] += float(cb[0]) * m0 + float(cb[1]) * m1 + float(cb[2]) * m2 + float(cb[3]) * m3 + float(cb[4]) * m4 + float(cb[5]) * m5 + float(cb[6]) * m6 + float(cb[7]) * m7;\n"
+     "      }\n"
+     "    }\n"
+     "  }\n"
+     "  for (uint rr = 0u; rr < 16u; rr++) { acc[rr] = simd_sum(acc[rr]); if (tiisg == 0u) partial[rr * 8u + sgitg] = acc[rr]; }\n"
+     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "  if (tid == 0u) { for (uint rr = 0u; rr < 16u; rr++) { const uint row = row_base + rr; if (row < args.rows) { float total = 0.0f; for (uint sg = 0u; sg < 8u; sg++) total += partial[rr * 8u + sg]; out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] = total; } } }\n"
+     "}\n";
+
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile8_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_preweighted_batch_tile16_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_mtl4_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_mtl4_pipeline;
+static int g_d8f_down_sum_selected_mtl4_init_attempted;
+static int g_d8f_down_sum_selected_mtl4_init_ok;
+
+static int ds4_d8f_down_sum_selected_mtl4_pipeline_init(void) {
+    if (g_d8f_down_sum_selected_mtl4_init_attempted)
+        return g_d8f_down_sum_selected_mtl4_init_ok;
+    g_d8f_down_sum_selected_mtl4_init_attempted = 1;
+    g_d8f_down_sum_selected_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_d8f_down_sum_selected_mtl4_msl,
+        @"ds4_d8f_down_sum_selected_mtl4",
+        @"d8f_down_sum_selected",
+        256, NULL, 0);
+    g_d8f_down_sum_selected_weighted_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_d8f_down_sum_selected_mtl4_msl,
+        @"ds4_d8f_down_sum_selected_weighted_mtl4",
+        @"d8f_down_sum_selected_weighted",
+        256, NULL, 0);
+    g_d8f_down_sum_selected_weighted_batch_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_d8f_down_sum_selected_mtl4_msl,
+        @"ds4_d8f_down_sum_selected_weighted_batch_mtl4",
+        @"d8f_down_sum_selected_weighted_batch",
+        256, NULL, 0);
+    g_d8f_down_sum_selected_weighted_batch_tile8_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_d8f_down_sum_selected_mtl4_msl,
+        @"ds4_d8f_down_sum_selected_weighted_batch_tile8_mtl4",
+        @"d8f_down_sum_selected_weighted_batch_tile8",
+        256, NULL, 0);
+    g_d8f_down_sum_selected_weighted_batch_tile16_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+        k_d8f_down_sum_selected_mtl4_msl,
+        @"ds4_d8f_down_sum_selected_weighted_batch_tile16_mtl4",
+        @"d8f_down_sum_selected_weighted_batch_tile16",
+        256, NULL, 0);
+    if (ds4_gpu_env_bool("DS4_D8F_PREWEIGHT_MID") > 0) {
+        g_d8f_down_sum_selected_preweighted_batch_tile16_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+            k_d8f_down_sum_selected_mtl4_msl,
+            @"ds4_d8f_down_sum_selected_preweighted_batch_tile16_mtl4",
+            @"d8f_down_sum_selected_preweighted_batch_tile16",
+            256, NULL, 0);
+    }
+    NSString *d8f_embedded = ds4_gpu_embedded_metal_source(@"metal/d8f.metal");
+    if (d8f_embedded) {
+        g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+            d8f_embedded,
+            @"ds4_d8f_down_sum_selected_weighted_batch_tile16_recbuf_mtl4",
+            @"d8f_down_sum_selected_weighted_batch_tile16_recbuf",
+            256, NULL, 0);
+        g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_mtl4_pipeline = ds4_mtl4_build_kernel_pipeline(
+            d8f_embedded,
+            @"ds4_d8f_down_sum_selected_weighted_batch_tile32_recbuf_mtl4",
+            @"d8f_down_sum_selected_weighted_batch_tile32_recbuf",
+            256, NULL, 0);
+    }
+    g_d8f_down_sum_selected_mtl4_init_ok =
+        (g_d8f_down_sum_selected_mtl4_pipeline &&
+         g_d8f_down_sum_selected_weighted_mtl4_pipeline &&
+         g_d8f_down_sum_selected_weighted_batch_mtl4_pipeline &&
+         g_d8f_down_sum_selected_weighted_batch_tile8_mtl4_pipeline &&
+         g_d8f_down_sum_selected_weighted_batch_tile16_mtl4_pipeline) ? 1 : 0;
+    return g_d8f_down_sum_selected_mtl4_init_ok;
+}
+
+static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_tile4_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_weighted_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile8_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile8_recbuf_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_preweighted_batch_tile16_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_recbuf_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_recbuf_hmid_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_hmid_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_rank1_dot_batch_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_rank1_axpy_batch_classic_pipeline;
+static int g_d8f_classic_pipeline_init_attempted;
+static int g_d8f_classic_pipeline_init_ok;
+static ds4_icb_slot_t g_d8f_packet_icb_slot;
+static id<MTLResidencySet> g_d8f_packet_icb_rs;
+static int g_d8f_packet_icb_rs_added_to_queue;
+enum { ds4_d8f_packet_icb_cmds = DS4_ICB_SLOT_MAX_COMMANDS };
+
+static id<MTLComputePipelineState> ds4_d8f_classic_pipeline_from_library(id<MTLLibrary> lib,
+                                                                         NSString *name) {
+    if (!lib || !name) return nil;
+    id<MTLFunction> fn = [lib newFunctionWithName:name];
+    if (!fn) {
+        fprintf(stderr, "ds4_d8f: classic Metal function missing: %s\n",
+                name.UTF8String);
+        return nil;
+    }
+    MTLComputePipelineDescriptor *pdesc = [MTLComputePipelineDescriptor new];
+    pdesc.computeFunction = fn;
+    pdesc.supportIndirectCommandBuffers = YES;
+    NSError *pipeErr = nil;
+    id<MTLComputePipelineState> p =
+        [g_device newComputePipelineStateWithDescriptor:pdesc
+                                                options:0
+                                             reflection:nil
+                                                  error:&pipeErr];
+    if (!p) {
+        fprintf(stderr, "ds4_d8f: classic Metal pipeline failed for %s: %s\n",
+                name.UTF8String, pipeErr.localizedDescription.UTF8String);
+        return nil;
+    }
+    return p;
+}
+
+static int ds4_d8f_classic_pipeline_init(void) {
+    if (g_d8f_classic_pipeline_init_attempted)
+        return g_d8f_classic_pipeline_init_ok;
+    g_d8f_classic_pipeline_init_attempted = 1;
+    if (g_library) {
+        g_d8f_gateup_swiglu_selected_batch_classic_pipeline =
+            ds4_gpu_get_pipeline("d8f_gateup_swiglu_selected_batch");
+        g_d8f_gateup_swiglu_selected_batch_tile4_classic_pipeline =
+            ds4_gpu_get_pipeline("d8f_gateup_swiglu_selected_batch_tile4");
+        if (ds4_gpu_env_bool("DS4_D8F_PREWEIGHT_MID") > 0) {
+            g_d8f_gateup_swiglu_selected_batch_weighted_classic_pipeline =
+                ds4_gpu_get_pipeline("d8f_gateup_swiglu_selected_batch_weighted");
+        }
+        g_d8f_down_sum_selected_weighted_batch_classic_pipeline =
+            ds4_gpu_get_pipeline("d8f_down_sum_selected_weighted_batch");
+        g_d8f_down_sum_selected_weighted_batch_tile8_classic_pipeline =
+            ds4_gpu_get_pipeline("d8f_down_sum_selected_weighted_batch_tile8");
+        g_d8f_down_sum_selected_weighted_batch_tile8_recbuf_classic_pipeline =
+            ds4_gpu_get_pipeline("d8f_down_sum_selected_weighted_batch_tile8_recbuf");
+        g_d8f_down_sum_selected_weighted_batch_tile16_classic_pipeline =
+            ds4_gpu_get_pipeline("d8f_down_sum_selected_weighted_batch_tile16");
+        g_d8f_gateup_swiglu_selected_batch_recbuf_classic_pipeline =
+            ds4_gpu_get_pipeline("d8f_gateup_swiglu_selected_batch_recbuf");
+        g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_classic_pipeline =
+            ds4_gpu_get_pipeline("d8f_down_sum_selected_weighted_batch_tile16_recbuf");
+        g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline =
+            ds4_gpu_get_pipeline("d8f_down_sum_selected_weighted_batch_tile32_recbuf");
+        g_d8f_down_rank1_dot_batch_classic_pipeline =
+            ds4_gpu_get_pipeline("d8f_down_rank1_dot_batch");
+        g_d8f_down_rank1_axpy_batch_classic_pipeline =
+            ds4_gpu_get_pipeline("d8f_down_rank1_axpy_batch");
+        if (ds4_gpu_d8f_half_mid_kernel_needed()) {
+            g_d8f_gateup_swiglu_selected_batch_recbuf_hmid_classic_pipeline =
+                ds4_gpu_get_pipeline("d8f_gateup_swiglu_selected_batch_recbuf_hmid");
+            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_hmid_classic_pipeline =
+                ds4_gpu_get_pipeline("d8f_down_sum_selected_weighted_batch_tile16_recbuf_hmid");
+        }
+        if (ds4_gpu_env_bool("DS4_D8F_PREWEIGHT_MID") > 0) {
+            g_d8f_down_sum_selected_preweighted_batch_tile16_classic_pipeline =
+                ds4_gpu_get_pipeline("d8f_down_sum_selected_preweighted_batch_tile16");
+        }
+        const int recbuf_required = ds4_gpu_d8f_recbuf_enabled();
+        const int half_mid_required = ds4_gpu_d8f_half_mid_enabled();
+        g_d8f_classic_pipeline_init_ok =
+            g_d8f_gateup_swiglu_selected_batch_classic_pipeline &&
+            g_d8f_down_sum_selected_weighted_batch_classic_pipeline &&
+            g_d8f_down_sum_selected_weighted_batch_tile8_classic_pipeline &&
+            g_d8f_down_sum_selected_weighted_batch_tile16_classic_pipeline &&
+            (!recbuf_required ||
+             (g_d8f_gateup_swiglu_selected_batch_recbuf_classic_pipeline &&
+              g_d8f_down_sum_selected_weighted_batch_tile8_recbuf_classic_pipeline &&
+              g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_classic_pipeline)) &&
+            (!half_mid_required ||
+             (g_d8f_gateup_swiglu_selected_batch_recbuf_hmid_classic_pipeline &&
+              g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_hmid_classic_pipeline));
+        if (g_d8f_classic_pipeline_init_ok) return 1;
+    }
+    MTLCompileOptions *opts = [MTLCompileOptions new];
+    opts.fastMathEnabled = YES;
+    NSError *gateErr = nil;
+    id<MTLLibrary> gateLib = [g_device newLibraryWithSource:k_d8f_gateup_swiglu_selected_mtl4_msl
+                                                    options:opts
+                                                      error:&gateErr];
+    if (!gateLib) {
+        fprintf(stderr, "ds4_d8f: classic Metal gate/up library failed: %s\n",
+                gateErr.localizedDescription.UTF8String);
+        return 0;
+    }
+    NSError *downErr = nil;
+    id<MTLLibrary> downLib = [g_device newLibraryWithSource:k_d8f_down_sum_selected_mtl4_msl
+                                                    options:opts
+                                                      error:&downErr];
+    if (!downLib) {
+        fprintf(stderr, "ds4_d8f: classic Metal down library failed: %s\n",
+                downErr.localizedDescription.UTF8String);
+        return 0;
+    }
+    g_d8f_gateup_swiglu_selected_batch_classic_pipeline =
+        ds4_d8f_classic_pipeline_from_library(gateLib, @"d8f_gateup_swiglu_selected_batch");
+    g_d8f_gateup_swiglu_selected_batch_tile4_classic_pipeline =
+        ds4_d8f_classic_pipeline_from_library(gateLib, @"d8f_gateup_swiglu_selected_batch_tile4");
+    if (ds4_gpu_env_bool("DS4_D8F_PREWEIGHT_MID") > 0) {
+        g_d8f_gateup_swiglu_selected_batch_weighted_classic_pipeline =
+            ds4_d8f_classic_pipeline_from_library(gateLib, @"d8f_gateup_swiglu_selected_batch_weighted");
+    }
+    g_d8f_down_sum_selected_weighted_batch_classic_pipeline =
+        ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch");
+    g_d8f_down_sum_selected_weighted_batch_tile8_classic_pipeline =
+        ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile8");
+    g_d8f_down_sum_selected_weighted_batch_tile8_recbuf_classic_pipeline =
+        ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile8_recbuf");
+    g_d8f_down_sum_selected_weighted_batch_tile16_classic_pipeline =
+        ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile16");
+    g_d8f_gateup_swiglu_selected_batch_recbuf_classic_pipeline =
+        ds4_d8f_classic_pipeline_from_library(gateLib, @"d8f_gateup_swiglu_selected_batch_recbuf");
+    g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_classic_pipeline =
+        ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile16_recbuf");
+    g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline =
+        ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile32_recbuf");
+    g_d8f_down_rank1_dot_batch_classic_pipeline =
+        ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_rank1_dot_batch");
+    g_d8f_down_rank1_axpy_batch_classic_pipeline =
+        ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_rank1_axpy_batch");
+        if (ds4_gpu_d8f_half_mid_kernel_needed()) {
+            g_d8f_gateup_swiglu_selected_batch_recbuf_hmid_classic_pipeline =
+                ds4_d8f_classic_pipeline_from_library(gateLib, @"d8f_gateup_swiglu_selected_batch_recbuf_hmid");
+            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_hmid_classic_pipeline =
+            ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile16_recbuf_hmid");
+    }
+    if (ds4_gpu_env_bool("DS4_D8F_PREWEIGHT_MID") > 0) {
+        g_d8f_down_sum_selected_preweighted_batch_tile16_classic_pipeline =
+            ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_sum_selected_preweighted_batch_tile16");
+    }
+    const int recbuf_required = ds4_gpu_d8f_recbuf_enabled();
+    const int half_mid_required = ds4_gpu_d8f_half_mid_enabled();
+    g_d8f_classic_pipeline_init_ok =
+        g_d8f_gateup_swiglu_selected_batch_classic_pipeline &&
+        g_d8f_down_sum_selected_weighted_batch_classic_pipeline &&
+        g_d8f_down_sum_selected_weighted_batch_tile8_classic_pipeline &&
+        g_d8f_down_sum_selected_weighted_batch_tile16_classic_pipeline &&
+        (!recbuf_required ||
+         (g_d8f_gateup_swiglu_selected_batch_recbuf_classic_pipeline &&
+          g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_classic_pipeline)) &&
+        (!half_mid_required ||
+         (g_d8f_gateup_swiglu_selected_batch_recbuf_hmid_classic_pipeline &&
+          g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_hmid_classic_pipeline));
+    return g_d8f_classic_pipeline_init_ok;
+}
+
+static void ds4_d8f_packet_icb_reset(void) {
+    if (g_d8f_packet_icb_rs) {
+        if (g_d8f_packet_icb_rs_added_to_queue) {
+            [g_polar_queue removeResidencySet:g_d8f_packet_icb_rs];
+        }
+        [g_d8f_packet_icb_rs endResidency];
+        g_d8f_packet_icb_rs = nil;
+        g_d8f_packet_icb_rs_added_to_queue = 0;
+    }
+    ds4_icb_slot_reset(&g_d8f_packet_icb_slot);
+}
+
+static int ds4_d8f_packet_icb_residency_prepare(void) {
+    if (!g_d8f_packet_icb_slot.icb) return 0;
+    if (!g_d8f_packet_icb_rs) {
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = 1;
+        NSError *err = nil;
+        g_d8f_packet_icb_rs = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (!g_d8f_packet_icb_rs) {
+            fprintf(stderr, "ds4_d8f: packet ICB residency set failed: %s\n",
+                    err.localizedDescription.UTF8String);
+            return 0;
+        }
+        id<MTLAllocation> alloc = (id<MTLAllocation>)g_d8f_packet_icb_slot.icb;
+        [g_d8f_packet_icb_rs addAllocation:alloc];
+        [g_d8f_packet_icb_rs commit];
+        ds4_residency_request_checked(g_d8f_packet_icb_rs, __func__);
+    }
+    if (!g_d8f_packet_icb_rs_added_to_queue) {
+        [g_polar_queue addResidencySet:g_d8f_packet_icb_rs];
+        g_d8f_packet_icb_rs_added_to_queue = 1;
+    }
+    return 1;
+}
+
+static float ds4_d8f_ref_mid_at(const ds4_d8f_file *file,
+                                const ds4_d8f_record *rec,
+                                const float *mid,
+                                uint32_t index) {
+    if (file && rec && (rec->flags & 1u) && rec->scale_offset && rec->scale_bytes >= (index + 1u) * 2u) {
+        const uint8_t *half = file->map + rec->scale_offset + (uint64_t)index * 2u;
+        return mid[index] * ds4_m1r_f16_to_f32(ds4_m1r_u16(half));
+    }
+    return mid[index];
+}
+
+static double ds4_d8f_ref_rank1_down_sidecar_delta(const ds4_d8f_file *file,
+                                                   const ds4_d8f_record *down,
+                                                   uint32_t expert,
+                                                   const float *slot_mid,
+                                                   uint32_t row,
+                                                   uint32_t in_dim) {
+    ds4_d8f_sidecar_record sidecar;
+    if (!file || !down || !slot_mid || !ds4_d8f_get_down_sidecar(file, expert, &sidecar)) return 0.0;
+    if (sidecar.rank != 1u || sidecar.in_dim != in_dim || row >= sidecar.out_dim) return 0.0;
+    if (sidecar.u_offset + sidecar.u_bytes > file->size ||
+        sidecar.a_offset + sidecar.a_bytes > file->size ||
+        sidecar.u_bytes < sidecar.in_dim * 2u ||
+        sidecar.a_bytes < sidecar.out_dim * 2u) return 0.0;
+    const uint8_t *u = file->map + sidecar.u_offset;
+    const uint8_t *a = file->map + sidecar.a_offset;
+    double dot = 0.0;
+    for (uint32_t i = 0; i < in_dim; i++) {
+        dot += (double)ds4_m1r_f16_to_f32(ds4_m1r_u16(u + (uint64_t)i * 2u)) *
+               (double)ds4_d8f_ref_mid_at(file, down, slot_mid, i);
+    }
+    return dot * (double)ds4_m1r_f16_to_f32(ds4_m1r_u16(a + (uint64_t)row * 2u));
+}
+
+int ds4_gpu_mtl4_d8f_down_selected_canary(const char *d8f_path,
+                                          const uint32_t *experts,
+                                          uint32_t n_experts,
+                                          uint32_t rows,
+                                          uint32_t rounds) {
+    enum { ds4_selected_expert_cap = 6, ds4_down_in_dim = 2048, ds4_down_out_dim = 4096, ds4_d8f_table_offset = 4096 };
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_d8f_down_sum_selected_mtl4_pipeline_init()) return 0;
+    if (!d8f_path || !experts || n_experts == 0 || n_experts > ds4_selected_expert_cap) return 0;
+    if (rows == 0 || rows > ds4_down_out_dim) rows = 128u;
+    if (rounds == 0) rounds = 1u;
+    ds4_d8f_file file;
+    if (!ds4_d8f_open(d8f_path, &file)) return 0;
+    const uint32_t blocks_per_row = ds4_down_in_dim >> 3;
+    for (uint32_t slot = 0; slot < n_experts; slot++) {
+        ds4_d8f_record rec;
+        if (!ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &rec)) {
+            fprintf(stderr, "ds4_d8f: selected down expert %u missing\n", experts[slot]);
+            ds4_d8f_close(&file);
+            return 0;
+        }
+        const uint64_t blocks = ((uint64_t)rec.index_bytes * 8ull) / (uint64_t)rec.bits;
+        if (rec.block != 8u || blocks < (uint64_t)rows * blocks_per_row ||
+            ((rec.flags & 1u) != 0u && rec.scale_bytes < ds4_down_in_dim * 2u)) {
+            fprintf(stderr, "ds4_d8f: selected down expert %u too short for rows=%u\n", experts[slot], rows);
+            ds4_d8f_close(&file);
+            return 0;
+        }
+    }
+    float *mid = (float *)malloc((size_t)n_experts * ds4_down_in_dim * sizeof(float));
+    float *ref = (float *)calloc(rows, sizeof(float));
+    if (!mid || !ref) {
+        free(ref); free(mid); ds4_d8f_close(&file);
+        return 0;
+    }
+    for (uint32_t slot = 0; slot < n_experts; slot++) {
+        for (uint32_t i = 0; i < ds4_down_in_dim; i++) {
+            mid[(uint64_t)slot * ds4_down_in_dim + i] =
+                0.50f * sinf((float)(i + slot * 17u) * 0.011f) +
+                0.25f * cosf((float)(i + slot * 29u) * 0.023f);
+        }
+    }
+    for (uint32_t row = 0; row < rows; row++) {
+        double sum = 0.0;
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            ds4_d8f_record rec;
+            ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &rec);
+            const float *slot_mid = mid + (uint64_t)slot * ds4_down_in_dim;
+            for (uint32_t block_col = 0; block_col < blocks_per_row; block_col++) {
+                const uint64_t block_index = (uint64_t)row * blocks_per_row + block_col;
+                const uint32_t code = ds4_d8f_code_at(&file, &rec, block_index);
+                if (code >= rec.k) continue;
+                const uint8_t *half = file.map + rec.codebook_offset + (uint64_t)code * 16u;
+                const uint32_t x_base = block_col << 3;
+                sum += ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 0u)) * ds4_d8f_ref_mid_at(&file, &rec, slot_mid, x_base + 0u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 2u)) * ds4_d8f_ref_mid_at(&file, &rec, slot_mid, x_base + 1u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 4u)) * ds4_d8f_ref_mid_at(&file, &rec, slot_mid, x_base + 2u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 6u)) * ds4_d8f_ref_mid_at(&file, &rec, slot_mid, x_base + 3u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 8u)) * ds4_d8f_ref_mid_at(&file, &rec, slot_mid, x_base + 4u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 10u)) * ds4_d8f_ref_mid_at(&file, &rec, slot_mid, x_base + 5u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * ds4_d8f_ref_mid_at(&file, &rec, slot_mid, x_base + 6u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * ds4_d8f_ref_mid_at(&file, &rec, slot_mid, x_base + 7u);
+            }
+        }
+        ref[row] = (float)sum;
+    }
+    int ok = 0;
+    int mismatch = 0;
+    int gpu_zero = 0;
+    int gpu_sentinel = 0;
+    double max_abs = 0.0;
+    double max_rel = 0.0;
+    double timed_ms = 0.0;
+    float dbg_ref[4] = {0};
+    float dbg_gpu[4] = {0};
+    @autoreleasepool {
+        id<MTLBuffer> packBuf = [g_device newBufferWithBytesNoCopy:(void *)file.map
+                                                            length:file.size
+                                                           options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
+        id<MTLBuffer> midBuf = [g_device newBufferWithBytes:mid
+                                                     length:(NSUInteger)n_experts * ds4_down_in_dim * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf = [g_device newBufferWithBytes:experts
+                                                     length:(NSUInteger)n_experts * sizeof(uint32_t)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf = [g_device newBufferWithLength:(NSUInteger)rows * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        struct args_t {
+            uint32_t rows, in_dim, n_selected, table_offset, record_bytes, mid_slot_stride;
+        } args = { rows, ds4_down_in_dim, n_experts, ds4_d8f_table_offset, file.record_bytes, ds4_down_in_dim };
+        id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args) options:MTLResourceStorageModeShared];
+        id<MTLResidencySet> rs = nil;
+        if (packBuf && midBuf && selBuf && outBuf && argsBuf) {
+            MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+            rsDesc.initialCapacity = 5;
+            NSError *err = nil;
+            rs = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        }
+        if (rs) {
+            id<MTLAllocation> allocs[5] = { packBuf, midBuf, selBuf, outBuf, argsBuf };
+            [rs addAllocations:allocs count:5];
+            [rs commit];
+            ds4_residency_request_checked(rs, __func__);
+            [g_polar_queue addResidencySet:rs];
+            float *out_init = (float *)outBuf.contents;
+            for (uint32_t row = 0; row < rows; row++) out_init[row] = -1234567.0f;
+            void (^dispatch_once)(void) = ^{
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:rs];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                id<MTL4ArgumentTable> at = ds4_mtl4_pool_acquire(5);
+                [at setAddress:packBuf.gpuAddress atIndex:0];
+                [at setAddress:midBuf.gpuAddress atIndex:1];
+                [at setAddress:selBuf.gpuAddress atIndex:2];
+                [at setAddress:outBuf.gpuAddress atIndex:3];
+                [at setAddress:argsBuf.gpuAddress atIndex:4];
+                [enc setComputePipelineState:g_d8f_down_sum_selected_mtl4_pipeline];
+                [enc setArgumentTable:at];
+                [enc setThreadgroupMemoryLength:8u * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+                ds4_mtl4_pool_release(at, 5);
+            };
+            dispatch_once();
+            mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+            const uint64_t t0 = mach_absolute_time();
+            for (uint32_t r = 0; r < rounds; r++) dispatch_once();
+            const uint64_t t1 = mach_absolute_time();
+            timed_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+            const float *gpu = (const float *)outBuf.contents;
+            for (uint32_t row = 0; row < rows; row++) {
+                if (row < 4u) {
+                    dbg_ref[row] = ref[row];
+                    dbg_gpu[row] = gpu[row];
+                }
+                if (gpu[row] == 0.0f) gpu_zero++;
+                if (gpu[row] == -1234567.0f) gpu_sentinel++;
+                const double err_abs = fabs((double)gpu[row] - (double)ref[row]);
+                const double denom = fabs((double)ref[row]) > 1e-4 ? fabs((double)ref[row]) : 1e-4;
+                const double err_rel = err_abs / denom;
+                if (err_abs > max_abs) max_abs = err_abs;
+                if (err_rel > max_rel) max_rel = err_rel;
+                if (err_abs > 5e-4 && err_rel > 5e-4) mismatch++;
+            }
+            ok = (mismatch == 0);
+        } else {
+            fprintf(stderr, "ds4_d8f: down Metal buffer or residency allocation failed\n");
+        }
+        if (rs) {
+            [g_polar_queue removeResidencySet:rs];
+            [rs endResidency];
+        }
+    }
+    fprintf(stderr,
+            "ds4: d8f_down_selected_canary nsel=%u rows=%u rounds=%u pack=%.2f MiB gpu %.3f ms total (%.3f us/row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
+            n_experts, rows, rounds, (double)file.size / 1048576.0, timed_ms,
+            timed_ms * 1000.0 / ((double)rows * (double)rounds),
+            mismatch, gpu_zero, gpu_sentinel, max_abs, max_rel, ok);
+    for (uint32_t i = 0; i < rows && i < 4u; i++) {
+        fprintf(stderr, " row%u_ref=%.7g row%u_gpu=%.7g", i, dbg_ref[i], i, dbg_gpu[i]);
+    }
+    fprintf(stderr, " experts=");
+    for (uint32_t slot = 0; slot < n_experts; slot++) fprintf(stderr, "%s%u", slot ? "," : "", experts[slot]);
+    fprintf(stderr, "\n");
+    free(ref);
+    free(mid);
+    ds4_d8f_close(&file);
+    return ok;
+}
+
+int ds4_gpu_mtl4_d8f_organ_selected_canary(const char *d8f_path,
+                                           const uint32_t *experts,
+                                           uint32_t n_experts,
+                                           uint32_t rows,
+                                           uint32_t rounds,
+                                           float swiglu_limit) {
+    enum {
+        ds4_selected_expert_cap = 6,
+        ds4_gateup_in_dim = 4096,
+        ds4_mid_dim = 2048,
+        ds4_down_out_dim = 4096,
+        ds4_d8f_table_offset = 4096
+    };
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_d8f_gateup_swiglu_selected_mtl4_pipeline_init()) return 0;
+    if (!ds4_d8f_down_sum_selected_mtl4_pipeline_init()) return 0;
+    if (!d8f_path || !experts || n_experts == 0 || n_experts > ds4_selected_expert_cap) return 0;
+    if (rows == 0 || rows > ds4_down_out_dim) rows = 128u;
+    if (rounds == 0) rounds = 1u;
+    if (!(swiglu_limit > 0.0f)) swiglu_limit = 10.0f;
+    ds4_d8f_file file;
+    if (!ds4_d8f_open(d8f_path, &file)) return 0;
+    const uint32_t gate_blocks_per_row = ds4_gateup_in_dim >> 3;
+    const uint32_t down_blocks_per_row = ds4_mid_dim >> 3;
+    for (uint32_t slot = 0; slot < n_experts; slot++) {
+        ds4_d8f_record gate, up, down;
+        if (!ds4_d8f_get_record(&file, DS4_D8F_GATE, experts[slot], &gate) ||
+            !ds4_d8f_get_record(&file, DS4_D8F_UP, experts[slot], &up) ||
+            !ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &down)) {
+            fprintf(stderr, "ds4_d8f: selected organ expert %u missing\n", experts[slot]);
+            ds4_d8f_close(&file);
+            return 0;
+        }
+        const uint64_t gate_blocks = ((uint64_t)gate.index_bytes * 8ull) / (uint64_t)gate.bits;
+        const uint64_t up_blocks = ((uint64_t)up.index_bytes * 8ull) / (uint64_t)up.bits;
+        const uint64_t down_blocks = ((uint64_t)down.index_bytes * 8ull) / (uint64_t)down.bits;
+        if (gate.block != 8u || up.block != 8u || down.block != 8u ||
+            gate_blocks < (uint64_t)ds4_mid_dim * gate_blocks_per_row ||
+            up_blocks < (uint64_t)ds4_mid_dim * gate_blocks_per_row ||
+            down_blocks < (uint64_t)rows * down_blocks_per_row ||
+            ((down.flags & 1u) != 0u && down.scale_bytes < ds4_mid_dim * 2u)) {
+            fprintf(stderr, "ds4_d8f: selected organ expert %u too short for rows=%u\n", experts[slot], rows);
+            ds4_d8f_close(&file);
+            return 0;
+        }
+    }
+    float *x = (float *)malloc((size_t)ds4_gateup_in_dim * sizeof(float));
+    float *mid_ref = (float *)malloc((size_t)n_experts * ds4_mid_dim * sizeof(float));
+    float *route_weights = (float *)malloc((size_t)n_experts * sizeof(float));
+    float *ref = (float *)calloc(rows, sizeof(float));
+    if (!x || !mid_ref || !route_weights || !ref) {
+        free(ref); free(route_weights); free(mid_ref); free(x); ds4_d8f_close(&file);
+        return 0;
+    }
+    for (uint32_t i = 0; i < ds4_gateup_in_dim; i++) {
+        x[i] = 0.35f * sinf((float)i * 0.011f) + 0.17f * cosf((float)i * 0.019f);
+    }
+    float route_sum = 0.0f;
+    for (uint32_t slot = 0; slot < n_experts; slot++) {
+        route_weights[slot] = 1.0f / (1.0f + (float)slot);
+        route_sum += route_weights[slot];
+    }
+    for (uint32_t slot = 0; slot < n_experts; slot++) route_weights[slot] /= route_sum;
+    for (uint32_t slot = 0; slot < n_experts; slot++) {
+        ds4_d8f_record gate, up;
+        ds4_d8f_get_record(&file, DS4_D8F_GATE, experts[slot], &gate);
+        ds4_d8f_get_record(&file, DS4_D8F_UP, experts[slot], &up);
+        for (uint32_t row = 0; row < ds4_mid_dim; row++) {
+            ds4_d8f_record gate_overlay, up_overlay;
+            const uint32_t row_block = row >> 7;
+            const ds4_d8f_record *gate_ref =
+                ds4_d8f_get_gateup_overlay_record(&file, DS4_D8F_GATE, experts[slot], row_block, &gate_overlay)
+                ? &gate_overlay : &gate;
+            const ds4_d8f_record *up_ref =
+                ds4_d8f_get_gateup_overlay_record(&file, DS4_D8F_UP, experts[slot], row_block, &up_overlay)
+                ? &up_overlay : &up;
+            float gv = ds4_d8f_ref_dot(&file, gate_ref, x, row, ds4_gateup_in_dim);
+            float uv = ds4_d8f_ref_dot(&file, up_ref, x, row, ds4_gateup_in_dim);
+            if (gv > swiglu_limit) gv = swiglu_limit;
+            if (uv > swiglu_limit) uv = swiglu_limit;
+            if (uv < -swiglu_limit) uv = -swiglu_limit;
+            mid_ref[(uint64_t)slot * ds4_mid_dim + row] = (gv / (1.0f + expf(-gv))) * uv;
+        }
+    }
+    for (uint32_t row = 0; row < rows; row++) {
+        double sum = 0.0;
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            ds4_d8f_record down;
+            ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &down);
+            const float *slot_mid = mid_ref + (uint64_t)slot * ds4_mid_dim;
+            const float route_weight = route_weights[slot];
+            for (uint32_t block_col = 0; block_col < down_blocks_per_row; block_col++) {
+                const uint64_t block_index = (uint64_t)row * down_blocks_per_row + block_col;
+                const uint32_t code = ds4_d8f_code_at(&file, &down, block_index);
+                if (code >= down.k) continue;
+                const uint8_t *half = file.map + down.codebook_offset + (uint64_t)code * 16u;
+                const uint32_t x_base = block_col << 3;
+                const double block_sum =
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 0u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 0u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 2u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 1u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 4u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 2u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 6u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 3u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 8u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 4u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 10u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 5u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 6u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 7u);
+                sum += (double)route_weight * block_sum;
+            }
+            sum += (double)route_weight *
+                   ds4_d8f_ref_rank1_down_sidecar_delta(&file, &down, experts[slot], slot_mid, row, ds4_mid_dim);
+        }
+        ref[row] = (float)sum;
+    }
+    int ok = 0;
+    int mismatch = 0;
+    int gpu_zero = 0;
+    int gpu_sentinel = 0;
+    double max_abs = 0.0;
+    double max_rel = 0.0;
+    double timed_ms = 0.0;
+    float dbg_ref[4] = {0};
+    float dbg_gpu[4] = {0};
+    @autoreleasepool {
+        id<MTLBuffer> packBuf = [g_device newBufferWithBytesNoCopy:(void *)file.map
+                                                            length:file.size
+                                                           options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
+        id<MTLBuffer> xBuf = [g_device newBufferWithBytes:x
+                                                   length:(NSUInteger)ds4_gateup_in_dim * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf = [g_device newBufferWithBytes:experts
+                                                     length:(NSUInteger)n_experts * sizeof(uint32_t)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> routeBuf = [g_device newBufferWithBytes:route_weights
+                                                       length:(NSUInteger)n_experts * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> midBuf = [g_device newBufferWithLength:(NSUInteger)n_experts * ds4_mid_dim * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf = [g_device newBufferWithLength:(NSUInteger)rows * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        struct gate_args_t {
+            uint32_t rows, in_dim, n_selected, table_offset, record_bytes, mid_slot_stride;
+            float clamp;
+        } gate_args = { ds4_mid_dim, ds4_gateup_in_dim, n_experts, ds4_d8f_table_offset, file.record_bytes, ds4_mid_dim, swiglu_limit };
+        struct down_args_t {
+            uint32_t rows, in_dim, n_selected, table_offset, record_bytes, mid_slot_stride;
+        } down_args = { rows, ds4_mid_dim, n_experts, ds4_d8f_table_offset, file.record_bytes, ds4_mid_dim };
+        id<MTLBuffer> gateArgsBuf = [g_device newBufferWithBytes:&gate_args length:sizeof(gate_args) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> downArgsBuf = [g_device newBufferWithBytes:&down_args length:sizeof(down_args) options:MTLResourceStorageModeShared];
+        id<MTLResidencySet> rs = nil;
+        if (packBuf && xBuf && selBuf && routeBuf && midBuf && outBuf && gateArgsBuf && downArgsBuf) {
+            MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+            rsDesc.initialCapacity = 8;
+            NSError *err = nil;
+            rs = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        }
+        if (rs) {
+            id<MTLAllocation> allocs[8] = { packBuf, xBuf, selBuf, routeBuf, midBuf, outBuf, gateArgsBuf, downArgsBuf };
+            [rs addAllocations:allocs count:8];
+            [rs commit];
+            ds4_residency_request_checked(rs, __func__);
+            [g_polar_queue addResidencySet:rs];
+            float *mid_init = (float *)midBuf.contents;
+            float *out_init = (float *)outBuf.contents;
+            for (uint64_t i = 0; i < (uint64_t)n_experts * ds4_mid_dim; i++) mid_init[i] = -1234567.0f;
+            for (uint32_t row = 0; row < rows; row++) out_init[row] = -1234567.0f;
+            void (^dispatch_once)(void) = ^{
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:rs];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                id<MTL4ArgumentTable> gateAt = ds4_mtl4_pool_acquire(5);
+                [gateAt setAddress:packBuf.gpuAddress atIndex:0];
+                [gateAt setAddress:xBuf.gpuAddress atIndex:1];
+                [gateAt setAddress:selBuf.gpuAddress atIndex:2];
+                [gateAt setAddress:midBuf.gpuAddress atIndex:3];
+                [gateAt setAddress:gateArgsBuf.gpuAddress atIndex:4];
+                [enc setComputePipelineState:g_d8f_gateup_swiglu_selected_mtl4_pipeline];
+                [enc setArgumentTable:gateAt];
+                [enc setThreadgroupMemoryLength:16u * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(ds4_mid_dim, n_experts, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                id<MTL4ArgumentTable> downAt = ds4_mtl4_pool_acquire(5);
+                [downAt setAddress:packBuf.gpuAddress atIndex:0];
+                [downAt setAddress:midBuf.gpuAddress atIndex:1];
+                [downAt setAddress:selBuf.gpuAddress atIndex:2];
+                [downAt setAddress:outBuf.gpuAddress atIndex:3];
+                [downAt setAddress:downArgsBuf.gpuAddress atIndex:4];
+                [downAt setAddress:routeBuf.gpuAddress atIndex:5];
+                [enc setComputePipelineState:g_d8f_down_sum_selected_weighted_mtl4_pipeline];
+                [enc setArgumentTable:downAt];
+                [enc setThreadgroupMemoryLength:8u * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+                ds4_mtl4_pool_release(gateAt, 5);
+                ds4_mtl4_pool_release(downAt, 5);
+            };
+            dispatch_once();
+            mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+            const uint64_t t0 = mach_absolute_time();
+            for (uint32_t r = 0; r < rounds; r++) dispatch_once();
+            const uint64_t t1 = mach_absolute_time();
+            timed_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+            const float *gpu = (const float *)outBuf.contents;
+            for (uint32_t row = 0; row < rows; row++) {
+                if (row < 4u) {
+                    dbg_ref[row] = ref[row];
+                    dbg_gpu[row] = gpu[row];
+                }
+                if (gpu[row] == 0.0f) gpu_zero++;
+                if (gpu[row] == -1234567.0f) gpu_sentinel++;
+                const double err_abs = fabs((double)gpu[row] - (double)ref[row]);
+                const double denom = fabs((double)ref[row]) > 1e-4 ? fabs((double)ref[row]) : 1e-4;
+                const double err_rel = err_abs / denom;
+                if (err_abs > max_abs) max_abs = err_abs;
+                if (err_rel > max_rel) max_rel = err_rel;
+                if (err_abs > 5e-4 && err_rel > 5e-4) mismatch++;
+            }
+            ok = (mismatch == 0);
+        } else {
+            fprintf(stderr, "ds4_d8f: organ Metal buffer or residency allocation failed\n");
+        }
+        if (rs) {
+            [g_polar_queue removeResidencySet:rs];
+            [rs endResidency];
+        }
+    }
+    fprintf(stderr,
+            "ds4: d8f_organ_selected_canary route_weighted=1 nsel=%u rows=%u rounds=%u clamp=%.1f pack=%.2f MiB gpu %.3f ms total (%.3f us/row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
+            n_experts, rows, rounds, swiglu_limit, (double)file.size / 1048576.0, timed_ms,
+            timed_ms * 1000.0 / ((double)rows * (double)rounds),
+            mismatch, gpu_zero, gpu_sentinel, max_abs, max_rel, ok);
+    for (uint32_t i = 0; i < rows && i < 4u; i++) {
+        fprintf(stderr, " row%u_ref=%.7g row%u_gpu=%.7g", i, dbg_ref[i], i, dbg_gpu[i]);
+    }
+    fprintf(stderr, " experts=");
+    for (uint32_t slot = 0; slot < n_experts; slot++) fprintf(stderr, "%s%u", slot ? "," : "", experts[slot]);
+    fprintf(stderr, " weights=");
+    for (uint32_t slot = 0; slot < n_experts; slot++) fprintf(stderr, "%s%.6f", slot ? "," : "", route_weights[slot]);
+    fprintf(stderr, "\n");
+    free(ref);
+    free(route_weights);
+    free(mid_ref);
+    free(x);
+    ds4_d8f_close(&file);
+    return ok;
+}
+
+int ds4_gpu_mtl4_d8f_organ_selected_batch_canary(const char *d8f_path,
+                                                 const uint32_t *experts,
+                                                 uint32_t n_experts,
+                                                 uint32_t rows,
+                                                 uint32_t n_tokens,
+                                                 uint32_t rounds,
+                                                 float swiglu_limit) {
+    enum {
+        ds4_selected_expert_cap = 6,
+        ds4_batch_token_cap = 64,
+        ds4_gateup_in_dim = 4096,
+        ds4_mid_dim = 2048,
+        ds4_down_out_dim = 4096,
+        ds4_d8f_table_offset = 4096
+    };
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_d8f_gateup_swiglu_selected_mtl4_pipeline_init()) return 0;
+    if (!ds4_d8f_down_sum_selected_mtl4_pipeline_init()) return 0;
+    if (!d8f_path || !experts || n_experts == 0 || n_experts > ds4_selected_expert_cap) return 0;
+    if (rows == 0 || rows > ds4_down_out_dim) rows = 8u;
+    if (n_tokens == 0) n_tokens = 2u;
+    if (n_tokens > ds4_batch_token_cap) n_tokens = ds4_batch_token_cap;
+    if (rounds == 0) rounds = 1u;
+    if (!(swiglu_limit > 0.0f)) swiglu_limit = 10.0f;
+    ds4_d8f_file file;
+    if (!ds4_d8f_open(d8f_path, &file)) return 0;
+    const uint32_t gate_blocks_per_row = ds4_gateup_in_dim >> 3;
+    const uint32_t down_blocks_per_row = ds4_mid_dim >> 3;
+    for (uint32_t slot = 0; slot < n_experts; slot++) {
+        ds4_d8f_record gate, up, down;
+        if (!ds4_d8f_get_record(&file, DS4_D8F_GATE, experts[slot], &gate) ||
+            !ds4_d8f_get_record(&file, DS4_D8F_UP, experts[slot], &up) ||
+            !ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &down)) {
+            fprintf(stderr, "ds4_d8f: selected batch organ expert %u missing\n", experts[slot]);
+            ds4_d8f_close(&file);
+            return 0;
+        }
+        const uint64_t gate_blocks = ((uint64_t)gate.index_bytes * 8ull) / (uint64_t)gate.bits;
+        const uint64_t up_blocks = ((uint64_t)up.index_bytes * 8ull) / (uint64_t)up.bits;
+        const uint64_t down_blocks = ((uint64_t)down.index_bytes * 8ull) / (uint64_t)down.bits;
+        if (gate.block != 8u || up.block != 8u || down.block != 8u ||
+            gate_blocks < (uint64_t)ds4_mid_dim * gate_blocks_per_row ||
+            up_blocks < (uint64_t)ds4_mid_dim * gate_blocks_per_row ||
+            down_blocks < (uint64_t)rows * down_blocks_per_row ||
+            ((down.flags & 1u) != 0u && down.scale_bytes < ds4_mid_dim * 2u)) {
+            fprintf(stderr, "ds4_d8f: selected batch organ expert %u too short for rows=%u\n", experts[slot], rows);
+            ds4_d8f_close(&file);
+            return 0;
+        }
+    }
+    float *x = (float *)malloc((size_t)n_tokens * ds4_gateup_in_dim * sizeof(float));
+    float *mid_ref = (float *)malloc((size_t)n_tokens * n_experts * ds4_mid_dim * sizeof(float));
+    float *route_weights = (float *)malloc((size_t)n_tokens * n_experts * sizeof(float));
+    float *ref = (float *)calloc((size_t)n_tokens * rows, sizeof(float));
+    if (!x || !mid_ref || !route_weights || !ref) {
+        free(ref); free(route_weights); free(mid_ref); free(x); ds4_d8f_close(&file);
+        return 0;
+    }
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        float *xt = x + (uint64_t)token * ds4_gateup_in_dim;
+        for (uint32_t i = 0; i < ds4_gateup_in_dim; i++) {
+            xt[i] = 0.35f * sinf((float)(i + 17u * token) * 0.011f) +
+                    0.17f * cosf((float)(i + 31u * token) * 0.019f);
+        }
+        float route_sum = 0.0f;
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            const float v = 1.0f / (1.0f + (float)slot + 0.25f * (float)((token + slot) % 3u));
+            route_weights[(uint64_t)token * n_experts + slot] = v;
+            route_sum += v;
+        }
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            route_weights[(uint64_t)token * n_experts + slot] /= route_sum;
+        }
+    }
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        const float *xt = x + (uint64_t)token * ds4_gateup_in_dim;
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            ds4_d8f_record gate, up;
+            ds4_d8f_get_record(&file, DS4_D8F_GATE, experts[slot], &gate);
+            ds4_d8f_get_record(&file, DS4_D8F_UP, experts[slot], &up);
+            float *slot_mid = mid_ref + ((uint64_t)token * n_experts + slot) * ds4_mid_dim;
+            for (uint32_t row = 0; row < ds4_mid_dim; row++) {
+                ds4_d8f_record gate_overlay, up_overlay;
+                const uint32_t row_block = row >> 7;
+                const ds4_d8f_record *gate_ref =
+                    ds4_d8f_get_gateup_overlay_record(&file, DS4_D8F_GATE, experts[slot], row_block, &gate_overlay)
+                    ? &gate_overlay : &gate;
+                const ds4_d8f_record *up_ref =
+                    ds4_d8f_get_gateup_overlay_record(&file, DS4_D8F_UP, experts[slot], row_block, &up_overlay)
+                    ? &up_overlay : &up;
+                float gv = ds4_d8f_ref_dot(&file, gate_ref, xt, row, ds4_gateup_in_dim);
+                float uv = ds4_d8f_ref_dot(&file, up_ref, xt, row, ds4_gateup_in_dim);
+                if (gv > swiglu_limit) gv = swiglu_limit;
+                if (uv > swiglu_limit) uv = swiglu_limit;
+                if (uv < -swiglu_limit) uv = -swiglu_limit;
+                slot_mid[row] = (gv / (1.0f + expf(-gv))) * uv;
+            }
+        }
+    }
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        for (uint32_t row = 0; row < rows; row++) {
+            double sum = 0.0;
+            for (uint32_t slot = 0; slot < n_experts; slot++) {
+                ds4_d8f_record down;
+                ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &down);
+                const float *slot_mid = mid_ref + ((uint64_t)token * n_experts + slot) * ds4_mid_dim;
+                const float route_weight = route_weights[(uint64_t)token * n_experts + slot];
+                for (uint32_t block_col = 0; block_col < down_blocks_per_row; block_col++) {
+                    const uint64_t block_index = (uint64_t)row * down_blocks_per_row + block_col;
+                    const uint32_t code = ds4_d8f_code_at(&file, &down, block_index);
+                    if (code >= down.k) continue;
+                    const uint8_t *half = file.map + down.codebook_offset + (uint64_t)code * 16u;
+                    const uint32_t x_base = block_col << 3;
+                    const double block_sum =
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 0u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 0u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 2u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 1u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 4u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 2u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 6u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 3u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 8u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 4u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 10u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 5u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 6u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * ds4_d8f_ref_mid_at(&file, &down, slot_mid, x_base + 7u);
+                    sum += (double)route_weight * block_sum;
+                }
+                sum += (double)route_weight *
+                       ds4_d8f_ref_rank1_down_sidecar_delta(&file, &down, experts[slot], slot_mid, row, ds4_mid_dim);
+            }
+            ref[(uint64_t)token * rows + row] = (float)sum;
+        }
+    }
+    int ok = 0;
+    int mismatch = 0;
+    int gpu_zero = 0;
+    int gpu_sentinel = 0;
+    double max_abs = 0.0;
+    double max_rel = 0.0;
+    double timed_ms = 0.0;
+    int tensor_mismatch = 0;
+    int tensor_zero = 0;
+    int tensor_sentinel = 0;
+    double tensor_max_abs = 0.0;
+    double tensor_max_rel = 0.0;
+    double tensor_timed_ms = 0.0;
+    int tensor_ok = 0;
+    int classic_mismatch = 0;
+    int classic_zero = 0;
+    int classic_sentinel = 0;
+    double classic_max_abs = 0.0;
+    double classic_max_rel = 0.0;
+    double classic_timed_ms = 0.0;
+    int classic_ok = 0;
+    int classic_graph_mismatch = 0;
+    int classic_graph_zero = 0;
+    int classic_graph_sentinel = 0;
+    double classic_graph_max_abs = 0.0;
+    double classic_graph_max_rel = 0.0;
+    double classic_graph_timed_ms = 0.0;
+    int classic_graph_ok = 0;
+    int selected_mismatch = 0;
+    int selected_zero = 0;
+    int selected_sentinel = 0;
+    double selected_max_abs = 0.0;
+    double selected_max_rel = 0.0;
+    double selected_timed_ms = 0.0;
+    int selected_ok = 0;
+    const int canary_rank1_sidecars =
+        file.rank1_residual_sidecars && ds4_d8f_down_sidecar_count(&file) > 0u;
+    const int selected_external_mtl4 = ds4_gpu_env_bool("DS4_D8F_FORCE_MTL4_PACKET") > 0;
+    const char *selected_path = selected_external_mtl4 ? "mtl4_external" : "classic_inline_graph";
+    const int down_tile16 = ds4_gpu_d8f_down_tile16_enabled(n_tokens) &&
+        g_d8f_down_sum_selected_weighted_batch_tile16_mtl4_pipeline;
+    const int preweight_mid = ds4_gpu_d8f_preweight_mid_enabled(n_tokens) && n_tokens == 1u && down_tile16 &&
+        g_d8f_gateup_swiglu_selected_batch_weighted_mtl4_pipeline &&
+        g_d8f_down_sum_selected_preweighted_batch_tile16_mtl4_pipeline;
+    const int gateup_tile4 = !preweight_mid && ds4_gpu_d8f_gateup_tile4_enabled() &&
+        g_d8f_gateup_swiglu_selected_batch_tile4_mtl4_pipeline;
+    const int down_tile8 = !down_tile16 && ds4_gpu_d8f_down_tile8_enabled() &&
+        g_d8f_down_sum_selected_weighted_batch_tile8_mtl4_pipeline;
+    float dbg_ref[4] = {0};
+    float dbg_gpu[4] = {0};
+    float dbg_tensor[4] = {0};
+    float dbg_classic[4] = {0};
+    float dbg_classic_graph[4] = {0};
+    float dbg_selected[4] = {0};
+    @autoreleasepool {
+        id<MTLBuffer> packBuf = [g_device newBufferWithBytesNoCopy:(void *)file.map
+                                                            length:file.size
+                                                           options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
+        id<MTLBuffer> xBuf = [g_device newBufferWithBytes:x
+                                                   length:(NSUInteger)n_tokens * ds4_gateup_in_dim * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> selBuf = [g_device newBufferWithBytes:experts
+                                                     length:(NSUInteger)n_experts * sizeof(uint32_t)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> routeBuf = [g_device newBufferWithBytes:route_weights
+                                                       length:(NSUInteger)n_tokens * n_experts * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> midBuf = [g_device newBufferWithLength:(NSUInteger)n_tokens * n_experts * ds4_mid_dim * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outBuf = [g_device newBufferWithLength:(NSUInteger)n_tokens * rows * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        struct gate_args_t {
+            uint32_t rows, in_dim, n_selected, n_tokens, table_offset, record_bytes, mid_slot_stride, mid_token_stride, x_token_stride, selected_token_stride;
+            float clamp;
+        } gate_args = {
+            ds4_mid_dim, ds4_gateup_in_dim, n_experts, n_tokens, ds4_d8f_table_offset,
+            file.record_bytes, ds4_mid_dim, n_experts * ds4_mid_dim, ds4_gateup_in_dim, 0u, swiglu_limit
+        };
+        struct down_args_t {
+            uint32_t rows, in_dim, n_selected, n_tokens, table_offset, record_bytes, mid_slot_stride, mid_token_stride, out_token_stride, route_token_stride, selected_token_stride;
+        } down_args = {
+            rows, ds4_mid_dim, n_experts, n_tokens, ds4_d8f_table_offset, file.record_bytes,
+            ds4_mid_dim, n_experts * ds4_mid_dim, rows, n_experts, 0u
+        };
+        id<MTLBuffer> gateArgsBuf = [g_device newBufferWithBytes:&gate_args length:sizeof(gate_args) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> downArgsBuf = [g_device newBufferWithBytes:&down_args length:sizeof(down_args) options:MTLResourceStorageModeShared];
+        id<MTLResidencySet> rs = nil;
+        if (packBuf && xBuf && selBuf && routeBuf && midBuf && outBuf && gateArgsBuf && downArgsBuf) {
+            MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+            rsDesc.initialCapacity = 8;
+            NSError *err = nil;
+            rs = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        }
+        if (rs) {
+            id<MTLAllocation> allocs[8] = { packBuf, xBuf, selBuf, routeBuf, midBuf, outBuf, gateArgsBuf, downArgsBuf };
+            [rs addAllocations:allocs count:8];
+            [rs commit];
+            ds4_residency_request_checked(rs, __func__);
+            [g_polar_queue addResidencySet:rs];
+            float *mid_init = (float *)midBuf.contents;
+            float *out_init = (float *)outBuf.contents;
+            for (uint64_t i = 0; i < (uint64_t)n_tokens * n_experts * ds4_mid_dim; i++) mid_init[i] = -1234567.0f;
+            for (uint64_t i = 0; i < (uint64_t)n_tokens * rows; i++) out_init[i] = -1234567.0f;
+            void (^dispatch_once)(void) = ^{
+                id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+                [cb beginCommandBufferWithAllocator:g_polar_allocator];
+                [cb useResidencySet:rs];
+                id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                const uint32_t gate_arg_count = preweight_mid ? 6u : 5u;
+                id<MTL4ArgumentTable> gateAt = ds4_mtl4_pool_acquire(gate_arg_count);
+                [gateAt setAddress:packBuf.gpuAddress atIndex:0];
+                [gateAt setAddress:xBuf.gpuAddress atIndex:1];
+                [gateAt setAddress:selBuf.gpuAddress atIndex:2];
+                [gateAt setAddress:midBuf.gpuAddress atIndex:3];
+                [gateAt setAddress:gateArgsBuf.gpuAddress atIndex:4];
+                if (preweight_mid) [gateAt setAddress:routeBuf.gpuAddress atIndex:5];
+                [enc setComputePipelineState:preweight_mid ?
+                    g_d8f_gateup_swiglu_selected_batch_weighted_mtl4_pipeline :
+                    gateup_tile4 ?
+                    g_d8f_gateup_swiglu_selected_batch_tile4_mtl4_pipeline :
+                    g_d8f_gateup_swiglu_selected_batch_mtl4_pipeline];
+                [enc setArgumentTable:gateAt];
+                [enc setThreadgroupMemoryLength:(gateup_tile4 ? 64u : 16u) * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(gateup_tile4 ? ((ds4_mid_dim + 3u) >> 2) : ds4_mid_dim, n_experts, n_tokens)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc barrierAfterEncoderStages:MTLStageDispatch
+                             beforeEncoderStages:MTLStageDispatch
+                               visibilityOptions:MTL4VisibilityOptionDevice];
+                id<MTL4ArgumentTable> downAt = ds4_mtl4_pool_acquire(6);
+                [downAt setAddress:packBuf.gpuAddress atIndex:0];
+                [downAt setAddress:midBuf.gpuAddress atIndex:1];
+                [downAt setAddress:selBuf.gpuAddress atIndex:2];
+                [downAt setAddress:outBuf.gpuAddress atIndex:3];
+                [downAt setAddress:downArgsBuf.gpuAddress atIndex:4];
+                [downAt setAddress:routeBuf.gpuAddress atIndex:5];
+                [enc setComputePipelineState:preweight_mid ?
+                    g_d8f_down_sum_selected_preweighted_batch_tile16_mtl4_pipeline :
+                    down_tile16 ?
+                    g_d8f_down_sum_selected_weighted_batch_tile16_mtl4_pipeline :
+                    down_tile8 ?
+                    g_d8f_down_sum_selected_weighted_batch_tile8_mtl4_pipeline :
+                    g_d8f_down_sum_selected_weighted_batch_mtl4_pipeline];
+                [enc setArgumentTable:downAt];
+                [enc setThreadgroupMemoryLength:(down_tile16 ? 128u : (down_tile8 ? 64u : 8u)) * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(down_tile16 ? ((rows + 15u) >> 4) : (down_tile8 ? ((rows + 7u) >> 3) : rows), n_tokens, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                [cb endCommandBuffer];
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                MTL4CommitOptions *opts = [MTL4CommitOptions new];
+                [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { (void)fb; dispatch_semaphore_signal(sem); }];
+                id<MTL4CommandBuffer> bufs[1] = { cb };
+                [g_polar_queue commit:bufs count:1 options:opts];
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+                ds4_mtl4_pool_release(gateAt, gate_arg_count);
+                ds4_mtl4_pool_release(downAt, 6);
+            };
+            dispatch_once();
+            mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+            const uint64_t t0 = mach_absolute_time();
+            for (uint32_t r = 0; r < rounds; r++) dispatch_once();
+            const uint64_t t1 = mach_absolute_time();
+            timed_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+            const float *gpu = (const float *)outBuf.contents;
+            const uint64_t count = (uint64_t)n_tokens * rows;
+            for (uint64_t i = 0; i < count; i++) {
+                if (i < 4u) {
+                    dbg_ref[i] = ref[i];
+                    dbg_gpu[i] = gpu[i];
+                }
+                if (gpu[i] == 0.0f) gpu_zero++;
+                if (gpu[i] == -1234567.0f) gpu_sentinel++;
+                const double err_abs = fabs((double)gpu[i] - (double)ref[i]);
+                const double denom = fabs((double)ref[i]) > 1e-4 ? fabs((double)ref[i]) : 1e-4;
+                const double err_rel = err_abs / denom;
+                if (err_abs > max_abs) max_abs = err_abs;
+                if (err_rel > max_rel) max_rel = err_rel;
+                if (err_abs > 5e-4 && err_rel > 5e-4) mismatch++;
+            }
+            ok = (mismatch == 0);
+        } else {
+            fprintf(stderr, "ds4_d8f: batch organ Metal buffer or residency allocation failed\n");
+        }
+        if (rs) {
+            [g_polar_queue removeResidencySet:rs];
+            [rs endResidency];
+        }
+    }
+    uint32_t *selected_full = (uint32_t *)malloc((size_t)n_tokens * n_experts * sizeof(uint32_t));
+    float *tensor_out = (float *)malloc((size_t)n_tokens * ds4_down_out_dim * sizeof(float));
+    if (selected_full && tensor_out) {
+        for (uint32_t token = 0; token < n_tokens; token++) {
+            for (uint32_t slot = 0; slot < n_experts; slot++) {
+                selected_full[(uint64_t)token * n_experts + slot] = experts[slot];
+            }
+        }
+        ds4_gpu_tensor *selected_t = ds4_gpu_tensor_alloc_managed((uint64_t)n_tokens * n_experts * sizeof(uint32_t));
+        ds4_gpu_tensor *weights_t = ds4_gpu_tensor_alloc_managed((uint64_t)n_tokens * n_experts * sizeof(float));
+        ds4_gpu_tensor *input_t = ds4_gpu_tensor_alloc_managed((uint64_t)n_tokens * ds4_gateup_in_dim * sizeof(float));
+        ds4_gpu_tensor *output_t = ds4_gpu_tensor_alloc_managed((uint64_t)n_tokens * ds4_down_out_dim * sizeof(float));
+        const char *tensor_fail_stage = "alloc";
+        int tensor_dispatch_ok = selected_t && weights_t && input_t && output_t;
+        if (tensor_dispatch_ok) { tensor_fail_stage = "selected_write"; tensor_dispatch_ok = ds4_gpu_tensor_write(selected_t, 0, selected_full, (uint64_t)n_tokens * n_experts * sizeof(uint32_t)); }
+        if (tensor_dispatch_ok) { tensor_fail_stage = "weights_write"; tensor_dispatch_ok = ds4_gpu_tensor_write(weights_t, 0, route_weights, (uint64_t)n_tokens * n_experts * sizeof(float)); }
+        if (tensor_dispatch_ok) { tensor_fail_stage = "input_write"; tensor_dispatch_ok = ds4_gpu_tensor_write(input_t, 0, x, (uint64_t)n_tokens * ds4_gateup_in_dim * sizeof(float)); }
+        if (tensor_dispatch_ok) { tensor_fail_stage = "output_fill"; tensor_dispatch_ok = ds4_gpu_tensor_fill_f32(output_t, -1234567.0f, (uint64_t)n_tokens * ds4_down_out_dim); }
+        if (tensor_dispatch_ok && canary_rank1_sidecars) {
+            tensor_fail_stage = "unsupported_rank1_external";
+            tensor_dispatch_ok = 0;
+        }
+        if (tensor_dispatch_ok) {
+            tensor_fail_stage = "warmup_dispatch";
+            tensor_dispatch_ok =
+                ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(
+                    d8f_path, file.layer, selected_t, weights_t, input_t, output_t,
+                    n_tokens, n_experts, swiglu_limit) == 0;
+        }
+        if (tensor_dispatch_ok) { tensor_fail_stage = "output_refill"; tensor_dispatch_ok = ds4_gpu_tensor_fill_f32(output_t, -1234567.0f, (uint64_t)n_tokens * ds4_down_out_dim); }
+        if (tensor_dispatch_ok) {
+            mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+            const uint64_t t0 = mach_absolute_time();
+            tensor_fail_stage = "dispatch";
+            for (uint32_t r = 0; tensor_dispatch_ok && r < rounds; r++) {
+                tensor_dispatch_ok =
+                    ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(
+                        d8f_path, file.layer, selected_t, weights_t, input_t, output_t,
+                        n_tokens, n_experts, swiglu_limit) == 0;
+            }
+            const uint64_t t1 = mach_absolute_time();
+            tensor_timed_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        }
+        if (tensor_dispatch_ok) {
+            tensor_fail_stage = "readback";
+            tensor_dispatch_ok = ds4_gpu_tensor_read(output_t, 0, tensor_out, (uint64_t)n_tokens * ds4_down_out_dim * sizeof(float));
+        }
+        if (tensor_dispatch_ok) {
+            for (uint32_t token = 0; token < n_tokens; token++) {
+                const float *token_tensor = tensor_out + (uint64_t)token * ds4_down_out_dim;
+                const float *token_ref = ref + (uint64_t)token * rows;
+                for (uint32_t row = 0; row < rows; row++) {
+                    const uint64_t flat = (uint64_t)token * rows + row;
+                    if (flat < 4u) dbg_tensor[flat] = token_tensor[row];
+                    if (token_tensor[row] == 0.0f) tensor_zero++;
+                    if (token_tensor[row] == -1234567.0f) tensor_sentinel++;
+                    const double err_abs = fabs((double)token_tensor[row] - (double)token_ref[row]);
+                    const double denom = fabs((double)token_ref[row]) > 1e-4 ? fabs((double)token_ref[row]) : 1e-4;
+                    const double err_rel = err_abs / denom;
+                    if (err_abs > tensor_max_abs) tensor_max_abs = err_abs;
+                    if (err_rel > tensor_max_rel) tensor_max_rel = err_rel;
+                    if (err_abs > 5e-4 && err_rel > 5e-4) tensor_mismatch++;
+                }
+            }
+            tensor_ok = (tensor_mismatch == 0 && tensor_sentinel == 0);
+        }
+        if (!tensor_dispatch_ok && !canary_rank1_sidecars) {
+            fprintf(stderr, "ds4_d8f: tensor dispatch canary failed stage=%s n_tokens=%u nsel=%u layer=%u\n",
+                    tensor_fail_stage, n_tokens, n_experts, file.layer);
+        }
+        const char *classic_fail_stage = "alloc";
+        int classic_dispatch_ok = selected_t && weights_t && input_t && output_t;
+        if (classic_dispatch_ok) { classic_fail_stage = "output_fill"; classic_dispatch_ok = ds4_gpu_tensor_fill_f32(output_t, -1234567.0f, (uint64_t)n_tokens * ds4_down_out_dim); }
+        if (classic_dispatch_ok) {
+            classic_fail_stage = "warmup";
+            const int began = ds4_gpu_begin_commands() != 0;
+            int dr = -1;
+            int ended = 0;
+            if (began) {
+                dr = ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+                    d8f_path, file.layer, selected_t, weights_t, input_t, output_t,
+                    n_tokens, n_experts, swiglu_limit);
+                ended = ds4_gpu_end_commands() != 0;
+            }
+            classic_dispatch_ok = began && dr == 0 && ended;
+        }
+        if (classic_dispatch_ok) { classic_fail_stage = "output_refill"; classic_dispatch_ok = ds4_gpu_tensor_fill_f32(output_t, -1234567.0f, (uint64_t)n_tokens * ds4_down_out_dim); }
+        if (classic_dispatch_ok) {
+            mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+            const uint64_t t0 = mach_absolute_time();
+            classic_fail_stage = "dispatch";
+            for (uint32_t r = 0; classic_dispatch_ok && r < rounds; r++) {
+                const int began = ds4_gpu_begin_commands() != 0;
+                int dr = -1;
+                int ended = 0;
+                if (began) {
+                    dr = ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+                        d8f_path, file.layer, selected_t, weights_t, input_t, output_t,
+                        n_tokens, n_experts, swiglu_limit);
+                    ended = ds4_gpu_end_commands() != 0;
+                }
+                classic_dispatch_ok = began && dr == 0 && ended;
+            }
+            const uint64_t t1 = mach_absolute_time();
+            classic_timed_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        }
+        if (classic_dispatch_ok) {
+            classic_fail_stage = "readback";
+            classic_dispatch_ok = ds4_gpu_tensor_read(output_t, 0, tensor_out, (uint64_t)n_tokens * ds4_down_out_dim * sizeof(float));
+        }
+        if (classic_dispatch_ok) {
+            for (uint32_t token = 0; token < n_tokens; token++) {
+                const float *token_classic = tensor_out + (uint64_t)token * ds4_down_out_dim;
+                const float *token_ref = ref + (uint64_t)token * rows;
+                for (uint32_t row = 0; row < rows; row++) {
+                    const uint64_t flat = (uint64_t)token * rows + row;
+                    if (flat < 4u) dbg_classic[flat] = token_classic[row];
+                    if (token_classic[row] == 0.0f) classic_zero++;
+                    if (token_classic[row] == -1234567.0f) classic_sentinel++;
+                    const double err_abs = fabs((double)token_classic[row] - (double)token_ref[row]);
+                    const double denom = fabs((double)token_ref[row]) > 1e-4 ? fabs((double)token_ref[row]) : 1e-4;
+                    const double err_rel = err_abs / denom;
+                    if (err_abs > classic_max_abs) classic_max_abs = err_abs;
+                    if (err_rel > classic_max_rel) classic_max_rel = err_rel;
+                    if (err_abs > 5e-4 && err_rel > 5e-4) classic_mismatch++;
+                }
+            }
+            classic_ok = (classic_mismatch == 0 && classic_sentinel == 0);
+        }
+        if (!classic_dispatch_ok) {
+            fprintf(stderr, "ds4_d8f: classic in-graph dispatch canary failed stage=%s n_tokens=%u nsel=%u layer=%u\n",
+                    classic_fail_stage, n_tokens, n_experts, file.layer);
+        }
+        const char *classic_graph_fail_stage = "alloc";
+        int classic_graph_dispatch_ok = selected_t && weights_t && input_t && output_t;
+        if (classic_graph_dispatch_ok) { classic_graph_fail_stage = "output_fill"; classic_graph_dispatch_ok = ds4_gpu_tensor_fill_f32(output_t, -1234567.0f, (uint64_t)n_tokens * ds4_down_out_dim); }
+        if (classic_graph_dispatch_ok) {
+            classic_graph_fail_stage = "warmup";
+            const int began = ds4_gpu_begin_commands() != 0;
+            int dr = -1;
+            int ended = 0;
+            if (began) {
+                dr = ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+                    d8f_path, file.layer, selected_t, weights_t, input_t, output_t,
+                    n_tokens, n_experts, swiglu_limit);
+                ended = ds4_gpu_end_commands() != 0;
+            }
+            classic_graph_dispatch_ok = began && dr == 0 && ended;
+        }
+        if (classic_graph_dispatch_ok) { classic_graph_fail_stage = "output_refill"; classic_graph_dispatch_ok = ds4_gpu_tensor_fill_f32(output_t, -1234567.0f, (uint64_t)n_tokens * ds4_down_out_dim); }
+        if (classic_graph_dispatch_ok) {
+            mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+            const uint64_t t0 = mach_absolute_time();
+            classic_graph_fail_stage = "dispatch";
+            const int began = ds4_gpu_begin_commands() != 0;
+            int ended = 0;
+            if (began) {
+                for (uint32_t r = 0; classic_graph_dispatch_ok && r < rounds; r++) {
+                    classic_graph_dispatch_ok =
+                        ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+                            d8f_path, file.layer, selected_t, weights_t, input_t, output_t,
+                            n_tokens, n_experts, swiglu_limit) == 0;
+                }
+                ended = ds4_gpu_end_commands() != 0;
+            }
+            classic_graph_dispatch_ok = began && classic_graph_dispatch_ok && ended;
+            const uint64_t t1 = mach_absolute_time();
+            classic_graph_timed_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        }
+        if (classic_graph_dispatch_ok) {
+            classic_graph_fail_stage = "readback";
+            classic_graph_dispatch_ok = ds4_gpu_tensor_read(output_t, 0, tensor_out, (uint64_t)n_tokens * ds4_down_out_dim * sizeof(float));
+        }
+        if (classic_graph_dispatch_ok) {
+            for (uint32_t token = 0; token < n_tokens; token++) {
+                const float *token_classic_graph = tensor_out + (uint64_t)token * ds4_down_out_dim;
+                const float *token_ref = ref + (uint64_t)token * rows;
+                for (uint32_t row = 0; row < rows; row++) {
+                    const uint64_t flat = (uint64_t)token * rows + row;
+                    if (flat < 4u) dbg_classic_graph[flat] = token_classic_graph[row];
+                    if (token_classic_graph[row] == 0.0f) classic_graph_zero++;
+                    if (token_classic_graph[row] == -1234567.0f) classic_graph_sentinel++;
+                    const double err_abs = fabs((double)token_classic_graph[row] - (double)token_ref[row]);
+                    const double denom = fabs((double)token_ref[row]) > 1e-4 ? fabs((double)token_ref[row]) : 1e-4;
+                    const double err_rel = err_abs / denom;
+                    if (err_abs > classic_graph_max_abs) classic_graph_max_abs = err_abs;
+                    if (err_rel > classic_graph_max_rel) classic_graph_max_rel = err_rel;
+                    if (err_abs > 5e-4 && err_rel > 5e-4) classic_graph_mismatch++;
+                }
+            }
+            classic_graph_ok = (classic_graph_mismatch == 0 && classic_graph_sentinel == 0);
+        }
+        if (!classic_graph_dispatch_ok) {
+            fprintf(stderr, "ds4_d8f: classic graph-owned dispatch canary failed stage=%s n_tokens=%u nsel=%u layer=%u\n",
+                    classic_graph_fail_stage, n_tokens, n_experts, file.layer);
+        }
+        const char *selected_fail_stage = "alloc";
+        int selected_dispatch_ok = selected_t && weights_t && input_t && output_t;
+        if (selected_dispatch_ok) { selected_fail_stage = "output_fill"; selected_dispatch_ok = ds4_gpu_tensor_fill_f32(output_t, -1234567.0f, (uint64_t)n_tokens * ds4_down_out_dim); }
+        if (selected_dispatch_ok) {
+            selected_fail_stage = "warmup";
+            if (selected_external_mtl4) {
+                selected_dispatch_ok =
+                    ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(
+                        d8f_path, file.layer, selected_t, weights_t, input_t, output_t,
+                        n_tokens, n_experts, swiglu_limit) == 0;
+            } else {
+                const int began = ds4_gpu_begin_commands() != 0;
+                int dr = -1;
+                int ended = 0;
+                if (began) {
+                    dr = ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+                        d8f_path, file.layer, selected_t, weights_t, input_t, output_t,
+                        n_tokens, n_experts, swiglu_limit);
+                    ended = ds4_gpu_end_commands() != 0;
+                }
+                selected_dispatch_ok = began && dr == 0 && ended;
+            }
+        }
+        if (selected_dispatch_ok) { selected_fail_stage = "output_refill"; selected_dispatch_ok = ds4_gpu_tensor_fill_f32(output_t, -1234567.0f, (uint64_t)n_tokens * ds4_down_out_dim); }
+        if (selected_dispatch_ok) {
+            mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+            const uint64_t t0 = mach_absolute_time();
+            selected_fail_stage = "dispatch";
+            if (selected_external_mtl4) {
+                for (uint32_t r = 0; selected_dispatch_ok && r < rounds; r++) {
+                    selected_dispatch_ok =
+                        ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(
+                            d8f_path, file.layer, selected_t, weights_t, input_t, output_t,
+                            n_tokens, n_experts, swiglu_limit) == 0;
+                }
+            } else {
+                const int began = ds4_gpu_begin_commands() != 0;
+                int ended = 0;
+                if (began) {
+                    for (uint32_t r = 0; selected_dispatch_ok && r < rounds; r++) {
+                        selected_dispatch_ok =
+                            ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+                            d8f_path, file.layer, selected_t, weights_t, input_t, output_t,
+                            n_tokens, n_experts, swiglu_limit) == 0;
+                    }
+                    ended = ds4_gpu_end_commands() != 0;
+                }
+                selected_dispatch_ok = began && selected_dispatch_ok && ended;
+            }
+            const uint64_t t1 = mach_absolute_time();
+            selected_timed_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        }
+        if (selected_dispatch_ok) {
+            selected_fail_stage = "readback";
+            selected_dispatch_ok = ds4_gpu_tensor_read(output_t, 0, tensor_out, (uint64_t)n_tokens * ds4_down_out_dim * sizeof(float));
+        }
+        if (selected_dispatch_ok) {
+            for (uint32_t token = 0; token < n_tokens; token++) {
+                const float *token_selected = tensor_out + (uint64_t)token * ds4_down_out_dim;
+                const float *token_ref = ref + (uint64_t)token * rows;
+                for (uint32_t row = 0; row < rows; row++) {
+                    const uint64_t flat = (uint64_t)token * rows + row;
+                    if (flat < 4u) dbg_selected[flat] = token_selected[row];
+                    if (token_selected[row] == 0.0f) selected_zero++;
+                    if (token_selected[row] == -1234567.0f) selected_sentinel++;
+                    const double err_abs = fabs((double)token_selected[row] - (double)token_ref[row]);
+                    const double denom = fabs((double)token_ref[row]) > 1e-4 ? fabs((double)token_ref[row]) : 1e-4;
+                    const double err_rel = err_abs / denom;
+                    if (err_abs > selected_max_abs) selected_max_abs = err_abs;
+                    if (err_rel > selected_max_rel) selected_max_rel = err_rel;
+                    if (err_abs > 5e-4 && err_rel > 5e-4) selected_mismatch++;
+                }
+            }
+            selected_ok = (selected_mismatch == 0 && selected_sentinel == 0);
+        }
+        if (!selected_dispatch_ok) {
+            fprintf(stderr, "ds4_d8f: selected production dispatch canary failed stage=%s path=%s n_tokens=%u nsel=%u layer=%u\n",
+                    selected_fail_stage, selected_path, n_tokens, n_experts, file.layer);
+        }
+        ds4_gpu_tensor_free(output_t);
+        ds4_gpu_tensor_free(input_t);
+        ds4_gpu_tensor_free(weights_t);
+        ds4_gpu_tensor_free(selected_t);
+    } else {
+        fprintf(stderr, "ds4_d8f: tensor dispatch canary host allocation failed\n");
+    }
+    free(tensor_out);
+    free(selected_full);
+    fprintf(stderr,
+            "ds4: d8f_organ_selected_batch_canary route_weighted=1 nsel=%u rows=%u tokens=%u rounds=%u clamp=%.1f preweight_mid=%d gateup_tile4=%d down_tile8=%d down_tile16=%d pack=%.2f MiB gpu %.3f ms total (%.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d tensor_gpu %.3f ms total tensor_mismatch=%d tensor_zero=%d tensor_sentinel=%d tensor_max_abs=%.6e tensor_max_rel=%.6e tensor_rc=%d classic_gpu %.3f ms total classic_mismatch=%d classic_zero=%d classic_sentinel=%d classic_max_abs=%.6e classic_max_rel=%.6e classic_rc=%d classic_graph_gpu %.3f ms total classic_graph_mismatch=%d classic_graph_zero=%d classic_graph_sentinel=%d classic_graph_max_abs=%.6e classic_graph_max_rel=%.6e classic_graph_rc=%d selected_path=%s selected_gpu %.3f ms total selected_mismatch=%d selected_zero=%d selected_sentinel=%d selected_max_abs=%.6e selected_max_rel=%.6e selected_rc=%d",
+            n_experts, rows, n_tokens, rounds, swiglu_limit, preweight_mid, gateup_tile4, down_tile8, down_tile16, (double)file.size / 1048576.0, timed_ms,
+            timed_ms * 1000.0 / ((double)n_tokens * (double)rows * (double)rounds),
+            mismatch, gpu_zero, gpu_sentinel, max_abs, max_rel, ok,
+            tensor_timed_ms, tensor_mismatch, tensor_zero, tensor_sentinel, tensor_max_abs, tensor_max_rel, tensor_ok,
+            classic_timed_ms, classic_mismatch, classic_zero, classic_sentinel, classic_max_abs, classic_max_rel, classic_ok,
+            classic_graph_timed_ms, classic_graph_mismatch, classic_graph_zero, classic_graph_sentinel, classic_graph_max_abs, classic_graph_max_rel, classic_graph_ok,
+            selected_path, selected_timed_ms, selected_mismatch, selected_zero, selected_sentinel, selected_max_abs, selected_max_rel, selected_ok);
+    for (uint32_t i = 0; i < n_tokens * rows && i < 4u; i++) {
+        fprintf(stderr, " out%u_ref=%.7g out%u_gpu=%.7g out%u_tensor=%.7g out%u_classic=%.7g out%u_classic_graph=%.7g out%u_selected=%.7g", i, dbg_ref[i], i, dbg_gpu[i], i, dbg_tensor[i], i, dbg_classic[i], i, dbg_classic_graph[i], i, dbg_selected[i]);
+    }
+    fprintf(stderr, " experts=");
+    for (uint32_t slot = 0; slot < n_experts; slot++) fprintf(stderr, "%s%u", slot ? "," : "", experts[slot]);
+    fprintf(stderr, "\n");
+    free(ref);
+    free(route_weights);
+    free(mid_ref);
+    free(x);
+    const int rank1_sidecar_canary = ds4_d8f_down_sidecar_count(&file) > 0u;
+    const int gateup_overlay_canary = ds4_d8f_gateup_overlay_count(&file) > 0u;
+    ds4_d8f_close(&file);
+    if (rank1_sidecar_canary) return classic_ok && classic_graph_ok && selected_ok;
+    if (gateup_overlay_canary) return tensor_ok && classic_ok && classic_graph_ok && selected_ok;
+    return ok && tensor_ok && classic_ok && classic_graph_ok && selected_ok;
+}
+
+int ds4_gpu_d8f_prefix_graph_canary(const char *d8f_dir,
+                                    const uint32_t *experts,
+                                    uint32_t n_experts,
+                                    uint32_t first_layer,
+                                    uint32_t n_layers,
+                                    uint32_t n_tokens,
+                                    uint32_t rounds,
+                                    float swiglu_limit) {
+    enum {
+        ds4_selected_expert_cap = 6,
+        ds4_batch_token_cap = 16,
+        ds4_gateup_in_dim = 4096,
+        ds4_down_out_dim = 4096,
+        ds4_layer_cap = 43
+    };
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!d8f_dir || !d8f_dir[0] || !experts || n_experts == 0 || n_experts > ds4_selected_expert_cap) return 0;
+    if (first_layer >= ds4_layer_cap) return 0;
+    if (n_layers == 0 || first_layer + n_layers > ds4_layer_cap) n_layers = ds4_layer_cap - first_layer;
+    if (n_tokens == 0 || n_tokens > ds4_batch_token_cap) n_tokens = 1u;
+    if (rounds == 0) rounds = 1u;
+    if (!(swiglu_limit > 0.0f)) swiglu_limit = 10.0f;
+
+    char paths[ds4_layer_cap][4096];
+    uint64_t total_pack_bytes = 0;
+    for (uint32_t li = 0; li < n_layers; li++) {
+        const uint32_t layer = first_layer + li;
+        snprintf(paths[li], sizeof(paths[li]),
+                 "%s/ds4_L%02u_gate_up_down_VQD8_noE8_rank1.d8f",
+                 d8f_dir, layer);
+        if (access(paths[li], R_OK) != 0) {
+            snprintf(paths[li], sizeof(paths[li]),
+                 "%s/ds4_L%02u_gate_up_down_VQD8_noE8_fit131k_i8.d8f",
+                 d8f_dir, layer);
+        }
+        if (access(paths[li], R_OK) != 0) {
+            fprintf(stderr, "ds4_d8f: prefix graph canary missing L%02u path=%s\n", layer, paths[li]);
+            return 0;
+        }
+        struct stat st;
+        if (stat(paths[li], &st) == 0 && st.st_size > 0) total_pack_bytes += (uint64_t)st.st_size;
+    }
+    const uint32_t prefix_max_pack_mib =
+        ds4_gpu_env_u32("DS4_D8F_PREFIX_MAX_PACK_MIB", 8192u);
+    const uint64_t prefix_max_pack_bytes = (uint64_t)prefix_max_pack_mib << 20;
+    const int prefix_allow_large = ds4_gpu_env_bool("DS4_D8F_PREFIX_ALLOW_LARGE") > 0;
+    if (!prefix_allow_large && total_pack_bytes > prefix_max_pack_bytes) {
+        fprintf(stderr,
+                "ds4_d8f: prefix graph canary refused %.2f GiB pack window "
+                "(first_layer=%u n_layers=%u max=%u MiB). Split the probe or set "
+                "DS4_D8F_PREFIX_ALLOW_LARGE=1 if this large residency test is intentional.\n",
+                (double)total_pack_bytes / 1073741824.0,
+                first_layer, n_layers, prefix_max_pack_mib);
+        return 0;
+    }
+    fprintf(stderr,
+            "ds4_d8f: prefix graph canary window first_layer=%u n_layers=%u "
+            "tokens=%u rounds=%u chain=%d pack_window=%.2f GiB\n",
+            first_layer, n_layers, n_tokens, rounds,
+            ds4_gpu_env_bool("DS4_D8F_PREFIX_CHAIN") > 0,
+            (double)total_pack_bytes / 1073741824.0);
+
+    const uint64_t selected_count = (uint64_t)n_tokens * n_experts;
+    const uint64_t vector_count = (uint64_t)n_tokens * ds4_gateup_in_dim;
+    const int chain_mode = ds4_gpu_env_bool("DS4_D8F_PREFIX_CHAIN") > 0;
+    const uint64_t result_count = chain_mode ? vector_count : (uint64_t)n_layers * vector_count;
+    uint32_t *selected = (uint32_t *)malloc((size_t)selected_count * sizeof(uint32_t));
+    float *weights = (float *)malloc((size_t)selected_count * sizeof(float));
+    float *input = (float *)malloc((size_t)vector_count * sizeof(float));
+    float *graph_out = (float *)malloc((size_t)result_count * sizeof(float));
+    float *loop_out = (float *)malloc((size_t)result_count * sizeof(float));
+    float *external_out = (float *)malloc((size_t)result_count * sizeof(float));
+    float *mtl4_graph_out = (float *)malloc((size_t)result_count * sizeof(float));
+    if (!selected || !weights || !input || !graph_out || !loop_out || !external_out || !mtl4_graph_out) {
+        free(mtl4_graph_out); free(external_out); free(loop_out); free(graph_out); free(input); free(weights); free(selected);
+        return 0;
+    }
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        float route_sum = 0.0f;
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            const uint32_t expert = experts[(slot + token) % n_experts];
+            if (expert >= 256u) {
+                free(mtl4_graph_out); free(external_out); free(loop_out); free(graph_out); free(input); free(weights); free(selected);
+                return 0;
+            }
+            selected[(uint64_t)token * n_experts + slot] = expert;
+            const float w = 1.0f / (1.0f + (float)slot + 0.25f * (float)((token + slot) % 3u));
+            weights[(uint64_t)token * n_experts + slot] = w;
+            route_sum += w;
+        }
+        for (uint32_t slot = 0; slot < n_experts; slot++) {
+            weights[(uint64_t)token * n_experts + slot] /= route_sum;
+        }
+        float *xt = input + (uint64_t)token * ds4_gateup_in_dim;
+        for (uint32_t i = 0; i < ds4_gateup_in_dim; i++) {
+            xt[i] = 0.35f * sinf((float)(i + 17u * token) * 0.011f) +
+                    0.17f * cosf((float)(i + 31u * token) * 0.019f);
+        }
+    }
+
+    ds4_gpu_tensor *selected_t = ds4_gpu_tensor_alloc_managed(selected_count * sizeof(uint32_t));
+    ds4_gpu_tensor *weights_t = ds4_gpu_tensor_alloc_managed(selected_count * sizeof(float));
+    ds4_gpu_tensor *a_t = ds4_gpu_tensor_alloc_managed(vector_count * sizeof(float));
+    ds4_gpu_tensor *b_t = ds4_gpu_tensor_alloc_managed(result_count * sizeof(float));
+    int ok = selected_t && weights_t && a_t && b_t;
+    if (ok) ok = ds4_gpu_tensor_write(selected_t, 0, selected, selected_count * sizeof(uint32_t));
+    if (ok) ok = ds4_gpu_tensor_write(weights_t, 0, weights, selected_count * sizeof(float));
+
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    double graph_ms = 0.0, loop_ms = 0.0, external_ms = 0.0, mtl4_graph_ms = 0.0;
+    const uint64_t output_bytes = vector_count * sizeof(float);
+    const uint64_t result_bytes = result_count * sizeof(float);
+    const uint32_t final_is_a = (n_layers % 2u) == 0u;
+
+    int warmup_ok = ok;
+    if (warmup_ok) {
+        fprintf(stderr, "ds4_d8f: prefix graph canary phase=warmup layers=%u\n", n_layers);
+        warmup_ok = ds4_gpu_tensor_write(a_t, 0, input, output_bytes);
+        if (warmup_ok) warmup_ok = ds4_gpu_tensor_fill_f32(b_t, -1234567.0f, result_count);
+        ds4_gpu_tensor *src = a_t;
+        ds4_gpu_tensor *dst = b_t;
+        for (uint32_t li = 0; warmup_ok && li < n_layers; li++) {
+            const uint32_t layer = first_layer + li;
+            const int began = ds4_gpu_begin_commands() != 0;
+            int dr = -1;
+            int ended = 0;
+            if (began) {
+                if (chain_mode) {
+                    dr = ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+                        paths[li], layer, selected_t, weights_t, src, dst,
+                        n_tokens, n_experts, swiglu_limit);
+                } else {
+                    ds4_gpu_tensor *dst_view = ds4_gpu_tensor_view(b_t, (uint64_t)li * output_bytes, output_bytes);
+                    dr = dst_view ?
+                        ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+                            paths[li], layer, selected_t, weights_t, a_t, dst_view,
+                            n_tokens, n_experts, swiglu_limit) : -1;
+                    ds4_gpu_tensor_free(dst_view);
+                }
+                ended = ds4_gpu_end_commands() != 0;
+            }
+            warmup_ok = began && dr == 0 && ended;
+            if (chain_mode) {
+                ds4_gpu_tensor *tmp = src; src = dst; dst = tmp;
+            }
+        }
+    }
+
+    int graph_ok = ok && warmup_ok;
+    if (ok) {
+        fprintf(stderr, "ds4_d8f: prefix graph canary phase=graph rounds=%u layers=%u\n", rounds, n_layers);
+        graph_ok = ds4_gpu_tensor_write(a_t, 0, input, output_bytes);
+        if (graph_ok) graph_ok = ds4_gpu_tensor_fill_f32(b_t, -1234567.0f, result_count);
+        const uint64_t t0 = mach_absolute_time();
+        if (graph_ok) graph_ok = ds4_gpu_begin_commands() != 0;
+        for (uint32_t r = 0; graph_ok && r < rounds; r++) {
+            ds4_gpu_tensor *src = a_t;
+            ds4_gpu_tensor *dst = b_t;
+            for (uint32_t li = 0; graph_ok && li < n_layers; li++) {
+                const uint32_t layer = first_layer + li;
+                if (chain_mode) {
+                    graph_ok = ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+                        paths[li], layer, selected_t, weights_t, src, dst,
+                        n_tokens, n_experts, swiglu_limit) == 0;
+                    ds4_gpu_tensor *tmp = src; src = dst; dst = tmp;
+                } else {
+                    ds4_gpu_tensor *dst_view = ds4_gpu_tensor_view(b_t, (uint64_t)li * output_bytes, output_bytes);
+                    graph_ok = dst_view &&
+                        ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+                            paths[li], layer, selected_t, weights_t, a_t, dst_view,
+                            n_tokens, n_experts, swiglu_limit) == 0;
+                    ds4_gpu_tensor_free(dst_view);
+                }
+            }
+        }
+        if (graph_ok) graph_ok = ds4_gpu_end_commands() != 0;
+        const uint64_t t1 = mach_absolute_time();
+        graph_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        if (graph_ok) graph_ok = ds4_gpu_tensor_read(chain_mode && final_is_a ? a_t : b_t, 0, graph_out, chain_mode ? output_bytes : result_bytes);
+    }
+
+    int loop_ok = ok && warmup_ok;
+    if (ok) {
+        fprintf(stderr, "ds4_d8f: prefix graph canary phase=loop rounds=%u layers=%u\n", rounds, n_layers);
+        loop_ok = ds4_gpu_tensor_write(a_t, 0, input, output_bytes);
+        if (loop_ok) loop_ok = ds4_gpu_tensor_fill_f32(b_t, -1234567.0f, result_count);
+        const uint64_t t0 = mach_absolute_time();
+        for (uint32_t r = 0; loop_ok && r < rounds; r++) {
+            ds4_gpu_tensor *src = a_t;
+            ds4_gpu_tensor *dst = b_t;
+            for (uint32_t li = 0; loop_ok && li < n_layers; li++) {
+                const uint32_t layer = first_layer + li;
+                const int began = ds4_gpu_begin_commands() != 0;
+                int dr = -1;
+                int ended = 0;
+                if (began) {
+                    if (chain_mode) {
+                        dr = ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+                            paths[li], layer, selected_t, weights_t, src, dst,
+                            n_tokens, n_experts, swiglu_limit);
+                    } else {
+                        ds4_gpu_tensor *dst_view = ds4_gpu_tensor_view(b_t, (uint64_t)li * output_bytes, output_bytes);
+                        dr = dst_view ?
+                            ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(
+                                paths[li], layer, selected_t, weights_t, a_t, dst_view,
+                                n_tokens, n_experts, swiglu_limit) : -1;
+                        ds4_gpu_tensor_free(dst_view);
+                    }
+                    ended = ds4_gpu_end_commands() != 0;
+                }
+                loop_ok = began && dr == 0 && ended;
+                if (chain_mode) {
+                    ds4_gpu_tensor *tmp = src; src = dst; dst = tmp;
+                }
+            }
+        }
+        const uint64_t t1 = mach_absolute_time();
+        loop_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        if (loop_ok) loop_ok = ds4_gpu_tensor_read(chain_mode && final_is_a ? a_t : b_t, 0, loop_out, chain_mode ? output_bytes : result_bytes);
+    }
+
+    int external_ok = ok;
+    if (ok) {
+        fprintf(stderr, "ds4_d8f: prefix graph canary phase=external rounds=%u layers=%u\n", rounds, n_layers);
+        external_ok = ds4_gpu_tensor_write(a_t, 0, input, output_bytes);
+        if (external_ok) external_ok = ds4_gpu_tensor_fill_f32(b_t, -1234567.0f, result_count);
+        const uint64_t t0 = mach_absolute_time();
+        for (uint32_t r = 0; external_ok && r < rounds; r++) {
+            ds4_gpu_tensor *src = a_t;
+            ds4_gpu_tensor *dst = b_t;
+            for (uint32_t li = 0; external_ok && li < n_layers; li++) {
+                const uint32_t layer = first_layer + li;
+                if (chain_mode) {
+                    external_ok = ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(
+                        paths[li], layer, selected_t, weights_t, src, dst,
+                        n_tokens, n_experts, swiglu_limit) == 0;
+                    ds4_gpu_tensor *tmp = src; src = dst; dst = tmp;
+                } else {
+                    ds4_gpu_tensor *dst_view = ds4_gpu_tensor_view(b_t, (uint64_t)li * output_bytes, output_bytes);
+                    external_ok = dst_view &&
+                        ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(
+                            paths[li], layer, selected_t, weights_t, a_t, dst_view,
+                            n_tokens, n_experts, swiglu_limit) == 0;
+                    ds4_gpu_tensor_free(dst_view);
+                }
+            }
+        }
+        const uint64_t t1 = mach_absolute_time();
+        external_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        if (external_ok) external_ok = ds4_gpu_tensor_read(chain_mode && final_is_a ? a_t : b_t, 0, external_out, chain_mode ? output_bytes : result_bytes);
+    }
+
+    int mtl4_graph_ok = ok;
+    if (ok) {
+        fprintf(stderr, "ds4_d8f: prefix graph canary phase=mtl4_graph rounds=%u layers=%u\n", rounds, n_layers);
+        mtl4_graph_ok = ds4_gpu_tensor_write(a_t, 0, input, output_bytes);
+        if (mtl4_graph_ok) mtl4_graph_ok = ds4_gpu_tensor_fill_f32(b_t, -1234567.0f, result_count);
+        const uint64_t t0 = mach_absolute_time();
+        if (mtl4_graph_ok) mtl4_graph_ok = ds4_gpu_mtl4_begin_commands() != 0;
+        for (uint32_t r = 0; mtl4_graph_ok && r < rounds; r++) {
+            ds4_gpu_tensor *src = a_t;
+            ds4_gpu_tensor *dst = b_t;
+            for (uint32_t li = 0; mtl4_graph_ok && li < n_layers; li++) {
+                const uint32_t layer = first_layer + li;
+                if (chain_mode) {
+                    mtl4_graph_ok = ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(
+                        paths[li], layer, selected_t, weights_t, src, dst,
+                        n_tokens, n_experts, swiglu_limit) == 0;
+                    ds4_gpu_tensor *tmp = src; src = dst; dst = tmp;
+                } else {
+                    ds4_gpu_tensor *dst_view = ds4_gpu_tensor_view(b_t, (uint64_t)li * output_bytes, output_bytes);
+                    mtl4_graph_ok = dst_view &&
+                        ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(
+                            paths[li], layer, selected_t, weights_t, a_t, dst_view,
+                            n_tokens, n_experts, swiglu_limit) == 0;
+                    ds4_gpu_tensor_free(dst_view);
+                }
+            }
+        }
+        if (mtl4_graph_ok) mtl4_graph_ok = ds4_gpu_mtl4_end_commands() != 0;
+        else (void)ds4_gpu_mtl4_end_commands();
+        const uint64_t t1 = mach_absolute_time();
+        mtl4_graph_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+        if (mtl4_graph_ok) mtl4_graph_ok = ds4_gpu_tensor_read(chain_mode && final_is_a ? a_t : b_t, 0, mtl4_graph_out, chain_mode ? output_bytes : result_bytes);
+    }
+
+    uint64_t graph_loop_mismatch = 0, graph_external_mismatch = 0, graph_mtl4_graph_mismatch = 0;
+    uint64_t graph_sentinel = 0, graph_nonfinite = 0;
+    double graph_loop_max_abs = 0.0, graph_external_max_abs = 0.0, graph_mtl4_graph_max_abs = 0.0;
+    double graph_loop_max_rel = 0.0, graph_external_max_rel = 0.0, graph_mtl4_graph_max_rel = 0.0;
+    double checksum = 0.0;
+    if (graph_ok) {
+        const uint64_t compare_count = chain_mode ? vector_count : result_count;
+        for (uint64_t i = 0; i < compare_count; i++) {
+            const float gv = graph_out[i];
+            if (gv == -1234567.0f) graph_sentinel++;
+            if (!isfinite(gv)) graph_nonfinite++;
+            checksum += (double)gv * (double)((i % 17u) + 1u);
+            if (loop_ok) {
+                const double gl_abs = fabs((double)gv - (double)loop_out[i]);
+                const double gl_den = fabs((double)loop_out[i]) > 1e-4 ? fabs((double)loop_out[i]) : 1e-4;
+                const double gl_rel = gl_abs / gl_den;
+                if (gl_abs > graph_loop_max_abs) graph_loop_max_abs = gl_abs;
+                if (gl_rel > graph_loop_max_rel) graph_loop_max_rel = gl_rel;
+                if (gl_abs > 5e-4 && gl_rel > 5e-4) graph_loop_mismatch++;
+            }
+            if (external_ok) {
+                const double ge_abs = fabs((double)gv - (double)external_out[i]);
+                const double ge_den = fabs((double)external_out[i]) > 1e-4 ? fabs((double)external_out[i]) : 1e-4;
+                const double ge_rel = ge_abs / ge_den;
+                if (ge_abs > graph_external_max_abs) graph_external_max_abs = ge_abs;
+                if (ge_rel > graph_external_max_rel) graph_external_max_rel = ge_rel;
+                if (ge_abs > 5e-4 && ge_rel > 5e-4) graph_external_mismatch++;
+            }
+            if (mtl4_graph_ok) {
+                const double gm_abs = fabs((double)gv - (double)mtl4_graph_out[i]);
+                const double gm_den = fabs((double)mtl4_graph_out[i]) > 1e-4 ? fabs((double)mtl4_graph_out[i]) : 1e-4;
+                const double gm_rel = gm_abs / gm_den;
+                if (gm_abs > graph_mtl4_graph_max_abs) graph_mtl4_graph_max_abs = gm_abs;
+                if (gm_rel > graph_mtl4_graph_max_rel) graph_mtl4_graph_max_rel = gm_rel;
+                if (gm_abs > 5e-4 && gm_rel > 5e-4) graph_mtl4_graph_mismatch++;
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "ds4: d8f_prefix_graph_canary first_layer=%u n_layers=%u chain_mode=%d nsel=%u tokens=%u rounds=%u clamp=%.1f warmup_rc=%d graph_rc=%d loop_rc=%d external_rc=%d mtl4_graph_rc=%d graph_ms=%.3f loop_ms=%.3f external_ms=%.3f mtl4_graph_ms=%.3f loop_over_graph=%.3f external_over_graph=%.3f mtl4_graph_over_graph=%.3f graph_loop_mismatch=%llu graph_external_mismatch=%llu graph_mtl4_graph_mismatch=%llu graph_loop_max_abs=%.6e graph_loop_max_rel=%.6e graph_external_max_abs=%.6e graph_external_max_rel=%.6e graph_mtl4_graph_max_abs=%.6e graph_mtl4_graph_max_rel=%.6e graph_sentinel=%llu graph_nonfinite=%llu checksum=%.9e rc=%d\n",
+            first_layer, n_layers, chain_mode, n_experts, n_tokens, rounds, swiglu_limit,
+            warmup_ok, graph_ok, loop_ok, external_ok, mtl4_graph_ok,
+            graph_ms, loop_ms, external_ms, mtl4_graph_ms,
+            graph_ms > 0.0 ? loop_ms / graph_ms : 0.0,
+            graph_ms > 0.0 ? external_ms / graph_ms : 0.0,
+            graph_ms > 0.0 ? mtl4_graph_ms / graph_ms : 0.0,
+            (unsigned long long)graph_loop_mismatch,
+            (unsigned long long)graph_external_mismatch,
+            (unsigned long long)graph_mtl4_graph_mismatch,
+            graph_loop_max_abs, graph_loop_max_rel,
+            graph_external_max_abs, graph_external_max_rel,
+            graph_mtl4_graph_max_abs, graph_mtl4_graph_max_rel,
+            (unsigned long long)graph_sentinel,
+            (unsigned long long)graph_nonfinite,
+            checksum,
+            graph_ok && loop_ok && graph_loop_mismatch == 0 &&
+            mtl4_graph_ok && graph_mtl4_graph_mismatch == 0 &&
+            graph_sentinel == 0 && graph_nonfinite == 0);
+
+    ds4_gpu_tensor_free(b_t);
+    ds4_gpu_tensor_free(a_t);
+    ds4_gpu_tensor_free(weights_t);
+    ds4_gpu_tensor_free(selected_t);
+    free(mtl4_graph_out);
+    free(external_out);
+    free(loop_out);
+    free(graph_out);
+    free(input);
+    free(weights);
+    free(selected);
+    return graph_ok && loop_ok && graph_loop_mismatch == 0 &&
+           mtl4_graph_ok && graph_mtl4_graph_mismatch == 0 &&
+           graph_sentinel == 0 && graph_nonfinite == 0;
+}
+
+static char g_d8f_runtime_path[4096];
+static ds4_d8f_file g_d8f_runtime_file;
+static id<MTLBuffer> g_d8f_runtime_buf;
+static id<MTLResidencySet> g_d8f_runtime_rs;
+static uint32_t g_d8f_runtime_layer = UINT32_MAX;
+static int g_d8f_runtime_open;
+enum { ds4_d8f_runtime_layer_cap = 43 };
+enum {
+    ds4_d8f_recbuf_gate_offset = 0,
+    ds4_d8f_recbuf_up_offset = 256 * 16,
+    ds4_d8f_recbuf_down_offset = 2 * 256 * 16,
+    ds4_d8f_recbuf_record_count = 2 * 256 * 16 + 256
+};
+typedef struct ds4_d8f_runtime_record_lite {
+    uint32_t k;
+    uint32_t bits;
+    uint32_t mask;
+    uint32_t flags;
+    uint64_t codebook_offset;
+    uint64_t index_offset;
+    uint64_t scale_offset;
+    uint32_t scale_bytes;
+    uint32_t row_base;
+} ds4_d8f_runtime_record_lite;
+static ds4_d8f_runtime_record_lite g_d8f_runtime_record_staging[ds4_d8f_recbuf_record_count];
+
+static void ds4_d8f_runtime_record_lite_from_record(ds4_d8f_runtime_record_lite *dst,
+                                                    const ds4_d8f_record *src) {
+    dst->k = src->k;
+    dst->bits = src->bits;
+    dst->mask = (src->bits >= 32u) ? UINT32_MAX : ((1u << src->bits) - 1u);
+    dst->flags = src->flags;
+    dst->codebook_offset = src->codebook_offset;
+    dst->index_offset = src->index_offset;
+    dst->scale_offset = (src->flags & 1u) ? src->scale_offset : 0ull;
+    dst->scale_bytes = src->scale_bytes;
+    dst->row_base = src->row_block * 128u;
+}
+static char g_d8f_runtime_layer_path[ds4_d8f_runtime_layer_cap][4096];
+static ds4_d8f_file g_d8f_runtime_layer_file[ds4_d8f_runtime_layer_cap];
+static id<MTLBuffer> g_d8f_runtime_layer_buf[ds4_d8f_runtime_layer_cap];
+static id<MTLBuffer> g_d8f_runtime_layer_rec_buf[ds4_d8f_runtime_layer_cap];
+static int g_d8f_runtime_layer_open[ds4_d8f_runtime_layer_cap];
+static id<MTLBuffer> g_d8f_runtime_rec_buf;
+static id<MTLResidencySet> g_d8f_runtime_pack_rs;
+static int g_d8f_runtime_pack_rs_added_to_queue;
+static uint64_t g_d8f_runtime_pack_rs_requested_bytes;
+static id<MTLBuffer> g_d8f_runtime_mid_buf;
+static id<MTLBuffer> g_d8f_runtime_sidecar_dot_buf;
+static id<MTLBuffer> g_d8f_runtime_gate_args_buf;
+static id<MTLBuffer> g_d8f_runtime_down_args_buf;
+static id<MTLResidencySet> g_d8f_runtime_scratch_rs;
+static uint32_t g_d8f_runtime_scratch_token_cap;
+static uint32_t g_d8f_runtime_scratch_expert_cap;
+static int g_d8f_runtime_scratch_half_mid;
+static int g_d8f_runtime_scratch_rank1_sidecar;
+static id<MTLResidencySet> g_d8f_external_tensor_rs;
+static id<MTLBuffer> g_d8f_external_x_buf;
+static id<MTLBuffer> g_d8f_external_weight_buf;
+static id<MTLBuffer> g_d8f_external_sel_buf;
+static id<MTLBuffer> g_d8f_external_out_buf;
+
+static void ds4_d8f_runtime_scratch_reset(void) {
+    if (g_d8f_runtime_scratch_rs) {
+        [g_polar_queue removeResidencySet:g_d8f_runtime_scratch_rs];
+        [g_d8f_runtime_scratch_rs endResidency];
+        g_d8f_runtime_scratch_rs = nil;
+    }
+    g_d8f_runtime_mid_buf = nil;
+    g_d8f_runtime_sidecar_dot_buf = nil;
+    g_d8f_runtime_gate_args_buf = nil;
+    g_d8f_runtime_down_args_buf = nil;
+    g_d8f_runtime_scratch_token_cap = 0;
+    g_d8f_runtime_scratch_expert_cap = 0;
+    g_d8f_runtime_scratch_half_mid = 0;
+    g_d8f_runtime_scratch_rank1_sidecar = 0;
+}
+
+static void ds4_d8f_external_tensor_rs_reset(void) {
+    if (g_d8f_external_tensor_rs) {
+        [g_polar_queue removeResidencySet:g_d8f_external_tensor_rs];
+        [g_d8f_external_tensor_rs endResidency];
+        g_d8f_external_tensor_rs = nil;
+    }
+    g_d8f_external_x_buf = nil;
+    g_d8f_external_weight_buf = nil;
+    g_d8f_external_sel_buf = nil;
+    g_d8f_external_out_buf = nil;
+}
+
+static int ds4_d8f_runtime_scratch_prepare(uint32_t n_tokens, uint32_t n_experts, int half_mid, int rank1_sidecar) {
+    enum { ds4_selected_expert_cap = 6, ds4_mid_dim = 2048 };
+    if (n_tokens == 0 || n_experts == 0 || n_experts > ds4_selected_expert_cap) return 0;
+    half_mid = half_mid ? 1 : 0;
+    rank1_sidecar = rank1_sidecar ? 1 : 0;
+    if (g_d8f_runtime_scratch_rs && g_d8f_runtime_mid_buf &&
+        g_d8f_runtime_gate_args_buf && g_d8f_runtime_down_args_buf &&
+        (!rank1_sidecar || g_d8f_runtime_sidecar_dot_buf) &&
+        g_d8f_runtime_scratch_token_cap >= n_tokens &&
+        g_d8f_runtime_scratch_expert_cap >= n_experts &&
+        g_d8f_runtime_scratch_half_mid == half_mid &&
+        g_d8f_runtime_scratch_rank1_sidecar == rank1_sidecar) return 1;
+    ds4_d8f_runtime_scratch_reset();
+    const NSUInteger mid_bytes = (NSUInteger)n_tokens * ds4_selected_expert_cap * ds4_mid_dim *
+                                 (half_mid ? sizeof(uint16_t) : sizeof(float));
+    g_d8f_runtime_mid_buf = [g_device newBufferWithLength:mid_bytes
+                                                  options:MTLResourceStorageModeShared];
+    if (rank1_sidecar) {
+        const NSUInteger dot_bytes = (NSUInteger)n_tokens * ds4_selected_expert_cap * sizeof(float);
+        g_d8f_runtime_sidecar_dot_buf = [g_device newBufferWithLength:dot_bytes
+                                                              options:MTLResourceStorageModeShared];
+    }
+    g_d8f_runtime_gate_args_buf = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    g_d8f_runtime_down_args_buf = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    if (!g_d8f_runtime_mid_buf || (rank1_sidecar && !g_d8f_runtime_sidecar_dot_buf) ||
+        !g_d8f_runtime_gate_args_buf || !g_d8f_runtime_down_args_buf) {
+        ds4_d8f_runtime_scratch_reset();
+        return 0;
+    }
+    MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+    rsDesc.initialCapacity = rank1_sidecar ? 4 : 3;
+    NSError *rsErr = nil;
+    g_d8f_runtime_scratch_rs = [g_device newResidencySetWithDescriptor:rsDesc error:&rsErr];
+    if (!g_d8f_runtime_scratch_rs) {
+        fprintf(stderr, "ds4_d8f: scratch residency set failed: %s\n",
+                rsErr.localizedDescription.UTF8String);
+        ds4_d8f_runtime_scratch_reset();
+        return 0;
+    }
+    id<MTLAllocation> allocs[4] = { g_d8f_runtime_mid_buf, g_d8f_runtime_gate_args_buf, g_d8f_runtime_down_args_buf, nil };
+    NSUInteger alloc_count = 3;
+    if (rank1_sidecar) allocs[alloc_count++] = g_d8f_runtime_sidecar_dot_buf;
+    [g_d8f_runtime_scratch_rs addAllocations:allocs count:alloc_count];
+    [g_d8f_runtime_scratch_rs commit];
+    ds4_residency_request_checked(g_d8f_runtime_scratch_rs, __func__);
+    [g_polar_queue addResidencySet:g_d8f_runtime_scratch_rs];
+    g_d8f_runtime_scratch_token_cap = n_tokens;
+    g_d8f_runtime_scratch_expert_cap = n_experts;
+    g_d8f_runtime_scratch_half_mid = half_mid;
+    g_d8f_runtime_scratch_rank1_sidecar = rank1_sidecar;
+    return 1;
+}
+
+static int ds4_d8f_external_tensor_rs_prepare(id<MTLBuffer> xBuf,
+                                              id<MTLBuffer> weightBuf,
+                                              id<MTLBuffer> selBuf,
+                                              id<MTLBuffer> outBuf) {
+    if (!xBuf || !weightBuf || !selBuf || !outBuf) return 0;
+    if (g_d8f_external_tensor_rs &&
+        g_d8f_external_x_buf == xBuf &&
+        g_d8f_external_weight_buf == weightBuf &&
+        g_d8f_external_sel_buf == selBuf &&
+        g_d8f_external_out_buf == outBuf) return 1;
+    ds4_d8f_external_tensor_rs_reset();
+    MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+    rsDesc.initialCapacity = 4;
+    NSError *rsErr = nil;
+    g_d8f_external_tensor_rs = [g_device newResidencySetWithDescriptor:rsDesc error:&rsErr];
+    if (!g_d8f_external_tensor_rs) {
+        fprintf(stderr, "ds4_d8f: external tensor residency set failed: %s\n",
+                rsErr.localizedDescription.UTF8String);
+        ds4_d8f_external_tensor_rs_reset();
+        return 0;
+    }
+    id<MTLAllocation> allocs[4] = { xBuf, weightBuf, selBuf, outBuf };
+    [g_d8f_external_tensor_rs addAllocations:allocs count:4];
+    [g_d8f_external_tensor_rs commit];
+    ds4_residency_request_checked(g_d8f_external_tensor_rs, __func__);
+    [g_polar_queue addResidencySet:g_d8f_external_tensor_rs];
+    g_d8f_external_x_buf = xBuf;
+    g_d8f_external_weight_buf = weightBuf;
+    g_d8f_external_sel_buf = selBuf;
+    g_d8f_external_out_buf = outBuf;
+    return 1;
+}
+
+static void ds4_d8f_runtime_active_clear(void) {
+    memset(&g_d8f_runtime_file, 0, sizeof(g_d8f_runtime_file));
+    g_d8f_runtime_buf = nil;
+    g_d8f_runtime_rec_buf = nil;
+    g_d8f_runtime_rs = nil;
+    g_d8f_runtime_path[0] = '\0';
+    g_d8f_runtime_layer = UINT32_MAX;
+    g_d8f_runtime_open = 0;
+}
+
+static void ds4_d8f_runtime_layer_reset(uint32_t layer) {
+    if (layer >= ds4_d8f_runtime_layer_cap) return;
+    if (g_d8f_runtime_pack_rs && (g_d8f_runtime_layer_buf[layer] || g_d8f_runtime_layer_rec_buf[layer])) {
+        id<MTLAllocation> allocs[2];
+        NSUInteger count = 0;
+        if (g_d8f_runtime_layer_buf[layer]) allocs[count++] = g_d8f_runtime_layer_buf[layer];
+        if (g_d8f_runtime_layer_rec_buf[layer]) allocs[count++] = g_d8f_runtime_layer_rec_buf[layer];
+        if (count) {
+            [g_d8f_runtime_pack_rs removeAllocations:allocs count:count];
+            [g_d8f_runtime_pack_rs commit];
+            const uint64_t allocated = (uint64_t)[g_d8f_runtime_pack_rs allocatedSize];
+            if (g_d8f_runtime_pack_rs_requested_bytes > allocated) {
+                g_d8f_runtime_pack_rs_requested_bytes = allocated;
+            }
+        }
+    }
+    g_d8f_runtime_layer_buf[layer] = nil;
+    g_d8f_runtime_layer_rec_buf[layer] = nil;
+    if (g_d8f_runtime_layer_open[layer]) {
+        ds4_d8f_close(&g_d8f_runtime_layer_file[layer]);
+    }
+    memset(&g_d8f_runtime_layer_file[layer], 0, sizeof(g_d8f_runtime_layer_file[layer]));
+    g_d8f_runtime_layer_path[layer][0] = '\0';
+    g_d8f_runtime_layer_open[layer] = 0;
+    if (g_d8f_runtime_layer == layer) ds4_d8f_runtime_active_clear();
+}
+
+static void ds4_d8f_runtime_cache_reset(void) {
+    for (uint32_t layer = 0; layer < ds4_d8f_runtime_layer_cap; layer++) {
+        ds4_d8f_runtime_layer_reset(layer);
+    }
+    if (g_d8f_runtime_pack_rs) {
+        if (g_d8f_runtime_pack_rs_added_to_queue) {
+            [g_polar_queue removeResidencySet:g_d8f_runtime_pack_rs];
+        }
+        [g_d8f_runtime_pack_rs endResidency];
+        g_d8f_runtime_pack_rs = nil;
+        g_d8f_runtime_pack_rs_added_to_queue = 0;
+        g_d8f_runtime_pack_rs_requested_bytes = 0;
+    }
+    ds4_d8f_runtime_active_clear();
+}
+
+static void ds4_d8f_runtime_activate_layer(uint32_t layer) {
+    g_d8f_runtime_file = g_d8f_runtime_layer_file[layer];
+    g_d8f_runtime_buf = g_d8f_runtime_layer_buf[layer];
+    g_d8f_runtime_rec_buf = g_d8f_runtime_layer_rec_buf[layer];
+    g_d8f_runtime_rs = g_d8f_runtime_pack_rs;
+    snprintf(g_d8f_runtime_path, sizeof(g_d8f_runtime_path), "%s",
+             g_d8f_runtime_layer_path[layer]);
+    g_d8f_runtime_layer = layer;
+    g_d8f_runtime_open = g_d8f_runtime_layer_open[layer];
+}
+
+static int ds4_d8f_runtime_layer_queue_attach(uint32_t layer) {
+    if (layer >= ds4_d8f_runtime_layer_cap || !g_d8f_runtime_pack_rs) return 0;
+    if (!g_d8f_runtime_pack_rs_added_to_queue) {
+        [g_polar_queue addResidencySet:g_d8f_runtime_pack_rs];
+        g_d8f_runtime_pack_rs_added_to_queue = 1;
+    }
+    return 0;
+}
+
+static void ds4_d8f_runtime_layer_queue_detach(uint32_t layer) {
+    (void)layer;
+}
+
+static int ds4_d8f_runtime_pack_residency_prepare(uint32_t layer) {
+    if (!g_d8f_runtime_pack_rs) {
+        MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
+        rsDesc.initialCapacity = ds4_d8f_runtime_layer_cap * 2;
+        NSError *err = nil;
+        g_d8f_runtime_pack_rs = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
+        if (!g_d8f_runtime_pack_rs) {
+            fprintf(stderr, "ds4_d8f: consolidated residency set failed: %s\n",
+                    err.localizedDescription.UTF8String);
+            return 0;
+        }
+    }
+    id<MTLAllocation> allocs[2] = { g_d8f_runtime_layer_buf[layer], g_d8f_runtime_layer_rec_buf[layer] };
+    [g_d8f_runtime_pack_rs addAllocations:allocs count:2];
+    [g_d8f_runtime_pack_rs commit];
+    const uint64_t allocated = (uint64_t)[g_d8f_runtime_pack_rs allocatedSize];
+    const uint64_t delta = allocated > g_d8f_runtime_pack_rs_requested_bytes
+                         ? allocated - g_d8f_runtime_pack_rs_requested_bytes : 0;
+    if (delta) {
+        extern int ds4_mem_would_overcommit(uint64_t);
+        if (!getenv("DS4_FORCE_FULL_RESIDENCY") && ds4_mem_would_overcommit(delta)) {
+            [g_d8f_runtime_pack_rs removeAllocations:allocs count:2];
+            [g_d8f_runtime_pack_rs commit];
+            fprintf(stderr,
+                    "ds4: D8F consolidated residency SKIPPED L%u delta=%.3f GB total=%.3f GB; "
+                    "layer removed from residency set to avoid delayed wired burst\n",
+                    layer, (double)delta / 1e9, (double)allocated / 1e9);
+        } else {
+            [g_d8f_runtime_pack_rs requestResidency];
+            g_d8f_runtime_pack_rs_requested_bytes = allocated;
+        }
+    }
+    if (!g_d8f_runtime_pack_rs_added_to_queue) {
+        [g_polar_queue addResidencySet:g_d8f_runtime_pack_rs];
+        g_d8f_runtime_pack_rs_added_to_queue = 1;
+    }
+    return 1;
+}
+
+static int ds4_d8f_runtime_cache_prepare(uint32_t layer, const char *path) {
+    enum { ds4_gateup_in_dim = 4096, ds4_mid_dim = 2048, ds4_down_out_dim = 4096 };
+    if (!path || !path[0] || layer >= ds4_d8f_runtime_layer_cap) return 0;
+    if (g_d8f_runtime_layer_open[layer] &&
+        g_d8f_runtime_layer_buf[layer] &&
+        g_d8f_runtime_layer_rec_buf[layer] &&
+        g_d8f_runtime_pack_rs &&
+        !strcmp(g_d8f_runtime_layer_path[layer], path)) {
+        ds4_d8f_runtime_activate_layer(layer);
+        return 1;
+    }
+    ds4_d8f_runtime_layer_reset(layer);
+    ds4_d8f_file *file = &g_d8f_runtime_layer_file[layer];
+    if (!ds4_d8f_open(path, file)) return 0;
+    if (file->layer != layer) {
+        fprintf(stderr, "ds4_d8f: runtime cache layer mismatch requested=%u packet=%u path=%s\n",
+                layer, file->layer, path);
+        ds4_d8f_runtime_layer_reset(layer);
+        return 0;
+    }
+    const uint32_t gate_blocks_per_row = ds4_gateup_in_dim >> 3;
+    const uint32_t down_blocks_per_row = ds4_mid_dim >> 3;
+    const char *allow_partial_env = getenv("DS4_D8F_ALLOW_PARTIAL_PACK");
+    const int allow_partial_pack = allow_partial_env && allow_partial_env[0] == '1';
+    for (uint32_t expert = 0; expert < 256u; expert++) {
+        ds4_d8f_record gate, up, down;
+        if (!ds4_d8f_get_record(file, DS4_D8F_GATE, expert, &gate) ||
+            !ds4_d8f_get_record(file, DS4_D8F_UP, expert, &up) ||
+            !ds4_d8f_get_record(file, DS4_D8F_DOWN, expert, &down)) {
+            if (allow_partial_pack) continue;
+            fprintf(stderr, "ds4_d8f: runtime cache missing expert=%u path=%s\n", expert, path);
+            ds4_d8f_runtime_layer_reset(layer);
+            return 0;
+        }
+        const uint64_t gate_blocks = gate.bits ? (((uint64_t)gate.index_bytes * 8ull) / (uint64_t)gate.bits) : 0;
+        const uint64_t up_blocks = up.bits ? (((uint64_t)up.index_bytes * 8ull) / (uint64_t)up.bits) : 0;
+        const uint64_t down_blocks = down.bits ? (((uint64_t)down.index_bytes * 8ull) / (uint64_t)down.bits) : 0;
+        if (gate.block != 8u || up.block != 8u || down.block != 8u ||
+            gate.k == 0u || up.k == 0u || down.k == 0u ||
+            gate.bits == 0u || up.bits == 0u || down.bits == 0u ||
+            gate.bits >= 31u || up.bits >= 31u || down.bits >= 31u ||
+            gate.k != (1u << gate.bits) ||
+            up.k != (1u << up.bits) ||
+            down.k != (1u << down.bits) ||
+            gate_blocks < (uint64_t)ds4_mid_dim * gate_blocks_per_row ||
+            up_blocks < (uint64_t)ds4_mid_dim * gate_blocks_per_row ||
+            down_blocks < (uint64_t)ds4_down_out_dim * down_blocks_per_row ||
+            ((down.flags & 1u) != 0u && down.scale_bytes < ds4_mid_dim * 2u)) {
+            if (allow_partial_pack && (gate.k == 0u || up.k == 0u || down.k == 0u)) continue;
+            fprintf(stderr, "ds4_d8f: runtime cache rejected expert=%u path=%s\n", expert, path);
+            ds4_d8f_runtime_layer_reset(layer);
+            return 0;
+        }
+    }
+    g_d8f_runtime_layer_buf[layer] = [g_device newBufferWithBytesNoCopy:(void *)file->map
+                                                                 length:file->size
+                                                                options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
+    if (!g_d8f_runtime_layer_buf[layer]) {
+        ds4_d8f_runtime_layer_reset(layer);
+        return 0;
+    }
+    ds4_d8f_runtime_record_lite *recs = g_d8f_runtime_record_staging;
+    memset(recs, 0, sizeof(g_d8f_runtime_record_staging));
+    for (uint32_t expert = 0; expert < 256u; expert++) {
+        const ds4_d8f_record *gate_base = &file->records[DS4_D8F_GATE][expert];
+        const ds4_d8f_record *up_base = &file->records[DS4_D8F_UP][expert];
+        const ds4_d8f_record *down_base = &file->records[DS4_D8F_DOWN][expert];
+        for (uint32_t row_block = 0; row_block < 16u; row_block++) {
+            ds4_d8f_record gate_overlay;
+            ds4_d8f_record up_overlay;
+            const ds4_d8f_record *gate_src =
+                ds4_d8f_get_gateup_overlay_record(file, DS4_D8F_GATE, expert, row_block, &gate_overlay)
+                ? &gate_overlay : gate_base;
+            const ds4_d8f_record *up_src =
+                ds4_d8f_get_gateup_overlay_record(file, DS4_D8F_UP, expert, row_block, &up_overlay)
+                ? &up_overlay : up_base;
+            ds4_d8f_runtime_record_lite_from_record(
+                &recs[ds4_d8f_recbuf_gate_offset + expert * 16u + row_block], gate_src);
+            ds4_d8f_runtime_record_lite_from_record(
+                &recs[ds4_d8f_recbuf_up_offset + expert * 16u + row_block], up_src);
+        }
+        ds4_d8f_runtime_record_lite_from_record(
+            &recs[ds4_d8f_recbuf_down_offset + expert], down_base);
+    }
+    g_d8f_runtime_layer_rec_buf[layer] = [g_device newBufferWithBytes:recs
+                                                               length:sizeof(g_d8f_runtime_record_staging)
+                                                              options:MTLResourceStorageModeShared];
+    if (!g_d8f_runtime_layer_rec_buf[layer]) {
+        ds4_d8f_runtime_layer_reset(layer);
+        return 0;
+    }
+    if (!ds4_d8f_runtime_pack_residency_prepare(layer)) {
+        ds4_d8f_runtime_layer_reset(layer);
+        return 0;
+    }
+    snprintf(g_d8f_runtime_layer_path[layer], sizeof(g_d8f_runtime_layer_path[layer]), "%s", path);
+    g_d8f_runtime_layer_open[layer] = 1;
+    ds4_d8f_runtime_activate_layer(layer);
+    return 1;
+}
+
+static int ds4_d8f_runtime_rank1_sidecar_supported_or_fail(uint32_t layer,
+                                                           const char *path,
+                                                           const char *caller,
+                                                           int runtime_support) {
+    const uint32_t sidecar_count = ds4_d8f_down_sidecar_count(&g_d8f_runtime_file);
+    if (sidecar_count == 0u) return 1;
+    for (uint32_t expert = 0; expert < 256u; expert++) {
+        ds4_d8f_sidecar_record rec;
+        if (!ds4_d8f_get_down_sidecar(&g_d8f_runtime_file, expert, &rec)) continue;
+        if (rec.rank != 1u || rec.in_dim != 2048u || rec.out_dim != 4096u) {
+            fprintf(stderr,
+                    "ds4_d8f: refusing non-rank1 sidecar row L%u expert=%u rank=%u in=%u out=%u path=%s caller=%s\n",
+                    layer, expert, rec.rank, rec.in_dim, rec.out_dim, path ? path : "(null)",
+                    caller ? caller : "unknown");
+            return 0;
+        }
+    }
+    if (runtime_support) return 1;
+    if (getenv("DS4_D8F_IGNORE_RANK1")) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "ds4_d8f: WARNING ignoring rank1 down sidecars for diagnostic run only "
+                    "(count=%u caller=%s)\n",
+                    sidecar_count, caller ? caller : "unknown");
+        }
+        return 1;
+    }
+    fprintf(stderr,
+            "ds4_d8f: refusing to run rank1 sidecar pack without rank1 runtime application "
+            "L%u count=%u path=%s caller=%s; set DS4_D8F_IGNORE_RANK1=1 only for diagnostics\n",
+            layer, sidecar_count, path ? path : "(null)", caller ? caller : "unknown");
+    return 0;
+}
+
+int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
+                                                          uint32_t layer,
+                                                          ds4_gpu_tensor *selected_experts,
+                                                          ds4_gpu_tensor *route_weights,
+                                                          ds4_gpu_tensor *input,
+                                                          ds4_gpu_tensor *output,
+                                                          uint32_t n_tokens,
+                                                          uint32_t n_experts,
+                                                          float swiglu_limit) {
+    enum {
+        ds4_selected_expert_cap = 6,
+        ds4_gateup_in_dim = 4096,
+        ds4_mid_dim = 2048,
+        ds4_down_out_dim = 4096,
+        ds4_d8f_table_offset = 4096
+    };
+    if (!g_initialized && !ds4_gpu_init()) return -1;
+    if (!ds4_d8f_classic_pipeline_init()) return -1;
+    if (!d8f_path || !selected_experts || !route_weights || !input || !output ||
+        n_tokens == 0 || n_experts == 0 || n_experts > ds4_selected_expert_cap ||
+        layer >= 43u) return -1;
+    if (!(swiglu_limit > 0.0f)) swiglu_limit = 10.0f;
+    if (!ds4_d8f_runtime_cache_prepare(layer, d8f_path)) return -1;
+    const int gateup_overlay_active = ds4_d8f_gateup_overlay_count(&g_d8f_runtime_file) > 0u;
+    const uint32_t rank1_sidecar_count = ds4_d8f_down_sidecar_count(&g_d8f_runtime_file);
+    const int rank1_sidecar_active = rank1_sidecar_count > 0u &&
+        ds4_gpu_d8f_rank1_sidecar_enabled_for_layer(layer);
+    const uint64_t rank1_sidecar_table_offset = rank1_sidecar_active ?
+        g_d8f_runtime_file.sidecar_table_offset : 0ull;
+    const uint32_t rank1_sidecar_record_bytes = rank1_sidecar_active ?
+        g_d8f_runtime_file.sidecar_record_bytes : 0u;
+    atomic_fetch_add_explicit(&g_ds4_d8f_inline_count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(rank1_sidecar_active ? &g_ds4_d8f_rank1_count : &g_ds4_d8f_no_sidecar_count,
+                              1, memory_order_relaxed);
+    if (ds4_gpu_tensor_bytes(input) < (uint64_t)n_tokens * ds4_gateup_in_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(selected_experts) < (uint64_t)n_tokens * n_experts * sizeof(uint32_t) ||
+        ds4_gpu_tensor_bytes(route_weights) < (uint64_t)n_tokens * n_experts * sizeof(float) ||
+        ds4_gpu_tensor_bytes(output) < (uint64_t)n_tokens * ds4_down_out_dim * sizeof(float)) {
+        fprintf(stderr, "ds4_d8f: inline tensor dispatch undersized tensors L%u tokens=%u\n", layer, n_tokens);
+        return -1;
+    }
+
+    int ok = -1;
+    @autoreleasepool {
+        id<MTLBuffer> xBuf = ds4_gpu_tensor_buffer(input);
+        id<MTLBuffer> weightBuf = ds4_gpu_tensor_buffer(route_weights);
+        id<MTLBuffer> selBuf = ds4_gpu_tensor_buffer(selected_experts);
+        id<MTLBuffer> outBuf = ds4_gpu_tensor_buffer(output);
+        if (!xBuf || !weightBuf || !selBuf || !outBuf) return -1;
+        const int down_tile16 = ds4_gpu_d8f_down_tile16_enabled(n_tokens) &&
+            g_d8f_down_sum_selected_weighted_batch_tile16_classic_pipeline;
+        const int preweight_mid = !gateup_overlay_active && !rank1_sidecar_active &&
+            ds4_gpu_d8f_preweight_mid_enabled(n_tokens) && down_tile16 &&
+            g_d8f_gateup_swiglu_selected_batch_weighted_classic_pipeline &&
+            g_d8f_down_sum_selected_preweighted_batch_tile16_classic_pipeline;
+        const int gateup_tile4 = !gateup_overlay_active && !preweight_mid && ds4_gpu_d8f_gateup_tile4_enabled() &&
+            g_d8f_gateup_swiglu_selected_batch_tile4_classic_pipeline;
+        const int down_tile8 = !down_tile16 && ds4_gpu_d8f_down_tile8_enabled() &&
+            g_d8f_down_sum_selected_weighted_batch_tile8_classic_pipeline;
+        const int recbuf_enabled = ds4_gpu_d8f_recbuf_enabled();
+        const int half_mid = !rank1_sidecar_active && ((ds4_gpu_d8f_half_mid_enabled() && n_tokens > 1u) ||
+            ds4_gpu_d8f_half_mid_decode_enabled(n_tokens)) &&
+            recbuf_enabled && !preweight_mid && !gateup_tile4 && down_tile16 &&
+            g_d8f_gateup_swiglu_selected_batch_recbuf_hmid_classic_pipeline &&
+            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_hmid_classic_pipeline;
+        if (!ds4_d8f_runtime_scratch_prepare(n_tokens, n_experts, half_mid, rank1_sidecar_active)) return -1;
+
+        struct gate_args_t {
+            uint32_t rows, in_dim, n_selected, n_tokens, table_offset, record_bytes, mid_slot_stride, mid_token_stride, x_token_stride, selected_token_stride;
+            float clamp;
+        } gate_args = {
+            ds4_mid_dim, ds4_gateup_in_dim, n_experts, n_tokens, ds4_d8f_table_offset,
+            g_d8f_runtime_file.record_bytes, ds4_mid_dim, n_experts * ds4_mid_dim,
+            ds4_gateup_in_dim, n_experts, swiglu_limit
+        };
+        struct down_args_t {
+            uint32_t rows, in_dim, n_selected, n_tokens, table_offset, record_bytes, mid_slot_stride, mid_token_stride, out_token_stride, route_token_stride, selected_token_stride;
+            uint32_t sidecar_table_offset_lo, sidecar_table_offset_hi, sidecar_record_bytes, sidecar_rank_max, sidecar_dot_stride;
+        } down_args = {
+            ds4_down_out_dim, ds4_mid_dim, n_experts, n_tokens, ds4_d8f_table_offset,
+            g_d8f_runtime_file.record_bytes, ds4_mid_dim, n_experts * ds4_mid_dim,
+            ds4_down_out_dim, n_experts, n_experts,
+            (uint32_t)(rank1_sidecar_table_offset & 0xffffffffull),
+            (uint32_t)(rank1_sidecar_table_offset >> 32),
+            rank1_sidecar_record_bytes,
+            1u,
+            ds4_selected_expert_cap
+        };
+        memcpy(g_d8f_runtime_gate_args_buf.contents, &gate_args, sizeof(gate_args));
+        memcpy(g_d8f_runtime_down_args_buf.contents, &down_args, sizeof(down_args));
+
+        const NSUInteger x_off = ds4_gpu_tensor_offset(input);
+        const NSUInteger weight_off = ds4_gpu_tensor_offset(route_weights);
+        const NSUInteger sel_off = ds4_gpu_tensor_offset(selected_experts);
+        const NSUInteger out_off = ds4_gpu_tensor_offset(output);
+        const int gateup_recbuf = recbuf_enabled && !preweight_mid && !gateup_tile4 &&
+            g_d8f_runtime_rec_buf &&
+            (half_mid ? g_d8f_gateup_swiglu_selected_batch_recbuf_hmid_classic_pipeline :
+                        g_d8f_gateup_swiglu_selected_batch_recbuf_classic_pipeline);
+        if (gateup_overlay_active && !gateup_recbuf) {
+            fprintf(stderr, "ds4_d8f: gate/up row-block overlay requires recbuf dispatch L%u path=%s\n",
+                    layer, d8f_path);
+            return -1;
+        }
+        const int down_tile32_requested =
+            ds4_gpu_d8f_down_tile32_enabled_for_layer(layer, rank1_sidecar_active);
+        const int down_tile32_recbuf = down_tile32_requested && n_tokens > 8u &&
+            !half_mid && recbuf_enabled && !preweight_mid &&
+            g_d8f_runtime_rec_buf &&
+            g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline;
+        const int down_tile16_recbuf = !down_tile32_recbuf &&
+            recbuf_enabled && !preweight_mid && down_tile16 &&
+            g_d8f_runtime_rec_buf &&
+            (half_mid ? g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_hmid_classic_pipeline :
+                        g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_classic_pipeline);
+        const int rank1_split_sidecar = rank1_sidecar_active && n_tokens > 8u &&
+            !down_tile32_recbuf && !down_tile16_recbuf && !half_mid && !preweight_mid &&
+            g_d8f_down_rank1_dot_batch_classic_pipeline &&
+            g_d8f_down_rank1_axpy_batch_classic_pipeline;
+        const int down_tile8_recbuf = !down_tile32_recbuf && !down_tile16_recbuf &&
+            !rank1_split_sidecar &&
+            rank1_sidecar_active && !half_mid && recbuf_enabled && !preweight_mid && down_tile8 &&
+            g_d8f_runtime_rec_buf &&
+            g_d8f_down_sum_selected_weighted_batch_tile8_recbuf_classic_pipeline;
+        const int down_any_recbuf = down_tile8_recbuf || down_tile16_recbuf || down_tile32_recbuf;
+        const int rank1_runtime_support = rank1_sidecar_active &&
+            !half_mid && !preweight_mid && (rank1_split_sidecar || down_any_recbuf);
+        if (rank1_sidecar_active &&
+            !ds4_d8f_runtime_rank1_sidecar_supported_or_fail(layer, d8f_path, __func__,
+                                                             rank1_runtime_support)) return -1;
+        id<MTLComputePipelineState> gate_pso = half_mid ?
+            g_d8f_gateup_swiglu_selected_batch_recbuf_hmid_classic_pipeline :
+            gateup_recbuf ?
+            g_d8f_gateup_swiglu_selected_batch_recbuf_classic_pipeline :
+            preweight_mid ?
+            g_d8f_gateup_swiglu_selected_batch_weighted_classic_pipeline :
+            gateup_tile4 ?
+            g_d8f_gateup_swiglu_selected_batch_tile4_classic_pipeline :
+            g_d8f_gateup_swiglu_selected_batch_classic_pipeline;
+        id<MTLComputePipelineState> down_pso = half_mid ?
+            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_hmid_classic_pipeline :
+            down_tile32_recbuf ?
+            g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline :
+            down_tile16_recbuf ?
+            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_classic_pipeline :
+            down_tile8_recbuf ?
+            g_d8f_down_sum_selected_weighted_batch_tile8_recbuf_classic_pipeline :
+            preweight_mid ?
+            g_d8f_down_sum_selected_preweighted_batch_tile16_classic_pipeline :
+            down_tile16 ?
+            g_d8f_down_sum_selected_weighted_batch_tile16_classic_pipeline :
+            down_tile8 ?
+            g_d8f_down_sum_selected_weighted_batch_tile8_classic_pipeline :
+            g_d8f_down_sum_selected_weighted_batch_classic_pipeline;
+        const uint32_t gate_tg_mem = (gateup_tile4 ? 64u : 16u) * (uint32_t)sizeof(float);
+        const uint32_t down_tg_mem = (down_tile32_recbuf ? 256u : (down_tile16 ? 128u : ((down_tile8 || down_tile8_recbuf) ? 64u : 8u))) * (uint32_t)sizeof(float);
+        const MTLSize gate_grid = MTLSizeMake(gateup_tile4 ? ((ds4_mid_dim + 3u) >> 2) : ds4_mid_dim,
+                                              n_experts, n_tokens);
+        const MTLSize down_grid = MTLSizeMake(down_tile32_recbuf ? ((ds4_down_out_dim + 31u) >> 5) : (down_tile16 ? ((ds4_down_out_dim + 15u) >> 4) : (down_tile8 ? ((ds4_down_out_dim + 7u) >> 3) : ds4_down_out_dim)),
+                                              n_tokens, 1);
+        const MTLSize packet_tg = MTLSizeMake(256, 1, 1);
+        const NSUInteger packet_gate_cmd = (NSUInteger)layer * 2u;
+        const NSUInteger packet_down_cmd = packet_gate_cmd + 1u;
+        int packet_icb_ready = 0;
+        const int rank1_packet_icb_policy = ds4_gpu_env_bool("DS4_D8F_RANK1_PACKET_ICB");
+        const int rank1_packet_icb_requested =
+            rank1_sidecar_active && rank1_packet_icb_policy != 0;
+        if (n_tokens == 1u && !rank1_split_sidecar && (!rank1_sidecar_active || rank1_packet_icb_requested) &&
+            (rank1_packet_icb_requested || ds4_gpu_d8f_classic_packet_icb_enabled()) && gate_pso && down_pso &&
+            packet_down_cmd < (NSUInteger)ds4_d8f_packet_icb_cmds &&
+            ds4_icb_slot_acquire(&g_d8f_packet_icb_slot, (NSUInteger)ds4_d8f_packet_icb_cmds, 8)) {
+            __unsafe_unretained id<MTLBuffer> gate_bufs[8] = { nil };
+            NSUInteger gate_offs[8] = { 0 };
+            NSUInteger gate_n = 0;
+            gate_bufs[gate_n] = g_d8f_runtime_buf; gate_offs[gate_n++] = 0;
+            gate_bufs[gate_n] = xBuf; gate_offs[gate_n++] = x_off;
+            gate_bufs[gate_n] = selBuf; gate_offs[gate_n++] = sel_off;
+            gate_bufs[gate_n] = g_d8f_runtime_mid_buf; gate_offs[gate_n++] = 0;
+            gate_bufs[gate_n] = g_d8f_runtime_gate_args_buf; gate_offs[gate_n++] = 0;
+            if (gateup_recbuf) {
+                gate_bufs[gate_n] = g_d8f_runtime_rec_buf; gate_offs[gate_n++] = 0;
+            } else if (preweight_mid) {
+                gate_bufs[gate_n] = weightBuf; gate_offs[gate_n++] = weight_off;
+            }
+            __unsafe_unretained id<MTLBuffer> down_bufs[8] = { nil };
+            NSUInteger down_offs[8] = { 0 };
+            NSUInteger down_n = 0;
+            down_bufs[down_n] = g_d8f_runtime_buf; down_offs[down_n++] = 0;
+            down_bufs[down_n] = g_d8f_runtime_mid_buf; down_offs[down_n++] = 0;
+            down_bufs[down_n] = selBuf; down_offs[down_n++] = sel_off;
+            down_bufs[down_n] = outBuf; down_offs[down_n++] = out_off;
+            down_bufs[down_n] = g_d8f_runtime_down_args_buf; down_offs[down_n++] = 0;
+            if (!preweight_mid) {
+                down_bufs[down_n] = weightBuf; down_offs[down_n++] = weight_off;
+            }
+            if (down_any_recbuf) {
+                down_bufs[down_n] = g_d8f_runtime_rec_buf; down_offs[down_n++] = 0;
+                down_bufs[down_n] = g_d8f_runtime_mid_buf; down_offs[down_n++] = 0;
+            }
+            uint64_t gate_extra[8] = { layer, n_tokens, n_experts, gateup_recbuf, gateup_tile4, preweight_mid, ds4_mid_dim, ds4_gateup_in_dim };
+            uint64_t down_extra[8] = { layer, n_tokens, n_experts, down_tile16_recbuf, down_tile8_recbuf || down_tile8, down_tile16, preweight_mid, ds4_down_out_dim };
+            packet_icb_ready =
+                ds4_icb_slot_record_command(&g_d8f_packet_icb_slot, packet_gate_cmd, gate_pso,
+                                            gate_bufs, gate_offs, gate_n,
+                                            gate_grid, packet_tg, gate_tg_mem,
+                                            gate_extra, 8) &&
+                ds4_icb_slot_record_command(&g_d8f_packet_icb_slot, packet_down_cmd, down_pso,
+                                            down_bufs, down_offs, down_n,
+                                            down_grid, packet_tg, down_tg_mem,
+                                            down_extra, 8);
+        }
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return -1;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return -1;
+        const int layer_rs_attached = ds4_d8f_runtime_layer_queue_attach(layer);
+
+        if (packet_icb_ready) {
+            atomic_fetch_add_explicit(&g_ds4_d8f_packet_icb_hit_count, 1, memory_order_relaxed);
+            static int s_d8f_classic_packet_icb_notice = 0;
+            if (!s_d8f_classic_packet_icb_notice) {
+                s_d8f_classic_packet_icb_notice = 1;
+                fprintf(stderr,
+                        "ds4: D8F classic in-graph packet ICB enabled "
+                        "(gateup_recbuf=%d down_recbuf=%d half_mid=%d down_tile32=%d)\n",
+                        gateup_recbuf, down_tile16_recbuf, half_mid, down_tile32_recbuf);
+            }
+            ds4_icb_slot_use_resources(&g_d8f_packet_icb_slot, enc,
+                                       packet_gate_cmd, 1,
+                                       MTLResourceUsageRead | MTLResourceUsageWrite);
+            ds4_icb_slot_execute(&g_d8f_packet_icb_slot, enc, packet_gate_cmd, 1);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            ds4_icb_slot_use_resources(&g_d8f_packet_icb_slot, enc,
+                                       packet_down_cmd, 1,
+                                       MTLResourceUsageRead | MTLResourceUsageWrite);
+            ds4_icb_slot_execute(&g_d8f_packet_icb_slot, enc, packet_down_cmd, 1);
+        } else {
+            [enc setComputePipelineState:gate_pso];
+            [enc setBuffer:g_d8f_runtime_buf     offset:0 atIndex:0];
+            [enc setBuffer:xBuf                  offset:x_off atIndex:1];
+            [enc setBuffer:selBuf                offset:sel_off atIndex:2];
+            [enc setBuffer:g_d8f_runtime_mid_buf offset:0 atIndex:3];
+            [enc setBuffer:g_d8f_runtime_gate_args_buf offset:0 atIndex:4];
+            if (gateup_recbuf) {
+                [enc setBuffer:g_d8f_runtime_rec_buf offset:0 atIndex:5];
+            } else if (preweight_mid) {
+                [enc setBuffer:weightBuf offset:weight_off atIndex:5];
+            }
+            [enc setThreadgroupMemoryLength:gate_tg_mem atIndex:0];
+            [enc dispatchThreadgroups:gate_grid threadsPerThreadgroup:packet_tg];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            if (rank1_split_sidecar) {
+                [enc setComputePipelineState:g_d8f_down_rank1_dot_batch_classic_pipeline];
+                [enc setBuffer:g_d8f_runtime_buf offset:0 atIndex:0];
+                [enc setBuffer:g_d8f_runtime_mid_buf offset:0 atIndex:1];
+                [enc setBuffer:selBuf offset:sel_off atIndex:2];
+                [enc setBuffer:g_d8f_runtime_sidecar_dot_buf offset:0 atIndex:3];
+                [enc setBuffer:g_d8f_runtime_down_args_buf offset:0 atIndex:4];
+                [enc setBuffer:weightBuf offset:weight_off atIndex:5];
+                [enc setThreadgroupMemoryLength:8u * (uint32_t)sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(n_experts, n_tokens, 1) threadsPerThreadgroup:packet_tg];
+            }
+
+            [enc setComputePipelineState:down_pso];
+            [enc setBuffer:g_d8f_runtime_buf     offset:0 atIndex:0];
+            [enc setBuffer:g_d8f_runtime_mid_buf offset:0 atIndex:1];
+            [enc setBuffer:selBuf                offset:sel_off atIndex:2];
+            [enc setBuffer:outBuf                offset:out_off atIndex:3];
+            [enc setBuffer:g_d8f_runtime_down_args_buf offset:0 atIndex:4];
+            if (!preweight_mid) [enc setBuffer:weightBuf offset:weight_off atIndex:5];
+            if (down_any_recbuf) [enc setBuffer:g_d8f_runtime_rec_buf offset:0 atIndex:6];
+            if (down_any_recbuf) [enc setBuffer:(rank1_sidecar_active ? g_d8f_runtime_sidecar_dot_buf : g_d8f_runtime_mid_buf) offset:0 atIndex:7];
+            [enc setThreadgroupMemoryLength:down_tg_mem atIndex:0];
+            [enc dispatchThreadgroups:down_grid threadsPerThreadgroup:packet_tg];
+            if (rank1_split_sidecar) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                [enc setComputePipelineState:g_d8f_down_rank1_axpy_batch_classic_pipeline];
+                [enc setBuffer:g_d8f_runtime_buf offset:0 atIndex:0];
+                [enc setBuffer:selBuf offset:sel_off atIndex:1];
+                [enc setBuffer:outBuf offset:out_off atIndex:2];
+                [enc setBuffer:g_d8f_runtime_sidecar_dot_buf offset:0 atIndex:3];
+                [enc setBuffer:g_d8f_runtime_down_args_buf offset:0 atIndex:4];
+                [enc setBuffer:weightBuf offset:weight_off atIndex:5];
+                [enc dispatchThreadgroups:MTLSizeMake((ds4_down_out_dim + 255u) >> 8, n_tokens, 1)
+                    threadsPerThreadgroup:packet_tg];
+            }
+        }
+        if (!packet_icb_ready) {
+            atomic_fetch_add_explicit(&g_ds4_d8f_packet_icb_miss_count, 1, memory_order_relaxed);
+        }
+        ds4_gpu_end_compute_encoder(cb, enc);
+        ok = ds4_gpu_finish_command_buffer(cb, owned, "d8f inline routed organ") ? 0 : -1;
+        if (layer_rs_attached) ds4_d8f_runtime_layer_queue_detach(layer);
+
+        static int s_d8f_inline_notice = 0;
+        if (ok == 0 && !s_d8f_inline_notice) {
+            s_d8f_inline_notice = 1;
+            fprintf(stderr, "ds4: D8F inline Metal routed organ enabled; MTL4 external path remains fallback; half_mid=%d gateup_tile4=%d down_tile32=%d\n",
+                    half_mid, gateup_tile4, down_tile32_recbuf);
+        }
+        static int s_d8f_half_mid_notice = 0;
+        if (ok == 0 && half_mid && !s_d8f_half_mid_notice) {
+            s_d8f_half_mid_notice = 1;
+            fprintf(stderr,
+                    "ds4: D8F half-mid scratch active — mid buffer stored as f16 and accumulated as f32 in down path\n");
+        }
+    }
+    return ok;
+}
+
+int ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(const char *d8f_path,
+                                                        uint32_t layer,
+                                                        ds4_gpu_tensor *selected_experts,
+                                                        ds4_gpu_tensor *route_weights,
+                                                        ds4_gpu_tensor *input,
+                                                        ds4_gpu_tensor *output,
+                                                        uint32_t n_tokens,
+                                                        uint32_t n_experts,
+                                                        float swiglu_limit) {
+    enum {
+        ds4_selected_expert_cap = 6,
+        ds4_gateup_in_dim = 4096,
+        ds4_mid_dim = 2048,
+        ds4_down_out_dim = 4096,
+        ds4_d8f_table_offset = 4096
+    };
+    if (!g_initialized && !ds4_gpu_init()) return -1;
+    if (!ds4_d8f_gateup_swiglu_selected_mtl4_pipeline_init()) return -1;
+    if (!ds4_d8f_down_sum_selected_mtl4_pipeline_init()) return -1;
+    if (!d8f_path || !selected_experts || !route_weights || !input || !output ||
+        n_tokens == 0 || n_experts == 0 || n_experts > ds4_selected_expert_cap || layer >= 43u) return -1;
+    atomic_fetch_add_explicit(&g_ds4_d8f_external_mtl4_count, 1, memory_order_relaxed);
+    if (!(swiglu_limit > 0.0f)) swiglu_limit = 10.0f;
+    if (!ds4_d8f_runtime_cache_prepare(layer, d8f_path)) return -1;
+    const int gateup_overlay_active = ds4_d8f_gateup_overlay_count(&g_d8f_runtime_file) > 0u;
+    const uint32_t rank1_sidecar_count = ds4_d8f_down_sidecar_count(&g_d8f_runtime_file);
+    const int rank1_sidecar_active = rank1_sidecar_count > 0u &&
+        ds4_gpu_d8f_rank1_sidecar_enabled_for_layer(layer);
+    const uint64_t rank1_sidecar_table_offset = rank1_sidecar_active ?
+        g_d8f_runtime_file.sidecar_table_offset : 0ull;
+    const uint32_t rank1_sidecar_record_bytes = rank1_sidecar_active ?
+        g_d8f_runtime_file.sidecar_record_bytes : 0u;
+    if (ds4_gpu_tensor_bytes(input) < (uint64_t)n_tokens * ds4_gateup_in_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(selected_experts) < (uint64_t)n_tokens * n_experts * sizeof(uint32_t) ||
+        ds4_gpu_tensor_bytes(route_weights) < (uint64_t)n_tokens * n_experts * sizeof(float) ||
+        ds4_gpu_tensor_bytes(output) < (uint64_t)n_tokens * ds4_down_out_dim * sizeof(float)) {
+        fprintf(stderr, "ds4_d8f: tensor batch dispatch undersized tensors L%u tokens=%u\n", layer, n_tokens);
+        return -1;
+    }
+
+    int ok = -1;
+    @autoreleasepool {
+        id<MTLBuffer> xBuf = ds4_gpu_tensor_buffer(input);
+        id<MTLBuffer> weightBuf = ds4_gpu_tensor_buffer(route_weights);
+        id<MTLBuffer> selBuf = ds4_gpu_tensor_buffer(selected_experts);
+        id<MTLBuffer> outBuf = ds4_gpu_tensor_buffer(output);
+        if (!xBuf || !weightBuf || !selBuf || !outBuf) return -1;
+        if (!ds4_d8f_runtime_scratch_prepare(n_tokens, n_experts, 0, rank1_sidecar_active) ||
+            !ds4_d8f_external_tensor_rs_prepare(xBuf, weightBuf, selBuf, outBuf)) return -1;
+        struct gate_args_t {
+            uint32_t rows, in_dim, n_selected, n_tokens, table_offset, record_bytes, mid_slot_stride, mid_token_stride, x_token_stride, selected_token_stride;
+            float clamp;
+        } gate_args = {
+            ds4_mid_dim, ds4_gateup_in_dim, n_experts, n_tokens, ds4_d8f_table_offset,
+            g_d8f_runtime_file.record_bytes, ds4_mid_dim, n_experts * ds4_mid_dim,
+            ds4_gateup_in_dim, n_experts, swiglu_limit
+        };
+        struct down_args_t {
+            uint32_t rows, in_dim, n_selected, n_tokens, table_offset, record_bytes, mid_slot_stride, mid_token_stride, out_token_stride, route_token_stride, selected_token_stride;
+            uint32_t sidecar_table_offset_lo, sidecar_table_offset_hi, sidecar_record_bytes, sidecar_rank_max, sidecar_dot_stride;
+        } down_args = {
+            ds4_down_out_dim, ds4_mid_dim, n_experts, n_tokens, ds4_d8f_table_offset,
+            g_d8f_runtime_file.record_bytes, ds4_mid_dim, n_experts * ds4_mid_dim,
+            ds4_down_out_dim, n_experts, n_experts,
+            (uint32_t)(rank1_sidecar_table_offset & 0xffffffffull),
+            (uint32_t)(rank1_sidecar_table_offset >> 32),
+            rank1_sidecar_record_bytes,
+            1u,
+            ds4_selected_expert_cap
+        };
+        const int mtl4_batch_active = ds4_gpu_mtl4_commands_active();
+        id<MTLBuffer> gate_args_buf = g_d8f_runtime_gate_args_buf;
+        id<MTLBuffer> down_args_buf = g_d8f_runtime_down_args_buf;
+        NSUInteger gate_args_off = 0;
+        NSUInteger down_args_off = 0;
+        uint64_t gate_args_addr = g_d8f_runtime_gate_args_buf.gpuAddress;
+        uint64_t down_args_addr = g_d8f_runtime_down_args_buf.gpuAddress;
+        if (mtl4_batch_active) {
+            if (!ds4_gpu_mtl4_batch_copy_args(&gate_args, sizeof(gate_args),
+                                              &gate_args_buf, &gate_args_off,
+                                              &gate_args_addr) ||
+                !ds4_gpu_mtl4_batch_copy_args(&down_args, sizeof(down_args),
+                                              &down_args_buf, &down_args_off,
+                                              &down_args_addr)) return -1;
+        } else {
+            memcpy(g_d8f_runtime_gate_args_buf.contents, &gate_args, sizeof(gate_args));
+            memcpy(g_d8f_runtime_down_args_buf.contents, &down_args, sizeof(down_args));
+        }
+
+        const NSUInteger x_off = ds4_gpu_tensor_offset(input);
+        const NSUInteger weight_off = ds4_gpu_tensor_offset(route_weights);
+        const NSUInteger sel_off = ds4_gpu_tensor_offset(selected_experts);
+        const NSUInteger out_off = ds4_gpu_tensor_offset(output);
+        const uint64_t x_addr = xBuf.gpuAddress + x_off;
+        const uint64_t weight_addr = weightBuf.gpuAddress + weight_off;
+        const uint64_t sel_addr = selBuf.gpuAddress + sel_off;
+        const uint64_t out_addr = outBuf.gpuAddress + out_off;
+        const int down_tile16 = ds4_gpu_d8f_down_tile16_enabled(n_tokens) &&
+            g_d8f_down_sum_selected_weighted_batch_tile16_mtl4_pipeline;
+        const int preweight_mid = !gateup_overlay_active && !rank1_sidecar_active &&
+            ds4_gpu_d8f_preweight_mid_enabled(n_tokens) && down_tile16 &&
+            g_d8f_gateup_swiglu_selected_batch_weighted_mtl4_pipeline &&
+            g_d8f_down_sum_selected_preweighted_batch_tile16_mtl4_pipeline;
+        const int gateup_tile4 = !gateup_overlay_active && !preweight_mid && ds4_gpu_d8f_gateup_tile4_enabled() &&
+            g_d8f_gateup_swiglu_selected_batch_tile4_mtl4_pipeline;
+        const int down_tile8 = !down_tile16 && ds4_gpu_d8f_down_tile8_enabled() &&
+            g_d8f_down_sum_selected_weighted_batch_tile8_mtl4_pipeline;
+        const int recbuf_enabled = ds4_gpu_d8f_recbuf_enabled();
+        const int gateup_recbuf = recbuf_enabled && !preweight_mid && !gateup_tile4 &&
+            g_d8f_runtime_rec_buf &&
+            g_d8f_gateup_swiglu_selected_batch_recbuf_mtl4_pipeline;
+        if (gateup_overlay_active && !gateup_recbuf) {
+            fprintf(stderr, "ds4_d8f: MTL4 gate/up row-block overlay requires recbuf dispatch L%u path=%s\n",
+                    layer, d8f_path);
+            return -1;
+        }
+        const int down_tile32_requested =
+            ds4_gpu_d8f_down_tile32_enabled_for_layer(layer, rank1_sidecar_active);
+        const int down_tile32_recbuf = down_tile32_requested &&
+            recbuf_enabled && !preweight_mid && down_tile16 &&
+            g_d8f_runtime_rec_buf &&
+            g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_mtl4_pipeline;
+        const int down_tile16_recbuf = !down_tile32_recbuf &&
+            recbuf_enabled && !preweight_mid && down_tile16 &&
+            g_d8f_runtime_rec_buf &&
+            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_mtl4_pipeline;
+        const int rank1_runtime_support =
+            rank1_sidecar_active && !preweight_mid && (down_tile16_recbuf || down_tile32_recbuf);
+        if (rank1_sidecar_active &&
+            !ds4_d8f_runtime_rank1_sidecar_supported_or_fail(layer, d8f_path, __func__,
+                                                             rank1_runtime_support)) return -1;
+        id<MTLComputePipelineState> gate_pso = gateup_recbuf ?
+            g_d8f_gateup_swiglu_selected_batch_recbuf_mtl4_pipeline :
+            preweight_mid ?
+            g_d8f_gateup_swiglu_selected_batch_weighted_mtl4_pipeline :
+            gateup_tile4 ?
+            g_d8f_gateup_swiglu_selected_batch_tile4_mtl4_pipeline :
+            g_d8f_gateup_swiglu_selected_batch_mtl4_pipeline;
+        id<MTLComputePipelineState> down_pso = down_tile32_recbuf ?
+            g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_mtl4_pipeline :
+            down_tile16_recbuf ?
+            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_mtl4_pipeline :
+            preweight_mid ?
+            g_d8f_down_sum_selected_preweighted_batch_tile16_mtl4_pipeline :
+            down_tile16 ?
+            g_d8f_down_sum_selected_weighted_batch_tile16_mtl4_pipeline :
+            down_tile8 ?
+            g_d8f_down_sum_selected_weighted_batch_tile8_mtl4_pipeline :
+            g_d8f_down_sum_selected_weighted_batch_mtl4_pipeline;
+        const uint32_t gate_arg_count = (gateup_recbuf || preweight_mid) ? 6u : 5u;
+        const uint32_t down_arg_count = (down_tile16_recbuf || down_tile32_recbuf) ? 8u : (preweight_mid ? 5u : 6u);
+        const uint32_t gate_tg_mem = (gateup_tile4 ? 64u : 16u) * (uint32_t)sizeof(float);
+        const uint32_t down_tg_mem = (down_tile32_recbuf ? 256u : (down_tile16 ? 128u : (down_tile8 ? 64u : 8u))) * (uint32_t)sizeof(float);
+        const MTLSize gate_grid = MTLSizeMake(gateup_tile4 ? ((ds4_mid_dim + 3u) >> 2) : ds4_mid_dim,
+                                              n_experts, n_tokens);
+        const MTLSize down_grid = MTLSizeMake(down_tile32_recbuf ? ((ds4_down_out_dim + 31u) >> 5) : (down_tile16 ? ((ds4_down_out_dim + 15u) >> 4) : (down_tile8 ? ((ds4_down_out_dim + 7u) >> 3) : ds4_down_out_dim)),
+                                              n_tokens, 1);
+        const MTLSize packet_tg = MTLSizeMake(256, 1, 1);
+        int packet_icb_requested =
+            (n_tokens == 1u) && ds4_gpu_d8f_mtl4_packet_icb_enabled();
+        int packet_icb_ready = 0;
+        NSUInteger packet_gate_cmd = (NSUInteger)layer * 2u;
+        NSUInteger packet_down_cmd = packet_gate_cmd + 1u;
+        if (packet_icb_requested && mtl4_batch_active) {
+            packet_gate_cmd = g_mtl4_batch_packet_cmd_used;
+            packet_down_cmd = packet_gate_cmd + 1u;
+            if (packet_down_cmd < (NSUInteger)ds4_d8f_packet_icb_cmds) {
+                g_mtl4_batch_packet_cmd_used += 2u;
+            } else {
+                static int d8f_mtl4_packet_icb_batch_overflow_notice = 0;
+                if (!d8f_mtl4_packet_icb_batch_overflow_notice) {
+                    d8f_mtl4_packet_icb_batch_overflow_notice = 1;
+                    fprintf(stderr,
+                            "ds4_d8f: MTL4 packet ICB batch slot overflow; "
+                            "falling back to direct MTL4 dispatch for this batch\n");
+                }
+                packet_icb_requested = 0;
+            }
+        }
+        if (packet_icb_requested && gate_pso && down_pso &&
+            packet_down_cmd < (NSUInteger)ds4_d8f_packet_icb_cmds &&
+            ds4_icb_slot_acquire(&g_d8f_packet_icb_slot, (NSUInteger)ds4_d8f_packet_icb_cmds, 8)) {
+            __unsafe_unretained id<MTLBuffer> gate_bufs[7] = { nil };
+            NSUInteger gate_offs[7] = { 0 };
+            NSUInteger gate_n = 0;
+            gate_bufs[gate_n] = g_d8f_runtime_buf; gate_offs[gate_n++] = 0;
+            gate_bufs[gate_n] = xBuf; gate_offs[gate_n++] = x_off;
+            gate_bufs[gate_n] = selBuf; gate_offs[gate_n++] = sel_off;
+            gate_bufs[gate_n] = g_d8f_runtime_mid_buf; gate_offs[gate_n++] = 0;
+            gate_bufs[gate_n] = gate_args_buf; gate_offs[gate_n++] = gate_args_off;
+            if (gateup_recbuf) {
+                gate_bufs[gate_n] = g_d8f_runtime_rec_buf; gate_offs[gate_n++] = 0;
+            } else if (preweight_mid) {
+                gate_bufs[gate_n] = weightBuf; gate_offs[gate_n++] = weight_off;
+            }
+            __unsafe_unretained id<MTLBuffer> down_bufs[8] = { nil };
+            NSUInteger down_offs[8] = { 0 };
+            NSUInteger down_n = 0;
+            down_bufs[down_n] = g_d8f_runtime_buf; down_offs[down_n++] = 0;
+            down_bufs[down_n] = g_d8f_runtime_mid_buf; down_offs[down_n++] = 0;
+            down_bufs[down_n] = selBuf; down_offs[down_n++] = sel_off;
+            down_bufs[down_n] = outBuf; down_offs[down_n++] = out_off;
+            down_bufs[down_n] = down_args_buf; down_offs[down_n++] = down_args_off;
+            if (!preweight_mid) {
+                down_bufs[down_n] = weightBuf; down_offs[down_n++] = weight_off;
+            }
+            if (down_tile16_recbuf || down_tile32_recbuf) {
+                down_bufs[down_n] = g_d8f_runtime_rec_buf; down_offs[down_n++] = 0;
+                down_bufs[down_n] = rank1_sidecar_active ? g_d8f_runtime_sidecar_dot_buf : g_d8f_runtime_mid_buf;
+                down_offs[down_n++] = 0;
+            }
+            uint64_t gate_extra[8] = { layer, n_tokens, n_experts, gateup_recbuf, gateup_tile4, preweight_mid, ds4_mid_dim, ds4_gateup_in_dim };
+            uint64_t down_extra[8] = { layer, n_tokens, n_experts, down_tile16_recbuf, down_tile32_recbuf, down_tile16, preweight_mid, ds4_down_out_dim };
+            packet_icb_ready =
+                ds4_icb_slot_record_command(&g_d8f_packet_icb_slot, packet_gate_cmd, gate_pso,
+                                            gate_bufs, gate_offs, gate_n,
+                                            gate_grid, packet_tg, gate_tg_mem,
+                                            gate_extra, 8) &&
+                ds4_icb_slot_record_command(&g_d8f_packet_icb_slot, packet_down_cmd, down_pso,
+                                            down_bufs, down_offs, down_n,
+                                            down_grid, packet_tg, down_tg_mem,
+                                            down_extra, 8) &&
+                ds4_d8f_packet_icb_residency_prepare();
+            if (!packet_icb_ready && !mtl4_batch_active) ds4_d8f_packet_icb_reset();
+        }
+        const int layer_rs_attached = ds4_d8f_runtime_layer_queue_attach(layer);
+        id<MTL4CommandBuffer> cb = mtl4_batch_active ? g_mtl4_batch_cb : [g_device newCommandBuffer];
+        if (!mtl4_batch_active) [cb beginCommandBufferWithAllocator:g_polar_allocator];
+        [cb useResidencySet:g_d8f_runtime_rs];
+        [cb useResidencySet:g_d8f_runtime_scratch_rs];
+        [cb useResidencySet:g_d8f_external_tensor_rs];
+        if (packet_icb_ready && g_d8f_packet_icb_rs) [cb useResidencySet:g_d8f_packet_icb_rs];
+        id<MTL4ComputeCommandEncoder> enc = mtl4_batch_active ? g_mtl4_batch_enc : [cb computeCommandEncoder];
+        id<MTL4ArgumentTable> gateAt = nil;
+        id<MTL4ArgumentTable> downAt = nil;
+        if (packet_icb_ready) {
+            static int d8f_packet_icb_notice_printed = 0;
+            if (!d8f_packet_icb_notice_printed) {
+                d8f_packet_icb_notice_printed = 1;
+                fprintf(stderr,
+                        "ds4_d8f: MTL4 packet ICB enabled for routed organ path "
+                        "(gateup_recbuf=%d down16=%d down32=%d)\n",
+                        gateup_recbuf, down_tile16_recbuf, down_tile32_recbuf);
+            }
+            [enc executeCommandsInBuffer:g_d8f_packet_icb_slot.icb withRange:NSMakeRange(packet_gate_cmd, 1)];
+            [enc barrierAfterEncoderStages:MTLStageDispatch
+                         beforeEncoderStages:MTLStageDispatch
+                           visibilityOptions:MTL4VisibilityOptionDevice];
+            [enc executeCommandsInBuffer:g_d8f_packet_icb_slot.icb withRange:NSMakeRange(packet_down_cmd, 1)];
+        } else {
+            gateAt = ds4_mtl4_pool_acquire(gate_arg_count);
+            [gateAt setAddress:g_d8f_runtime_buf.gpuAddress atIndex:0];
+            [gateAt setAddress:x_addr                         atIndex:1];
+            [gateAt setAddress:sel_addr                       atIndex:2];
+            [gateAt setAddress:g_d8f_runtime_mid_buf.gpuAddress       atIndex:3];
+            [gateAt setAddress:gate_args_addr atIndex:4];
+            if (gateup_recbuf) {
+                [gateAt setAddress:g_d8f_runtime_rec_buf.gpuAddress atIndex:5];
+            } else if (preweight_mid) {
+                [gateAt setAddress:weight_addr atIndex:5];
+            }
+            [enc setComputePipelineState:gate_pso];
+            [enc setArgumentTable:gateAt];
+            [enc setThreadgroupMemoryLength:gate_tg_mem atIndex:0];
+            [enc dispatchThreadgroups:gate_grid threadsPerThreadgroup:packet_tg];
+            [enc barrierAfterEncoderStages:MTLStageDispatch
+                         beforeEncoderStages:MTLStageDispatch
+                           visibilityOptions:MTL4VisibilityOptionDevice];
+            downAt = ds4_mtl4_pool_acquire(down_arg_count);
+            [downAt setAddress:g_d8f_runtime_buf.gpuAddress atIndex:0];
+            [downAt setAddress:g_d8f_runtime_mid_buf.gpuAddress       atIndex:1];
+            [downAt setAddress:sel_addr                       atIndex:2];
+            [downAt setAddress:out_addr                       atIndex:3];
+            [downAt setAddress:down_args_addr atIndex:4];
+            if (!preweight_mid) [downAt setAddress:weight_addr atIndex:5];
+            if (down_tile16_recbuf || down_tile32_recbuf) [downAt setAddress:g_d8f_runtime_rec_buf.gpuAddress atIndex:6];
+            if (down_tile16_recbuf || down_tile32_recbuf) {
+                id<MTLBuffer> auxBuf = rank1_sidecar_active ? g_d8f_runtime_sidecar_dot_buf : g_d8f_runtime_mid_buf;
+                [downAt setAddress:auxBuf.gpuAddress atIndex:7];
+            }
+            [enc setComputePipelineState:down_pso];
+            [enc setArgumentTable:downAt];
+            [enc setThreadgroupMemoryLength:down_tg_mem atIndex:0];
+            [enc dispatchThreadgroups:down_grid threadsPerThreadgroup:packet_tg];
+        }
+        if (mtl4_batch_active) {
+            [enc barrierAfterEncoderStages:MTLStageDispatch
+                         beforeEncoderStages:MTLStageDispatch
+                           visibilityOptions:MTL4VisibilityOptionDevice];
+            int append_ok = 1;
+            if (gateAt && !ds4_gpu_mtl4_batch_hold_arg_table(gateAt, gate_arg_count)) append_ok = 0;
+            if (downAt && !ds4_gpu_mtl4_batch_hold_arg_table(downAt, down_arg_count)) append_ok = 0;
+            if (append_ok) {
+                gateAt = nil;
+                downAt = nil;
+                atomic_fetch_add_explicit(&g_ds4_d8f_mtl4_batch_append_count, 1,
+                                          memory_order_relaxed);
+                ok = 0;
+            } else {
+                ok = -1;
+            }
+        } else {
+            [enc endEncoding];
+            [cb endCommandBuffer];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            __block NSError *fbErr = nil;
+            MTL4CommitOptions *opts = [MTL4CommitOptions new];
+            [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+                fbErr = fb.error;
+                dispatch_semaphore_signal(sem);
+            }];
+            id<MTL4CommandBuffer> bufs[1] = { cb };
+            [g_polar_queue commit:bufs count:1 options:opts];
+            long wait_rc = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+            if (wait_rc != 0) {
+                fprintf(stderr, "ds4_d8f: tensor batch dispatch timed out L%u\n", layer);
+                ok = -1;
+            } else if (fbErr) {
+                fprintf(stderr, "ds4_d8f: tensor batch dispatch feedback error L%u: %s\n",
+                        layer, fbErr.localizedDescription.UTF8String);
+                ok = -1;
+            } else {
+                ok = 0;
+            }
+        }
+        if (gateAt) ds4_mtl4_pool_release(gateAt, gate_arg_count);
+        if (downAt) ds4_mtl4_pool_release(downAt, down_arg_count);
+        if (layer_rs_attached) ds4_d8f_runtime_layer_queue_detach(layer);
+    }
+    return ok;
+}
+
+int ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor(const char *d8f_path,
+                                                  uint32_t layer,
+                                                  ds4_gpu_tensor *selected_experts,
+                                                  ds4_gpu_tensor *route_weights,
+                                                  ds4_gpu_tensor *input,
+                                                  ds4_gpu_tensor *output,
+                                                  uint32_t n_experts,
+                                                  float swiglu_limit) {
+    return ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(
+        d8f_path, layer, selected_experts, route_weights, input, output,
+        1u, n_experts, swiglu_limit);
 }
 
 static char g_m1r_cached_path[4096];
@@ -47027,7 +52979,8 @@ static int ds4_d8m_runtime_cache_prepare(uint32_t layer,
         ds4_d8m_record rec;
         if (!ds4_d8m_get_record(&g_d8m_runtime_file, expert, &rec) ||
             rec.block != 8u || rec.k == 0 || rec.bits == 0 ||
-            ((uint64_t)rec.index_bytes * 8ull) / (uint64_t)rec.bits < expected_blocks) {
+            ((uint64_t)rec.index_bytes * 8ull) / (uint64_t)rec.bits < expected_blocks ||
+            ((rec.flags & 1u) != 0u && rec.scale_bytes < in_dim * 2u)) {
             fprintf(stderr,
                     "ds4_d8m: production pack rejected L%u expert=%u path=%s\n",
                     layer, expert, path);
@@ -47913,22 +53866,27 @@ int ds4_gpu_mtl4_m1r_routed_organ_dispatch_tensor_batch(const char *m1r_path,
                 uint32_t rows, in_dim, n_selected, n_tokens, table_offset, record_bytes;
                 uint32_t mid_token_stride, mid_slot_stride, out_token_stride;
             } d8m_args = {
-                down.out_dim, down.in_dim, n_experts, chunk_tokens, 4096u, 40u,
+                down.out_dim, down.in_dim, n_experts, chunk_tokens,
+                g_d8m_runtime_file.table_offset, g_d8m_runtime_file.record_bytes,
                 n_experts * down.in_dim, down.in_dim, down.out_dim,
             };
             memcpy(g_m1r_runtime_down_args_buf.contents, &d8m_args, sizeof(d8m_args));
-            const int down_tile4 = ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE4") > 0;
+            const int down_tile16 = ds4_gpu_d8m_down_tile16_enabled(chunk_tokens) && g_d8m_down_sum_selected_batch_tile16_mtl4_pipeline;
+            const int down_tile8 = !down_tile16 && ds4_gpu_d8m_down_tile8_enabled();
+            const int down_tile4 = !down_tile16 && !down_tile8 && ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE4") > 0;
             [at2 setAddress:g_d8m_runtime_buf.gpuAddress atIndex:0];
             [at2 setAddress:g_m1r_runtime_mid_buf.gpuAddress + (uint64_t)token_base * mid_token_bytes atIndex:1];
             [at2 setAddress:sel_addr + (uint64_t)token_base * selected_token_bytes atIndex:2];
             [at2 setAddress:out_addr + (uint64_t)token_base * output_token_bytes atIndex:3];
             [at2 setAddress:g_m1r_runtime_down_args_buf.gpuAddress atIndex:4];
             [enc2 setComputePipelineState:
+                down_tile16 ? g_d8m_down_sum_selected_batch_tile16_mtl4_pipeline :
+                down_tile8 ? g_d8m_down_sum_selected_batch_tile8_mtl4_pipeline :
                 down_tile4 ? g_d8m_down_sum_selected_batch_tile4_mtl4_pipeline
                            : g_d8m_down_sum_selected_batch_mtl4_pipeline];
             [enc2 setArgumentTable:at2];
-            [enc2 setThreadgroupMemoryLength:(down_tile4 ? 32u : 8u) * sizeof(float) atIndex:0];
-            [enc2 dispatchThreadgroups:MTLSizeMake((NSUInteger)(down_tile4 ? ((down.out_dim + 3u) >> 2) : down.out_dim),
+            [enc2 setThreadgroupMemoryLength:(down_tile16 ? 128u : (down_tile8 ? 64u : (down_tile4 ? 32u : 8u))) * sizeof(float) atIndex:0];
+            [enc2 dispatchThreadgroups:MTLSizeMake((NSUInteger)(down_tile16 ? ((down.out_dim + 15u) >> 4) : (down_tile8 ? ((down.out_dim + 7u) >> 3) : (down_tile4 ? ((down.out_dim + 3u) >> 2) : down.out_dim))),
                                                    (NSUInteger)chunk_tokens, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         };
@@ -49020,15 +54978,15 @@ int ds4_gpu_mtl4_m1r_d8m_routed_organ_canary(const char *m1r_path,
                 const uint32_t code = ds4_d8m_code_at(&d8m, &rec, block_index);
                 if (code >= rec.k) continue;
                 const uint8_t *half = d8m.map + rec.codebook_offset + (uint64_t)code * 16u;
-                const float *xb = slot_mid + (uint64_t)block_col * 8u;
-                sum += ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 0u)) * xb[0] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 2u)) * xb[1] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 4u)) * xb[2] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 6u)) * xb[3] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 8u)) * xb[4] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 10u)) * xb[5] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * xb[6] +
-                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * xb[7];
+                const uint32_t x_base = block_col * 8u;
+                sum += ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 0u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 0u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 2u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 1u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 4u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 2u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 6u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 3u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 8u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 4u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 10u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 5u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 6u) +
+                       ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 7u);
             }
         }
         ref[row] = (float)sum;
@@ -49069,7 +55027,7 @@ int ds4_gpu_mtl4_m1r_d8m_routed_organ_canary(const char *m1r_path,
         };
         struct down_args_t {
             uint32_t rows, in_dim, n_selected, table_offset, record_bytes, mid_slot_stride;
-        } down_args = { rows, gate.out_dim, n_experts, 4096u, 40u, gate.out_dim };
+        } down_args = { rows, gate.out_dim, n_experts, d8m.table_offset, d8m.record_bytes, gate.out_dim };
         id<MTLBuffer> gateArgsBuf = [g_device newBufferWithBytes:&gate_args length:sizeof(gate_args) options:MTLResourceStorageModeShared];
         id<MTLBuffer> downArgsBuf = [g_device newBufferWithBytes:&down_args length:sizeof(down_args) options:MTLResourceStorageModeShared];
         id<MTLResidencySet> rs = nil;
@@ -49308,15 +55266,15 @@ int ds4_gpu_mtl4_m1r_d8m_routed_organ_batch_canary(const char *m1r_path,
                     const uint32_t code = ds4_d8m_code_at(&d8m, &rec, block_index);
                     if (code >= rec.k) continue;
                     const uint8_t *half = d8m.map + rec.codebook_offset + (uint64_t)code * 16u;
-                    const float *xb = slot_mid + (uint64_t)block_col * 8u;
-                    sum += ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 0u)) * xb[0] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 2u)) * xb[1] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 4u)) * xb[2] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 6u)) * xb[3] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 8u)) * xb[4] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 10u)) * xb[5] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * xb[6] +
-                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * xb[7];
+                    const uint32_t x_base = block_col * 8u;
+                    sum += ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 0u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 0u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 2u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 1u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 4u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 2u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 6u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 3u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 8u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 4u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 10u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 5u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 12u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 6u) +
+                           ds4_m1r_f16_to_f32(ds4_m1r_u16(half + 14u)) * ds4_d8m_ref_mid_at(&d8m, &rec, slot_mid, x_base + 7u);
                 }
             }
             ref[(uint64_t)token * rows + row] = (float)sum;
@@ -49331,7 +55289,13 @@ int ds4_gpu_mtl4_m1r_d8m_routed_organ_batch_canary(const char *m1r_path,
     double warmup_ms = 0.0;
     double timed_ms = 0.0;
     const int row_tile4 = ds4_gpu_env_bool("DS4_M1R_ROW_TILE4") > 0;
-    const int down_tile4 = row_tile4 || ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE4") > 0;
+    const int down_tile16 = ds4_gpu_d8m_down_tile16_enabled(n_tokens) && g_d8m_down_sum_selected_batch_tile16_mtl4_pipeline;
+    const int down_tile8 = !down_tile16 && ds4_gpu_d8m_down_tile8_enabled();
+    const int down_tile4 = !down_tile16 && !down_tile8 && (row_tile4 || ds4_gpu_env_bool("DS4_D8M_DOWN_ROW_TILE4") > 0);
+    const int packet_icb_requested =
+        ds4_gpu_env_bool("DS4_MTL4_PACKET_ICB") > 0 ||
+        ds4_gpu_env_bool("DS4_M1R_D8M_PACKET_ICB") > 0;
+    int packet_icb_ready = 0;
     @autoreleasepool {
         id<MTLBuffer> d8mBuf = [g_device newBufferWithBytesNoCopy:(void *)d8m.map
                                                             length:d8m.size
@@ -49364,20 +55328,77 @@ int ds4_gpu_mtl4_m1r_d8m_routed_organ_batch_canary(const char *m1r_path,
         };
         struct d8m_batch_args_t {
             uint32_t rows, in_dim, n_selected, n_tokens, table_offset, record_bytes, mid_token_stride, mid_slot_stride, out_token_stride;
-        } down_args = { rows, gate.out_dim, n_experts, n_tokens, 4096u, 40u,
+        } down_args = { rows, gate.out_dim, n_experts, n_tokens, d8m.table_offset, d8m.record_bytes,
                         n_experts * gate.out_dim, gate.out_dim, rows };
         id<MTLBuffer> gateArgsBuf = [g_device newBufferWithBytes:&gate_args length:sizeof(gate_args) options:MTLResourceStorageModeShared];
         id<MTLBuffer> downArgsBuf = [g_device newBufferWithBytes:&down_args length:sizeof(down_args) options:MTLResourceStorageModeShared];
+        ds4_icb_slot_t packet_icb_slot;
+        packet_icb_slot.icb = nil;
+        packet_icb_slot.max_commands = 0;
+        packet_icb_slot.max_buffer_bind_count = 0;
+        memset(packet_icb_slot.recorded, 0, sizeof(packet_icb_slot.recorded));
+        memset(packet_icb_slot.sig, 0, sizeof(packet_icb_slot.sig));
+        id<MTLComputePipelineState> gate_pso =
+            row_tile4 ? g_cdx3_gateup_swiglu_d8_rowtg_m1r_selected_batch_tile4_mtl4_pipeline
+                      : g_cdx3_gateup_swiglu_d8_rowtg_m1r_selected_batch_mtl4_pipeline;
+        id<MTLComputePipelineState> down_pso =
+            down_tile16 ? g_d8m_down_sum_selected_batch_tile16_mtl4_pipeline :
+            down_tile8 ? g_d8m_down_sum_selected_batch_tile8_mtl4_pipeline :
+            down_tile4 ? g_d8m_down_sum_selected_batch_tile4_mtl4_pipeline
+                       : g_d8m_down_sum_selected_batch_mtl4_pipeline;
+        const uint32_t gate_tg_mem = (row_tile4 ? 64u : 16u) * (uint32_t)sizeof(float);
+        const uint32_t down_tg_mem = (down_tile16 ? 128u : (down_tile8 ? 64u : (down_tile4 ? 32u : 8u))) * (uint32_t)sizeof(float);
+        const MTLSize gate_grid = MTLSizeMake(row_tile4 ? ((gate.out_dim + 3u) >> 2) : gate.out_dim,
+                                              n_experts * n_tokens, 1);
+        const MTLSize down_grid = MTLSizeMake(down_tile16 ? ((rows + 15u) >> 4) : (down_tile8 ? ((rows + 7u) >> 3) : (down_tile4 ? ((rows + 3u) >> 2) : rows)),
+                                              n_tokens, 1);
+        const MTLSize packet_tg = MTLSizeMake(256, 1, 1);
+        if (packet_icb_requested && gate_pso && down_pso &&
+            g_m1r_cached_gate_cb_buf[layer] && g_m1r_cached_up_cb_buf[layer] &&
+            g_m1r_cached_gate_scale_buf[layer] && g_m1r_cached_up_scale_buf[layer] &&
+            g_m1r_cached_gate_index_buf[layer] && g_m1r_cached_up_index_buf[layer] &&
+            g_m1r_cached_scale_lp_buf && d8mBuf && xBuf && weightBuf && selBuf &&
+            midBuf && outBuf && gateArgsBuf && downArgsBuf &&
+            ds4_icb_slot_acquire(&packet_icb_slot, 2, 12)) {
+            __unsafe_unretained id<MTLBuffer> gate_bufs[12] = {
+                g_m1r_cached_gate_cb_buf[layer],
+                g_m1r_cached_up_cb_buf[layer],
+                g_m1r_cached_gate_scale_buf[layer],
+                g_m1r_cached_up_scale_buf[layer],
+                g_m1r_cached_gate_index_buf[layer],
+                g_m1r_cached_up_index_buf[layer],
+                xBuf, weightBuf, selBuf, midBuf, g_m1r_cached_scale_lp_buf, gateArgsBuf,
+            };
+            NSUInteger gate_offs[12] = {0};
+            uint64_t gate_extra[6] = { layer, n_tokens, n_experts, gate.out_dim, row_tile4, gate.k };
+            __unsafe_unretained id<MTLBuffer> down_bufs[5] = {
+                d8mBuf, midBuf, selBuf, outBuf, downArgsBuf,
+            };
+            NSUInteger down_offs[5] = {0};
+            uint64_t down_extra[6] = { rows, n_tokens, n_experts, down_tile4, down_tile8, down_tile16 };
+            packet_icb_ready =
+                ds4_icb_slot_record_command(&packet_icb_slot, 0, gate_pso,
+                                            gate_bufs, gate_offs, 12,
+                                            gate_grid, packet_tg, gate_tg_mem,
+                                            gate_extra, 6) &&
+                ds4_icb_slot_record_command(&packet_icb_slot, 1, down_pso,
+                                            down_bufs, down_offs, 5,
+                                            down_grid, packet_tg, down_tg_mem,
+                                            down_extra, 6);
+            if (!packet_icb_ready) ds4_icb_slot_reset(&packet_icb_slot);
+        }
         id<MTLResidencySet> rs = nil;
         if (g_m1r_cached_gateup_rs[layer] && d8mBuf && xBuf && weightBuf && selBuf && midBuf && outBuf && gateArgsBuf && downArgsBuf) {
             MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-            rsDesc.initialCapacity = 8;
+            rsDesc.initialCapacity = packet_icb_ready ? 9 : 8;
             NSError *err = nil;
             rs = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
         }
         if (rs) {
-            id<MTLAllocation> allocs[8] = { d8mBuf, xBuf, weightBuf, selBuf, midBuf, outBuf, gateArgsBuf, downArgsBuf };
-            [rs addAllocations:allocs count:8];
+            id<MTLAllocation> allocs[9] = { d8mBuf, xBuf, weightBuf, selBuf, midBuf, outBuf, gateArgsBuf, downArgsBuf, nil };
+            NSUInteger n_allocs = 8;
+            if (packet_icb_ready) allocs[n_allocs++] = (id<MTLAllocation>)packet_icb_slot.icb;
+            [rs addAllocations:allocs count:n_allocs];
             [rs commit];
             ds4_residency_request_checked(rs, __func__);
             [g_polar_queue addResidencySet:rs];
@@ -49389,44 +55410,47 @@ int ds4_gpu_mtl4_m1r_d8m_routed_organ_batch_canary(const char *m1r_path,
                 [cb useResidencySet:g_m1r_cached_gateup_rs[layer]];
                 [cb useResidencySet:rs];
                 id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                id<MTL4ArgumentTable> at1 = ds4_mtl4_pool_acquire(12);
-                [at1 setAddress:g_m1r_cached_gate_cb_buf[layer].gpuAddress    atIndex:0];
-                [at1 setAddress:g_m1r_cached_up_cb_buf[layer].gpuAddress      atIndex:1];
-                [at1 setAddress:g_m1r_cached_gate_scale_buf[layer].gpuAddress atIndex:2];
-                [at1 setAddress:g_m1r_cached_up_scale_buf[layer].gpuAddress   atIndex:3];
-                [at1 setAddress:g_m1r_cached_gate_index_buf[layer].gpuAddress atIndex:4];
-                [at1 setAddress:g_m1r_cached_up_index_buf[layer].gpuAddress   atIndex:5];
-                [at1 setAddress:xBuf.gpuAddress                               atIndex:6];
-                [at1 setAddress:weightBuf.gpuAddress                          atIndex:7];
-                [at1 setAddress:selBuf.gpuAddress                             atIndex:8];
-                [at1 setAddress:midBuf.gpuAddress                             atIndex:9];
-                [at1 setAddress:g_m1r_cached_scale_lp_buf.gpuAddress          atIndex:10];
-                [at1 setAddress:gateArgsBuf.gpuAddress                        atIndex:11];
-                [enc setComputePipelineState:
-                    row_tile4 ? g_cdx3_gateup_swiglu_d8_rowtg_m1r_selected_batch_tile4_mtl4_pipeline
-                              : g_cdx3_gateup_swiglu_d8_rowtg_m1r_selected_batch_mtl4_pipeline];
-                [enc setArgumentTable:at1];
-                [enc setThreadgroupMemoryLength:(row_tile4 ? 64u : 16u) * sizeof(float) atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(row_tile4 ? ((gate.out_dim + 3u) >> 2) : gate.out_dim,
-                                                       n_experts * n_tokens, 1)
-                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc barrierAfterEncoderStages:MTLStageDispatch
-                             beforeEncoderStages:MTLStageDispatch
-                               visibilityOptions:MTL4VisibilityOptionDevice];
+                id<MTL4ArgumentTable> at1 = nil;
+                id<MTL4ArgumentTable> at2 = nil;
+                if (packet_icb_ready) {
+                    [enc executeCommandsInBuffer:packet_icb_slot.icb withRange:NSMakeRange(0, 1)];
+                    [enc barrierAfterEncoderStages:MTLStageDispatch
+                                 beforeEncoderStages:MTLStageDispatch
+                                   visibilityOptions:MTL4VisibilityOptionDevice];
+                    [enc executeCommandsInBuffer:packet_icb_slot.icb withRange:NSMakeRange(1, 1)];
+                } else {
+                    at1 = ds4_mtl4_pool_acquire(12);
+                    [at1 setAddress:g_m1r_cached_gate_cb_buf[layer].gpuAddress    atIndex:0];
+                    [at1 setAddress:g_m1r_cached_up_cb_buf[layer].gpuAddress      atIndex:1];
+                    [at1 setAddress:g_m1r_cached_gate_scale_buf[layer].gpuAddress atIndex:2];
+                    [at1 setAddress:g_m1r_cached_up_scale_buf[layer].gpuAddress   atIndex:3];
+                    [at1 setAddress:g_m1r_cached_gate_index_buf[layer].gpuAddress atIndex:4];
+                    [at1 setAddress:g_m1r_cached_up_index_buf[layer].gpuAddress   atIndex:5];
+                    [at1 setAddress:xBuf.gpuAddress                               atIndex:6];
+                    [at1 setAddress:weightBuf.gpuAddress                          atIndex:7];
+                    [at1 setAddress:selBuf.gpuAddress                             atIndex:8];
+                    [at1 setAddress:midBuf.gpuAddress                             atIndex:9];
+                    [at1 setAddress:g_m1r_cached_scale_lp_buf.gpuAddress          atIndex:10];
+                    [at1 setAddress:gateArgsBuf.gpuAddress                        atIndex:11];
+                    [enc setComputePipelineState:gate_pso];
+                    [enc setArgumentTable:at1];
+                    [enc setThreadgroupMemoryLength:gate_tg_mem atIndex:0];
+                    [enc dispatchThreadgroups:gate_grid threadsPerThreadgroup:packet_tg];
+                    [enc barrierAfterEncoderStages:MTLStageDispatch
+                                 beforeEncoderStages:MTLStageDispatch
+                                   visibilityOptions:MTL4VisibilityOptionDevice];
 
-                id<MTL4ArgumentTable> at2 = ds4_mtl4_pool_acquire(5);
-                [at2 setAddress:d8mBuf.gpuAddress      atIndex:0];
-                [at2 setAddress:midBuf.gpuAddress      atIndex:1];
-                [at2 setAddress:selBuf.gpuAddress      atIndex:2];
-                [at2 setAddress:outBuf.gpuAddress      atIndex:3];
-                [at2 setAddress:downArgsBuf.gpuAddress atIndex:4];
-                [enc setComputePipelineState:
-                    down_tile4 ? g_d8m_down_sum_selected_batch_tile4_mtl4_pipeline
-                               : g_d8m_down_sum_selected_batch_mtl4_pipeline];
-                [enc setArgumentTable:at2];
-                [enc setThreadgroupMemoryLength:(down_tile4 ? 32u : 8u) * sizeof(float) atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(down_tile4 ? ((rows + 3u) >> 2) : rows, n_tokens, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    at2 = ds4_mtl4_pool_acquire(5);
+                    [at2 setAddress:d8mBuf.gpuAddress      atIndex:0];
+                    [at2 setAddress:midBuf.gpuAddress      atIndex:1];
+                    [at2 setAddress:selBuf.gpuAddress      atIndex:2];
+                    [at2 setAddress:outBuf.gpuAddress      atIndex:3];
+                    [at2 setAddress:downArgsBuf.gpuAddress atIndex:4];
+                    [enc setComputePipelineState:down_pso];
+                    [enc setArgumentTable:at2];
+                    [enc setThreadgroupMemoryLength:down_tg_mem atIndex:0];
+                    [enc dispatchThreadgroups:down_grid threadsPerThreadgroup:packet_tg];
+                }
                 [enc endEncoding];
                 [cb endCommandBuffer];
                 dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -49446,8 +55470,8 @@ int ds4_gpu_mtl4_m1r_d8m_routed_organ_batch_canary(const char *m1r_path,
                     fprintf(stderr, "ds4_hybrid: batch dispatch feedback error L%u tokens=%u: %s\n",
                             layer, n_tokens, fbErr.localizedDescription.UTF8String);
                 }
-                ds4_mtl4_pool_release(at2, 5);
-                ds4_mtl4_pool_release(at1, 12);
+                if (at2) ds4_mtl4_pool_release(at2, 5);
+                if (at1) ds4_mtl4_pool_release(at1, 12);
             };
             mach_timebase_info_data_t tb; mach_timebase_info(&tb);
             const uint64_t w0 = mach_absolute_time();
@@ -49480,8 +55504,8 @@ int ds4_gpu_mtl4_m1r_d8m_routed_organ_batch_canary(const char *m1r_path,
     const double per_round_ms = rounds ? timed_ms / (double)rounds : 0.0;
     const double us_per_token = (rounds && n_tokens) ? (timed_ms * 1000.0) / ((double)rounds * (double)n_tokens) : 0.0;
     fprintf(stderr,
-            "ds4: m1r_d8m_routed_organ_batch_canary L%u tokens=%u nsel=%u rows=%u rounds=%u row_tile4=%d down_tile4=%d warmup_ms=%.3f batch_ms=%.3f per_round_ms=%.3f us_per_token=%.3f gateK=%u gateBits=%u m1r=%.2fGiB d8m=%.2fMiB mismatch=%llu sentinel=%llu max_abs=%.6e max_rel=%.6e rc=%d experts=",
-            layer, n_tokens, n_experts, rows, rounds, row_tile4, down_tile4,
+            "ds4: m1r_d8m_routed_organ_batch_canary L%u tokens=%u nsel=%u rows=%u rounds=%u row_tile4=%d down_tile4=%d down_tile8=%d down_tile16=%d packet_icb=%d warmup_ms=%.3f batch_ms=%.3f per_round_ms=%.3f us_per_token=%.3f gateK=%u gateBits=%u m1r=%.2fGiB d8m=%.2fMiB mismatch=%llu sentinel=%llu max_abs=%.6e max_rel=%.6e rc=%d experts=",
+            layer, n_tokens, n_experts, rows, rounds, row_tile4, down_tile4, down_tile8, down_tile16, packet_icb_ready,
             warmup_ms, timed_ms, per_round_ms, us_per_token,
             gate.k, gate.bits, (double)m1r_size / 1073741824.0, (double)d8m.size / 1048576.0,
             (unsigned long long)mismatch, (unsigned long long)sentinel, max_abs, max_rel, ok);

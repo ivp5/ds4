@@ -1192,6 +1192,7 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *nonrouted_pack_path;
     const char *trace_path;
     const char *regrade_trace_path;
     const char *case_sequence;
@@ -1203,11 +1204,15 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    float presence_penalty;
     uint64_t seed;
     int pause_ms;
     int soft_limit_reply_budget;
     int hard_limit_reply_budget;
     int soft_limit_think_close_rank;
+    int mtp_draft_tokens;
+    int mtp_draft_tree_width;
+    float mtp_margin;
     ds4_think_mode think_mode;
     bool plain;
     bool warm_weights;
@@ -1490,11 +1495,16 @@ static void usage(FILE *fp) {
         "Model and backend:\n"
         "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
         "  --mtp FILE             Optional MTP support GGUF.\n"
+        "  --nonrouted-pack FILE  DS4NRPK1 non-routed tensor pack.\n"
         "  -c, --ctx N            Allocated session context. Default: auto-sized.\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
+        "  --mtp-draft-tokens N   Enable MTP speculative decode depth. Default: 2\n"
+        "  --mtp-tree-width N     MTP diagnostic tree width. Default: 1\n"
+        "  --mtp-margin F         MTP margin threshold. Default: 3\n"
         "  --warm-weights         Touch mapped tensor pages before evaluation.\n"
+        "  DS4_PRIME_PATH=1      Prefer D8F classic in-graph packet ICB; external MTL4 packet dispatch remains force-only.\n"
         "\n"
         "Evaluation:\n"
         "  -n, --tokens N         Max generated tokens per question. Default: 16000\n"
@@ -1503,6 +1513,7 @@ static void usage(FILE *fp) {
         "  --temp F               Sampling temperature. Default: 0\n"
         "  --top-p F              Nucleus sampling probability. Default: 1\n"
         "  --min-p F              Keep tokens scoring at least F times the top token. Default: 0.05\n"
+        "  --presence-penalty F   Subtract F once from every prior token's logit. Default: 0\n"
         "  --seed N               Sampling seed. Default: time-based\n"
         "  --trace FILE           Write questions, outputs, and grading decisions.\n"
         "  --regrade-trace FILE   Regrade a prior --trace file without loading the model.\n"
@@ -1536,6 +1547,9 @@ static eval_config parse_options(int argc, char **argv) {
         .soft_limit_reply_budget = 1024,
         .hard_limit_reply_budget = 512,
         .soft_limit_think_close_rank = 3,
+        .mtp_draft_tokens = 2,
+        .mtp_draft_tree_width = 1,
+        .mtp_margin = 3.0f,
         .think_mode = DS4_THINK_HIGH,
     };
 
@@ -1548,6 +1562,8 @@ static eval_config parse_options(int argc, char **argv) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--nonrouted-pack")) {
+            c.nonrouted_pack_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -1562,6 +1578,8 @@ static eval_config parse_options(int argc, char **argv) {
             c.top_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--min-p")) {
             c.min_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+        } else if (!strcmp(arg, "--presence-penalty")) {
+            c.presence_penalty = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
         } else if (!strcmp(arg, "--seed")) {
             c.seed = parse_u64_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -1588,6 +1606,12 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
+        } else if (!strcmp(arg, "--mtp-draft-tokens")) {
+            c.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-tree-width")) {
+            c.mtp_draft_tree_width = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-margin")) {
+            c.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
         } else if (!strcmp(arg, "--think")) {
@@ -2503,6 +2527,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             "temperature: %.6g\n"
             "top_p: %.6g\n"
             "min_p: %.6g\n"
+            "presence_penalty: %.6g\n"
             "seed: %llu\n"
             "think_mode_requested: %s\n"
             "soft_limit_reply_budget: %d\n"
@@ -2520,6 +2545,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             cfg->temperature,
             cfg->top_p,
             cfg->min_p,
+            cfg->presence_penalty,
             (unsigned long long)cfg->seed,
             ds4_think_mode_name(cfg->think_mode),
             cfg->soft_limit_reply_budget,
@@ -2562,6 +2588,7 @@ static void trace_write_case(FILE *trace,
             "temperature: %.6g\n"
             "top_p: %.6g\n"
             "min_p: %.6g\n"
+            "presence_penalty: %.6g\n"
             "think_mode_effective: %s\n",
             idx + 1, ncases, tc->source, tc->id,
             (long long)time(NULL),
@@ -2578,6 +2605,7 @@ static void trace_write_case(FILE *trace,
             cfg->temperature,
             cfg->top_p,
             cfg->min_p,
+            cfg->presence_penalty,
             ds4_think_mode_name(effective_think_mode));
     if (think_close && think_close->kind != EVAL_THINK_CLOSE_NONE) {
         fprintf(trace,
@@ -3469,6 +3497,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
 
     const int eos = ds4_token_eos(engine);
     double t0 = ui->phase_start_sec;
+    double last_plain_progress_sec = t0;
+    int last_plain_progress_tokens = 0;
     int forced_close_pos = -1;
     for (int i = 0; i < generation_limit; i++) {
         if (tty) {
@@ -3567,8 +3597,9 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             }
         }
         if (token < 0)
-            token = ds4_session_sample(session, cfg->temperature, 0,
-                                       cfg->top_p, cfg->min_p, rng);
+            token = ds4_session_sample_with_presence_penalty(session, cfg->temperature, 0,
+                                                             cfg->top_p, cfg->min_p,
+                                                             cfg->presence_penalty, rng);
         if (token == eos) break;
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {
@@ -3577,7 +3608,42 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             think_close.remaining_budget = remaining_budget;
             think_close.rank = close_rank;
         }
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+        int accepted_tokens[17];
+        int accepted_count = 0;
+        bool use_mtp_spec =
+            cfg->temperature <= 0.0f &&
+            cfg->presence_penalty <= 0.0f &&
+            !generation_in_think &&
+            forced_close_pos < 0 &&
+            close_kind == EVAL_THINK_CLOSE_NONE &&
+            ds4_engine_mtp_draft_tokens(engine) > 1 &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+        if (use_mtp_spec) {
+            accepted_count = ds4_session_eval_speculative_argmax(session,
+                                                                 token,
+                                                                 generation_limit - ui->generated,
+                                                                 eos,
+                                                                 accepted_tokens,
+                                                                 (int)(sizeof(accepted_tokens) /
+                                                                       sizeof(accepted_tokens[0])),
+                                                                 err,
+                                                                 sizeof(err));
+            if (accepted_count < 0) {
+                plain_reset_color(use_plain_color);
+                ui->generated_tokens[idx] = ui->generated;
+                tui_run_clock_stop(ui);
+                fprintf(stderr, "ds4-eval: speculative decode failed for %s: %s\n",
+                        tc->id, err);
+                trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
+                                 system, question, raw.v ? raw.v : "", think_mode,
+                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 &think_close);
+                free(question);
+                ds4_tokens_free(&think_close_tokens);
+                buf_free(&raw);
+                return EVAL_RUN_ERROR;
+            }
+        } else if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
             plain_reset_color(use_plain_color);
             ui->generated_tokens[idx] = ui->generated;
             tui_run_clock_stop(ui);
@@ -3590,38 +3656,78 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             ds4_tokens_free(&think_close_tokens);
             buf_free(&raw);
             return EVAL_RUN_ERROR;
-        }
-
-        size_t len = 0;
-        char *text = ds4_token_text(engine, token, &len);
-        buf_append(&raw, text, len);
-        ui->generated++;
-        ui->generated_tokens[idx] = ui->generated;
-        tui_run_clock_tick(ui);
-        if (generation_in_think && raw.v && strstr(raw.v, "</think>")) {
-            generation_in_think = false;
-            if (think_close.kind == EVAL_THINK_CLOSE_NONE) {
-                think_close.kind = EVAL_THINK_CLOSE_NATURAL;
-                think_close.token_index = ui->generated;
-                think_close.remaining_budget = remaining_budget;
-                think_close.rank = 0;
-            }
-        }
-        double elapsed = now_sec() - ui->phase_start_sec;
-        ui->speed_tps = elapsed > 0.001 ? (double)ui->generated / elapsed : 0.0;
-
-        if (tty) {
-            stream_append_token_text(ui, text, len, false);
-            tui_refresh(ui, ui->in_think ? "thinking" : "answer");
         } else {
-            if (plain_in_think && strstr(raw.v ? raw.v : "", "</think>")) {
-                plain_in_think = false;
-                plain_reset_color(use_plain_color);
-            }
-            fwrite(text, 1, len, stdout);
-            fflush(stdout);
+            accepted_tokens[0] = token;
+            accepted_count = 1;
         }
-        free(text);
+
+        bool stop_after_accept = false;
+        for (int accepted_i = 0; accepted_i < accepted_count; accepted_i++) {
+            const int accepted_token = accepted_tokens[accepted_i];
+            if (accepted_token == eos) {
+                stop_after_accept = true;
+                break;
+            }
+            size_t len = 0;
+            char *text = ds4_token_text(engine, accepted_token, &len);
+            buf_append(&raw, text, len);
+            ui->generated++;
+            ui->generated_tokens[idx] = ui->generated;
+            tui_run_clock_tick(ui);
+            if (generation_in_think && raw.v && strstr(raw.v, "</think>")) {
+                generation_in_think = false;
+                if (think_close.kind == EVAL_THINK_CLOSE_NONE) {
+                    think_close.kind = EVAL_THINK_CLOSE_NATURAL;
+                    think_close.token_index = ui->generated;
+                    think_close.remaining_budget = generation_limit - ui->generated;
+                    think_close.rank = 0;
+                }
+            }
+            double elapsed = now_sec() - ui->phase_start_sec;
+            ui->speed_tps = elapsed > 0.001 ? (double)ui->generated / elapsed : 0.0;
+            if (!tty) {
+                const double progress_now = now_sec();
+                const int token_delta = ui->generated - last_plain_progress_tokens;
+                const double time_delta = progress_now - last_plain_progress_sec;
+                if (ui->generated == 1 || token_delta >= 32 || time_delta >= 10.0) {
+                    fprintf(stderr,
+                            "ds4-eval: decode-progress case=%d/%d source=%s id=%s "
+                            "generated=%d/%d remaining=%d phase=%s tps=%.3f elapsed=%.1fs mtp_batch=%d\n",
+                            idx + 1,
+                            ui->ncases,
+                            tc->source,
+                            tc->id,
+                            ui->generated,
+                            generation_limit,
+                            generation_limit - ui->generated,
+                            generation_in_think ? "thinking" : "answer",
+                            ui->speed_tps,
+                            elapsed,
+                            accepted_count);
+                    fflush(stderr);
+                    last_plain_progress_sec = progress_now;
+                    last_plain_progress_tokens = ui->generated;
+                }
+            }
+
+            if (tty) {
+                stream_append_token_text(ui, text, len, false);
+                tui_refresh(ui, ui->in_think ? "thinking" : "answer");
+            } else {
+                if (plain_in_think && strstr(raw.v ? raw.v : "", "</think>")) {
+                    plain_in_think = false;
+                    plain_reset_color(use_plain_color);
+                }
+                fwrite(text, 1, len, stdout);
+                fflush(stdout);
+            }
+            free(text);
+            if (ui->generated >= generation_limit) {
+                stop_after_accept = true;
+                break;
+            }
+        }
+        if (stop_after_accept) break;
     }
     if (tty) {
         stream_append_token_text(ui, NULL, 0, true);
@@ -3817,8 +3923,10 @@ int main(int argc, char **argv) {
         .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
-        .mtp_draft_tokens = 1,
-        .mtp_margin = 3.0f,
+        .mtp_draft_tokens = cfg.mtp_draft_tokens,
+        .mtp_draft_tree_width = cfg.mtp_draft_tree_width,
+        .mtp_margin = cfg.mtp_margin,
+        .nonrouted_pack_path = cfg.nonrouted_pack_path,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
     };
