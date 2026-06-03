@@ -16,6 +16,7 @@ MPSGraph has not been exhausted. The current evidence is deep enough to reject t
 - Layer-matched L26 shared CoreML plus L26 routed D8F on a real hidden row still gives useful overlap+merge speedup.
 - Cache warmup is not promotion-grade for exact D8F: D8F-after-ANE repeatedly fails to beat D8F-only in the clean no-evict cases.
 - Standard MPSGraph LUT implementation expands packed D8F codes into `int32` `[groups, rows]` gather indices. That is O(n) over touched rows, but it is not the encoded memory floor because index traffic is inflated before execution.
+- Packed-code decode is expressible in MPSGraph for both 4-bit synthetic and 12-bit VQ-D8 LUT indices using `coordinateAlongAxis`, byte gathers, bit shifts, and masks. Correctness passes, but performance does not promote: 12-bit VQ-D8 packed decode was slower than expanded gather in both measured runs.
 
 ## Steelman Lenses
 
@@ -29,8 +30,8 @@ MPSGraph has not been exhausted. The current evidence is deep enough to reject t
 
 ## Remaining MPSGraph Steelman Tests
 
-1. Packed-index expression test: determine whether MPSGraph can decode D8F packed codes in-graph using bitwise/shift/select operations, then gather without materializing expanded `int32` indices.
-2. Fusion test: if packed decode is expressible, inspect timing against expanded-index gather to see whether the compiler fuses decode/gather/reduce or inserts a worse intermediate.
+1. Packed-index expression test: done. MPSGraph can decode packed 4-bit and 12-bit codes in-graph.
+2. Fusion test: first result is negative. The 12-bit VQ-D8 path shrank index storage `2.666x` but ran slower than expanded gather, so the compiler is not making this a memory-floor path.
 3. Down-only production test: keep gate/up on the existing best GPU/Metal path and use MPSGraph only for selected routed down where the current isolated result is strongest.
 4. Executable cache footprint: compile and retain layer/expert/shape-specialized MPSGraph executables for a representative layer set; measure cold compile, warm run, and resident memory.
 5. Layout sweep: test codebook `[block,k]` versus alternative table orientations, gather axis choice, and contiguous versus strided hidden-state buffers.
@@ -41,7 +42,7 @@ MPSGraph has not been exhausted. The current evidence is deep enough to reject t
 
 ## Current Architecture Decision
 
-Do not promote generic MPSGraph gather as the final D8F runtime. Keep it as an exact graph oracle and overlap probe while the production path moves toward:
+Do not promote generic MPSGraph gather or packed-index MPSGraph decode as the final D8F runtime. Keep MPSGraph as an exact graph oracle, overlap probe, and possible down-only cache organ while the production path moves toward:
 
 1. cold-loaded CoreML shared-expert package cache;
 2. cold-compiled routed D8F graph or fused Metal kernel cache;

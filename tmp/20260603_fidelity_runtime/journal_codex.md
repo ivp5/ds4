@@ -249,3 +249,12 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - Six resident B=2048 8-bit shared models for layers `0,8,16,26,32,42` measured `240.38 MiB` total process footprint delta after prediction. Linear all-layer estimate for 43 layers is about `1.7 GiB`, which is plausible inside the 52GB architecture budget.
 - Model load latency is not plausible on the hot path: each package load measured about `2.4 s`. The runtime sidecar therefore needs explicit cold precompile/preload or a bounded layer-window model cache.
 - MPSGraph steelman status: standard expanded-index gather is not the memory-floor solution, but MPSGraph is not exhausted until packed-index decode/fusion, executable-cache footprint, down-only graph cache, queue/fence policy, and layout/shape sweeps are tested.
+
+## 2026-06-04T00:59 JST — packed-index MPSGraph and fresh VQ-D8 LUT retests
+
+- Added `tmp/20260603_mpsgraph_ane/mpsgraph_packed_index_probe.m`, a synthetic MPSGraph canary that compares expanded `int32` gather indices against in-graph packed-code decode using `coordinateAlongAxis`, byte gathers, bit shifts, masks, and the same LUT contraction.
+- First impact: `compileWithDevice:device` crashes in this SDK path with `-[AGXG13XDevice metalDevice]`; the probe now uses the same `compileWithDevice:nil` pattern as the proven MPSGraph canaries.
+- 4-bit packed decode is correct but slower: `rows=4096`, `bits=4`, expanded `622.990 us`, packed `1081.402 us`, `bad=0`, index storage shrink `7.996x`.
+- 12-bit VQ-D8 packed decode is also correct but not fast enough: first run expanded `668.612 us`, packed `766.167 us`; clean rerun expanded `724.956 us`, packed `1408.538 us`; both had `bad=0` and index storage shrink `2.666x`.
+- Fresh real H3355 L26 VQ-D8 LUT canaries passed. Down single expert E165: `808.583 us/op`, `bad=0`; down selected six `165,0,1,2,3,4`: `1903.469 us/op`, `bad=0`; gate/up E165: `1187.917 us/op`, `bad=0`; gate/up selected six: `2871.323 us/op`, `bad=0`.
+- Decision: MPSGraph can express packed VQ-D8 LUT indices, but direct packed decode/gather does not reach the memory floor. Keep MPSGraph for exactness/oracle/overlap/down-only tests; move memory-floor routed work toward custom Metal packed-index kernels.

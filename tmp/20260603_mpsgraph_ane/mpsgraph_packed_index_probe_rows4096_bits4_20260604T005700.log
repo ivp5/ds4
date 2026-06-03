@@ -1,0 +1,1 @@
+mpsgraph_packed_index_probe: rows=4096 rounds=20 bits=4 groups=256 k=16 expanded_compile_ms=5.993 packed_compile_ms=2.477 expanded_us=622.990 packed_us=1081.402 speedup=0.576 expanded_index_MB=4.194 packed_index_MB=0.525 index_shrink=7.996 bad=0 max_abs=0 rms=0 sample_exp=-0.0738525 sample_pack=-0.0738525

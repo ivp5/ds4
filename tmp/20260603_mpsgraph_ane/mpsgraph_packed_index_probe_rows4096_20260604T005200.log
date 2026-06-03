@@ -1,0 +1,15 @@
+*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason: '-[AGXG13XDevice metalDevice]: unrecognized selector sent to instance 0x86f078000'
+*** First throw call stack:
+(
+	0   CoreFoundation                      0x000000018cf191c0 __exceptionPreprocess + 176
+	1   libobjc.A.dylib                     0x000000018c9a291c objc_exception_throw + 88
+	2   CoreFoundation                      0x000000018cfda250 -[NSObject(NSObject) __retain_OA] + 0
+	3   CoreFoundation                      0x000000018ce89f38 ___forwarding___ + 1480
+	4   CoreFoundation                      0x000000018ce898b0 _CF_forwarding_prep_0 + 96
+	5   MetalPerformanceShadersGraph        0x00000002382e4160 -[MPSGraphExecutable initWithGraph:device:feeds:targetTensors:targetOperations:executableDescriptor:] + 1788
+	6   MetalPerformanceShadersGraph        0x000000023817bfb4 -[MPSGraph compileWithDevice:feeds:targetTensors:targetOperations:compilationDescriptor:] + 392
+	7   mpsgraph_packed_index_probe         0x0000000104b21d48 build_executable + 1916
+	8   mpsgraph_packed_index_probe         0x0000000104b2107c main + 1732
+	9   dyld                                0x000000018ca2fe00 start + 6992
+)
+libc++abi: terminating due to uncaught exception of type NSException

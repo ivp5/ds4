@@ -22,7 +22,7 @@ The clean runtime architecture is a small set of cold-owned organs:
 - Hot path must be O(n) over touched blocks/rows/tensors and O(1) over unrelated layers/packs.
 - Cold path may scan packages/layers, but must expose resident footprint and load/compile time.
 - No hidden full-model scans in token decode; no lazy `2.4 s` CoreML model loads inside generation.
-- Expanded MPSGraph gather remains O(n), but with inflated constants from materialized `int32` indices; packed-index Metal is the baseline for memory-floor comparison.
+- Expanded MPSGraph gather remains O(n), but with inflated constants from materialized `int32` indices; direct packed-index MPSGraph decode is correct but slower; packed-index Metal is the baseline for memory-floor comparison.
 
 ## Simplifications Applied
 
@@ -42,8 +42,8 @@ The clean runtime architecture is a small set of cold-owned organs:
 
 ## Next Compacting Targets
 
-1. Packed-index MPSGraph probe: prove or reject in-graph packed-code decode.
+1. Packed-index MPSGraph probe: first pass rejects direct in-graph packed-code decode as the memory-floor route; it is correct for 12-bit VQ-D8 but slower than expanded gather.
 2. Runtime sidecar scaffold: one default-off owner for CoreML model cache, D8F graph/kernel cache, hidden backing, parallel launch, and merge.
 3. Package cache manifest: record layer package path, compile URL, resident footprint, load state, and validation status in one typed table.
 4. Canary harness library: if more ANE/MPSGraph canaries are added, extract shared CoreML feature/backing helpers instead of copy-pasting per file.
-5. Packed Metal baseline: quantify actual bytes/op against MPSGraph expanded gather so “memory floor” has a measured reference.
+5. Packed Metal baseline: quantify actual bytes/op against MPSGraph expanded and packed gather so “memory floor” has a measured reference.

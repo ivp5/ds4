@@ -45,3 +45,11 @@ Append-only transaction log. Scope: IVP5 DS4 MPSGraph/ANE runtime architecture, 
 - Added `ARCHITECTURE_REVIEW.md` to consolidate the current architecture decision instead of leaving it distributed across timing logs.
 - Decision captured: H3355/D8F remains active; ANE is for shared high-B prefill overlap; MPSGraph remains an oracle/probe/down-only candidate until packed-index and executable-cache tests settle it.
 - Complexity rule captured: hot path O(n) over touched tensor data, O(1) over unrelated layers/packs, and no hot lazy CoreML loads.
+
+## 2026-06-04T00:59 JST — VQ-D8 LUT and packed-index impact
+
+- Built `mpsgraph_packed_index_probe.m` to test the remaining MPSGraph steelman: in-graph packed-code decode instead of host-expanded `int32` index materialization.
+- Result: MPSGraph can express the packed decode. Correctness passed for both 4-bit and 12-bit VQ-D8 shapes with `bad=0`.
+- Result: MPSGraph does not make it fast. 12-bit VQ-D8 index storage shrank `2.666x`, but packed decode ran slower than expanded gather (`766.167 us` vs `668.612 us` in one run; `1408.538 us` vs `724.956 us` in the clean rerun).
+- Retested real H3355 L26 VQ-D8 LUT canaries through `ds4`: down E165 `808.583 us`, down selected-six `1903.469 us`, gate/up E165 `1187.917 us`, gate/up selected-six `2871.323 us`; all passed `bad=0`.
+- Architecture update: direct packed-index MPSGraph is not the routed memory-floor path. The next compact high-probability route is a custom Metal packed VQ-D8 LUT kernel baseline, while MPSGraph remains useful as exact oracle and overlap probe.
