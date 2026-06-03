@@ -2717,7 +2717,7 @@ int main(int argc, char **argv) {
     }
     /* --d8f-mpsgraph-lut-down-canary <d8f> [EXPERTS_CSV [rows [rounds [mode]]]]
      * Real D8F VQ-GEMV loophole canary: table=x[groups,8]@codebook[8,k],
-     * gather(table, idx), reduce groups. mode=0 fp16 throughput path, mode=1 fp32 fidelity path. */
+     * gather(table, idx), reduce groups. mode=0 fp16 path, mode=1 fp32 path (M1 default). */
     if (argc >= 3 && !strcmp(argv[1], "--d8f-mpsgraph-lut-down-canary")) {
 #if defined(__APPLE__)
         const char *path = argv[2];
@@ -2742,7 +2742,7 @@ int main(int argc, char **argv) {
         }
         const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
         const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
-        const uint32_t mode = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 0u;
+        const uint32_t mode = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1u;
         return ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(path, experts, n_experts, rows, rounds, mode) ? 0 : 1;
 #else
         fprintf(stderr, "ds4: --d8f-mpsgraph-lut-down-canary requires Apple MPSGraph\n");
@@ -2775,7 +2775,7 @@ int main(int argc, char **argv) {
         }
         const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
         const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
-        const uint32_t mode = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 0u;
+        const uint32_t mode = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1u;
         const float clamp = (argc >= 8) ? strtof(argv[7], NULL) : 10.0f;
         return ds4_gpu_mpsgraph_d8f_gateup_lut_selected_canary(path, experts, n_experts, rows, rounds, mode, clamp) ? 0 : 1;
 #else

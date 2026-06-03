@@ -437,14 +437,16 @@ int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
         NSArray *outputs = @[timed_out_data];
         const double elapsed = ds4_mpsgraph_time_executable(executable, queue, inputs, outputs, rounds);
         const double us_per = elapsed * 1.0e6 / (double)rounds;
-        double logical_bytes = (double)out_bytes;
+        const size_t scalar_bytes = fp32_path ? sizeof(float) : sizeof(uint16_t);
+        double logical_bytes = (double)timed_out_bytes;
         for (uint32_t slot = 0; slot < n_experts; slot++) {
             const uint32_t codebook_cols = records[slot].k + 1u;
-            logical_bytes += (double)(x_f16_bytes +
-                                      (size_t)block * codebook_cols * sizeof(uint16_t) +
+            logical_bytes += (double)((fp32_path ? x_f32_bytes : x_f16_bytes) +
+                                      (size_t)block * codebook_cols * scalar_bytes +
                                       idx_bytes +
-                                      (size_t)groups * codebook_cols * (fp32_path ? 4u : 2u));
+                                      (size_t)groups * codebook_cols * scalar_bytes);
         }
+        const double logical_gbps = us_per > 0.0 ? logical_bytes / (us_per * 1000.0) : 0.0;
         char expert_csv[128];
         expert_csv[0] = '\0';
         for (uint32_t slot = 0; slot < n_experts; slot++) {
@@ -453,9 +455,9 @@ int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
             strlcat(expert_csv, item, sizeof(expert_csv));
         }
         fprintf(stderr,
-                "ds4_mpsgraph: d8f_down_lut_selected path=%s experts=%s nsel=%u rows=%u max_k=%u mode=%s compile=%s exec=%s rounds=%u us/op=%.3f logical_MB/op=%.3f bad=%u max_abs=%.6g max_rel=%.6g rms=%.6g sample_ref=%.6g sample_got=%.6g\n",
+                "ds4_mpsgraph: d8f_down_lut_selected path=%s experts=%s nsel=%u rows=%u max_k=%u mode=%s compile=%s exec=%s rounds=%u us/op=%.3f logical_MB/op=%.3f logical_GBps=%.3f bad=%u max_abs=%.6g max_rel=%.6g rms=%.6g sample_ref=%.6g sample_got=%.6g\n",
                 d8f_path, expert_csv, n_experts, rows, max_k,
-                fp32_path ? "fp32" : "fp16", ds4_mpsgraph_compile_mode(), ds4_mpsgraph_execution_mode(), rounds, us_per, logical_bytes / 1.0e6,
+                fp32_path ? "fp32" : "fp16", ds4_mpsgraph_compile_mode(), ds4_mpsgraph_execution_mode(), rounds, us_per, logical_bytes / 1.0e6, logical_gbps,
                 bad, max_abs, max_rel, rms, (double)ref[0], (double)got[0]);
         ds4_mpsgraph_free_down_arrays(n_experts, indices, cb_f32, cb_f16, x_f32, x_f16);
         free(got); free(ref);
@@ -705,14 +707,16 @@ int ds4_gpu_mpsgraph_d8f_gateup_lut_selected_canary(const char *d8f_path,
         NSArray *outputs = @[timed_out_data];
         const double elapsed = ds4_mpsgraph_time_executable(executable, queue, inputs, outputs, rounds);
         const double us_per = elapsed * 1.0e6 / (double)rounds;
-        double logical_bytes = (double)(x_f16_bytes + out_count * sizeof(uint16_t));
+        const size_t scalar_bytes = fp32_path ? sizeof(float) : sizeof(uint16_t);
+        double logical_bytes = (double)((fp32_path ? x_f32_bytes : x_f16_bytes) + timed_out_bytes);
         for (uint32_t slot = 0; slot < n_experts; slot++) {
             const uint32_t gate_cols = gate_records[slot].k + 1u;
             const uint32_t up_cols = up_records[slot].k + 1u;
-            logical_bytes += (double)((size_t)block * (gate_cols + up_cols) * sizeof(uint16_t) +
+            logical_bytes += (double)((size_t)block * (gate_cols + up_cols) * scalar_bytes +
                                       idx_bytes * 2u +
-                                      (size_t)groups * (gate_cols + up_cols) * (fp32_path ? 4u : 2u));
+                                      (size_t)groups * (gate_cols + up_cols) * scalar_bytes);
         }
+        const double logical_gbps = us_per > 0.0 ? logical_bytes / (us_per * 1000.0) : 0.0;
         char expert_csv[128];
         expert_csv[0] = '\0';
         for (uint32_t slot = 0; slot < n_experts; slot++) {
@@ -721,9 +725,9 @@ int ds4_gpu_mpsgraph_d8f_gateup_lut_selected_canary(const char *d8f_path,
             strlcat(expert_csv, item, sizeof(expert_csv));
         }
         fprintf(stderr,
-                "ds4_mpsgraph: d8f_gateup_lut_selected path=%s experts=%s nsel=%u rows=%u max_k=%u mode=%s compile=%s exec=%s rounds=%u clamp=%.1f us/op=%.3f logical_MB/op=%.3f bad=%u max_abs=%.6g max_rel=%.6g rms=%.6g sample_ref=%.6g sample_got=%.6g\n",
+                "ds4_mpsgraph: d8f_gateup_lut_selected path=%s experts=%s nsel=%u rows=%u max_k=%u mode=%s compile=%s exec=%s rounds=%u clamp=%.1f us/op=%.3f logical_MB/op=%.3f logical_GBps=%.3f bad=%u max_abs=%.6g max_rel=%.6g rms=%.6g sample_ref=%.6g sample_got=%.6g\n",
                 d8f_path, expert_csv, n_experts, rows, max_k, fp32_path ? "fp32" : "fp16",
-                ds4_mpsgraph_compile_mode(), ds4_mpsgraph_execution_mode(), rounds, swiglu_limit, us_per, logical_bytes / 1.0e6,
+                ds4_mpsgraph_compile_mode(), ds4_mpsgraph_execution_mode(), rounds, swiglu_limit, us_per, logical_bytes / 1.0e6, logical_gbps,
                 bad, max_abs, max_rel, rms, (double)ref[0], (double)got[0]);
         ds4_mpsgraph_free_gateup_arrays(n_experts, gate_idx, up_idx, gate_cb_f32, up_cb_f32, gate_cb_f16, up_cb_f16);
         free(up_tmp); free(gate_tmp); free(got); free(ref); free(x_f16); free(x_f32);
