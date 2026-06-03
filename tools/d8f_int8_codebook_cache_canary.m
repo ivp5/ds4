@@ -37,6 +37,24 @@ static const char *SRC =
 "  out[(ulong(slot) * ulong(groups) + ulong(group)) * ulong(K) + ulong(code)] = acc;\n"
 "}\n"
 "\n"
+"kernel void score_half_const(\n"
+"    constant const half4 *cb [[buffer(0)]],\n"
+"    device const float4 *x [[buffer(1)]],\n"
+"    device float *out [[buffer(2)]],\n"
+"    constant uint &K [[buffer(3)]],\n"
+"    constant uint &groups [[buffer(4)]],\n"
+"    constant uint &in_dim [[buffer(5)]],\n"
+"    uint3 gid [[thread_position_in_grid]]) {\n"
+"  const uint code = gid.x;\n"
+"  const uint group = gid.y;\n"
+"  const uint slot = gid.z;\n"
+"  if (code >= K || group >= groups) return;\n"
+"  const constant half4 *q = cb + code * 2u;\n"
+"  const uint x4_base = (slot * in_dim + group * 8u) >> 2;\n"
+"  const float acc = dot_half4(q[0], x[x4_base]) + dot_half4(q[1], x[x4_base + 1u]);\n"
+"  out[(ulong(slot) * ulong(groups) + ulong(group)) * ulong(K) + ulong(code)] = acc;\n"
+"}\n"
+"\n"
 "kernel void score_half_tg16(\n"
 "    device const half4 *cb [[buffer(0)]],\n"
 "    device const float4 *x [[buffer(1)]],\n"
@@ -151,6 +169,7 @@ static const char *SRC =
 
 typedef enum KernelKind {
     KernelKindHalf,
+    KernelKindHalfConst,
     KernelKindHalfTg16,
     KernelKindI8,
     KernelKindI8Const,
@@ -191,7 +210,7 @@ static double run_kernel(id<MTLCommandQueue> queue,
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:pipeline];
-        if (kind == KernelKindHalf || kind == KernelKindHalfTg16) {
+        if (kind == KernelKindHalf || kind == KernelKindHalfConst || kind == KernelKindHalfTg16) {
             [enc setBuffer:codebook offset:0 atIndex:0];
             [enc setBuffer:x offset:0 atIndex:1];
             [enc setBuffer:out offset:0 atIndex:2];
@@ -241,6 +260,7 @@ static double run_kernel(id<MTLCommandQueue> queue,
 static int run_case(id<MTLDevice> device,
                     id<MTLCommandQueue> queue,
                     id<MTLComputePipelineState> half_direct,
+                    id<MTLComputePipelineState> half_const,
                     id<MTLComputePipelineState> half_tg16,
                     id<MTLComputePipelineState> i8_direct,
                     id<MTLComputePipelineState> i8_const,
@@ -295,27 +315,29 @@ static int run_case(id<MTLDevice> device,
            K, in_dim, groups, slots, (double)out_bytes / 1048576.0, iterations);
 
     const double half_s = run_kernel(queue, half_direct, KernelKindHalf, cbh, nil, x, out, K, groups, slots, in_dim, global_scale, iterations);
+    const double half_c = run_kernel(queue, half_const, KernelKindHalfConst, cbh, nil, x, out, K, groups, slots, in_dim, global_scale, iterations);
     const double half_tg = run_kernel(queue, half_tg16, KernelKindHalfTg16, cbh, nil, x, out, K, groups, slots, in_dim, global_scale, iterations);
     const double i8_s = run_kernel(queue, i8_direct, KernelKindI8, cbi, scales, x, out, K, groups, slots, in_dim, global_scale, iterations);
     const double i8_c = run_kernel(queue, i8_const, KernelKindI8Const, cbi, scales, x, out, K, groups, slots, in_dim, global_scale, iterations);
     const double i8_g = run_kernel(queue, i8_global, KernelKindI8Global, cbi, nil, x, out, K, groups, slots, in_dim, global_scale, iterations);
     const double i8_tg = run_kernel(queue, i8_tg16, KernelKindI8Tg16, cbi, scales, x, out, K, groups, slots, in_dim, global_scale, iterations);
-    printf(" shared half_direct=%.4f half_tg16=%.4f i8_direct=%.4f i8_const=%.4f i8_global=%.4f i8_tg16=%.4f\n",
-           half_s, half_tg, i8_s, i8_c, i8_g, i8_tg);
-    printf(" shared speed_vs_half: half_tg16=%.3fx i8_direct=%.3fx i8_const=%.3fx i8_global=%.3fx i8_tg16=%.3fx\n",
-           half_s / half_tg, half_s / i8_s, half_s / i8_c, half_s / i8_g, half_s / i8_tg);
+    printf(" shared half_direct=%.4f half_const=%.4f half_tg16=%.4f i8_direct=%.4f i8_const=%.4f i8_global=%.4f i8_tg16=%.4f\n",
+           half_s, half_c, half_tg, i8_s, i8_c, i8_g, i8_tg);
+    printf(" shared speed_vs_half: half_const=%.3fx half_tg16=%.3fx i8_direct=%.3fx i8_const=%.3fx i8_global=%.3fx i8_tg16=%.3fx\n",
+           half_s / half_c, half_s / half_tg, half_s / i8_s, half_s / i8_c, half_s / i8_g, half_s / i8_tg);
 
     if (cbh_private && cbi_private && scales_private) {
         const double phalf_s = run_kernel(queue, half_direct, KernelKindHalf, cbh_private, nil, x, out, K, groups, slots, in_dim, global_scale, iterations);
+        const double phalf_c = run_kernel(queue, half_const, KernelKindHalfConst, cbh_private, nil, x, out, K, groups, slots, in_dim, global_scale, iterations);
         const double phalf_tg = run_kernel(queue, half_tg16, KernelKindHalfTg16, cbh_private, nil, x, out, K, groups, slots, in_dim, global_scale, iterations);
         const double pi8_s = run_kernel(queue, i8_direct, KernelKindI8, cbi_private, scales_private, x, out, K, groups, slots, in_dim, global_scale, iterations);
         const double pi8_c = run_kernel(queue, i8_const, KernelKindI8Const, cbi_private, scales_private, x, out, K, groups, slots, in_dim, global_scale, iterations);
         const double pi8_g = run_kernel(queue, i8_global, KernelKindI8Global, cbi_private, nil, x, out, K, groups, slots, in_dim, global_scale, iterations);
         const double pi8_tg = run_kernel(queue, i8_tg16, KernelKindI8Tg16, cbi_private, scales_private, x, out, K, groups, slots, in_dim, global_scale, iterations);
-        printf("private half_direct=%.4f half_tg16=%.4f i8_direct=%.4f i8_const=%.4f i8_global=%.4f i8_tg16=%.4f\n",
-               phalf_s, phalf_tg, pi8_s, pi8_c, pi8_g, pi8_tg);
-        printf("private speed_vs_half: half_tg16=%.3fx i8_direct=%.3fx i8_const=%.3fx i8_global=%.3fx i8_tg16=%.3fx\n",
-               phalf_s / phalf_tg, phalf_s / pi8_s, phalf_s / pi8_c, phalf_s / pi8_g, phalf_s / pi8_tg);
+        printf("private half_direct=%.4f half_const=%.4f half_tg16=%.4f i8_direct=%.4f i8_const=%.4f i8_global=%.4f i8_tg16=%.4f\n",
+               phalf_s, phalf_c, phalf_tg, pi8_s, pi8_c, pi8_g, pi8_tg);
+        printf("private speed_vs_half: half_const=%.3fx half_tg16=%.3fx i8_direct=%.3fx i8_const=%.3fx i8_global=%.3fx i8_tg16=%.3fx\n",
+               phalf_s / phalf_c, phalf_s / phalf_tg, phalf_s / pi8_s, phalf_s / pi8_c, phalf_s / pi8_g, phalf_s / pi8_tg);
     }
     return 1;
 }
@@ -336,18 +358,19 @@ int main(int argc, char **argv) {
             return 1;
         }
         id<MTLComputePipelineState> half_direct = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"score_half_direct"] error:&err];
+        id<MTLComputePipelineState> half_const = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"score_half_const"] error:&err];
         id<MTLComputePipelineState> half_tg16 = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"score_half_tg16"] error:&err];
         id<MTLComputePipelineState> i8_direct = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"score_i8_direct"] error:&err];
         id<MTLComputePipelineState> i8_const = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"score_i8_const"] error:&err];
         id<MTLComputePipelineState> i8_global = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"score_i8_global_scale"] error:&err];
         id<MTLComputePipelineState> i8_tg16 = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"score_i8_tg16"] error:&err];
-        if (!half_direct || !half_tg16 || !i8_direct || !i8_const || !i8_global || !i8_tg16) {
+        if (!half_direct || !half_const || !half_tg16 || !i8_direct || !i8_const || !i8_global || !i8_tg16) {
             NSLog(@"pipeline creation failed: %@", err);
             return 1;
         }
         printf("d8f int8 codebook cache score-phase canary\n");
-        if (!run_case(device, queue, half_direct, half_tg16, i8_direct, i8_const, i8_global, i8_tg16, 1024, 4096, slots, iterations)) return 1;
-        if (!run_case(device, queue, half_direct, half_tg16, i8_direct, i8_const, i8_global, i8_tg16, 2048, 7168, slots, iterations)) return 1;
+        if (!run_case(device, queue, half_direct, half_const, half_tg16, i8_direct, i8_const, i8_global, i8_tg16, 1024, 4096, slots, iterations)) return 1;
+        if (!run_case(device, queue, half_direct, half_const, half_tg16, i8_direct, i8_const, i8_global, i8_tg16, 2048, 7168, slots, iterations)) return 1;
     }
     return 0;
 }
