@@ -139,6 +139,19 @@ static void ds4_mpsgraph_free_down_arrays(uint32_t n_experts,
     }
 }
 
+static void ds4_mpsgraph_free_down_sidecar_arrays(uint32_t n_experts,
+                                                  float **u_f32,
+                                                  uint16_t **u_f16,
+                                                  float **a_f32,
+                                                  uint16_t **a_f16) {
+    for (uint32_t slot = 0; slot < n_experts; slot++) {
+        free(a_f16[slot]);
+        free(a_f32[slot]);
+        free(u_f16[slot]);
+        free(u_f32[slot]);
+    }
+}
+
 static bool ds4_mpsgraph_prepare_down_inputs(const ds4_d8f_file *file,
                                              const ds4_d8f_record *record,
                                              uint32_t rows,
@@ -386,6 +399,11 @@ int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
         float *cb_f32[6] = {0};
         uint16_t *cb_f16[6] = {0};
         int32_t *indices[6] = {0};
+        float *side_u_f32[6] = {0};
+        uint16_t *side_u_f16[6] = {0};
+        float *side_a_f32[6] = {0};
+        uint16_t *side_a_f16[6] = {0};
+        uint8_t sidecar_live[6] = {0};
         float *ref = (float *)calloc(rows, sizeof(float));
         float *got = (float *)calloc(rows, sizeof(float));
         bool ok = ref && got;
@@ -405,10 +423,45 @@ int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
             if (ok) {
                 ds4_mpsgraph_reference_down_lut_accum(x_f32[slot], cb_f32[slot], indices[slot],
                                                       codebook_cols, down_in_dim, rows, ref);
+                ds4_d8f_sidecar_record sidecar;
+                if (ds4_d8f_get_down_sidecar(&file, experts[slot], &sidecar)) {
+                    ok = sidecar.rank == 1u && sidecar.in_dim == down_in_dim &&
+                         sidecar.out_dim >= rows &&
+                         sidecar.u_bytes >= down_in_dim * sizeof(uint16_t) &&
+                         sidecar.a_bytes >= rows * sizeof(uint16_t);
+                    if (ok) {
+                        side_u_f32[slot] = (float *)malloc(x_f32_bytes);
+                        side_u_f16[slot] = (uint16_t *)malloc(x_f16_bytes);
+                        side_a_f32[slot] = (float *)malloc(out_bytes);
+                        side_a_f16[slot] = (uint16_t *)malloc((size_t)rows * sizeof(uint16_t));
+                        ok = side_u_f32[slot] && side_u_f16[slot] && side_a_f32[slot] && side_a_f16[slot];
+                    }
+                    if (ok) {
+                        double dot = 0.0;
+                        const uint8_t *u = file.map + sidecar.u_offset;
+                        for (uint32_t i = 0; i < down_in_dim; i++) {
+                            const uint16_t bits = ds4_mpsgraph_u16(u + (uint64_t)i * sizeof(uint16_t));
+                            const float value = ds4_mpsgraph_f16_to_f32(bits);
+                            side_u_f32[slot][i] = value;
+                            side_u_f16[slot][i] = bits;
+                            dot += (double)value * (double)x_f32[slot][i];
+                        }
+                        const uint8_t *a = file.map + sidecar.a_offset;
+                        for (uint32_t row = 0; row < rows; row++) {
+                            const uint16_t bits = ds4_mpsgraph_u16(a + (uint64_t)row * sizeof(uint16_t));
+                            const float value = ds4_mpsgraph_f16_to_f32(bits);
+                            side_a_f32[slot][row] = value;
+                            side_a_f16[slot][row] = bits;
+                            ref[row] += (float)((double)value * dot);
+                        }
+                        sidecar_live[slot] = 1u;
+                    }
+                }
             }
         }
         if (!ok) fprintf(stderr, "ds4_mpsgraph: failed to allocate or prepare selected D8F LUT tensors\n");
         if (!ok) {
+            ds4_mpsgraph_free_down_sidecar_arrays(n_experts, side_u_f32, side_u_f16, side_a_f32, side_a_f16);
             ds4_mpsgraph_free_down_arrays(n_experts, indices, cb_f32, cb_f16, x_f32, x_f16);
             free(got); free(ref);
             ds4_d8f_close(&file);
@@ -440,6 +493,32 @@ int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
                                                     shape:@[@(groups), @(rows)]
                                                  dataType:MPSDataTypeInt32];
             MPSGraphTensor *slot_out = ds4_mpsgraph_build_lut(graph, x, codebook, idx, down_in_dim, rows);
+            if (sidecar_live[slot]) {
+                NSData *u_data = fp32_path ?
+                    [NSData dataWithBytes:side_u_f32[slot] length:x_f32_bytes] :
+                    [NSData dataWithBytes:side_u_f16[slot] length:x_f16_bytes];
+                MPSGraphTensor *u = [graph constantWithData:u_data
+                                                      shape:@[@(down_in_dim), @1]
+                                                   dataType:data_type];
+                MPSGraphTensor *dot = [graph matrixMultiplicationWithPrimaryTensor:x
+                                                                   secondaryTensor:u
+                                                                              name:@"d8f_lut_sidecar_dot"];
+                NSData *a_data = fp32_path ?
+                    [NSData dataWithBytes:side_a_f32[slot] length:out_bytes] :
+                    [NSData dataWithBytes:side_a_f16[slot] length:(size_t)rows * sizeof(uint16_t)];
+                MPSGraphTensor *a = [graph constantWithData:a_data
+                                                      shape:@[@1, @(rows)]
+                                                   dataType:data_type];
+                MPSGraphTensor *side = [graph matrixMultiplicationWithPrimaryTensor:dot
+                                                                   secondaryTensor:a
+                                                                              name:@"d8f_lut_sidecar_outer"];
+                MPSGraphTensor *side_out = [graph reshapeTensor:side
+                                                      withShape:@[@(rows)]
+                                                           name:@"d8f_lut_sidecar_out"];
+                slot_out = [graph additionWithPrimaryTensor:slot_out
+                                            secondaryTensor:side_out
+                                                       name:@"d8f_lut_sidecar_add"];
+            }
             out = out ? [graph additionWithPrimaryTensor:out secondaryTensor:slot_out name:@"d8f_lut_selected_sum"] : slot_out;
             id<MTLBuffer> xbuf = [device newBufferWithBytes:(fp32_path ? (const void *)x_f32[slot] : (const void *)x_f16[slot])
                                                      length:(fp32_path ? x_f32_bytes : x_f16_bytes)
@@ -460,6 +539,7 @@ int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
         MPSGraphTensorData *out_data = result[out];
         if (!out_data) {
             fprintf(stderr, "ds4_mpsgraph: no output tensor data\n");
+            ds4_mpsgraph_free_down_sidecar_arrays(n_experts, side_u_f32, side_u_f16, side_a_f32, side_a_f16);
             ds4_mpsgraph_free_down_arrays(n_experts, indices, cb_f32, cb_f16, x_f32, x_f16);
             free(got); free(ref);
             ds4_d8f_close(&file);
@@ -472,6 +552,7 @@ int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
             uint16_t *got_h = (uint16_t *)calloc(rows, sizeof(uint16_t));
             if (!got_h) {
                 fprintf(stderr, "ds4_mpsgraph: output allocation failed\n");
+                ds4_mpsgraph_free_down_sidecar_arrays(n_experts, side_u_f32, side_u_f16, side_a_f32, side_a_f16);
                 ds4_mpsgraph_free_down_arrays(n_experts, indices, cb_f32, cb_f16, x_f32, x_f16);
                 free(got); free(ref);
                 ds4_d8f_close(&file);
@@ -519,6 +600,11 @@ int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
                                       (size_t)block * codebook_cols * scalar_bytes +
                                       idx_bytes +
                                       (size_t)groups * codebook_cols * scalar_bytes);
+            if (sidecar_live[slot]) {
+                logical_bytes += (double)((fp32_path ? x_f32_bytes : x_f16_bytes) +
+                                          timed_out_bytes +
+                                          (size_t)rows * scalar_bytes);
+            }
         }
         const double logical_gbps = us_per > 0.0 ? logical_bytes / (us_per * 1000.0) : 0.0;
         char expert_csv[128];
@@ -533,6 +619,7 @@ int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
                 d8f_path, expert_csv, n_experts, rows, max_k,
                 fp32_path ? "fp32" : "fp16", ds4_mpsgraph_compile_mode(), ds4_mpsgraph_execution_mode(), rounds, us_per, logical_bytes / 1.0e6, logical_gbps,
                 bad, max_abs, max_rel, rms, (double)ref[0], (double)got[0]);
+        ds4_mpsgraph_free_down_sidecar_arrays(n_experts, side_u_f32, side_u_f16, side_a_f32, side_a_f16);
         ds4_mpsgraph_free_down_arrays(n_experts, indices, cb_f32, cb_f16, x_f32, x_f16);
         free(got); free(ref);
         ds4_d8f_close(&file);
