@@ -138,6 +138,25 @@ DS4_JOURNAL_DB=/tmp/ds4.db ./ds4-bench --prefill-metal-phases auto ...
 - Promote KV-disk-dir to default-on for repeated-prefix agentic workloads.
 - Max-performance target: MTL4/compute + ICB/stable buffers + compressed routed-expert replay + block verifier + MTP/specdecode.
 
+## MPSGraph / ANE runtime status
+
+MPSGraph is an exact routed-D8F oracle and queueing probe, not the memory-floor
+packed-index path. The useful production-facing lever is async batching:
+`DS4_MPSGRAPH_ASYNC_BATCH=1` queues executable runs behind one shared-event wait.
+On H3355 L26 selected-six canaries it improved same-window down and gate/up
+throughput while preserving `bad=0` correctness.
+
+CoreML owns ANE placement for shared high-B branches. `MLComputePlan` verifies
+actual ANE placement for shared packages; CoreML output backings plus MPSGraph
+shared-event queueing are the current overlap route.
+
+Private/undocumented knobs remain probes only. `DS4_MPSGRAPH_COMPILE_MODE` accepts
+`private_compiler_options` for controlled experiments with
+`DS4_MPSGRAPH_COMPILER_OPTIONS=N`, but synthetic wins did not promote to real
+H3355 selected-six or ANE+D8F overlap. Do not default-enable private CoreML E5
+masks, precompiled-E5, priority strings, or raw MPSGraph compiler options until
+they pass real selected-layer D8F, overlap, and fidelity gates.
+
 ## Quantization landscape — M1 Max 64GB fit
 
 | File | Size | Status | Capability |

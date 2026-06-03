@@ -17,6 +17,7 @@
 __pycache__/
 *.pyc
 /misc/
+/tmp/
 .*.swp
 .DS_Store
 

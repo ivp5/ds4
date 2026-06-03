@@ -42,8 +42,18 @@ static const char *ds4_mpsgraph_compile_mode(void) {
     if (strcmp(mode, "level0") == 0 ||
         strcmp(mode, "level1") == 0 ||
         strcmp(mode, "fastmath") == 0 ||
-        strcmp(mode, "runtime_type_infer") == 0) return mode;
+        strcmp(mode, "runtime_type_infer") == 0 ||
+        strcmp(mode, "private_compiler_options") == 0) return mode;
     return "default";
+}
+
+static void ds4_mpsgraph_set_private_u64(id object, NSString *key, uint64_t value) {
+    @try {
+        [object setValue:@(value) forKey:key];
+    } @catch (NSException *exception) {
+        fprintf(stderr, "ds4_mpsgraph: private option skipped key=%s reason=%s\n",
+                key.UTF8String, exception.reason.UTF8String);
+    }
 }
 
 static MPSGraphCompilationDescriptor *ds4_mpsgraph_compile_descriptor(void) {
@@ -56,6 +66,10 @@ static MPSGraphCompilationDescriptor *ds4_mpsgraph_compile_descriptor(void) {
         descriptor.reducedPrecisionFastMath = MPSGraphReducedPrecisionFastMathAllowFP16Intermediates;
     } else if (strcmp(mode, "runtime_type_infer") == 0) {
         [descriptor disableTypeInference];
+    } else if (strcmp(mode, "private_compiler_options") == 0) {
+        const char *raw = getenv("DS4_MPSGRAPH_COMPILER_OPTIONS");
+        uint64_t value = raw && raw[0] ? strtoull(raw, NULL, 0) : 2u;
+        ds4_mpsgraph_set_private_u64(descriptor, @"compilerOptions", value);
     }
     return descriptor;
 }
