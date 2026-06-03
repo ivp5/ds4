@@ -23,6 +23,7 @@ import csv
 import hashlib
 import json
 import os
+import struct
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -51,6 +52,11 @@ GATEUP_OVERLAY_PREFIX = "gateup_overlay_"
 GATEUP_ROWS_PER_BLOCK = 128
 GATEUP_IN_DIM = 4096
 GATEUP_INDEX_GUARD_BYTES = 4
+DOWN_IN_DIM = 2048
+DOWN_GROUPS = DOWN_IN_DIM // 8
+DOWN_NATIVE_CODE_RECORD_BYTES = 32
+DOWN_NATIVE_CODE_RECORD = struct.Struct("<IIIIQII")
+DOWN_NATIVE_CODE_DTYPE_U16 = 1
 
 
 def parse_int_set(text: str, *, limit: int, name: str) -> list[int]:
@@ -426,6 +432,92 @@ def finish_gateup_overlay(state: dict[str, Any] | None, handle) -> dict[str, Any
     }
 
 
+def d8f_code_at_blob(index: bytes, bits: int, block_index: int) -> int:
+    bit_offset = block_index * bits
+    byte_offset = bit_offset >> 3
+    shift = bit_offset & 7
+    window = int.from_bytes(index[byte_offset:byte_offset + 4], "little", signed=False)
+    return (window >> shift) & ((1 << bits) - 1)
+
+
+def encode_down_native_codes(source_path: Path, source_record: tuple[Any, ...]) -> tuple[int, bytes]:
+    projection, expert, k, bits, block, _, _, index_offset, _, _, index_bytes, _, _ = [int(x) for x in source_record]
+    if projection != 2 or k == 0 or block != 8 or bits <= 0:
+        raise RuntimeError(f"invalid down native-code source p={projection} e={expert} k={k} block={block} bits={bits}")
+    blocks = (index_bytes * 8) // bits
+    if blocks % DOWN_GROUPS:
+        raise RuntimeError(f"down native-code source has non-integral rows e={expert} blocks={blocks}")
+    rows = blocks // DOWN_GROUPS
+    index = read_payload(source_path, index_offset, index_bytes)
+    out = bytearray(rows * DOWN_GROUPS * 2)
+    for row in range(rows):
+        for group in range(DOWN_GROUPS):
+            code = d8f_code_at_blob(index, bits, row * DOWN_GROUPS + group)
+            if code >= 65536:
+                raise RuntimeError(f"down native-code overflow e={expert} code={code}")
+            struct.pack_into("<H", out, (row * DOWN_GROUPS + group) * 2, code)
+    return rows, bytes(out)
+
+
+def begin_down_native_code_sidecars(source_path: Path,
+                                    records: list[tuple[Any, ...]],
+                                    hot_experts: list[int],
+                                    handle) -> dict[str, Any] | None:
+    if not hot_experts:
+        return None
+    table_offset = handle.tell()
+    padding = (-table_offset) % 16
+    if padding:
+        handle.write(b"\0" * padding)
+        table_offset += padding
+    table = bytearray(DOWN_NATIVE_CODE_RECORD_BYTES * EXPERTS)
+    handle.write(table)
+    payload_hash = hashlib.sha256()
+    count = 0
+    for expert in hot_experts:
+        record = records[2 * EXPERTS + expert]
+        rows, payload = encode_down_native_codes(source_path, record)
+        payload_offset = append_aligned(handle, payload)
+        payload_hash.update(payload)
+        table[expert * DOWN_NATIVE_CODE_RECORD_BYTES:(expert + 1) * DOWN_NATIVE_CODE_RECORD_BYTES] = DOWN_NATIVE_CODE_RECORD.pack(
+            expert,
+            rows,
+            DOWN_GROUPS,
+            DOWN_NATIVE_CODE_DTYPE_U16,
+            payload_offset,
+            len(payload),
+            0,
+        )
+        count += 1
+    return {
+        "table_offset": table_offset,
+        "table": table,
+        "count": count,
+        "payload_hash": payload_hash,
+    }
+
+
+def finish_down_native_code_sidecars(state: dict[str, Any] | None, handle) -> dict[str, Any]:
+    if not state:
+        return {}
+    here = handle.tell()
+    handle.seek(int(state["table_offset"]))
+    handle.write(state["table"])
+    handle.seek(here)
+    return {
+        "down_native_code_sidecar_format": "DS4D8F_DOWN_NATIVE_U16_CODES_V1",
+        "down_native_code_sidecar_table_offset": int(state["table_offset"]),
+        "down_native_code_sidecar_record_bytes": DOWN_NATIVE_CODE_RECORD_BYTES,
+        "down_native_code_sidecar_records": EXPERTS,
+        "down_native_code_sidecar_count": int(state["count"]),
+        "down_native_code_sidecar_record_struct": "<IIIIQII",
+        "down_native_code_sidecar_dtype": "uint16_le",
+        "down_native_code_sidecar_layout": "hot_selected_expert_row_major_group_u16",
+        "down_native_code_sidecar_groups": DOWN_GROUPS,
+        "down_native_code_sidecar_payload_sha256": state["payload_hash"].hexdigest(),
+    }
+
+
 def begin_hotblock_sidecars(source_path: Path,
                             sidecars: dict[int, tuple[Any, ...]],
                             hot_experts: list[int],
@@ -530,6 +622,16 @@ def strip_rebuilt_header_keys(header: dict[str, Any]) -> None:
         "sidecar_in_dim",
         "sidecar_out_dim",
         "sidecar_format",
+        "down_native_code_sidecar_format",
+        "down_native_code_sidecar_table_offset",
+        "down_native_code_sidecar_record_bytes",
+        "down_native_code_sidecar_records",
+        "down_native_code_sidecar_count",
+        "down_native_code_sidecar_record_struct",
+        "down_native_code_sidecar_dtype",
+        "down_native_code_sidecar_layout",
+        "down_native_code_sidecar_groups",
+        "down_native_code_sidecar_payload_sha256",
     ]:
         header.pop(key, None)
 
@@ -540,7 +642,8 @@ def relayout_layer(source_pack: Path,
                    hot_experts: list[int],
                    execute: bool,
                    status_every: int,
-                   gateup_rowblock_overlays: bool) -> dict[str, Any]:
+                   gateup_rowblock_overlays: bool,
+                   down_native_code_sidecars: bool) -> dict[str, Any]:
     source_path = d8f_path(source_pack, layer)
     info = read_d8f(source_path)
     report: dict[str, Any] = {
@@ -587,6 +690,7 @@ def relayout_layer(source_pack: Path,
         "d8f_hotblock_hot_experts": hot_experts,
         "d8f_hotblock_payload_order": "hot_expert_major_gate_up_down_then_remaining_expert_major",
         "d8f_hotblock_gateup_rowblock_overlays": bool(gateup_rowblock_overlays),
+        "d8f_hotblock_down_native_code_sidecars": bool(down_native_code_sidecars),
     })
     payload_hashers = {projection: hashlib.sha256() for projection in PROJECTIONS}
     overlay_hashers = {projection: hashlib.sha256() for projection in PROJECTIONS[:2]}
@@ -598,6 +702,7 @@ def relayout_layer(source_pack: Path,
         handle.write(b"\0" * (len(PROJECTIONS) * EXPERTS * FUSED_RECORD_BYTES))
         expert_order = ordered_experts(hot_experts)
         sidecar_state = begin_hotblock_sidecars(source_path, info["sidecars"], hot_experts, handle)
+        down_native_state = begin_down_native_code_sidecars(source_path, old_records, hot_experts, handle) if down_native_code_sidecars else None
         overlay_state = begin_gateup_overlay(handle, hot_experts) if gateup_rowblock_overlays else None
         if overlay_state:
             for row_block in range(GATEUP_ROW_BLOCKS):
@@ -655,8 +760,10 @@ def relayout_layer(source_pack: Path,
                     }, sort_keys=True), flush=True)
         overlay_header = finish_gateup_overlay(overlay_state, handle)
         sidecar_header = finish_hotblock_sidecars(sidecar_state, handle)
+        down_native_header = finish_down_native_code_sidecars(down_native_state, handle)
         header.update(overlay_header)
         header.update(sidecar_header)
+        header.update(down_native_header)
         if overlay_state:
             header["gateup_overlay_payload_sha256"] = {
                 projection: overlay_hashers[projection].hexdigest()
@@ -712,6 +819,8 @@ def main() -> int:
     parser.add_argument("--route-score", choices=["mass", "abs_mass", "count"], default="mass")
     parser.add_argument("--gateup-rowblock-overlays", action="store_true",
                         help="materialize hot gate/up experts as 128-row overlay records for deeper locality")
+    parser.add_argument("--down-native-code-sidecars", action="store_true",
+                        help="materialize hot down expert codes as row-major uint16 gather-native sidecars")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--status-every", type=int, default=32)
@@ -753,10 +862,12 @@ def main() -> int:
             "hot_experts": hot_experts,
             "execute": args.execute,
             "gateup_rowblock_overlays": args.gateup_rowblock_overlays,
+            "down_native_code_sidecars": args.down_native_code_sidecars,
         }, sort_keys=True), flush=True)
         report = relayout_layer(
             args.pack, args.out_dir, layer, hot_experts, args.execute,
             args.status_every, args.gateup_rowblock_overlays,
+            args.down_native_code_sidecars,
         )
         reports.append(report)
         print(json.dumps({
@@ -790,6 +901,7 @@ def main() -> int:
         "layers": layers,
         "common_hot_experts": common_hot,
         "gateup_rowblock_overlays": args.gateup_rowblock_overlays,
+        "down_native_code_sidecars": args.down_native_code_sidecars,
         "route_trace_csv": None if args.route_trace_csv is None else str(args.route_trace_csv),
         "route_top": args.route_top,
         "route_stages": args.route_stages,
