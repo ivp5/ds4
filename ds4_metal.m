@@ -49287,6 +49287,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     const int i8_score_mode = !half_score && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_I8") > 0;
     const int vec_score_mode = !half_score && !i8_score_mode && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_VEC") > 0;
     const int i8_act_scale = i8_score_mode && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_I8_ACTSCALE") > 0;
+    const int phase_profile = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_PROFILE_PHASES") > 0;
     const char *i8_max_rel_env = getenv("DS4_D8F_METAL_LUT_SCORE_I8_MAX_REL");
     const double i8_max_rel = (i8_max_rel_env && i8_max_rel_env[0]) ? strtod(i8_max_rel_env, NULL) : 1.0;
     const int native_code_env = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_NATIVE_CODES");
@@ -49307,6 +49308,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     else gather_tile_rows = 1u;
     int ok = 0, mismatch = 0, gpu_zero = 0, gpu_sentinel = 0;
     double max_abs = 0.0, max_rel = 0.0, timed_ms = 0.0;
+    double phase_score_ms = -1.0, phase_gather_ms = -1.0;
     double sum_abs = 0.0, sum_sq_abs = 0.0;
     uint64_t err_gt_1e5 = 0, err_gt_1e4 = 0, err_gt_3e4 = 0, err_gt_7e4 = 0;
     uint64_t worst_index[4] = {0, 0, 0, 0};
@@ -49597,6 +49599,103 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             for (uint32_t r = 0; r < rounds; r++) dispatch_once();
             const uint64_t t1 = mach_absolute_time();
             timed_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
+            if (phase_profile) {
+                const uint64_t ps0 = mach_absolute_time();
+                for (uint32_t r = 0; r < rounds; r++) {
+                    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    [enc setComputePipelineState:i8_score_mode
+                        ? g_d8f_down_lut_score_i8_selected_batch_pipeline
+                        : (half_score
+                        ? g_d8f_down_lut_scoreh_selected_batch_pipeline
+                        : (vec_score_mode
+                        ? g_d8f_down_lut_score_vec_selected_batch_pipeline
+                        : g_d8f_down_lut_score_selected_batch_pipeline))];
+                    [enc setBuffer:packBuf offset:0 atIndex:0];
+                    [enc setBuffer:midBuf offset:0 atIndex:1];
+                    [enc setBuffer:selBuf offset:0 atIndex:2];
+                    [enc setBuffer:scoreBuf offset:0 atIndex:3];
+                    [enc setBuffer:argsBuf offset:0 atIndex:4];
+                    [enc setBuffer:recBuf offset:0 atIndex:5];
+                    if (i8_score_mode) {
+                        [enc setBuffer:i8RecBuf offset:0 atIndex:6];
+                        [enc setBuffer:i8CodebookBuf offset:0 atIndex:7];
+                    }
+                    [enc dispatchThreads:MTLSizeMake(max_k, groups, n_tokens * n_experts)
+                        threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+                    [enc endEncoding];
+                    [cb commit];
+                    [cb waitUntilCompleted];
+                }
+                const uint64_t ps1 = mach_absolute_time();
+                phase_score_ms = (double)(ps1 - ps0) * (double)tb.numer / (double)tb.denom / 1e6;
+
+                const uint64_t pg0 = mach_absolute_time();
+                for (uint32_t r = 0; r < rounds; r++) {
+                    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    id<MTLComputePipelineState> gather_pipeline = half_score
+                        ? g_d8f_down_lut_gatherh_selected_batch_pipeline
+                        : g_d8f_down_lut_gather_selected_batch_pipeline;
+                    NSUInteger gather_partial_bytes = 8u * sizeof(float);
+                    uint32_t gather_grid_rows = rows;
+                    if (!half_score && gather_tile_rows == 16u) {
+                        gather_pipeline = g_d8f_down_lut_gather_selected_batch_tile16_pipeline;
+                        gather_partial_bytes = 16u * 8u * sizeof(float);
+                        gather_grid_rows = (rows + 15u) >> 4;
+                    } else if (!half_score && gather_tile_rows == 8u) {
+                        gather_pipeline = g_d8f_down_lut_gather_selected_batch_tile8_pipeline;
+                        gather_partial_bytes = 8u * 8u * sizeof(float);
+                        gather_grid_rows = (rows + 7u) >> 3;
+                    }
+                    [enc setComputePipelineState:gather_pipeline];
+                    if (native_code_mode) {
+                        if (gather_tile_rows == 32u) {
+                            [enc setComputePipelineState:g_d8f_down_lut_gather_codes_selected_batch_tile32_pipeline];
+                            gather_partial_bytes = 32u * 8u * sizeof(float);
+                            gather_grid_rows = (rows + 31u) >> 5;
+                        } else if (gather_tile_rows == 24u) {
+                            [enc setComputePipelineState:g_d8f_down_lut_gather_codes_selected_batch_tile24_pipeline];
+                            gather_partial_bytes = 24u * 8u * sizeof(float);
+                            gather_grid_rows = (rows + 23u) / 24u;
+                        } else if (gather_tile_rows == 16u) {
+                            [enc setComputePipelineState:g_d8f_down_lut_gather_codes_selected_batch_tile16_pipeline];
+                            gather_partial_bytes = 16u * 8u * sizeof(float);
+                            gather_grid_rows = (rows + 15u) >> 4;
+                        } else if (gather_tile_rows == 8u) {
+                            [enc setComputePipelineState:g_d8f_down_lut_gather_codes_selected_batch_tile8_pipeline];
+                            gather_partial_bytes = 8u * 8u * sizeof(float);
+                            gather_grid_rows = (rows + 7u) >> 3;
+                        } else {
+                            [enc setComputePipelineState:g_d8f_down_lut_gather_codes_selected_batch_pipeline];
+                            gather_partial_bytes = 8u * sizeof(float);
+                            gather_grid_rows = rows;
+                        }
+                        [enc setBuffer:codeBuf offset:0 atIndex:0];
+                        [enc setBuffer:scoreBuf offset:0 atIndex:1];
+                        [enc setBuffer:outBuf offset:0 atIndex:2];
+                        [enc setBuffer:argsBuf offset:0 atIndex:3];
+                        [enc setBuffer:sidecarBuf offset:0 atIndex:4];
+                        [enc setBuffer:sidecarDotBuf offset:0 atIndex:5];
+                        [enc setBuffer:packBuf offset:0 atIndex:6];
+                    } else {
+                        [enc setBuffer:packBuf offset:0 atIndex:0];
+                        [enc setBuffer:selBuf offset:0 atIndex:1];
+                        [enc setBuffer:scoreBuf offset:0 atIndex:2];
+                        [enc setBuffer:outBuf offset:0 atIndex:3];
+                        [enc setBuffer:argsBuf offset:0 atIndex:4];
+                        [enc setBuffer:recBuf offset:0 atIndex:5];
+                    }
+                    [enc setThreadgroupMemoryLength:gather_partial_bytes atIndex:0];
+                    [enc dispatchThreadgroups:MTLSizeMake(gather_grid_rows, n_tokens, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                    [cb commit];
+                    [cb waitUntilCompleted];
+                }
+                const uint64_t pg1 = mach_absolute_time();
+                phase_gather_ms = (double)(pg1 - pg0) * (double)tb.numer / (double)tb.denom / 1e6;
+            }
             memcpy(gpu_out, outBuf.contents, (size_t)n_tokens * rows * sizeof(float));
             const uint64_t count = (uint64_t)n_tokens * rows;
             for (uint64_t i = 0; i < count; i++) {
@@ -49666,6 +49765,12 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             timed_ms / (double)rounds,
             timed_ms * 1000.0 / ((double)n_tokens * (double)rows * (double)rounds),
             mismatch, gpu_zero, gpu_sentinel, max_abs, max_rel, ok);
+    if (phase_profile) {
+        fprintf(stderr,
+                " phase_score=%.3f ms total (%.3f ms/op) phase_gather=%.3f ms total (%.3f ms/op)",
+                phase_score_ms, phase_score_ms / (double)rounds,
+                phase_gather_ms, phase_gather_ms / (double)rounds);
+    }
     const uint64_t output_count = (uint64_t)n_tokens * rows;
     const double mean_abs = output_count ? sum_abs / (double)output_count : 0.0;
     const double rms_abs = output_count ? sqrt(sum_sq_abs / (double)output_count) : 0.0;
