@@ -48958,6 +48958,8 @@ static id<MTLComputePipelineState> g_d8f_down_lut_gather_codes_selected_batch_ti
 static id<MTLComputePipelineState> g_d8f_down_lut_gather_codes_selected_batch_tile16_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gather_codes_selected_batch_tile24_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gather_codes_selected_batch_tile32_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_lut_direct_codes_selected_batch_tile8_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_lut_direct_codes_selected_batch_tile16_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_scoreh_selected_batch_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gatherh_selected_batch_pipeline;
 static int g_d8f_down_lut_classic_init_attempted;
@@ -48987,10 +48989,13 @@ static int ds4_d8f_down_lut_classic_pipeline_init(void) {
     id<MTLFunction> gather_codes_tile16_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_codes_selected_batch_tile16"];
     id<MTLFunction> gather_codes_tile24_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_codes_selected_batch_tile24"];
     id<MTLFunction> gather_codes_tile32_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_codes_selected_batch_tile32"];
+    id<MTLFunction> direct_codes_tile8_fn = [lib newFunctionWithName:@"d8f_down_lut_direct_codes_selected_batch_tile8"];
+    id<MTLFunction> direct_codes_tile16_fn = [lib newFunctionWithName:@"d8f_down_lut_direct_codes_selected_batch_tile16"];
     id<MTLFunction> scoreh_fn = [lib newFunctionWithName:@"d8f_down_lut_scoreh_selected_batch"];
     id<MTLFunction> gatherh_fn = [lib newFunctionWithName:@"d8f_down_lut_gatherh_selected_batch"];
     if (!score_fn || !score_vec_fn || !score_i8_fn || !gather_fn || !gather_tile8_fn || !gather_tile16_fn ||
         !gather_codes_fn || !gather_codes_tile8_fn || !gather_codes_tile16_fn || !gather_codes_tile24_fn || !gather_codes_tile32_fn ||
+        !direct_codes_tile8_fn || !direct_codes_tile16_fn ||
         !scoreh_fn || !gatherh_fn) {
         fprintf(stderr, "ds4_d8f: down LUT Metal function lookup failed\n");
         return 0;
@@ -49069,6 +49074,20 @@ static int ds4_d8f_down_lut_classic_pipeline_init(void) {
         [g_device newComputePipelineStateWithFunction:gather_codes_tile32_fn error:&err];
     if (!g_d8f_down_lut_gather_codes_selected_batch_tile32_pipeline) {
         fprintf(stderr, "ds4_d8f: down LUT gather codes tile32 pipeline failed: %s\n",
+                err.localizedDescription.UTF8String);
+        return 0;
+    }
+    g_d8f_down_lut_direct_codes_selected_batch_tile8_pipeline =
+        [g_device newComputePipelineStateWithFunction:direct_codes_tile8_fn error:&err];
+    if (!g_d8f_down_lut_direct_codes_selected_batch_tile8_pipeline) {
+        fprintf(stderr, "ds4_d8f: down LUT direct codes tile8 pipeline failed: %s\n",
+                err.localizedDescription.UTF8String);
+        return 0;
+    }
+    g_d8f_down_lut_direct_codes_selected_batch_tile16_pipeline =
+        [g_device newComputePipelineStateWithFunction:direct_codes_tile16_fn error:&err];
+    if (!g_d8f_down_lut_direct_codes_selected_batch_tile16_pipeline) {
+        fprintf(stderr, "ds4_d8f: down LUT direct codes tile16 pipeline failed: %s\n",
                 err.localizedDescription.UTF8String);
         return 0;
     }
@@ -49285,7 +49304,9 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     const int half_score = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_HALF") > 0;
     const size_t score_bytes_per_value = half_score ? sizeof(uint16_t) : sizeof(float);
     const int i8_score_mode = !half_score && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_I8") > 0;
-    const int vec_score_mode = !half_score && !i8_score_mode && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_VEC") > 0;
+    const int direct_fused_mode = !half_score && !i8_score_mode && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_DIRECT_FUSED") > 0;
+    const int vec_score_mode = !half_score && !i8_score_mode && !direct_fused_mode &&
+        ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_VEC") > 0;
     const int i8_act_scale = i8_score_mode && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_I8_ACTSCALE") > 0;
     const int phase_profile = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_PROFILE_PHASES") > 0;
     const char *i8_max_rel_env = getenv("DS4_D8F_METAL_LUT_SCORE_I8_MAX_REL");
@@ -49297,7 +49318,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         return 0;
     }
     const int native_code_mode = !half_score &&
-        (rank1_sidecar_count > 0 || (native_code_env >= 0 ? native_code_env > 0 : n_tokens <= 4u));
+        (direct_fused_mode || rank1_sidecar_count > 0 || (native_code_env >= 0 ? native_code_env > 0 : n_tokens <= 4u));
     const uint32_t default_gather_tile_rows = (n_tokens <= 1u) ? 1u : ((n_tokens <= 4u) ? 16u : 8u);
     uint32_t gather_tile_rows = ds4_gpu_env_u32("DS4_D8F_METAL_LUT_GATHER_TILE_ROWS", default_gather_tile_rows);
     if (half_score) gather_tile_rows = 1u;
@@ -49306,6 +49327,8 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     else if (gather_tile_rows >= 16u) gather_tile_rows = 16u;
     else if (gather_tile_rows >= 8u) gather_tile_rows = 8u;
     else gather_tile_rows = 1u;
+    if (direct_fused_mode && gather_tile_rows > 16u) gather_tile_rows = 16u;
+    if (direct_fused_mode && gather_tile_rows < 8u) gather_tile_rows = 8u;
     int ok = 0, mismatch = 0, gpu_zero = 0, gpu_sentinel = 0;
     double max_abs = 0.0, max_rel = 0.0, timed_ms = 0.0;
     double phase_score_ms = -1.0, phase_gather_ms = -1.0;
@@ -49478,8 +49501,9 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         id<MTLBuffer> recBuf = [g_device newBufferWithBytes:recs
                                                      length:(NSUInteger)ds4_d8f_recbuf_record_count_local * sizeof(*recs)
                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> scoreBuf = [g_device newBufferWithLength:(NSUInteger)score_count * score_bytes_per_value
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> scoreBuf = direct_fused_mode ? nil :
+            [g_device newBufferWithLength:(NSUInteger)score_count * score_bytes_per_value
+                                  options:MTLResourceStorageModeShared];
         id<MTLBuffer> i8RecBuf = i8_score_mode ? [g_device newBufferWithBytes:i8_recs
                                                                         length:(NSUInteger)n_experts * sizeof(*i8_recs)
                                                                        options:MTLResourceStorageModeShared] : nil;
@@ -49509,12 +49533,34 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             rank1_sidecar_count > 0 ? 1u : 0u, 0u
         };
         id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args) options:MTLResourceStorageModeShared];
-        if (packBuf && midBuf && selBuf && recBuf && scoreBuf && outBuf && argsBuf &&
+        if (packBuf && midBuf && selBuf && recBuf && (direct_fused_mode || scoreBuf) && outBuf && argsBuf &&
             (!i8_score_mode || (i8RecBuf && i8CodebookBuf)) &&
             (!native_code_mode || (codeBuf && sidecarBuf && sidecarDotBuf))) {
             void (^dispatch_once)(void) = ^{
                 id<MTLCommandBuffer> cb = [g_queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                if (direct_fused_mode) {
+                    const BOOL direct_tile16 = gather_tile_rows >= 16u;
+                    [enc setComputePipelineState:direct_tile16
+                        ? g_d8f_down_lut_direct_codes_selected_batch_tile16_pipeline
+                        : g_d8f_down_lut_direct_codes_selected_batch_tile8_pipeline];
+                    [enc setBuffer:codeBuf offset:0 atIndex:0];
+                    [enc setBuffer:packBuf offset:0 atIndex:1];
+                    [enc setBuffer:midBuf offset:0 atIndex:2];
+                    [enc setBuffer:selBuf offset:0 atIndex:3];
+                    [enc setBuffer:outBuf offset:0 atIndex:4];
+                    [enc setBuffer:argsBuf offset:0 atIndex:5];
+                    [enc setBuffer:recBuf offset:0 atIndex:6];
+                    [enc setBuffer:sidecarBuf offset:0 atIndex:7];
+                    [enc setBuffer:sidecarDotBuf offset:0 atIndex:8];
+                    [enc setThreadgroupMemoryLength:(direct_tile16 ? 16u : 8u) * 8u * sizeof(float) atIndex:0];
+                    [enc dispatchThreadgroups:MTLSizeMake(direct_tile16 ? ((rows + 15u) >> 4) : ((rows + 7u) >> 3), n_tokens, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                    [cb commit];
+                    [cb waitUntilCompleted];
+                    return;
+                }
                 [enc setComputePipelineState:i8_score_mode
                     ? g_d8f_down_lut_score_i8_selected_batch_pipeline
                     : (half_score
@@ -49600,40 +49646,66 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             const uint64_t t1 = mach_absolute_time();
             timed_ms = (double)(t1 - t0) * (double)tb.numer / (double)tb.denom / 1e6;
             if (phase_profile) {
-                const uint64_t ps0 = mach_absolute_time();
-                for (uint32_t r = 0; r < rounds; r++) {
-                    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                    [enc setComputePipelineState:i8_score_mode
-                        ? g_d8f_down_lut_score_i8_selected_batch_pipeline
-                        : (half_score
-                        ? g_d8f_down_lut_scoreh_selected_batch_pipeline
-                        : (vec_score_mode
-                        ? g_d8f_down_lut_score_vec_selected_batch_pipeline
-                        : g_d8f_down_lut_score_selected_batch_pipeline))];
-                    [enc setBuffer:packBuf offset:0 atIndex:0];
-                    [enc setBuffer:midBuf offset:0 atIndex:1];
-                    [enc setBuffer:selBuf offset:0 atIndex:2];
-                    [enc setBuffer:scoreBuf offset:0 atIndex:3];
-                    [enc setBuffer:argsBuf offset:0 atIndex:4];
-                    [enc setBuffer:recBuf offset:0 atIndex:5];
-                    if (i8_score_mode) {
-                        [enc setBuffer:i8RecBuf offset:0 atIndex:6];
-                        [enc setBuffer:i8CodebookBuf offset:0 atIndex:7];
+                if (direct_fused_mode) {
+                    phase_score_ms = 0.0;
+                } else {
+                    const uint64_t ps0 = mach_absolute_time();
+                    for (uint32_t r = 0; r < rounds; r++) {
+                        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+                        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                        [enc setComputePipelineState:i8_score_mode
+                            ? g_d8f_down_lut_score_i8_selected_batch_pipeline
+                            : (half_score
+                            ? g_d8f_down_lut_scoreh_selected_batch_pipeline
+                            : (vec_score_mode
+                            ? g_d8f_down_lut_score_vec_selected_batch_pipeline
+                            : g_d8f_down_lut_score_selected_batch_pipeline))];
+                        [enc setBuffer:packBuf offset:0 atIndex:0];
+                        [enc setBuffer:midBuf offset:0 atIndex:1];
+                        [enc setBuffer:selBuf offset:0 atIndex:2];
+                        [enc setBuffer:scoreBuf offset:0 atIndex:3];
+                        [enc setBuffer:argsBuf offset:0 atIndex:4];
+                        [enc setBuffer:recBuf offset:0 atIndex:5];
+                        if (i8_score_mode) {
+                            [enc setBuffer:i8RecBuf offset:0 atIndex:6];
+                            [enc setBuffer:i8CodebookBuf offset:0 atIndex:7];
+                        }
+                        [enc dispatchThreads:MTLSizeMake(max_k, groups, n_tokens * n_experts)
+                            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+                        [enc endEncoding];
+                        [cb commit];
+                        [cb waitUntilCompleted];
                     }
-                    [enc dispatchThreads:MTLSizeMake(max_k, groups, n_tokens * n_experts)
-                        threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-                    [enc endEncoding];
-                    [cb commit];
-                    [cb waitUntilCompleted];
+                    const uint64_t ps1 = mach_absolute_time();
+                    phase_score_ms = (double)(ps1 - ps0) * (double)tb.numer / (double)tb.denom / 1e6;
                 }
-                const uint64_t ps1 = mach_absolute_time();
-                phase_score_ms = (double)(ps1 - ps0) * (double)tb.numer / (double)tb.denom / 1e6;
 
                 const uint64_t pg0 = mach_absolute_time();
                 for (uint32_t r = 0; r < rounds; r++) {
                     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
                     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    if (direct_fused_mode) {
+                        const BOOL direct_tile16 = gather_tile_rows >= 16u;
+                        [enc setComputePipelineState:direct_tile16
+                            ? g_d8f_down_lut_direct_codes_selected_batch_tile16_pipeline
+                            : g_d8f_down_lut_direct_codes_selected_batch_tile8_pipeline];
+                        [enc setBuffer:codeBuf offset:0 atIndex:0];
+                        [enc setBuffer:packBuf offset:0 atIndex:1];
+                        [enc setBuffer:midBuf offset:0 atIndex:2];
+                        [enc setBuffer:selBuf offset:0 atIndex:3];
+                        [enc setBuffer:outBuf offset:0 atIndex:4];
+                        [enc setBuffer:argsBuf offset:0 atIndex:5];
+                        [enc setBuffer:recBuf offset:0 atIndex:6];
+                        [enc setBuffer:sidecarBuf offset:0 atIndex:7];
+                        [enc setBuffer:sidecarDotBuf offset:0 atIndex:8];
+                        [enc setThreadgroupMemoryLength:(direct_tile16 ? 16u : 8u) * 8u * sizeof(float) atIndex:0];
+                        [enc dispatchThreadgroups:MTLSizeMake(direct_tile16 ? ((rows + 15u) >> 4) : ((rows + 7u) >> 3), n_tokens, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [enc endEncoding];
+                        [cb commit];
+                        [cb waitUntilCompleted];
+                        continue;
+                    }
                     id<MTLComputePipelineState> gather_pipeline = half_score
                         ? g_d8f_down_lut_gatherh_selected_batch_pipeline
                         : g_d8f_down_lut_gather_selected_batch_pipeline;
@@ -49744,20 +49816,22 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             }
             ok = (mismatch == 0 && gpu_sentinel == 0);
         } else {
-            fprintf(stderr, "ds4_d8f: down LUT Metal buffer allocation failed score=%.2f MiB\n",
-                    (double)(score_count * score_bytes_per_value) / 1048576.0);
+            fprintf(stderr, "ds4_d8f: down LUT Metal buffer allocation failed score=%.2f MiB direct=%d\n",
+                    direct_fused_mode ? 0.0 : (double)(score_count * score_bytes_per_value) / 1048576.0,
+                    direct_fused_mode);
         }
     }
     fprintf(stderr,
             "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s code_mode=%s code_source=%s sidecar_hits=%d rank1_sidecars=%u gather_tile=%u score=%.2f MiB code=%.2f MiB i8_keep=%u/%u pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
             n_experts, rows, n_tokens, rounds, max_k,
-            i8_score_mode ? (i8_act_scale ? "f32_i8cb_act" : "f32_i8cb") : (half_score ? "f16" : (vec_score_mode ? "f32vec" : "f32")),
+            direct_fused_mode ? (gather_tile_rows >= 16u ? "f32direct16" : "f32direct8") :
+                (i8_score_mode ? (i8_act_scale ? "f32_i8cb_act" : "f32_i8cb") : (half_score ? "f16" : (vec_score_mode ? "f32vec" : "f32"))),
             native_code_mode ? "native_u16" : "bitpack",
             native_code_mode ? (native_code_sidecar_hits == (int)n_experts ? "sidecar" : "predecode") : "bitpack",
             native_code_sidecar_hits,
             rank1_sidecar_count,
             gather_tile_rows,
-            (double)(score_count * score_bytes_per_value) / 1048576.0,
+            direct_fused_mode ? 0.0 : (double)(score_count * score_bytes_per_value) / 1048576.0,
             native_code_mode ? (double)(native_code_count * sizeof(uint16_t)) / 1048576.0 : 0.0,
             i8_codebook_kept,
             i8_codebook_total,
