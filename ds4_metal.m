@@ -48956,6 +48956,7 @@ static id<MTLComputePipelineState> g_d8f_down_lut_gather_selected_batch_tile16_p
 static id<MTLComputePipelineState> g_d8f_down_lut_gather_codes_selected_batch_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gather_codes_selected_batch_tile8_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gather_codes_selected_batch_tile16_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_lut_gather_codes_selected_batch_tile32_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_scoreh_selected_batch_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gatherh_selected_batch_pipeline;
 static int g_d8f_down_lut_classic_init_attempted;
@@ -48983,10 +48984,11 @@ static int ds4_d8f_down_lut_classic_pipeline_init(void) {
     id<MTLFunction> gather_codes_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_codes_selected_batch"];
     id<MTLFunction> gather_codes_tile8_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_codes_selected_batch_tile8"];
     id<MTLFunction> gather_codes_tile16_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_codes_selected_batch_tile16"];
+    id<MTLFunction> gather_codes_tile32_fn = [lib newFunctionWithName:@"d8f_down_lut_gather_codes_selected_batch_tile32"];
     id<MTLFunction> scoreh_fn = [lib newFunctionWithName:@"d8f_down_lut_scoreh_selected_batch"];
     id<MTLFunction> gatherh_fn = [lib newFunctionWithName:@"d8f_down_lut_gatherh_selected_batch"];
     if (!score_fn || !score_vec_fn || !score_i8_fn || !gather_fn || !gather_tile8_fn || !gather_tile16_fn ||
-        !gather_codes_fn || !gather_codes_tile8_fn || !gather_codes_tile16_fn ||
+        !gather_codes_fn || !gather_codes_tile8_fn || !gather_codes_tile16_fn || !gather_codes_tile32_fn ||
         !scoreh_fn || !gatherh_fn) {
         fprintf(stderr, "ds4_d8f: down LUT Metal function lookup failed\n");
         return 0;
@@ -49051,6 +49053,13 @@ static int ds4_d8f_down_lut_classic_pipeline_init(void) {
         [g_device newComputePipelineStateWithFunction:gather_codes_tile16_fn error:&err];
     if (!g_d8f_down_lut_gather_codes_selected_batch_tile16_pipeline) {
         fprintf(stderr, "ds4_d8f: down LUT gather codes tile16 pipeline failed: %s\n",
+                err.localizedDescription.UTF8String);
+        return 0;
+    }
+    g_d8f_down_lut_gather_codes_selected_batch_tile32_pipeline =
+        [g_device newComputePipelineStateWithFunction:gather_codes_tile32_fn error:&err];
+    if (!g_d8f_down_lut_gather_codes_selected_batch_tile32_pipeline) {
+        fprintf(stderr, "ds4_d8f: down LUT gather codes tile32 pipeline failed: %s\n",
                 err.localizedDescription.UTF8String);
         return 0;
     }
@@ -49282,6 +49291,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     const uint32_t default_gather_tile_rows = (n_tokens <= 1u) ? 1u : ((n_tokens <= 4u) ? 16u : 8u);
     uint32_t gather_tile_rows = ds4_gpu_env_u32("DS4_D8F_METAL_LUT_GATHER_TILE_ROWS", default_gather_tile_rows);
     if (half_score) gather_tile_rows = 1u;
+    else if (gather_tile_rows >= 32u) gather_tile_rows = native_code_mode ? 32u : 16u;
     else if (gather_tile_rows >= 16u) gather_tile_rows = 16u;
     else if (gather_tile_rows >= 8u) gather_tile_rows = 8u;
     else gather_tile_rows = 1u;
@@ -49528,7 +49538,11 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                 }
                 [enc setComputePipelineState:gather_pipeline];
                 if (native_code_mode) {
-                    if (gather_tile_rows == 16u) {
+                    if (gather_tile_rows == 32u) {
+                        [enc setComputePipelineState:g_d8f_down_lut_gather_codes_selected_batch_tile32_pipeline];
+                        gather_partial_bytes = 32u * 8u * sizeof(float);
+                        gather_grid_rows = (rows + 31u) >> 5;
+                    } else if (gather_tile_rows == 16u) {
                         [enc setComputePipelineState:g_d8f_down_lut_gather_codes_selected_batch_tile16_pipeline];
                         gather_partial_bytes = 16u * 8u * sizeof(float);
                         gather_grid_rows = (rows + 15u) >> 4;
