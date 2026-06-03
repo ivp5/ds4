@@ -445,9 +445,9 @@ def encode_down_native_codes(source_path: Path, source_record: tuple[Any, ...]) 
     if projection != 2 or k == 0 or block != 8 or bits <= 0:
         raise RuntimeError(f"invalid down native-code source p={projection} e={expert} k={k} block={block} bits={bits}")
     blocks = (index_bytes * 8) // bits
-    if blocks % DOWN_GROUPS:
-        raise RuntimeError(f"down native-code source has non-integral rows e={expert} blocks={blocks}")
-    rows = blocks // DOWN_GROUPS
+    rows = 4096
+    if blocks < rows * DOWN_GROUPS:
+        raise RuntimeError(f"down native-code source too short e={expert} blocks={blocks} need={rows * DOWN_GROUPS}")
     index = read_payload(source_path, index_offset, index_bytes)
     out = bytearray(rows * DOWN_GROUPS * 2)
     for row in range(rows):
