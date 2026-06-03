@@ -48386,6 +48386,7 @@ static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_preweighted_batch_tile16_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_recbuf_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_gateup_swiglu_selected_batch_recbuf_hmid_classic_pipeline;
@@ -48450,6 +48451,8 @@ static int ds4_d8f_classic_pipeline_init(void) {
             ds4_gpu_get_pipeline("d8f_gateup_swiglu_selected_batch_recbuf");
         g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_classic_pipeline =
             ds4_gpu_get_pipeline("d8f_down_sum_selected_weighted_batch_tile16_recbuf");
+        g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_classic_pipeline =
+            ds4_gpu_get_pipeline("d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes");
         g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram_classic_pipeline =
             ds4_gpu_get_pipeline("d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram");
         g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline =
@@ -48522,8 +48525,10 @@ static int ds4_d8f_classic_pipeline_init(void) {
         ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile16");
     g_d8f_gateup_swiglu_selected_batch_recbuf_classic_pipeline =
         ds4_d8f_classic_pipeline_from_library(gateLib, @"d8f_gateup_swiglu_selected_batch_recbuf");
-        g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_classic_pipeline =
+    g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_classic_pipeline =
         ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile16_recbuf");
+    g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_classic_pipeline =
+        ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes");
     g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram_classic_pipeline =
         ds4_d8f_classic_pipeline_from_library(downLib, @"d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram");
     g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline =
@@ -51223,6 +51228,9 @@ typedef struct ds4_d8f_runtime_record_lite {
     uint64_t scale_offset;
     uint32_t scale_bytes;
     uint32_t row_base;
+    uint64_t native_code_offset;
+    uint32_t native_code_bytes;
+    uint32_t native_code_flags;
 } ds4_d8f_runtime_record_lite;
 static ds4_d8f_runtime_record_lite g_d8f_runtime_record_staging[ds4_d8f_recbuf_record_count];
 
@@ -51237,6 +51245,9 @@ static void ds4_d8f_runtime_record_lite_from_record(ds4_d8f_runtime_record_lite 
     dst->scale_offset = (src->flags & 1u) ? src->scale_offset : 0ull;
     dst->scale_bytes = src->scale_bytes;
     dst->row_base = src->row_block * 128u;
+    dst->native_code_offset = 0ull;
+    dst->native_code_bytes = 0u;
+    dst->native_code_flags = 0u;
 }
 static char g_d8f_runtime_layer_path[ds4_d8f_runtime_layer_cap][4096];
 static ds4_d8f_file g_d8f_runtime_layer_file[ds4_d8f_runtime_layer_cap];
@@ -51587,6 +51598,16 @@ static int ds4_d8f_runtime_cache_prepare(uint32_t layer, const char *path) {
         }
         ds4_d8f_runtime_record_lite_from_record(
             &recs[ds4_d8f_recbuf_down_offset + expert], down_base);
+        ds4_d8f_native_code_record native_down;
+        if (ds4_d8f_get_down_native_codes(file, expert, &native_down) &&
+            native_down.rows >= ds4_down_out_dim &&
+            native_down.groups >= down_blocks_per_row &&
+            native_down.bytes >= ds4_down_out_dim * down_blocks_per_row * sizeof(uint16_t)) {
+            ds4_d8f_runtime_record_lite *down_lite = &recs[ds4_d8f_recbuf_down_offset + expert];
+            down_lite->native_code_offset = native_down.offset;
+            down_lite->native_code_bytes = native_down.bytes;
+            down_lite->native_code_flags = native_down.flags | 1u;
+        }
     }
     g_d8f_runtime_layer_rec_buf[layer] = [g_device newBufferWithBytes:recs
                                                                length:sizeof(g_d8f_runtime_record_staging)
@@ -52045,7 +52066,15 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             !half_mid && recbuf_enabled && !preweight_mid &&
             g_d8f_runtime_rec_buf &&
             g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline;
+        const int down_native_recbuf =
+            !down_tile32_recbuf &&
+            !half_mid && recbuf_enabled && !preweight_mid && down_tile16 &&
+            ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN") > 0 &&
+            ds4_d8f_down_native_code_sidecar_count(&g_d8f_runtime_file) > 0u &&
+            g_d8f_runtime_rec_buf &&
+            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_classic_pipeline;
         const int down_tile16_recbuf = !down_tile32_recbuf &&
+            !down_native_recbuf &&
             recbuf_enabled && !preweight_mid && down_tile16 &&
             g_d8f_runtime_rec_buf &&
             (half_mid ? g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_hmid_classic_pipeline :
@@ -52061,7 +52090,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             rank1_sidecar_active && !half_mid && recbuf_enabled && !preweight_mid && down_tile8 &&
             g_d8f_runtime_rec_buf &&
             g_d8f_down_sum_selected_weighted_batch_tile8_recbuf_classic_pipeline;
-        const int down_any_recbuf = down_tile8_recbuf || down_tile16_recbuf || down_tile32_recbuf;
+        const int down_any_recbuf = down_tile8_recbuf || down_tile16_recbuf || down_tile32_recbuf || down_native_recbuf;
         if (rank1_split_sidecar) {
             atomic_fetch_add_explicit(&g_ds4_d8f_rank1_split_count, 1, memory_order_relaxed);
             if (down_any_recbuf) {
@@ -52113,6 +52142,8 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_hmid_classic_pipeline :
             down_tile32_recbuf ?
             g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline :
+            down_native_recbuf ?
+            g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_classic_pipeline :
             down_tile16_recbuf_cbsram ?
             g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram_classic_pipeline :
             down_tile16_recbuf ?
@@ -52187,7 +52218,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                 down_bufs[down_n] = g_d8f_runtime_mid_buf; down_offs[down_n++] = 0;
             }
             uint64_t gate_extra[8] = { layer, n_tokens, n_experts, gateup_recbuf, gateup_tile4, preweight_mid, ds4_mid_dim, ds4_gateup_in_dim };
-            uint64_t down_extra[8] = { layer, n_tokens, n_experts, down_tile16_recbuf, down_tile8_recbuf || down_tile8, down_tile16, preweight_mid, down_tile16_recbuf_cbsram };
+            uint64_t down_extra[8] = { layer, n_tokens, n_experts, down_tile16_recbuf || down_native_recbuf, down_tile8_recbuf || down_tile8, down_tile16, preweight_mid, down_tile16_recbuf_cbsram || down_native_recbuf };
             packet_icb_ready =
                 ds4_icb_slot_record_command(&g_d8f_packet_icb_slot, packet_gate_cmd, gate_pso,
                                             gate_bufs, gate_offs, gate_n,
@@ -52254,9 +52285,9 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                 s_d8f_classic_packet_icb_notice = 1;
                 fprintf(stderr,
                         "ds4: D8F classic in-graph packet ICB enabled "
-                        "(gateup_recbuf=%d down_recbuf=%d down_cbsram=%u half_mid=%d down_tile32=%d rank1_split=%d)\n",
-                        gateup_recbuf, down_tile16_recbuf, down_cbsram_k_cap,
-                        half_mid, down_tile32_recbuf, rank1_split_sidecar);
+                        "(gateup_recbuf=%d down_recbuf=%d down_cbsram=%u half_mid=%d down_tile32=%d down_native=%d rank1_split=%d)\n",
+                        gateup_recbuf, down_tile16_recbuf || down_native_recbuf, down_cbsram_k_cap,
+                        half_mid, down_tile32_recbuf, down_native_recbuf, rank1_split_sidecar);
             }
             ds4_icb_slot_use_resources(&g_d8f_packet_icb_slot, enc,
                                        packet_gate_cmd, 1,
@@ -52341,8 +52372,8 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
         static int s_d8f_inline_notice = 0;
         if (ok == 0 && !s_d8f_inline_notice) {
             s_d8f_inline_notice = 1;
-            fprintf(stderr, "ds4: D8F inline Metal routed organ enabled; MTL4 external path remains fallback; half_mid=%d gateup_tile4=%d down_tile32=%d down_cbsram=%u rank1_split=%d\n",
-                    half_mid, gateup_tile4, down_tile32_recbuf, down_cbsram_k_cap,
+            fprintf(stderr, "ds4: D8F inline Metal routed organ enabled; MTL4 external path remains fallback; half_mid=%d gateup_tile4=%d down_tile32=%d down_native=%d down_cbsram=%u rank1_split=%d\n",
+                    half_mid, gateup_tile4, down_tile32_recbuf, down_native_recbuf, down_cbsram_k_cap,
                     rank1_split_sidecar);
         }
         static int s_d8f_half_mid_notice = 0;
