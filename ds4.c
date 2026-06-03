@@ -11388,6 +11388,30 @@ static void metal_graph_debug_dump_i32_tensor(
  }
 }
 
+static void metal_graph_dump_ffn_norm_batch_if_requested(ds4_gpu_tensor *tensor, uint32_t il, uint32_t n_tokens) {
+ const char *dir = getenv("DS4_DUMP_FFN_IN_DIR");
+ if (!dir || !dir[0] || !tensor || n_tokens == 0) return;
+ const char *layer_env = getenv("DS4_DUMP_FFN_IN_LAYER");
+ if (layer_env && layer_env[0] && strcmp(layer_env, "all") != 0 &&
+     (uint32_t)strtoul(layer_env, NULL, 10) != il) {
+  return;
+ }
+ const uint64_t n_f32 = (uint64_t)n_tokens * DS4_N_EMBD;
+ if (ds4_gpu_synchronize() == 0) {
+  fprintf(stderr, "ds4: failed to synchronize before DS4_DUMP_FFN_IN_DIR layer %u\n", il);
+  return;
+ }
+ float *buf = xmalloc((size_t)n_f32 * sizeof(buf[0]));
+ if (ds4_gpu_tensor_read(tensor, 0, buf, n_f32 * sizeof(buf[0])) != 0) {
+  ds4_ffn_in_dump_layer(il, buf, n_tokens, DS4_N_EMBD);
+  fprintf(stderr, "ds4: dumped GPU ffn_norm layer %u tokens=%u to %s\n", il, n_tokens, dir);
+ }
+ free(buf);
+ if (ds4_gpu_begin_commands() == 0) {
+  fprintf(stderr, "ds4: failed to resume Metal command batch after DS4_DUMP_FFN_IN_DIR layer %u\n", il);
+ }
+}
+
 /* === per-event router trace (codex research, hand-merged 2026-05-21) ===
  * Emits CSV per (stage, position, layer) after router selection. Gated by
  * DS4_ROUTER_TRACE_PE env. Validates cache-residency thesis on real workloads. */
@@ -17131,6 +17155,7 @@ static bool metal_graph_encode_layer_ffn_batch(
  metal_graph_debug_dump_tensor("ffn_norm", g->batch_ffn_norm,
  (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
  }
+ if (ok) metal_graph_dump_ffn_norm_batch_if_requested(g->batch_ffn_norm, il, n_tokens);
  DS4_L1_PROBE("ffn_norm", g->batch_ffn_norm, DS4_N_EMBD);
  DS4_METAL_PROFILE_FFN_STAGE("norm");
  if (ok) ok = ds4_matmul_f16_via_tensor(g->batch_router_logits, model,

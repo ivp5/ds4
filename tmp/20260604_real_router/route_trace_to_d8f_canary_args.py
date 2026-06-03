@@ -37,6 +37,8 @@ def main():
     parser.add_argument("--evict-mib", type=int, default=0)
     parser.add_argument("--mode", choices=["same", "separate"], default="same")
     parser.add_argument("--seed", type=int, default=29001)
+    parser.add_argument("--hidden-f32", default=None)
+    parser.add_argument("--hidden-row", type=int, default=None)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -57,6 +59,9 @@ def main():
         str(args.seed),
         weights,
     ]
+    if args.hidden_f32:
+        command.append(args.hidden_f32)
+        command.append(str(args.hidden_row if args.hidden_row is not None else int(row["pos"])))
     payload = {
         "trace_csv": args.trace_csv,
         "row": int(row["row"]),
@@ -68,6 +73,8 @@ def main():
         "experts_csv": experts,
         "weights_csv": weights,
         "d8f_path": d8f_path,
+        "hidden_f32": args.hidden_f32,
+        "hidden_row": args.hidden_row if args.hidden_row is not None else (int(row["pos"]) if args.hidden_f32 else None),
         "command": command,
     }
     if args.json:

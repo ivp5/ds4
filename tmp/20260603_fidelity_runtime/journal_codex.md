@@ -214,3 +214,12 @@ Validation: `make ds4_metal.o` passed; extracted runtime MSL compiled through `n
 - Real-router weighted overlap survived merge in the six-trial same-buffer run: ANE `15.637 ms`, D8F `6.967 ms`, merge `0.311 ms`, serial+merge `20.663 ms`, concurrent+merge `15.209 ms`, overlap+merge speedup `1.507x`.
 - The cache-warmup claim is still not proven for exact D8F: D8F-after-ANE p50 was `7.196 ms` versus D8F-only `6.967 ms`. Treat real-router evidence as overlap support, not as proof that ANE warms the routed graph to the memory floor.
 - The next falsifier is real hidden-state input. Route weights now match runtime rows, but the canary still uses synthetic hidden values and the current CoreML shared model is L0 while the routed D8F path is L26.
+
+## 2026-06-04T00:22 JST — real hidden-state route-weighted cache matrix
+
+- Extended `ane_d8f_routed_counterbalanced_canary.m` with optional `[HIDDEN_F32_BIN] [HIDDEN_ROW]` arguments. The exact D8F reference, MPSGraph input buffer, and CoreML/ANE input rows can now all use a real dumped FFN-norm row instead of the synthetic sine/cos hidden vector.
+- Added a GPU-prefill `DS4_DUMP_FFN_IN_DIR` hook for `batch_ffn_norm`, because the prior CPU-side dump hook is bypassed by the active D8F fused GPU prefill path. `DS4_DUMP_FFN_IN_LAYER=26` dumped `tmp/20260604_real_router/ffn_in_gpu_h3355_hi_20260604T001901/ffn_in_L26.bin` with `10` rows (`163840` bytes).
+- Matching L26 prefill pos `9` used experts `191,61,201,146,78,209` and weights `0.524048,0.451248,0.305137,0.084508,0.073911,0.061146`. The real hidden row stats were `mean=0.00300297`, `rms=0.488569`, `max_abs=1.98975`.
+- Real-hidden exactness passed in every matrix run: `bad=0`, `max_abs=0.00120807`, `rms=0.000232264`. The larger RMS versus synthetic is expected because the activation range is real; it is still far below the existing canary failure threshold.
+- Real-hidden overlap+merge p50 stayed useful: same/no-evict `1.489x`, separate/no-evict `1.464x`, same/256MiB CPU-evict `1.225x`, separate/256MiB CPU-evict `1.140x`.
+- Cache-warmup remains unproven for exact D8F. Same/no-evict D8F-only was `7.325 ms` and D8F-after-ANE was `7.994 ms`; separate/no-evict was `6.828 ms` versus `7.530 ms`. The production lever is same-layer ANE/GPU overlap and low-cost merge, not a demonstrated ANE-to-D8F warm cache.

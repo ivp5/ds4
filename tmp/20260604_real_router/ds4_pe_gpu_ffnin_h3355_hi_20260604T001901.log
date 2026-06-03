@@ -1,0 +1,95 @@
+ds4: --flat-pack /Users/silv/cl/tlp/montyneg/ds4/DeepSeek-V4-Flash_H3355_H3353_L26E165_gate_clean_D8F_800kctx_AIME_active_20260603 (metadata, nonrouted, D8F root; DS4_D8F_PACK_DIR set)
+ds4: about to mmap model 0.0 GB (MAP_SHARED)
+ds4: MEM[pre-mmap-metal] rss=0.01 GB  sys-wired=3.04 GB  phys=68.72 GB  free-est=65.68 GB
+ds4: MEM[post-mmap-metal] rss=0.01 GB  sys-wired=3.05 GB  phys=68.72 GB  free-est=65.67 GB
+ds4: --prefill-metal-phases auto: routed experts supplied by external D8F pack; no GGUF routed residency to phase, using phase-free GPU runtime
+ds4: --prefill-metal-phases auto: external D8F normalized to phase-free GPU runtime
+ds4: MTP embedded-head available (draft=2; spec policy is CLI/runtime gated)
+ds4: Metal device Apple M1 Max, 64.00 GiB RAM
+ds4: Metal 4 TensorOps fast path disabled (pre-M5/pre-A19); MTL4 compute pipelines still active
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal expert inverse table uploaded (44032 bytes, 43*256 int32)
+ds4: PRIME path active — D8F classic in-graph packet ICB is primary; external MTL4 packet dispatch remains force-only to avoid graph exit
+ds4: pack-direct mode — skipping GGUF tensor-data Metal map (no_tensor_data=true; storage supplied by packs)
+ds4: metal backend initialized for graph diagnostics
+ds4: --nonrouted-pack: opened /Users/silv/cl/tlp/montyneg/ds4/DeepSeek-V4-Flash_H3355_H3353_L26E165_gate_clean_D8F_800kctx_AIME_active_20260603/ds4v4_nonrouted.i32_normf32_bf16matf16.pack (9.01 GB, 1603 entries)
+ds4: --nonrouted-pack: embed.* → 1 entries
+ds4: --nonrouted-pack: head.* → 1 entries
+ds4: --nonrouted-pack: norm.* → 1 entries
+ds4: --nonrouted-pack: layers.0..* → 29 entries
+ds4: --nonrouted-pack: layers.22..* → 40 entries
+ds4: --nonrouted-pack: layers.42..* → 40 entries
+ds4: --nonrouted-pack: layers.0.attn.* → 14 entries
+ds4: --nonrouted-pack: layers.0.ffn.* → 9 entries
+ds4: --nonrouted-pack: layers.0.hc_.* → 6 entries
+ds4: --nonrouted-pack: mtp.0..* → 39 entries
+ds4: --nonrouted-pack: coverage probe — total GGUF tensors=1360
+ds4: --nonrouted-pack:   routed (skipped, expected): 132
+ds4: --nonrouted-pack:   translatable: 1228 (100.0% of non-routed)
+ds4: --nonrouted-pack:   HIT in pack: 1228 (100.0% of translatable)
+ds4: --nonrouted-pack:   MISS (translated name not in pack): 0
+ds4: --nonrouted-pack: override-fill — filled=1228 (9.01 GB), skipped dtype_mismatch=0 bytes_mismatch=0 alloc_fail=0 source_exact_kernel_gap=0 mtlbuf_wrap=1228/0 (ok/fail) zerocopy=7 fp8_scales=375 miss=0 bad=0 wrap=375/0
+ds4: --nonrouted-pack: Phase 1+2b-scaffold ship complete — identity-dtype overrides applied; BF16/FP8 kernel paths are silv-curated to unblock skipped tensors.
+ds4: --nonrouted-pack: registered 1228 synthetic model views (storage tensors now resolvable via wrap_model_range)
+ds4: context buffers 242.76 MiB (ctx=4096, backend=metal, prefill_chunk=2048, raw_kv_rows=2304, compressed_kv_rows=1026)
+ds4: polar MTL4 pipeline initialized (threadExecutionWidth=32 maxThreadsPerTg=256)
+ds4: ds4_matmul_fp8_pair_e4m3_e8m0_storage MTL4 pipeline initialized
+ds4: q_a/kv FP8 pair fusion active (in=4096 out=1024/512 n_tok=10)
+ds4: ds4_matmul_fp8_e4m3_e8m0_storage_mtl4 MTL4 pipeline initialized
+ds4: ds4_attn_low_fp8_e4m3_e8m0_storage_mtl4 MTL4 pipeline initialized
+ds4: D8F prefill using fused routed organ n_tokens=10
+ds4: D8F inline Metal routed organ enabled; MTL4 external path remains fallback; half_mid=0 gateup_tile4=1 down_tile32=0 down_cbsram=0 rank1_split=0
+ds4: MEM[gpu-prefill-L1] rss=17.57 GB  sys-wired=5.78 GB  phys=68.72 GB  free-est=62.94 GB
+ds4: MEM[gpu-prefill-L2] rss=17.57 GB  sys-wired=7.23 GB  phys=68.72 GB  free-est=61.49 GB
+ds4: MEM[gpu-prefill-L3] rss=17.57 GB  sys-wired=8.44 GB  phys=68.72 GB  free-est=60.28 GB
+ds4: MEM[gpu-prefill-L4] rss=17.57 GB  sys-wired=9.07 GB  phys=68.72 GB  free-est=59.65 GB
+ds4: MEM[gpu-prefill-L5] rss=17.57 GB  sys-wired=10.43 GB  phys=68.72 GB  free-est=58.29 GB
+ds4: MEM[gpu-prefill-L6] rss=17.57 GB  sys-wired=11.06 GB  phys=68.72 GB  free-est=57.66 GB
+ds4: MEM[gpu-prefill-L7] rss=17.57 GB  sys-wired=12.43 GB  phys=68.72 GB  free-est=56.29 GB
+ds4: MEM[gpu-prefill-L8] rss=17.57 GB  sys-wired=13.29 GB  phys=68.72 GB  free-est=55.43 GB
+ds4: MEM[gpu-prefill-L9] rss=17.57 GB  sys-wired=14.38 GB  phys=68.72 GB  free-est=54.34 GB
+ds4: MEM[gpu-prefill-L10] rss=17.57 GB  sys-wired=15.39 GB  phys=68.72 GB  free-est=53.33 GB
+ds4: MEM[gpu-prefill-L11] rss=17.57 GB  sys-wired=16.39 GB  phys=68.72 GB  free-est=52.33 GB
+ds4: MEM[gpu-prefill-L12] rss=17.57 GB  sys-wired=17.39 GB  phys=68.72 GB  free-est=51.33 GB
+ds4: MEM[gpu-prefill-L13] rss=17.57 GB  sys-wired=18.37 GB  phys=68.72 GB  free-est=50.35 GB
+ds4: MEM[gpu-prefill-L14] rss=17.58 GB  sys-wired=19.36 GB  phys=68.72 GB  free-est=49.36 GB
+ds4: MEM[gpu-prefill-L15] rss=17.58 GB  sys-wired=20.33 GB  phys=68.72 GB  free-est=48.39 GB
+ds4: MEM[gpu-prefill-L16] rss=17.58 GB  sys-wired=21.33 GB  phys=68.72 GB  free-est=47.39 GB
+ds4: MEM[gpu-prefill-L17] rss=17.58 GB  sys-wired=21.33 GB  phys=68.72 GB  free-est=47.39 GB
+ds4: MEM[gpu-prefill-L18] rss=17.58 GB  sys-wired=23.32 GB  phys=68.72 GB  free-est=45.40 GB
+ds4: MEM[gpu-prefill-L19] rss=17.58 GB  sys-wired=24.03 GB  phys=68.72 GB  free-est=44.69 GB
+ds4: MEM[gpu-prefill-L20] rss=15.16 GB  sys-wired=24.82 GB  phys=68.72 GB  free-est=43.90 GB
+ds4: MEM[gpu-prefill-L21] rss=13.15 GB  sys-wired=26.04 GB  phys=68.72 GB  free-est=42.68 GB
+ds4: MEM[gpu-prefill-L22] rss=11.11 GB  sys-wired=26.95 GB  phys=68.72 GB  free-est=41.77 GB
+ds4: MEM[gpu-prefill-L23] rss=10.23 GB  sys-wired=26.95 GB  phys=68.72 GB  free-est=41.77 GB
+ds4: MEM[gpu-prefill-L24] rss=10.20 GB  sys-wired=29.34 GB  phys=68.72 GB  free-est=39.38 GB
+ds4: MEM[gpu-prefill-L25] rss=10.18 GB  sys-wired=30.04 GB  phys=68.72 GB  free-est=38.68 GB
+ds4: MEM[gpu-prefill-L26] rss=10.15 GB  sys-wired=30.95 GB  phys=68.72 GB  free-est=37.77 GB
+ds4: dumped GPU ffn_norm layer 26 tokens=10 to tmp/20260604_real_router/ffn_in_gpu_h3355_hi_20260604T001901
+ds4: MEM[gpu-prefill-L27] rss=10.13 GB  sys-wired=32.30 GB  phys=68.72 GB  free-est=36.42 GB
+ds4: MEM[gpu-prefill-L28] rss=10.11 GB  sys-wired=32.79 GB  phys=68.72 GB  free-est=35.93 GB
+ds4: MEM[gpu-prefill-L29] rss=10.08 GB  sys-wired=34.14 GB  phys=68.72 GB  free-est=34.58 GB
+ds4: MEM[gpu-prefill-L30] rss=10.05 GB  sys-wired=35.26 GB  phys=68.72 GB  free-est=33.46 GB
+ds4: MEM[gpu-prefill-L31] rss=9.30 GB  sys-wired=35.96 GB  phys=68.72 GB  free-est=32.75 GB
+ds4: MEM[gpu-prefill-L32] rss=8.37 GB  sys-wired=36.76 GB  phys=68.72 GB  free-est=31.96 GB
+ds4: MEM[gpu-prefill-L33] rss=7.34 GB  sys-wired=37.95 GB  phys=68.72 GB  free-est=30.77 GB
+ds4: MEM[gpu-prefill-L34] rss=6.32 GB  sys-wired=38.84 GB  phys=68.72 GB  free-est=29.88 GB
+ds4: MEM[gpu-prefill-L35] rss=5.20 GB  sys-wired=39.81 GB  phys=68.72 GB  free-est=28.91 GB
+ds4: MEM[gpu-prefill-L36] rss=4.18 GB  sys-wired=40.73 GB  phys=68.72 GB  free-est=27.98 GB
+ds4: MEM[gpu-prefill-L37] rss=3.19 GB  sys-wired=41.82 GB  phys=68.72 GB  free-est=26.90 GB
+ds4: MEM[gpu-prefill-L38] rss=2.99 GB  sys-wired=42.75 GB  phys=68.72 GB  free-est=25.97 GB
+ds4: MEM[gpu-prefill-L39] rss=2.88 GB  sys-wired=43.84 GB  phys=68.72 GB  free-est=24.88 GB
+ds4: MEM[gpu-prefill-L40] rss=2.73 GB  sys-wired=44.89 GB  phys=68.72 GB  free-est=23.83 GB
+ds4: MEM[gpu-prefill-L41] rss=2.73 GB  sys-wired=45.98 GB  phys=68.72 GB  free-est=22.74 GB
+ds4: MEM[gpu-prefill-L42] rss=2.73 GB  sys-wired=46.89 GB  phys=68.72 GB  free-est=21.83 GB
+ds4: MEM[gpu-prefill-L43] rss=2.73 GB  sys-wired=47.99 GB  phys=68.72 GB  free-est=20.73 GB
+ds4: MTP spec disabled on D8F pack path; H2758/H2759 measured verifier slower than baseline. Set DS4_MTP_SPEC_FORCE=1 to force.
+ds4: ds4_matmul_fp8_e4m3_e8m0_hc_expand4_mtl4 MTL4 pipeline initialized
+ds4: D8F classic in-graph packet ICB enabled (gateup_recbuf=0 down_recbuf=1 down_cbsram=0 half_mid=0 down_tile32=0 rank1_split=0)
+ds4: ds4_shared_gate_up_swiglu_fp8_e4m3_e8m0 MTL4 pipeline initialized
+ds4: shared gate/up FP8 fused SwiGLU active
+:
+ds4: prefill: 0.34 t/s, generation: 0.30 t/s
+ds4: storage-dispatch f16 — heap=492 skip_multi_tok=0
+ds4: storage-dispatch fp8 — heap=537 (zero = via_tensor not called for FP8 attn weights)
+ds4: storage-dispatch fp8-direct — heap=172

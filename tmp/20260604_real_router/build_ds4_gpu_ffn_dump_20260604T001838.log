@@ -1,0 +1,3 @@
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -c -o ds4.o ds4.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99   -c -o ds4_nonrouted_pack.o ds4_nonrouted_pack.c
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -o ds4 ds4_cli.o linenoise.o ds4.o ds4_neon_i8mm.o ds4_metal.o ds4_mpsgraph.o ds4_expert_table.o ds4_inflight.o ds4_moe_route_log.o ds4_polar_reader.o ds4_vqb1_reader.o ds4_metal_vqb2_fp16.o ds4_vqb2_reader.o ds4_vqb2_pack.o ds4_cdx3_reader.o ds4_watersic_pack.o ds4_nonrouted_pack.o ds4_d8m_reader.o ds4_d8f_reader.o ds4_prefix_cache.o  -lm -pthread -framework Foundation -framework Metal -framework MetalPerformanceShadersGraph

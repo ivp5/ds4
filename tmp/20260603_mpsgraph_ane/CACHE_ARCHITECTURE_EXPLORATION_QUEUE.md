@@ -27,6 +27,8 @@
 - Route-weight semantics are now in the exact D8F graph canary. Weighted selected-six L26/E165 with weights `0.35,0.2,0.15,0.1,0.1,0.1` passed exactness (`bad=0`, `rms=7.04666e-06`). The short weighted timing run was noisy, so use it as a semantics gate, not a speed claim.
 - Real PE router weights from DS4 runtime now feed the exact D8F canary. L26 decode row `456` selected experts `191,61,201,18,100,78` with weights `0.457488,0.361998,0.232502,0.188364,0.147002,0.112646`; exactness passed (`bad=0`, `rms=1.41898e-05`) and same-buffer overlap+merge measured `1.507x` p50 speedup (`20.663 ms` serial+merge, `15.209 ms` concurrent+merge).
 - The real-router run again failed to prove D8F cache warmup: D8F-after-ANE was `7.196 ms` versus D8F-only `6.967 ms`. The defensible architecture is still free same-layer parallel compute plus low-cost merge; cache work remains exploratory until real hidden-state and eviction sweeps isolate a mechanism.
+- Real hidden-state input now passes the exact D8F canary. GPU-prefill `batch_ffn_norm` L26 row 9 from H3355 `Hi` has `rms=0.488569`, and route-weighted selected experts `191,61,201,146,78,209` passed exactness (`bad=0`, `rms=0.000232264`). This removes the synthetic-activation loophole for routed D8F scheduling canaries.
+- Real-hidden same/separate × CPU-evict matrix still supports overlap, not warmup: overlap+merge p50 speedups were `1.489x` same/no-evict, `1.464x` separate/no-evict, `1.225x` same/256MiB, and `1.140x` separate/256MiB. D8F-after-ANE was slower than D8F-only in both no-evict modes.
 
 ## Highest-Potential Experiments
 
@@ -49,10 +51,11 @@
 17. Microbatch interleave: test `B=256,512,1024,2048` shared-expert ANE while GPU runs routed D8F for the same layer. Same-layer shared and routed branches are dependency-parallel; cross-layer pipelining is not valid until the merge/residual is complete.
 18. Command-queue/fence policy: test one shared Metal command queue versus separate queues plus explicit events/fences around input readiness and output merge. The target is overlap without accidental serialization or cache-destructive waits.
 19. Merge survival canary: allocate CoreML shared output backing as a GPU-visible buffer/IOSurface, run exact D8F routed graph concurrently, then launch a Metal add/merge into the FFN output. Measure serial versus overlapped+merge; if merge erases the overlap, the architecture is not ready.
-20. Real hidden-state input: dump `batch_ffn_norm` rows with `DS4_DUMP_FFN_IN_DIR`, feed the matching row into the exact D8F canary, and rerun weighted exactness/timing. Synthetic hidden values can mask real activation range and cache-line behavior.
-21. Layer-matched shared CoreML: export L26 shared-expert CoreML to pair with L26 routed D8F before making any merged-fidelity claim. Current L0 shared + L26 routed pairing is sufficient for scheduling/overlap shape, not same-layer output fidelity.
-22. Real-router weighted timing: rerun actual router top-k weights under a longer low-load schedule after real hidden-state support. The short six-trial row-456 run supports overlap (`1.507x` with merge), but does not yet establish p90/p99 stability.
-23. Runtime sidecar scaffold: add an opt-in layer-local prefill organ that owns CoreML model cache, D8F graph cache, hidden-state backing, concurrent launch, and merge. Keep it default-off until route-weighted canary and real hidden-state fidelity checks pass.
+20. Metal eviction control: repeat the real-hidden matrix with a GPU eviction kernel over a large `MTLBuffer`. CPU eviction perturbs host caches/TLBs; Metal eviction separates GPU/SLC residency from CPU page warming.
+21. Real hidden-state replication: repeat L26 row 9 on at least two other prompts and one later layer. One real row closes the synthetic loophole; it does not establish activation-distribution stability.
+22. Layer-matched shared CoreML: export L26 shared-expert CoreML to pair with L26 routed D8F before making any merged-fidelity claim. Current L0 shared + L26 routed pairing is sufficient for scheduling/overlap shape, not same-layer output fidelity.
+23. Real-router weighted timing: rerun actual router top-k weights under a longer low-load schedule after metal eviction support. Short six-trial runs support overlap, but do not yet establish p90/p99 stability.
+24. Runtime sidecar scaffold: add an opt-in layer-local prefill organ that owns CoreML model cache, D8F graph cache, hidden-state backing, concurrent launch, and merge. Keep it default-off until route-weighted canary and real hidden-state fidelity checks pass.
 
 ## Production Direction
 
@@ -62,4 +65,4 @@
 - Treat the user’s “virtual bandwidth” hypothesis as plausible but unproven: the likely win is cache/SLC/TLB/DRAM-controller residency plus free parallel compute, not ANE magically warming GPU private cache. Promotion requires counterbalanced evidence and eviction controls.
 - The near-term runtime architecture should be same-layer parallelism: GPU computes routed D8F, ANE computes 8-bit shared expert from the same hidden-state allocation, GPU merges shared+routed outputs from CoreML output backing, then the normal layer dependency continues. Cache correctness matters at the input and merge buffers; violating that turns theoretical bandwidth into extra serialization.
 - After the exact routed canary, prioritize overlap integration over cache folklore: cache warmth helped synthetic dense, but exact D8F routed mainly benefits from concurrent ANE/GPU execution. The next go/no-go is merge/fence cost, then route-weighted exact graph caching.
-- After route-weighted exactness and real-router weighted timing, the next go/no-go shifts to real hidden-state fidelity and layer-matched shared-expert export. If those pass, the speed path becomes an opt-in runtime integration problem rather than a speculative cache experiment.
+- After route-weighted exactness, real-router weighted timing, and real hidden-state input, the next go/no-go shifts to metal eviction controls and layer-matched shared-expert export. If those pass, the speed path becomes an opt-in runtime integration problem rather than a speculative cache experiment.

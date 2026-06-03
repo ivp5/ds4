@@ -327,6 +327,43 @@ static void weights_csv(char *out, size_t out_bytes, const float *weights, uint3
     }
 }
 
+static void fill_synthetic_hidden(float *hidden_f32, uint16_t *hidden_f16) {
+    for (uint32_t index = 0; index < kHiddenDim; ++index) {
+        float value = 0.35f * sinf((float)index * 0.011f) + 0.17f * cosf((float)index * 0.019f);
+        hidden_f32[index] = value;
+        hidden_f16[index] = f32_to_f16(value);
+    }
+}
+
+static void load_hidden_row_f32(const char *path, uint32_t row_index, float *hidden_f32, uint16_t *hidden_f16) {
+    FILE *handle = fopen(path, "rb");
+    if (!handle) die([NSString stringWithFormat:@"failed to open hidden row file %s", path], nil);
+    const uint64_t offset = (uint64_t)row_index * kHiddenDim * sizeof(float);
+    if (fseeko(handle, (off_t)offset, SEEK_SET) != 0) {
+        fclose(handle);
+        die([NSString stringWithFormat:@"failed to seek hidden row file %s row=%u", path, row_index], nil);
+    }
+    size_t count = fread(hidden_f32, sizeof(float), kHiddenDim, handle);
+    fclose(handle);
+    if (count != kHiddenDim) {
+        die([NSString stringWithFormat:@"short hidden row file %s row=%u got=%zu", path, row_index, count], nil);
+    }
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    double max_abs = 0.0;
+    for (uint32_t index = 0; index < kHiddenDim; ++index) {
+        float value = hidden_f32[index];
+        if (!isfinite(value)) die([NSString stringWithFormat:@"nonfinite hidden value at %s row=%u index=%u", path, row_index, index], nil);
+        hidden_f16[index] = f32_to_f16(value);
+        sum += (double)value;
+        sum_sq += (double)value * (double)value;
+        double abs_value = fabs((double)value);
+        if (abs_value > max_abs) max_abs = abs_value;
+    }
+    NSLog(@"[hidden] source=file path=%s row=%u mean=%.6g rms=%.6g max_abs=%.6g first=%.6g",
+          path, row_index, sum / (double)kHiddenDim, sqrt(sum_sq / (double)kHiddenDim), max_abs, (double)hidden_f32[0]);
+}
+
 static void free_slots(D8FSlot *slots, uint32_t n_experts) {
     for (uint32_t slot = 0; slot < n_experts; ++slot) {
         free(slots[slot].gate_cb_f16);
@@ -395,7 +432,7 @@ static double p50_for_case(NSDictionary<NSString *, NSMutableArray<NSNumber *> *
 int main(int argc, const char **argv) {
     @autoreleasepool {
         if (argc < 4) {
-            fprintf(stderr, "usage: %s SHARED.mlpackage LAYER.d8f EXPERTS_CSV [trials] [evict_mib] [same|separate] [seed] [ROUTE_WEIGHTS_CSV]\n", argv[0]);
+            fprintf(stderr, "usage: %s SHARED.mlpackage LAYER.d8f EXPERTS_CSV [trials] [evict_mib] [same|separate] [seed] [ROUTE_WEIGHTS_CSV] [HIDDEN_F32_BIN] [HIDDEN_ROW]\n", argv[0]);
             return 2;
         }
         NSString *model_path = [NSString stringWithUTF8String:argv[1]];
@@ -409,6 +446,9 @@ int main(int argc, const char **argv) {
         NSString *input_mode = argc >= 7 ? [NSString stringWithUTF8String:argv[6]] : @"same";
         uint32_t random_state = argc >= 8 ? (uint32_t)strtoul(argv[7], NULL, 10) : 0x44384631u;
         if (!parse_weights(argc >= 9 ? argv[8] : NULL, route_weights, n_experts)) die(@"bad route weights CSV", nil);
+        const char *hidden_path = argc >= 10 ? argv[9] : NULL;
+        uint32_t hidden_row = argc >= 11 ? (uint32_t)strtoul(argv[10], NULL, 10) : 0u;
+        const bool use_hidden_file = hidden_path && hidden_path[0] && strcmp(hidden_path, "-") != 0 && strcmp(hidden_path, "synthetic") != 0;
         char route_weights_text[192];
         weights_csv(route_weights_text, sizeof(route_weights_text), route_weights, n_experts);
         BOOL separate_input = [input_mode isEqualToString:@"separate"];
@@ -428,8 +468,9 @@ int main(int argc, const char **argv) {
         uint32_t model_input_dim = input_shape[1].unsignedIntValue;
         uint32_t model_output_dim = output_shape[1].unsignedIntValue;
         if (model_input_dim != kHiddenDim || model_output_dim != kOutDim) die(@"CoreML shared model shape is not DS4 hidden->hidden", nil);
-        NSLog(@"[shape] coreml_input=%@ %@ coreml_output=%@ %@ d8f=%s experts=%s route_weights=%s nsel=%u trials=%u evict_mib=%u mode=%@ seed=%u",
-              input_name, input_shape, output_name, output_shape, d8f_path, argv[3], route_weights_text, n_experts, trials, evict_mib, input_mode, random_state);
+        NSLog(@"[shape] coreml_input=%@ %@ coreml_output=%@ %@ d8f=%s experts=%s route_weights=%s nsel=%u trials=%u evict_mib=%u mode=%@ seed=%u hidden=%s row=%u",
+              input_name, input_shape, output_name, output_shape, d8f_path, argv[3], route_weights_text, n_experts, trials, evict_mib, input_mode, random_state,
+              use_hidden_file ? hidden_path : "synthetic", hidden_row);
 
         ds4_d8f_file file;
         if (!ds4_d8f_open(d8f_path, &file)) die(@"ds4_d8f_open failed", nil);
@@ -480,10 +521,11 @@ int main(int argc, const char **argv) {
         float *ref = (float *)calloc(kOutDim, sizeof(float));
         float *got = (float *)calloc(kOutDim, sizeof(float));
         if (!x_f32 || !x_f16 || !gate_tmp || !up_tmp || !mid_tmp || !down_tmp || !ref || !got) die(@"host allocation failed", nil);
-        for (uint32_t index = 0; index < kHiddenDim; ++index) {
-            float value = 0.35f * sinf((float)index * 0.011f) + 0.17f * cosf((float)index * 0.019f);
-            x_f32[index] = value;
-            x_f16[index] = f32_to_f16(value);
+        if (use_hidden_file) {
+            load_hidden_row_f32(hidden_path, hidden_row, x_f32, x_f16);
+        } else {
+            fill_synthetic_hidden(x_f32, x_f16);
+            NSLog(@"[hidden] source=synthetic first=%.6g", (double)x_f32[0]);
         }
         for (uint32_t slot = 0; slot < n_experts; ++slot) {
             uint32_t gate_cols = slots[slot].gate.k + 1u;

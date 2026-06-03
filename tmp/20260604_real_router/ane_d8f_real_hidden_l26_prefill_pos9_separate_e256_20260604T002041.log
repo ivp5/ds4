@@ -1,0 +1,33 @@
+2026-06-04 00:20:50.212 ane_d8f_routed_counterbalanced_canary[99597:12549215] [coreml] compile_start path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage
+2026-06-04 00:20:52.698 ane_d8f_routed_counterbalanced_canary[99597:12549215] [shape] coreml_input=x (
+    2048,
+    4096
+) coreml_output=shared_out (
+    2048,
+    4096
+) d8f=/Users/silv/cl/tlp/montyneg/ds4/DeepSeek-V4-Flash_H3355_H3353_L26E165_gate_clean_D8F_800kctx_AIME_active_20260603/ds4_L26_gate_up_down_VQD8_noE8_rank1.d8f experts=191,61,201,146,78,209 route_weights=0.524048,0.451248,0.305137,0.084508,0.073911,0.061146 nsel=6 trials=6 evict_mib=256 mode=separate seed=31004 hidden=tmp/20260604_real_router/ffn_in_gpu_h3355_hi_20260604T001901/ffn_in_L26.bin row=9
+2026-06-04 00:20:52.744 ane_d8f_routed_counterbalanced_canary[99597:12549215] [hidden] source=file path=tmp/20260604_real_router/ffn_in_gpu_h3355_hi_20260604T001901/ffn_in_L26.bin row=9 mean=0.00300297 rms=0.488569 max_abs=1.98975 first=-0.116542
+2026-06-04 00:20:53.021 ane_d8f_routed_counterbalanced_canary[99597:12549215] [mpsgraph] compile_start nsel=6
+2026-06-04 00:20:53.182 ane_d8f_routed_counterbalanced_canary[99597:12549215] [validate] bad=0 max_abs=0.00120807 max_rel=0.0010113 rms=0.000232264 sample_ref=-0.483397 sample_got=-0.483398
+2026-06-04 00:20:53.274 ane_d8f_routed_counterbalanced_canary[99597:12549215] [warmup] output_backing_used=yes
+2026-06-04 00:20:53.507 ane_d8f_routed_counterbalanced_canary[99597:12549215] [trial] index=0 order=d8f_only,d8f_after_ane_evicted,d8f_evicted,ane_after_d8f,concurrent_then_merge,merge_only,d8f_after_ane,serial_ane_d8f_merge,concurrent,ane_only,serial_ane_d8f
+2026-06-04 00:20:53.722 ane_d8f_routed_counterbalanced_canary[99597:12549215] [trial] index=1 order=ane_after_d8f,d8f_after_ane,ane_only,serial_ane_d8f,d8f_only,concurrent_then_merge,merge_only,d8f_evicted,concurrent,d8f_after_ane_evicted,serial_ane_d8f_merge
+2026-06-04 00:20:53.920 ane_d8f_routed_counterbalanced_canary[99597:12549215] [trial] index=2 order=d8f_evicted,concurrent,d8f_only,concurrent_then_merge,serial_ane_d8f,serial_ane_d8f_merge,d8f_after_ane,d8f_after_ane_evicted,ane_after_d8f,ane_only,merge_only
+2026-06-04 00:20:54.126 ane_d8f_routed_counterbalanced_canary[99597:12549215] [trial] index=3 order=d8f_after_ane,ane_after_d8f,d8f_only,merge_only,ane_only,d8f_after_ane_evicted,d8f_evicted,concurrent_then_merge,concurrent,serial_ane_d8f,serial_ane_d8f_merge
+2026-06-04 00:20:54.333 ane_d8f_routed_counterbalanced_canary[99597:12549215] [trial] index=4 order=d8f_only,d8f_evicted,serial_ane_d8f,concurrent,d8f_after_ane,d8f_after_ane_evicted,concurrent_then_merge,ane_only,ane_after_d8f,merge_only,serial_ane_d8f_merge
+2026-06-04 00:20:54.540 ane_d8f_routed_counterbalanced_canary[99597:12549215] [trial] index=5 order=d8f_after_ane,concurrent_then_merge,d8f_only,merge_only,ane_after_d8f,ane_only,concurrent,d8f_evicted,serial_ane_d8f_merge,serial_ane_d8f,d8f_after_ane_evicted
+2026-06-04 00:20:54.540 ane_d8f_routed_counterbalanced_canary[99597:12549215] [summary] mode=separate evict_mib=256 nsel=6 case=ane_only n=6 min_ms=11.958 p50_ms=12.460 p90_ms=16.391 max_ms=16.391 mean_ms=13.262
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [summary] mode=separate evict_mib=256 nsel=6 case=d8f_only n=6 min_ms=4.074 p50_ms=7.791 p90_ms=7.929 max_ms=7.929 mean_ms=7.146
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [summary] mode=separate evict_mib=256 nsel=6 case=d8f_evicted n=6 min_ms=7.411 p50_ms=7.708 p90_ms=8.111 max_ms=8.111 mean_ms=7.731
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [summary] mode=separate evict_mib=256 nsel=6 case=d8f_after_ane n=6 min_ms=6.377 p50_ms=7.543 p90_ms=7.930 max_ms=7.930 mean_ms=7.405
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [summary] mode=separate evict_mib=256 nsel=6 case=d8f_after_ane_evicted n=6 min_ms=7.764 p50_ms=8.066 p90_ms=8.212 max_ms=8.212 mean_ms=7.992
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [summary] mode=separate evict_mib=256 nsel=6 case=ane_after_d8f n=6 min_ms=13.729 p50_ms=17.840 p90_ms=22.715 max_ms=22.715 mean_ms=18.514
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [summary] mode=separate evict_mib=256 nsel=6 case=serial_ane_d8f n=6 min_ms=16.639 p50_ms=20.004 p90_ms=30.054 max_ms=30.054 mean_ms=21.828
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [summary] mode=separate evict_mib=256 nsel=6 case=concurrent n=6 min_ms=11.995 p50_ms=14.960 p90_ms=23.607 max_ms=23.607 mean_ms=16.736
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [summary] mode=separate evict_mib=256 nsel=6 case=merge_only n=6 min_ms=0.250 p50_ms=0.348 p90_ms=0.648 max_ms=0.648 mean_ms=0.408
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [summary] mode=separate evict_mib=256 nsel=6 case=serial_ane_d8f_merge n=6 min_ms=19.109 p50_ms=23.026 p90_ms=29.745 max_ms=29.745 mean_ms=23.816
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [summary] mode=separate evict_mib=256 nsel=6 case=concurrent_then_merge n=6 min_ms=13.207 p50_ms=18.071 p90_ms=22.676 max_ms=22.676 mean_ms=17.503
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [derived] mode=separate evict_mib=256 nsel=6 ane_plus_d8f_p50_ms=20.251 serial_measured_p50_ms=20.004 concurrent_p50_ms=14.960 overlap_speedup_p50=1.354
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [merge_effect] mode=separate evict_mib=256 nsel=6 merge_p50_ms=0.348 ane_plus_d8f_plus_merge_p50_ms=20.599 serial_merge_p50_ms=23.026 concurrent_then_merge_p50_ms=18.071 overlap_merge_speedup_p50=1.140
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [cache_effect] mode=separate evict_mib=256 nsel=6 d8f_only_p50_ms=7.791 d8f_evicted_p50_ms=7.708 d8f_after_ane_p50_ms=7.543 d8f_after_ane_evicted_p50_ms=8.066 evict_p50_ms=14.359
+2026-06-04 00:20:54.541 ane_d8f_routed_counterbalanced_canary[99597:12549215] [samples] ane0=0xa2ac d8f0=0xb7bc merged0=0xb7f1
