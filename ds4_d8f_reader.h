@@ -45,6 +45,16 @@ typedef struct ds4_d8f_sidecar_record {
     float reserved_f32;
 } ds4_d8f_sidecar_record;
 
+typedef struct ds4_d8f_native_code_record {
+    uint32_t expert;
+    uint32_t rows;
+    uint32_t groups;
+    uint32_t dtype;
+    uint64_t offset;
+    uint32_t bytes;
+    uint32_t flags;
+} ds4_d8f_native_code_record;
+
 typedef struct ds4_d8f_file {
     int fd;
     const uint8_t *map;
@@ -65,12 +75,17 @@ typedef struct ds4_d8f_file {
     uint32_t gateup_overlay_records;
     uint32_t gateup_overlay_live_slots;
     uint32_t gateup_overlay_sentinel;
+    uint64_t down_native_code_sidecar_table_offset;
+    uint32_t down_native_code_sidecar_record_bytes;
+    uint32_t down_native_code_sidecar_records;
+    uint32_t down_native_code_sidecar_count;
     bool gateup_rowblock_overlay;
     bool rank1_residual_sidecars;
     bool sidecar_required;
     bool sidecar_none_selected;
     ds4_d8f_record records[DS4_D8F_PROJECTION_COUNT][256];
     ds4_d8f_sidecar_record down_sidecars[256];
+    ds4_d8f_native_code_record down_native_codes[256];
 } ds4_d8f_file;
 
 bool ds4_d8f_open(const char *path, ds4_d8f_file *file);
@@ -78,7 +93,9 @@ void ds4_d8f_close(ds4_d8f_file *file);
 bool ds4_d8f_get_record(const ds4_d8f_file *file, ds4_d8f_projection projection, uint32_t expert, ds4_d8f_record *out);
 bool ds4_d8f_get_gateup_overlay_record(const ds4_d8f_file *file, ds4_d8f_projection projection, uint32_t expert, uint32_t row_block, ds4_d8f_record *out);
 bool ds4_d8f_get_down_sidecar(const ds4_d8f_file *file, uint32_t expert, ds4_d8f_sidecar_record *out);
+bool ds4_d8f_get_down_native_codes(const ds4_d8f_file *file, uint32_t expert, ds4_d8f_native_code_record *out);
 uint32_t ds4_d8f_down_sidecar_count(const ds4_d8f_file *file);
+uint32_t ds4_d8f_down_native_code_sidecar_count(const ds4_d8f_file *file);
 uint32_t ds4_d8f_gateup_overlay_count(const ds4_d8f_file *file);
 uint32_t ds4_d8f_code_at(const ds4_d8f_file *file, const ds4_d8f_record *record, uint64_t block_index);
 void ds4_d8f_print_summary(const ds4_d8f_file *file);

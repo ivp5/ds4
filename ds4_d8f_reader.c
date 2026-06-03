@@ -13,6 +13,8 @@ enum {
     DS4_D8F_EXPERTS = 256,
     DS4_D8F_RECORD_BYTES = 64,
     DS4_D8F_SIDECAR_RECORD_BYTES = 64,
+    DS4_D8F_NATIVE_CODE_RECORD_BYTES = 32,
+    DS4_D8F_NATIVE_CODE_DTYPE_U16 = 1,
     DS4_D8F_FLAG_ACT_SCALE = 1u,
     DS4_D8F_GATEUP_OVERLAY_PROJECTIONS = 2,
     DS4_D8F_GATEUP_ROW_BLOCKS = 16,
@@ -182,6 +184,16 @@ static void d8f_record_read(const uint8_t *p, ds4_d8f_record *out) {
     out->flags = d8f_u32(p + 60);
 }
 
+static void d8f_native_code_read(const uint8_t *p, ds4_d8f_native_code_record *out) {
+    out->expert = d8f_u32(p + 0);
+    out->rows = d8f_u32(p + 4);
+    out->groups = d8f_u32(p + 8);
+    out->dtype = d8f_u32(p + 12);
+    out->offset = d8f_u64(p + 16);
+    out->bytes = d8f_u32(p + 24);
+    out->flags = d8f_u32(p + 28);
+}
+
 static bool d8f_span_ok(const ds4_d8f_file *file, uint64_t offset, uint64_t bytes) {
     if (bytes == 0u) return false;
     if (offset < DS4_D8F_HEADER_BYTES + (uint64_t)DS4_D8F_PROJECTION_COUNT * DS4_D8F_EXPERTS * DS4_D8F_RECORD_BYTES) return false;
@@ -315,6 +327,30 @@ bool ds4_d8f_open(const char *path, ds4_d8f_file *file) {
             return false;
         }
     }
+    uint64_t native_code_offset = 0;
+    if (d8f_header_u64(header_json, file->header_json_bytes, "down_native_code_sidecar_table_offset", &native_code_offset)) {
+        file->down_native_code_sidecar_table_offset = native_code_offset;
+        file->down_native_code_sidecar_record_bytes =
+            d8f_header_u32_or(header_json, file->header_json_bytes,
+                              "down_native_code_sidecar_record_bytes", DS4_D8F_NATIVE_CODE_RECORD_BYTES);
+        file->down_native_code_sidecar_records =
+            d8f_header_u32_or(header_json, file->header_json_bytes,
+                              "down_native_code_sidecar_records", DS4_D8F_EXPERTS);
+        if (file->down_native_code_sidecar_record_bytes != DS4_D8F_NATIVE_CODE_RECORD_BYTES ||
+            file->down_native_code_sidecar_records > DS4_D8F_EXPERTS ||
+            file->down_native_code_sidecar_table_offset <
+                DS4_D8F_HEADER_BYTES + (uint64_t)DS4_D8F_PROJECTION_COUNT * DS4_D8F_EXPERTS * DS4_D8F_RECORD_BYTES ||
+            file->down_native_code_sidecar_table_offset +
+                (uint64_t)file->down_native_code_sidecar_records * file->down_native_code_sidecar_record_bytes >
+                (uint64_t)file->size) {
+            fprintf(stderr, "ds4_d8f: invalid down native-code sidecar table off=%llu records=%u record_bytes=%u\n",
+                    (unsigned long long)file->down_native_code_sidecar_table_offset,
+                    file->down_native_code_sidecar_records,
+                    file->down_native_code_sidecar_record_bytes);
+            ds4_d8f_close(file);
+            return false;
+        }
+    }
     const uint8_t *table = base + DS4_D8F_HEADER_BYTES;
     for (uint32_t projection = 0; projection < DS4_D8F_PROJECTION_COUNT; projection++) {
         for (uint32_t expert = 0; expert < DS4_D8F_EXPERTS; expert++) {
@@ -428,6 +464,28 @@ bool ds4_d8f_open(const char *path, ds4_d8f_file *file) {
             file->sidecar_count++;
         }
     }
+    if (file->down_native_code_sidecar_table_offset) {
+        const uint8_t *native_table = base + file->down_native_code_sidecar_table_offset;
+        for (uint32_t i = 0; i < file->down_native_code_sidecar_records; i++) {
+            ds4_d8f_native_code_record rec;
+            d8f_native_code_read(native_table + (size_t)i * DS4_D8F_NATIVE_CODE_RECORD_BYTES, &rec);
+            if (rec.bytes == 0u) continue;
+            if (rec.expert >= DS4_D8F_EXPERTS ||
+                rec.rows != 4096u ||
+                rec.groups != 256u ||
+                rec.dtype != DS4_D8F_NATIVE_CODE_DTYPE_U16 ||
+                rec.flags != 0u ||
+                rec.bytes != rec.rows * rec.groups * 2u ||
+                !d8f_payload_span_ok(file, rec.offset, rec.bytes)) {
+                fprintf(stderr, "ds4_d8f: invalid down native-code sidecar row=%u expert=%u rows=%u groups=%u dtype=%u bytes=%u\n",
+                        i, rec.expert, rec.rows, rec.groups, rec.dtype, rec.bytes);
+                ds4_d8f_close(file);
+                return false;
+            }
+            file->down_native_codes[rec.expert] = rec;
+            file->down_native_code_sidecar_count++;
+        }
+    }
     if (file->sidecar_count > 0u && !file->rank1_residual_sidecars) {
         fprintf(stderr,
                 "ds4_d8f: sidecar table present without rank1-residual codec contract "
@@ -501,8 +559,20 @@ bool ds4_d8f_get_down_sidecar(const ds4_d8f_file *file, uint32_t expert, ds4_d8f
     return true;
 }
 
+bool ds4_d8f_get_down_native_codes(const ds4_d8f_file *file, uint32_t expert, ds4_d8f_native_code_record *out) {
+    if (!file || !out || expert >= DS4_D8F_EXPERTS) return false;
+    ds4_d8f_native_code_record rec = file->down_native_codes[expert];
+    if (rec.bytes == 0u) return false;
+    *out = rec;
+    return true;
+}
+
 uint32_t ds4_d8f_down_sidecar_count(const ds4_d8f_file *file) {
     return file ? file->sidecar_count : 0u;
+}
+
+uint32_t ds4_d8f_down_native_code_sidecar_count(const ds4_d8f_file *file) {
+    return file ? file->down_native_code_sidecar_count : 0u;
 }
 
 uint32_t ds4_d8f_gateup_overlay_count(const ds4_d8f_file *file) {
