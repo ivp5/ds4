@@ -36,6 +36,74 @@ static double ds4_mpsgraph_seconds(void) {
     return (double)mach_absolute_time() * (double)timebase.numer / (double)timebase.denom * 1e-9;
 }
 
+static const char *ds4_mpsgraph_compile_mode(void) {
+    const char *mode = getenv("DS4_MPSGRAPH_COMPILE_MODE");
+    if (!mode || !mode[0] || strcmp(mode, "default") == 0) return "default";
+    if (strcmp(mode, "level0") == 0 ||
+        strcmp(mode, "level1") == 0 ||
+        strcmp(mode, "fastmath") == 0 ||
+        strcmp(mode, "runtime_type_infer") == 0) return mode;
+    return "default";
+}
+
+static MPSGraphCompilationDescriptor *ds4_mpsgraph_compile_descriptor(void) {
+    const char *mode = ds4_mpsgraph_compile_mode();
+    if (strcmp(mode, "default") == 0) return nil;
+    MPSGraphCompilationDescriptor *descriptor = [[MPSGraphCompilationDescriptor alloc] init];
+    descriptor.waitForCompilationCompletion = YES;
+    descriptor.optimizationLevel = strcmp(mode, "level0") == 0 ? MPSGraphOptimizationLevel0 : MPSGraphOptimizationLevel1;
+    if (strcmp(mode, "fastmath") == 0) {
+        descriptor.reducedPrecisionFastMath = MPSGraphReducedPrecisionFastMathAllowFP16Intermediates;
+    } else if (strcmp(mode, "runtime_type_infer") == 0) {
+        [descriptor disableTypeInference];
+    }
+    return descriptor;
+}
+
+static bool ds4_mpsgraph_async_batch_enabled(void) {
+    return getenv("DS4_MPSGRAPH_ASYNC_BATCH") != NULL;
+}
+
+static const char *ds4_mpsgraph_execution_mode(void) {
+    return ds4_mpsgraph_async_batch_enabled() ? "async_batch" : "sync";
+}
+
+static double ds4_mpsgraph_time_executable(MPSGraphExecutable *executable,
+                                           id<MTLCommandQueue> queue,
+                                           NSArray<MPSGraphTensorData *> *inputs,
+                                           NSArray<MPSGraphTensorData *> *outputs,
+                                           uint32_t rounds) {
+    for (uint32_t i = 0; i < 3u; i++) {
+        [executable runWithMTLCommandQueue:queue
+                               inputsArray:inputs
+                              resultsArray:outputs
+                       executionDescriptor:nil];
+    }
+    const double t0 = ds4_mpsgraph_seconds();
+    if (!ds4_mpsgraph_async_batch_enabled()) {
+        for (uint32_t i = 0; i < rounds; i++) {
+            [executable runWithMTLCommandQueue:queue
+                                   inputsArray:inputs
+                                  resultsArray:outputs
+                           executionDescriptor:nil];
+        }
+        return ds4_mpsgraph_seconds() - t0;
+    }
+    id<MTLSharedEvent> event = [queue.device newSharedEvent];
+    if (!event) return -1.0;
+    event.signaledValue = 0u;
+    for (uint32_t i = 0; i < rounds; i++) {
+        MPSGraphExecutableExecutionDescriptor *descriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
+        [descriptor signalEvent:event atExecutionEvent:MPSGraphExecutionStageCompleted value:i + 1u];
+        [executable runAsyncWithMTLCommandQueue:queue
+                                    inputsArray:inputs
+                                   resultsArray:outputs
+                            executionDescriptor:descriptor];
+    }
+    if (![event waitUntilSignaledValue:rounds timeoutMS:60000u]) return -1.0;
+    return ds4_mpsgraph_seconds() - t0;
+}
+
 static bool ds4_mpsgraph_prepare_indices(const ds4_d8f_file *file,
                                          const ds4_d8f_record *record,
                                          uint32_t rows,
@@ -339,11 +407,12 @@ int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
             if (diff > tol_abs && rel > tol_rel) bad++;
         }
         rms = sqrt(rms / (double)rows);
+        MPSGraphCompilationDescriptor *compile_descriptor = ds4_mpsgraph_compile_descriptor();
         MPSGraphExecutable *executable = [graph compileWithDevice:nil
                                                             feeds:feed_types
                                                     targetTensors:@[out]
                                                  targetOperations:nil
-                                            compilationDescriptor:nil];
+                                            compilationDescriptor:compile_descriptor];
         executable.options = MPSGraphOptionsNone;
         const size_t timed_out_bytes = fp32_path ? out_bytes : (size_t)rows * sizeof(uint16_t);
         id<MTLBuffer> timed_out = [device newBufferWithLength:timed_out_bytes
@@ -352,20 +421,7 @@ int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
                                                                                      shape:@[@(rows)]
                                                                                   dataType:data_type];
         NSArray *outputs = @[timed_out_data];
-        for (uint32_t i = 0; i < 3u; i++) {
-            [executable runWithMTLCommandQueue:queue
-                                   inputsArray:inputs
-                                  resultsArray:outputs
-                           executionDescriptor:nil];
-        }
-        const double t0 = ds4_mpsgraph_seconds();
-        for (uint32_t i = 0; i < rounds; i++) {
-            [executable runWithMTLCommandQueue:queue
-                                   inputsArray:inputs
-                                  resultsArray:outputs
-                           executionDescriptor:nil];
-        }
-        const double elapsed = ds4_mpsgraph_seconds() - t0;
+        const double elapsed = ds4_mpsgraph_time_executable(executable, queue, inputs, outputs, rounds);
         const double us_per = elapsed * 1.0e6 / (double)rounds;
         double logical_bytes = (double)out_bytes;
         for (uint32_t slot = 0; slot < n_experts; slot++) {
@@ -383,9 +439,9 @@ int ds4_gpu_mpsgraph_d8f_down_lut_selected_canary(const char *d8f_path,
             strlcat(expert_csv, item, sizeof(expert_csv));
         }
         fprintf(stderr,
-                "ds4_mpsgraph: d8f_down_lut_selected path=%s experts=%s nsel=%u rows=%u max_k=%u mode=%s rounds=%u us/op=%.3f logical_MB/op=%.3f bad=%u max_abs=%.6g max_rel=%.6g rms=%.6g sample_ref=%.6g sample_got=%.6g\n",
+                "ds4_mpsgraph: d8f_down_lut_selected path=%s experts=%s nsel=%u rows=%u max_k=%u mode=%s compile=%s exec=%s rounds=%u us/op=%.3f logical_MB/op=%.3f bad=%u max_abs=%.6g max_rel=%.6g rms=%.6g sample_ref=%.6g sample_got=%.6g\n",
                 d8f_path, expert_csv, n_experts, rows, max_k,
-                fp32_path ? "fp32" : "fp16", rounds, us_per, logical_bytes / 1.0e6,
+                fp32_path ? "fp32" : "fp16", ds4_mpsgraph_compile_mode(), ds4_mpsgraph_execution_mode(), rounds, us_per, logical_bytes / 1.0e6,
                 bad, max_abs, max_rel, rms, (double)ref[0], (double)got[0]);
         ds4_mpsgraph_free_down_arrays(n_experts, indices, cb_f32, cb_f16, x_f32, x_f16);
         free(got); free(ref);
@@ -619,7 +675,12 @@ int ds4_gpu_mpsgraph_d8f_gateup_lut_selected_canary(const char *d8f_path,
         }
         rms = sqrt(rms / (double)out_count);
         MPSGraphShapedType *x_type = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(gateup_in_dim)] dataType:data_type];
-        MPSGraphExecutable *executable = [graph compileWithDevice:nil feeds:@{ x: x_type } targetTensors:@[out] targetOperations:nil compilationDescriptor:nil];
+        MPSGraphCompilationDescriptor *compile_descriptor = ds4_mpsgraph_compile_descriptor();
+        MPSGraphExecutable *executable = [graph compileWithDevice:nil
+                                                            feeds:@{ x: x_type }
+                                                    targetTensors:@[out]
+                                                 targetOperations:nil
+                                            compilationDescriptor:compile_descriptor];
         executable.options = MPSGraphOptionsNone;
         const size_t timed_out_bytes = fp32_path ? out_bytes : out_count * sizeof(uint16_t);
         id<MTLBuffer> timed_out = [device newBufferWithLength:timed_out_bytes options:MTLResourceStorageModeShared];
@@ -628,14 +689,7 @@ int ds4_gpu_mpsgraph_d8f_gateup_lut_selected_canary(const char *d8f_path,
                                                                                   dataType:data_type];
         NSArray *inputs = @[xdata];
         NSArray *outputs = @[timed_out_data];
-        for (uint32_t i = 0; i < 3u; i++) {
-            [executable runWithMTLCommandQueue:queue inputsArray:inputs resultsArray:outputs executionDescriptor:nil];
-        }
-        const double t0 = ds4_mpsgraph_seconds();
-        for (uint32_t i = 0; i < rounds; i++) {
-            [executable runWithMTLCommandQueue:queue inputsArray:inputs resultsArray:outputs executionDescriptor:nil];
-        }
-        const double elapsed = ds4_mpsgraph_seconds() - t0;
+        const double elapsed = ds4_mpsgraph_time_executable(executable, queue, inputs, outputs, rounds);
         const double us_per = elapsed * 1.0e6 / (double)rounds;
         double logical_bytes = (double)(x_f16_bytes + out_count * sizeof(uint16_t));
         for (uint32_t slot = 0; slot < n_experts; slot++) {
@@ -653,9 +707,9 @@ int ds4_gpu_mpsgraph_d8f_gateup_lut_selected_canary(const char *d8f_path,
             strlcat(expert_csv, item, sizeof(expert_csv));
         }
         fprintf(stderr,
-                "ds4_mpsgraph: d8f_gateup_lut_selected path=%s experts=%s nsel=%u rows=%u max_k=%u mode=%s rounds=%u clamp=%.1f us/op=%.3f logical_MB/op=%.3f bad=%u max_abs=%.6g max_rel=%.6g rms=%.6g sample_ref=%.6g sample_got=%.6g\n",
+                "ds4_mpsgraph: d8f_gateup_lut_selected path=%s experts=%s nsel=%u rows=%u max_k=%u mode=%s compile=%s exec=%s rounds=%u clamp=%.1f us/op=%.3f logical_MB/op=%.3f bad=%u max_abs=%.6g max_rel=%.6g rms=%.6g sample_ref=%.6g sample_got=%.6g\n",
                 d8f_path, expert_csv, n_experts, rows, max_k, fp32_path ? "fp32" : "fp16",
-                rounds, swiglu_limit, us_per, logical_bytes / 1.0e6,
+                ds4_mpsgraph_compile_mode(), ds4_mpsgraph_execution_mode(), rounds, swiglu_limit, us_per, logical_bytes / 1.0e6,
                 bad, max_abs, max_rel, rms, (double)ref[0], (double)got[0]);
         ds4_mpsgraph_free_gateup_arrays(n_experts, gate_idx, up_idx, gate_cb_f32, up_cb_f32, gate_cb_f16, up_cb_f16);
         free(up_tmp); free(gate_tmp); free(got); free(ref); free(x_f16); free(x_f32);

@@ -66,3 +66,13 @@ Append-only transaction log. Scope: IVP5 DS4 MPSGraph/ANE runtime architecture, 
 - Correctness: all real-record runs passed `bad=0`; after fixing the input seed to match `ds4_mpsgraph`, sample reference is `0.174939`.
 - Performance: specialized packed Metal is noisy but in contact with the right wall: `880-1435 us/op` in comparable r20/r50 runs versus same-window MPSGraph expanded r50 `748.555 us/op`.
 - Decision: single-expert packed Metal is not yet enough; continue by fusing selected-six experts/route weights or improving memory/coalescing. It remains the right path because it preserves packed indices and removes host-expanded gather materialization.
+
+## 2026-06-04T01:23 JST — MPSGraph/ANE low-level API pass
+
+- Local SDK is Xcode macOS/iPhoneOS 26.5. Relevant primary APIs: `MPSGraphCompilationDescriptor`, `MPSGraphExecutableExecutionDescriptor`, `MTLSharedEvent`, `MLModelConfiguration.optimizationHints`, and `MLComputePlan`.
+- MPSGraph direct device control is narrow: public `MPSGraphDevice` is Metal-only. The usable loopholes are compile descriptors, reduced-precision flags, async executable calls, shared events, MPSGraph packages, and MTLTensor aliasing in macOS 16/iOS 19 headers; prior project notes still mark MTLTensor/MTL4-ML as brittle.
+- Added real canary gates in `ds4_mpsgraph.m`: `DS4_MPSGRAPH_COMPILE_MODE` and `DS4_MPSGRAPH_ASYNC_BATCH`. Defaults stay conservative; the async gate is the high-value path.
+- Synthetic async batching with shared events showed the clearest MPSGraph gain: for 12-bit VQ-D8 rows=4096 r50, expanded sync `735.787 us` to async batch `398.767 us`, packed sync `1421.571 us` to async batch `695.074 us`.
+- Real H3355 selected-six async batching is also useful: down r50 `1609.519 -> 1081.396 us/op`, gate/up r50 `1719.212 -> 1242.824 us/op`, all `bad=0`.
+- CoreML `MLComputePlan` confirms actual ANE placement for shared packages: L0 b2048 8-bit reports `ane_preferred=9/21` ops and `ane_supported=9/21`, with operators `const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1`.
+- Architecture update: stop treating ANE and MPSGraph as one opaque offload. CoreML owns ANE placement; MPSGraph owns GPU graph execution and queue/fence shape. The overlap organ should use CoreML output backings plus MPSGraph async-batch/event fences, then merge on GPU.

@@ -53,6 +53,83 @@ static MLMultiArray *make_zero_input(NSArray<NSNumber *> *shape) {
     return array;
 }
 
+static MLModelConfiguration *make_configuration(void) {
+    MLModelConfiguration *config = [[MLModelConfiguration alloc] init];
+    config.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
+    MLOptimizationHints *hints = [[MLOptimizationHints alloc] init];
+    hints.reshapeFrequency = MLReshapeFrequencyHintInfrequent;
+    hints.specializationStrategy = MLSpecializationStrategyFastPrediction;
+    config.optimizationHints = hints;
+    return config;
+}
+
+static MLComputePlan *load_compute_plan(NSURL *compiled_url, MLModelConfiguration *config) {
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    __block MLComputePlan *loaded_plan = nil;
+    __block NSError *loaded_error = nil;
+    [MLComputePlan loadContentsOfURL:compiled_url
+                        configuration:config
+                    completionHandler:^(MLComputePlan * _Nullable computePlan, NSError * _Nullable error) {
+        loaded_plan = computePlan;
+        loaded_error = error;
+        dispatch_semaphore_signal(semaphore);
+    }];
+    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+    if (!loaded_plan && loaded_error) NSLog(@"[plan_error] %@", loaded_error.localizedDescription);
+    return loaded_plan;
+}
+
+static void summarize_compute_plan(MLComputePlan *plan, NSString *path) {
+    if (!plan) {
+        NSLog(@"[plan] path=%@ unavailable", path);
+        return;
+    }
+    MLModelStructureProgram *program = plan.modelStructure.program;
+    if (!program) {
+        NSLog(@"[plan] path=%@ type=non_program", path);
+        return;
+    }
+    MLModelStructureProgramFunction *function = program.functions[@"main"] ?: program.functions.allValues.firstObject;
+    NSArray<MLModelStructureProgramOperation *> *operations = function.block.operations;
+    NSUInteger ane_preferred = 0, gpu_preferred = 0, cpu_preferred = 0, other_preferred = 0;
+    NSUInteger ane_supported = 0, unknown_usage = 0;
+    NSMutableDictionary<NSString *, NSNumber *> *operators = [NSMutableDictionary dictionary];
+    for (MLModelStructureProgramOperation *operation in operations) {
+        operators[operation.operatorName] = @((operators[operation.operatorName].unsignedIntegerValue) + 1u);
+        MLComputePlanDeviceUsage *usage = [plan computeDeviceUsageForMLProgramOperation:operation];
+        if (!usage) {
+            unknown_usage++;
+            continue;
+        }
+        NSString *preferred = NSStringFromClass([usage.preferredComputeDevice class]);
+        if ([preferred containsString:@"NeuralEngine"]) ane_preferred++;
+        else if ([preferred containsString:@"GPU"]) gpu_preferred++;
+        else if ([preferred containsString:@"CPU"]) cpu_preferred++;
+        else other_preferred++;
+        for (id<MLComputeDeviceProtocol> device in usage.supportedComputeDevices) {
+            if ([NSStringFromClass([device class]) containsString:@"NeuralEngine"]) {
+                ane_supported++;
+                break;
+            }
+        }
+    }
+    NSArray<NSString *> *operator_names = [operators.allKeys sortedArrayUsingSelector:@selector(compare:)];
+    NSMutableString *operator_summary = [NSMutableString string];
+    for (NSString *name in operator_names) {
+        [operator_summary appendFormat:@"%@%@:%@", operator_summary.length ? @"," : @"", name, operators[name]];
+    }
+    NSLog(@"[plan] path=%@ ops=%lu ane_preferred=%lu gpu_preferred=%lu cpu_preferred=%lu other_preferred=%lu ane_supported=%lu unknown_usage=%lu operators=%@",
+          path,
+          (unsigned long)operations.count,
+          (unsigned long)ane_preferred,
+          (unsigned long)gpu_preferred,
+          (unsigned long)cpu_preferred,
+          (unsigned long)other_preferred,
+          (unsigned long)ane_supported,
+          (unsigned long)unknown_usage,
+          operator_summary);
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         if (argc < 2) {
@@ -70,8 +147,9 @@ int main(int argc, const char **argv) {
                 NSURL *compiled_url = [MLModel compileModelAtURL:[NSURL fileURLWithPath:path] error:&error];
                 if (!compiled_url) die([NSString stringWithFormat:@"compile failed %@", path], error);
                 double compile_done = now_seconds();
-                MLModelConfiguration *config = [[MLModelConfiguration alloc] init];
-                config.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
+                MLModelConfiguration *config = make_configuration();
+                MLComputePlan *compute_plan = load_compute_plan(compiled_url, config);
+                summarize_compute_plan(compute_plan, path);
                 double load_start = now_seconds();
                 MLModel *model = [MLModel modelWithContentsOfURL:compiled_url configuration:config error:&error];
                 if (!model) die([NSString stringWithFormat:@"load failed %@", path], error);

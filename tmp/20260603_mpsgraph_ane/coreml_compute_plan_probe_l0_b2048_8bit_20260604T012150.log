@@ -1,0 +1,4 @@
+2026-06-04 01:21:50.477 coreml_shared_cache_probe[7089:12606829] [start] packages=1 footprint_mib=1.53
+2026-06-04 01:21:53.446 coreml_shared_cache_probe[7089:12606829] [plan] path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage ops=21 ane_preferred=9 gpu_preferred=0 cpu_preferred=0 other_preferred=0 ane_supported=9 unknown_usage=12 operators=const:9,identity:1,ios18.matmul:3,ios18.silu:1,ios19.constexpr_lut_to_dense:3,ios19.maximum:1,ios19.minimum:2,ios19.mul:1
+2026-06-04 01:21:55.953 coreml_shared_cache_probe[7089:12606829] [model] index=0 path=tmp/20260603_mpsgraph_ane/shared_l0_b2048_8bit_20260603T234320.mlpackage compile_ms=69.409 load_ms=2485.184 predict_ms=19.996 resident_models=1 footprint_mib=81.53 delta_mib=80.00
+2026-06-04 01:21:55.953 coreml_shared_cache_probe[7089:12606829] [done] resident_models=1 final_footprint_mib=81.53 total_delta_mib=80.00

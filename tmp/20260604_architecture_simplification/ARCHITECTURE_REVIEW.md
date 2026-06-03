@@ -47,3 +47,10 @@ The clean runtime architecture is a small set of cold-owned organs:
 3. Package cache manifest: record layer package path, compile URL, resident footprint, load state, and validation status in one typed table.
 4. Canary harness library: if more ANE/MPSGraph canaries are added, extract shared CoreML feature/backing helpers instead of copy-pasting per file.
 5. Selected-six Metal fusion: extend the real packed down kernel from one H3355 expert to selected-six with route weights, then compare against MPSGraph selected-six and the full ANE+D8F overlap canary.
+
+## Low-Level API Architecture Update
+
+- MPSGraph should be treated as a GPU graph scheduler with useful compile and execution descriptors, not as the primary packed-index memory-floor engine.
+- CoreML is the public ANE surface. `MLComputePlan` is now the placement verifier; `MLModelConfiguration.optimizationHints` is the specialization lever.
+- The highest-probability overlap structure is: CoreML ANE shared branch with output backing, MPSGraph routed branch enqueued through async/shared-event batches, then a GPU merge. This avoids CPU readback and exploits queue headroom.
+- Packed Metal remains the memory-floor candidate for routed D8F because it preserves packed indices and can own mixed `k/bits` metadata directly.

@@ -50,3 +50,13 @@ Do not promote generic MPSGraph gather or packed-index MPSGraph decode as the fi
 4. parallel ANE shared + GPU routed launch;
 5. GPU merge into the layer FFN output;
 6. no CPU readback and no hot-path model/package loading.
+
+## 2026-06-04T01:23 JST — deeper low-level API findings
+
+- Header audit: local SDK 26.5 exposes `MPSGraphCompilationDescriptor` with `optimizationLevel`, `waitForCompilationCompletion`, `disableTypeInference`, and macOS/iOS 26 `reducedPrecisionFastMath`; `MPSGraphExecutableExecutionDescriptor` supports `waitUntilCompleted`, completion/scheduled handlers, and `MTLSharedEvent` wait/signal at `MPSGraphExecutionStageCompleted`.
+- Header audit: `MPSGraphDevice` is publicly Metal-only. MPSGraph may internally place work under optimization level 1, but there is no public ANE selector comparable to CoreML `MLComputeUnitsCPUAndNeuralEngine`.
+- Descriptor canary: compile modes are noisy and should remain an env-gated experiment. They can affect one shape, but did not produce stable universal wins across real down/gateup canaries.
+- Execution canary: shared-event async batching is stable enough to keep. Synthetic 12-bit VQ-D8 r50 showed expanded `735.787 -> 398.767 us/op` and packed `1421.571 -> 695.074 us/op` when enqueueing runs asynchronously and waiting once on an `MTLSharedEvent`.
+- Real canary: H3355 L26 selected-six MPSGraph r50 improved down `1609.519 -> 1081.396 us/op` and gate/up `1719.212 -> 1242.824 us/op`, both `bad=0`, using `DS4_MPSGRAPH_ASYNC_BATCH=1`.
+- CoreML plan canary: `MLComputePlan` on `shared_l0_b2048_8bit` reports `ane_preferred=9`, `ane_supported=9`, `unknown_usage=12`, proving the ANE path is live for the compiled shared package rather than inferred from timing alone.
+- Steelman conclusion: MPSGraph's deepest useful lever for this project is not in-graph packed decode; it is scheduling/fence control. Use it to batch/overlap GPU graph work while CoreML handles ANE shared-prefill/high-B work.

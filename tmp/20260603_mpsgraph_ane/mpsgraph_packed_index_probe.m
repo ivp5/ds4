@@ -112,6 +112,35 @@ static MPSGraphTensor *decode_packed_indices(MPSGraph *graph,
     return [graph bitwiseANDWithPrimaryTensor:shifted secondaryTensor:mask name:@"packed_codes_i32"];
 }
 
+static const char *descriptor_mode_name(uint32_t mode) {
+    switch (mode) {
+        case 1u: return "level0";
+        case 2u: return "level1";
+        case 3u: return "fastmath";
+        case 4u: return "runtime_type_infer";
+        default: return "default";
+    }
+}
+
+static uint32_t parse_descriptor_mode(const char *mode) {
+    if (!mode || !mode[0] || strcmp(mode, "default") == 0) return 0u;
+    if (strcmp(mode, "level0") == 0) return 1u;
+    if (strcmp(mode, "level1") == 0) return 2u;
+    if (strcmp(mode, "fastmath") == 0) return 3u;
+    if (strcmp(mode, "runtime_type_infer") == 0) return 4u;
+    return UINT32_MAX;
+}
+
+static MPSGraphCompilationDescriptor *make_compilation_descriptor(uint32_t mode) {
+    if (mode == 0u) return nil;
+    MPSGraphCompilationDescriptor *descriptor = [[MPSGraphCompilationDescriptor alloc] init];
+    descriptor.waitForCompilationCompletion = YES;
+    descriptor.optimizationLevel = mode == 1u ? MPSGraphOptimizationLevel0 : MPSGraphOptimizationLevel1;
+    if (mode == 3u) descriptor.reducedPrecisionFastMath = MPSGraphReducedPrecisionFastMathAllowFP16Intermediates;
+    if (mode == 4u) [descriptor disableTypeInference];
+    return descriptor;
+}
+
 static MPSGraphExecutable *build_executable(bool packed_path,
                                             uint32_t rows,
                                             uint32_t bits,
@@ -119,6 +148,7 @@ static MPSGraphExecutable *build_executable(bool packed_path,
                                             const uint16_t *codebook,
                                             const int32_t *expanded_indices,
                                             const uint8_t *packed_indices,
+                                            uint32_t descriptor_mode,
                                             MPSGraph **graph_out,
                                             MPSGraphTensor **x_tensor_out,
                                             MPSGraphTensor **out_tensor_out) {
@@ -148,11 +178,12 @@ static MPSGraphExecutable *build_executable(bool packed_path,
     MPSGraphTensor *out = build_lut(graph, x, codebook_tensor, indices, rows, packed_path ? @"packed" : @"expanded");
     MPSGraphShapedType *x_type = [[MPSGraphShapedType alloc] initWithShape:@[@1, @(kInputDim)]
                                                                    dataType:MPSDataTypeFloat16];
+    MPSGraphCompilationDescriptor *descriptor = make_compilation_descriptor(descriptor_mode);
     MPSGraphExecutable *executable = [graph compileWithDevice:nil
                                                         feeds:@{x : x_type}
                                                 targetTensors:@[out]
                                              targetOperations:nil
-                                        compilationDescriptor:nil];
+                                        compilationDescriptor:descriptor];
     if (!executable) {
         fprintf(stderr, "compile failed for %s path\n", packed_path ? "packed" : "expanded");
         exit(1);
@@ -181,15 +212,61 @@ static double time_executable(MPSGraphExecutable *executable,
     return (now_seconds() - start) * 1.0e6 / (double)rounds;
 }
 
+static double time_executable_async_wait(MPSGraphExecutable *executable,
+                                         id<MTLCommandQueue> queue,
+                                         MPSGraphTensorData *x_data,
+                                         MPSGraphTensorData *out_data,
+                                         uint32_t rounds) {
+    NSArray *inputs = @[x_data];
+    NSArray *outputs = @[out_data];
+    MPSGraphExecutableExecutionDescriptor *descriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
+    descriptor.waitUntilCompleted = YES;
+    for (uint32_t warmup = 0; warmup < 3u; ++warmup) {
+        [executable runAsyncWithMTLCommandQueue:queue inputsArray:inputs resultsArray:outputs executionDescriptor:descriptor];
+    }
+    double start = now_seconds();
+    for (uint32_t round = 0; round < rounds; ++round) {
+        [executable runAsyncWithMTLCommandQueue:queue inputsArray:inputs resultsArray:outputs executionDescriptor:descriptor];
+    }
+    return (now_seconds() - start) * 1.0e6 / (double)rounds;
+}
+
+static double time_executable_async_event_batch(MPSGraphExecutable *executable,
+                                                id<MTLCommandQueue> queue,
+                                                MPSGraphTensorData *x_data,
+                                                MPSGraphTensorData *out_data,
+                                                uint32_t rounds) {
+    id<MTLSharedEvent> event = [queue.device newSharedEvent];
+    if (!event) return -1.0;
+    NSArray *inputs = @[x_data];
+    NSArray *outputs = @[out_data];
+    for (uint32_t warmup = 0; warmup < 3u; ++warmup) {
+        MPSGraphExecutableExecutionDescriptor *descriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
+        [descriptor signalEvent:event atExecutionEvent:MPSGraphExecutionStageCompleted value:warmup + 1u];
+        [executable runAsyncWithMTLCommandQueue:queue inputsArray:inputs resultsArray:outputs executionDescriptor:descriptor];
+        if (![event waitUntilSignaledValue:warmup + 1u timeoutMS:60000u]) return -1.0;
+    }
+    event.signaledValue = 0u;
+    double start = now_seconds();
+    for (uint32_t round = 0; round < rounds; ++round) {
+        MPSGraphExecutableExecutionDescriptor *descriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
+        [descriptor signalEvent:event atExecutionEvent:MPSGraphExecutionStageCompleted value:round + 1u];
+        [executable runAsyncWithMTLCommandQueue:queue inputsArray:inputs resultsArray:outputs executionDescriptor:descriptor];
+    }
+    if (![event waitUntilSignaledValue:rounds timeoutMS:60000u]) return -1.0;
+    return (now_seconds() - start) * 1.0e6 / (double)rounds;
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         uint32_t rows = argc >= 2 ? (uint32_t)strtoul(argv[1], NULL, 10) : 4096u;
         uint32_t rounds = argc >= 3 ? (uint32_t)strtoul(argv[2], NULL, 10) : 20u;
         uint32_t bits = argc >= 4 ? (uint32_t)strtoul(argv[3], NULL, 10) : 4u;
+        uint32_t descriptor_mode = argc >= 5 ? parse_descriptor_mode(argv[4]) : 0u;
         if (rows == 0u || rows > 8192u) rows = 4096u;
         if (rounds == 0u) rounds = 20u;
-        if (bits != 4u && bits != 12u) {
-            fprintf(stderr, "usage: %s [rows] [rounds] [bits=4|12]\n", argv[0]);
+        if ((bits != 4u && bits != 12u) || descriptor_mode == UINT32_MAX) {
+            fprintf(stderr, "usage: %s [rows] [rounds] [bits=4|12] [default|level0|level1|fastmath|runtime_type_infer]\n", argv[0]);
             return 2;
         }
         const uint32_t code_count = 1u << bits;
@@ -253,14 +330,14 @@ int main(int argc, const char **argv) {
         MPSGraphTensor *expanded_tensor = nil;
         double compile_start = now_seconds();
         MPSGraphExecutable *expanded_exec = build_executable(false, rows, bits, code_count, codebook, expanded_indices, packed_indices,
-                                                             &expanded_graph, &expanded_x, &expanded_tensor);
+                                                             descriptor_mode, &expanded_graph, &expanded_x, &expanded_tensor);
         double expanded_compile_ms = (now_seconds() - compile_start) * 1.0e3;
         MPSGraph *packed_graph = nil;
         MPSGraphTensor *packed_x = nil;
         MPSGraphTensor *packed_tensor = nil;
         compile_start = now_seconds();
         MPSGraphExecutable *packed_exec = build_executable(true, rows, bits, code_count, codebook, expanded_indices, packed_indices,
-                                                           &packed_graph, &packed_x, &packed_tensor);
+                                                           descriptor_mode, &packed_graph, &packed_x, &packed_tensor);
         double packed_compile_ms = (now_seconds() - compile_start) * 1.0e3;
         (void)expanded_graph; (void)expanded_x; (void)expanded_tensor;
         (void)packed_graph; (void)packed_x; (void)packed_tensor;
@@ -280,13 +357,19 @@ int main(int argc, const char **argv) {
         rms = sqrt(rms / (double)rows);
         double expanded_us = time_executable(expanded_exec, queue, x_data, expanded_out_data, rounds);
         double packed_us = time_executable(packed_exec, queue, x_data, packed_out_data, rounds);
+        double expanded_async_wait_us = time_executable_async_wait(expanded_exec, queue, x_data, expanded_out_data, rounds);
+        double packed_async_wait_us = time_executable_async_wait(packed_exec, queue, x_data, packed_out_data, rounds);
+        double expanded_async_batch_us = time_executable_async_event_batch(expanded_exec, queue, x_data, expanded_out_data, rounds);
+        double packed_async_batch_us = time_executable_async_event_batch(packed_exec, queue, x_data, packed_out_data, rounds);
         double expanded_index_mb = (double)((size_t)kGroups * rows * sizeof(int32_t)) / 1.0e6;
         double packed_index_mb = (double)((size_t)kGroups * packed_bytes * sizeof(uint8_t)) / 1.0e6;
         fprintf(stderr,
-                "mpsgraph_packed_index_probe: rows=%u rounds=%u bits=%u groups=%u k=%u expanded_compile_ms=%.3f packed_compile_ms=%.3f expanded_us=%.3f packed_us=%.3f speedup=%.3f expanded_index_MB=%.3f packed_index_MB=%.3f index_shrink=%.3f bad=%u max_abs=%.6g rms=%.6g sample_exp=%.6g sample_pack=%.6g\n",
-                rows, rounds, bits, kGroups, code_count,
+                "mpsgraph_packed_index_probe: rows=%u rounds=%u bits=%u descriptor=%s groups=%u k=%u expanded_compile_ms=%.3f packed_compile_ms=%.3f expanded_us=%.3f packed_us=%.3f expanded_async_wait_us=%.3f packed_async_wait_us=%.3f expanded_async_batch_us=%.3f packed_async_batch_us=%.3f speedup=%.3f expanded_index_MB=%.3f packed_index_MB=%.3f index_shrink=%.3f bad=%u max_abs=%.6g rms=%.6g sample_exp=%.6g sample_pack=%.6g\n",
+                rows, rounds, bits, descriptor_mode_name(descriptor_mode), kGroups, code_count,
                 expanded_compile_ms, packed_compile_ms,
                 expanded_us, packed_us,
+                expanded_async_wait_us, packed_async_wait_us,
+                expanded_async_batch_us, packed_async_batch_us,
                 packed_us > 0.0 ? expanded_us / packed_us : 0.0,
                 expanded_index_mb, packed_index_mb,
                 packed_index_mb > 0.0 ? expanded_index_mb / packed_index_mb : 0.0,

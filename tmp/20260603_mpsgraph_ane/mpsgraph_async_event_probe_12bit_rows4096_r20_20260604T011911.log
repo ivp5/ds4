@@ -1,0 +1,4 @@
+mode=default
+mpsgraph_packed_index_probe: rows=4096 rounds=20 bits=12 descriptor=default groups=256 k=4096 expanded_compile_ms=4.960 packed_compile_ms=2.095 expanded_us=685.031 packed_us=1369.288 expanded_async_wait_us=694.190 packed_async_wait_us=1375.071 expanded_async_batch_us=411.798 packed_async_batch_us=1451.640 speedup=0.500 expanded_index_MB=4.194 packed_index_MB=1.573 index_shrink=2.666 bad=0 max_abs=0 rms=0 sample_exp=0.924805 sample_pack=0.924805
+mode=level0
+mpsgraph_packed_index_probe: rows=4096 rounds=20 bits=12 descriptor=level0 groups=256 k=4096 expanded_compile_ms=6.127 packed_compile_ms=3.876 expanded_us=711.206 packed_us=1403.115 expanded_async_wait_us=724.048 packed_async_wait_us=1405.319 expanded_async_batch_us=424.356 packed_async_batch_us=1429.017 speedup=0.507 expanded_index_MB=4.194 packed_index_MB=1.573 index_shrink=2.666 bad=0 max_abs=0 rms=0 sample_exp=0.924805 sample_pack=0.924805
