@@ -19,10 +19,12 @@ It changes locality, not quantization math or fidelity.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +90,63 @@ def parse_layer_hot_json(path: Path) -> dict[int, list[int]]:
                     result[layer].append(expert)
         if not result[layer]:
             raise SystemExit(f"L{layer} has no hot experts")
+    return result
+
+
+def parse_route_stages(text: str) -> set[str] | None:
+    if not text or text == "all":
+        return None
+    stages = {part.strip() for part in text.split(",") if part.strip()}
+    if not stages:
+        return None
+    return stages
+
+
+def route_trace_hot_experts(path: Path, *, top: int, stages: set[str] | None, score_mode: str) -> dict[int, list[int]]:
+    if top <= 0 or top > EXPERTS:
+        raise SystemExit(f"--route-top out of range: {top}")
+    scores: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    counts: dict[int, int] = defaultdict(int)
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {"layer", "stage", *(f"e{i}" for i in range(6)), *(f"w{i}" for i in range(6))}
+        missing = sorted(required.difference(reader.fieldnames or []))
+        if missing:
+            raise SystemExit(f"{path}: route trace missing columns: {missing}")
+        for row in reader:
+            if stages is not None and row["stage"] not in stages:
+                continue
+            layer = int(row["layer"])
+            counts[layer] += 1
+            for slot in range(6):
+                expert = int(row[f"e{slot}"])
+                if expert < 0 or expert >= EXPERTS:
+                    raise SystemExit(f"{path}: expert out of range in L{layer}: {expert}")
+                if score_mode == "count":
+                    value = 1.0
+                elif score_mode == "mass":
+                    value = float(row[f"w{slot}"])
+                elif score_mode == "abs_mass":
+                    value = abs(float(row[f"w{slot}"]))
+                else:
+                    raise SystemExit(f"unknown route score mode: {score_mode}")
+                scores[layer][expert] += value
+    if not scores:
+        raise SystemExit(f"{path}: no route rows matched stages={sorted(stages) if stages else 'all'}")
+    result: dict[int, list[int]] = {}
+    for layer, layer_scores in scores.items():
+        ranked = sorted(layer_scores.items(), key=lambda item: (-item[1], item[0]))
+        result[layer] = [expert for expert, _ in ranked[:top]]
+    print(json.dumps({
+        "phase": "route_trace_hot_selection",
+        "trace_csv": str(path),
+        "layers": sorted(result),
+        "route_top": top,
+        "route_score": score_mode,
+        "route_stages": sorted(stages) if stages else "all",
+        "rows_by_layer": {str(layer): counts[layer] for layer in sorted(counts)},
+        "hot_experts": {str(layer): result[layer] for layer in sorted(result)},
+    }, sort_keys=True), flush=True)
     return result
 
 
@@ -271,6 +330,10 @@ def main() -> int:
     parser.add_argument("--layers", default="all", help="comma/range list, or all")
     parser.add_argument("--hot-experts", default="", help="comma/range list used for every selected layer")
     parser.add_argument("--hot-json", type=Path, help='JSON: {"layers":{"26":[165,0,1]}}')
+    parser.add_argument("--route-trace-csv", type=Path, help="DS4_ROUTER_TRACE_PE csv; top experts become layer-local hot order")
+    parser.add_argument("--route-top", type=int, default=6)
+    parser.add_argument("--route-stages", default="all", help="all, or comma list such as prefill,decode")
+    parser.add_argument("--route-score", choices=["mass", "abs_mass", "count"], default="mass")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--status-every", type=int, default=32)
@@ -290,7 +353,16 @@ def main() -> int:
         if missing:
             raise SystemExit(f"requested missing D8F layers: {missing}")
 
-    per_layer_hot = parse_layer_hot_json(args.hot_json) if args.hot_json else {}
+    per_layer_hot: dict[int, list[int]] = {}
+    if args.route_trace_csv:
+        per_layer_hot.update(route_trace_hot_experts(
+            args.route_trace_csv,
+            top=args.route_top,
+            stages=parse_route_stages(args.route_stages),
+            score_mode=args.route_score,
+        ))
+    if args.hot_json:
+        per_layer_hot.update(parse_layer_hot_json(args.hot_json))
     common_hot = parse_int_set(args.hot_experts, limit=EXPERTS, name="expert") if args.hot_experts else []
     reports: list[dict[str, Any]] = []
     for layer in layers:
@@ -331,6 +403,10 @@ def main() -> int:
         "pack_out_dir": None if args.pack_out_dir is None else str(args.pack_out_dir),
         "layers": layers,
         "common_hot_experts": common_hot,
+        "route_trace_csv": None if args.route_trace_csv is None else str(args.route_trace_csv),
+        "route_top": args.route_top,
+        "route_stages": args.route_stages,
+        "route_score": args.route_score,
         "layer_reports": reports,
         "all_ready": all(item.get("ready") for item in reports),
         "pack_entries": pack_entries,
