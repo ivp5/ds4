@@ -29,13 +29,17 @@ def parse_metrics(line):
         "buffer",
         "tex_linear2d",
         "tex_buffer",
+        "tex_sample",
         "speedup_2d",
         "speedup_tb",
+        "speedup_sample",
         "max_abs_buffer",
         "max_abs_texture",
         "max_abs_texture_buffer",
+        "max_abs_texture_sample",
         "max_abs_buf_tex",
         "max_abs_buf_tb",
+        "max_abs_buf_sample",
     ):
         if key in metrics:
             metrics[key] = float(metrics[key].removesuffix("MiB").removesuffix("ms").removesuffix("x"))
@@ -71,11 +75,19 @@ def main():
         metrics["experts"] = entry["hot_experts"]
         metrics["d8f"] = entry["d8f"]
         metrics["best_texture_path"] = (
-            "texture_buffer"
-            if metrics.get("tex_buffer", 1e30) < metrics.get("tex_linear2d", 1e30)
-            else "linear2d"
+            min(
+                (
+                    (metrics.get("tex_linear2d", 1e30), "linear2d"),
+                    (metrics.get("tex_buffer", 1e30), "texture_buffer"),
+                    (metrics.get("tex_sample", 1e30), "sample_nearest"),
+                )
+            )[1]
         )
-        metrics["best_texture_ms"] = min(metrics.get("tex_buffer", 1e30), metrics.get("tex_linear2d", 1e30))
+        metrics["best_texture_ms"] = min(
+            metrics.get("tex_linear2d", 1e30),
+            metrics.get("tex_buffer", 1e30),
+            metrics.get("tex_sample", 1e30),
+        )
         metrics["best_texture_speedup"] = metrics["buffer"] / metrics["best_texture_ms"]
         results.append(metrics)
 
@@ -99,13 +111,16 @@ def main():
             "buffer",
             "tex_linear2d",
             "tex_buffer",
+            "tex_sample",
             "speedup_2d",
             "speedup_tb",
+            "speedup_sample",
             "best_texture_path",
             "best_texture_speedup",
             "max_abs_buffer",
             "max_abs_texture",
             "max_abs_texture_buffer",
+            "max_abs_texture_sample",
         ]
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()

@@ -36,6 +36,15 @@ static const char *kMetalSource =
 "         float(hi.x) * mid4 + float(hi.y) * mid5 + float(hi.z) * mid6 + float(hi.w) * mid7;\n"
 "}\n"
 "\n"
+"static inline float dot8_texture_sample(texture2d<float, access::sample> codebooks, uint slot, uint code, float mid0, float mid1, float mid2, float mid3, float mid4, float mid5, float mid6, float mid7) {\n"
+"  constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::nearest);\n"
+"  const float y = float(slot) + 0.5f;\n"
+"  const float4 lo = codebooks.sample(s, float2(float(code * 2u) + 0.5f, y));\n"
+"  const float4 hi = codebooks.sample(s, float2(float(code * 2u + 1u) + 0.5f, y));\n"
+"  return lo.x * mid0 + lo.y * mid1 + lo.z * mid2 + lo.w * mid3 +\n"
+"         hi.x * mid4 + hi.y * mid5 + hi.z * mid6 + hi.w * mid7;\n"
+"}\n"
+"\n"
 "kernel void selected_buffer(\n"
 "  device const half *codebooks [[buffer(0)]],\n"
 "  device const ushort *codes [[buffer(1)]],\n"
@@ -177,6 +186,59 @@ static const char *kMetalSource =
 "        const ushort code = codes[(ulong(slot) * ulong(rows) + ulong(row)) * ulong(groups) + ulong(group)];\n"
 "        if (code >= max_k) continue;\n"
 "        acc[row_offset] += dot8_texture_buffer(codebooks, max_k, slot, uint(code), mid0, mid1, mid2, mid3, mid4, mid5, mid6, mid7);\n"
+"      }\n"
+"    }\n"
+"  }\n"
+"  for (uint row_offset = 0; row_offset < 16u; row_offset++) {\n"
+"    const float subtotal = simd_sum(acc[row_offset]);\n"
+"    if (lane == 0u) partial[row_offset * 8u + uint(simdgroup)] = subtotal;\n"
+"  }\n"
+"  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  if (tid == 0u) {\n"
+"    for (uint row_offset = 0; row_offset < 16u; row_offset++) {\n"
+"      const uint row = row_base + row_offset;\n"
+"      if (row >= rows) continue;\n"
+"      float total = 0.0f;\n"
+"      for (uint sg = 0u; sg < 8u; sg++) total += partial[row_offset * 8u + sg];\n"
+"      out[row] = total;\n"
+"    }\n"
+"  }\n"
+"}\n"
+"\n"
+"kernel void selected_texture_sample(\n"
+"  texture2d<float, access::sample> codebooks [[texture(0)]],\n"
+"  device const ushort *codes [[buffer(0)]],\n"
+"  device const float *mid [[buffer(1)]],\n"
+"  device float *out [[buffer(2)]],\n"
+"  constant uint &max_k [[buffer(3)]],\n"
+"  constant uint &rows [[buffer(4)]],\n"
+"  constant uint &groups [[buffer(5)]],\n"
+"  constant uint &slots [[buffer(6)]],\n"
+"  threadgroup float *partial [[threadgroup(0)]],\n"
+"  uint tid [[thread_index_in_threadgroup]],\n"
+"  ushort lane [[thread_index_in_simdgroup]],\n"
+"  ushort simdgroup [[simdgroup_index_in_threadgroup]],\n"
+"  uint row_tile [[threadgroup_position_in_grid]]) {\n"
+"  const uint row_base = row_tile << 4;\n"
+"  float acc[16];\n"
+"  for (uint row_offset = 0; row_offset < 16u; row_offset++) acc[row_offset] = 0.0f;\n"
+"  for (uint slot = 0u; slot < slots; slot++) {\n"
+"    for (uint group = tid; group < groups; group += 256u) {\n"
+"      const uint mid_base = slot * groups * 8u + group * 8u;\n"
+"      const float mid0 = mid[mid_base + 0u];\n"
+"      const float mid1 = mid[mid_base + 1u];\n"
+"      const float mid2 = mid[mid_base + 2u];\n"
+"      const float mid3 = mid[mid_base + 3u];\n"
+"      const float mid4 = mid[mid_base + 4u];\n"
+"      const float mid5 = mid[mid_base + 5u];\n"
+"      const float mid6 = mid[mid_base + 6u];\n"
+"      const float mid7 = mid[mid_base + 7u];\n"
+"      for (uint row_offset = 0; row_offset < 16u; row_offset++) {\n"
+"        const uint row = row_base + row_offset;\n"
+"        if (row >= rows) continue;\n"
+"        const ushort code = codes[(ulong(slot) * ulong(rows) + ulong(row)) * ulong(groups) + ulong(group)];\n"
+"        if (code >= max_k) continue;\n"
+"        acc[row_offset] += dot8_texture_sample(codebooks, slot, uint(code), mid0, mid1, mid2, mid3, mid4, mid5, mid6, mid7);\n"
 "      }\n"
 "    }\n"
 "  }\n"
@@ -432,7 +494,8 @@ int main(int argc, char **argv) {
         id<MTLComputePipelineState> buffer_pipeline = make_pipeline(device, library, @"selected_buffer");
         id<MTLComputePipelineState> texture_pipeline = make_pipeline(device, library, @"selected_texture");
         id<MTLComputePipelineState> texture_buffer_pipeline = make_pipeline(device, library, @"selected_texture_buffer");
-        if (!buffer_pipeline || !texture_pipeline || !texture_buffer_pipeline) {
+        id<MTLComputePipelineState> texture_sample_pipeline = make_pipeline(device, library, @"selected_texture_sample");
+        if (!buffer_pipeline || !texture_pipeline || !texture_buffer_pipeline || !texture_sample_pipeline) {
             free(codebook_host); free(texel_host); free(code_host); free(mid_host); free(ref);
             ds4_d8f_close(&file);
             return 1;
@@ -446,7 +509,8 @@ int main(int argc, char **argv) {
         id<MTLBuffer> out_buffer = [device newBufferWithLength:out_bytes options:MTLResourceStorageModeShared];
         id<MTLBuffer> out_texture = [device newBufferWithLength:out_bytes options:MTLResourceStorageModeShared];
         id<MTLBuffer> out_texture_buffer = [device newBufferWithLength:out_bytes options:MTLResourceStorageModeShared];
-        if (!codebook_buf || !texel_buf || !texture || !texture_buffer || !code_buf || !mid_buf || !out_buffer || !out_texture || !out_texture_buffer) {
+        id<MTLBuffer> out_texture_sample = [device newBufferWithLength:out_bytes options:MTLResourceStorageModeShared];
+        if (!codebook_buf || !texel_buf || !texture || !texture_buffer || !code_buf || !mid_buf || !out_buffer || !out_texture || !out_texture_buffer || !out_texture_sample) {
             fprintf(stderr, "Metal allocation failed\n");
             free(codebook_host); free(texel_host); free(code_host); free(mid_host); free(ref);
             ds4_d8f_close(&file);
@@ -455,31 +519,40 @@ int main(int argc, char **argv) {
         (void)run_buffer(queue, buffer_pipeline, codebook_buf, code_buf, mid_buf, out_buffer, max_k, rows, groups, slots, 1);
         (void)run_texture(queue, texture_pipeline, texture, code_buf, mid_buf, out_texture, max_k, rows, groups, slots, 1);
         (void)run_texture(queue, texture_buffer_pipeline, texture_buffer, code_buf, mid_buf, out_texture_buffer, max_k, rows, groups, slots, 1);
+        (void)run_texture(queue, texture_sample_pipeline, texture, code_buf, mid_buf, out_texture_sample, max_k, rows, groups, slots, 1);
         const float *buffer_values = out_buffer.contents;
         const float *texture_values = out_texture.contents;
         const float *texture_buffer_values = out_texture_buffer.contents;
+        const float *texture_sample_values = out_texture_sample.contents;
         float max_abs_buffer = 0.0f;
         float max_abs_texture = 0.0f;
         float max_abs_texture_buffer = 0.0f;
+        float max_abs_texture_sample = 0.0f;
         float max_abs_buffer_texture = 0.0f;
         float max_abs_buffer_texture_buffer = 0.0f;
+        float max_abs_buffer_texture_sample = 0.0f;
         for (uint32_t row = 0; row < rows; row++) {
             const float db = fabsf(buffer_values[row] - ref[row]);
             const float dt = fabsf(texture_values[row] - ref[row]);
             const float dtb = fabsf(texture_buffer_values[row] - ref[row]);
+            const float dts = fabsf(texture_sample_values[row] - ref[row]);
             const float dbt = fabsf(buffer_values[row] - texture_values[row]);
             const float dbtb = fabsf(buffer_values[row] - texture_buffer_values[row]);
+            const float dbts = fabsf(buffer_values[row] - texture_sample_values[row]);
             if (db > max_abs_buffer) max_abs_buffer = db;
             if (dt > max_abs_texture) max_abs_texture = dt;
             if (dtb > max_abs_texture_buffer) max_abs_texture_buffer = dtb;
+            if (dts > max_abs_texture_sample) max_abs_texture_sample = dts;
             if (dbt > max_abs_buffer_texture) max_abs_buffer_texture = dbt;
             if (dbtb > max_abs_buffer_texture_buffer) max_abs_buffer_texture_buffer = dbtb;
+            if (dbts > max_abs_buffer_texture_sample) max_abs_buffer_texture_sample = dbts;
         }
         const char *measure_order = getenv("DS4_TEXTURE_CANARY_ORDER");
-        if (!measure_order || !measure_order[0]) measure_order = "B2T";
+        if (!measure_order || !measure_order[0]) measure_order = "B2TS";
         double buffer_ms = 0.0;
         double texture_ms = 0.0;
         double texture_buffer_ms = 0.0;
+        double texture_sample_ms = 0.0;
         for (const char *cursor = measure_order; *cursor; cursor++) {
             if (*cursor == 'B' && buffer_ms == 0.0) {
                 buffer_ms = run_buffer(queue, buffer_pipeline, codebook_buf, code_buf, mid_buf, out_buffer, max_k, rows, groups, slots, rounds);
@@ -487,22 +560,25 @@ int main(int argc, char **argv) {
                 texture_ms = run_texture(queue, texture_pipeline, texture, code_buf, mid_buf, out_texture, max_k, rows, groups, slots, rounds);
             } else if (*cursor == 'T' && texture_buffer_ms == 0.0) {
                 texture_buffer_ms = run_texture(queue, texture_buffer_pipeline, texture_buffer, code_buf, mid_buf, out_texture_buffer, max_k, rows, groups, slots, rounds);
+            } else if (*cursor == 'S' && texture_sample_ms == 0.0) {
+                texture_sample_ms = run_texture(queue, texture_sample_pipeline, texture, code_buf, mid_buf, out_texture_sample, max_k, rows, groups, slots, rounds);
             }
         }
         if (buffer_ms == 0.0) buffer_ms = run_buffer(queue, buffer_pipeline, codebook_buf, code_buf, mid_buf, out_buffer, max_k, rows, groups, slots, rounds);
         if (texture_ms == 0.0) texture_ms = run_texture(queue, texture_pipeline, texture, code_buf, mid_buf, out_texture, max_k, rows, groups, slots, rounds);
         if (texture_buffer_ms == 0.0) texture_buffer_ms = run_texture(queue, texture_buffer_pipeline, texture_buffer, code_buf, mid_buf, out_texture_buffer, max_k, rows, groups, slots, rounds);
+        if (texture_sample_ms == 0.0) texture_sample_ms = run_texture(queue, texture_sample_pipeline, texture, code_buf, mid_buf, out_texture_sample, max_k, rows, groups, slots, rounds);
         printf("real_texture_selected file=%s experts=%s rows=%u slots=%u max_k=%u rounds=%u "
-               "order=%s padded_codebook=%.3fMiB codes=%.3fMiB buffer=%.4fms tex_linear2d=%.4fms tex_buffer=%.4fms "
-               "speedup_2d=%.3fx speedup_tb=%.3fx max_abs_buffer=%.6g max_abs_texture=%.6g "
-               "max_abs_texture_buffer=%.6g max_abs_buf_tex=%.6g max_abs_buf_tb=%.6g\n",
+               "order=%s padded_codebook=%.3fMiB codes=%.3fMiB buffer=%.4fms tex_linear2d=%.4fms tex_buffer=%.4fms tex_sample=%.4fms "
+               "speedup_2d=%.3fx speedup_tb=%.3fx speedup_sample=%.3fx max_abs_buffer=%.6g max_abs_texture=%.6g "
+               "max_abs_texture_buffer=%.6g max_abs_texture_sample=%.6g max_abs_buf_tex=%.6g max_abs_buf_tb=%.6g max_abs_buf_sample=%.6g\n",
                path, argv[2], rows, slots, max_k, rounds, measure_order,
                (double)codebook_bytes / 1048576.0,
                (double)code_bytes / 1048576.0,
-               buffer_ms, texture_ms, texture_buffer_ms,
-               buffer_ms / texture_ms, buffer_ms / texture_buffer_ms,
-               max_abs_buffer, max_abs_texture, max_abs_texture_buffer,
-               max_abs_buffer_texture, max_abs_buffer_texture_buffer);
+               buffer_ms, texture_ms, texture_buffer_ms, texture_sample_ms,
+               buffer_ms / texture_ms, buffer_ms / texture_buffer_ms, buffer_ms / texture_sample_ms,
+               max_abs_buffer, max_abs_texture, max_abs_texture_buffer, max_abs_texture_sample,
+               max_abs_buffer_texture, max_abs_buffer_texture_buffer, max_abs_buffer_texture_sample);
         free(codebook_host); free(texel_host); free(code_host); free(mid_host); free(ref);
         ds4_d8f_close(&file);
     }
