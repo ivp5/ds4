@@ -49204,6 +49204,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     double first_mismatch_abs = 0.0, first_mismatch_rel = 0.0;
     float first_mismatch_ref = 0.0f, first_mismatch_gpu = 0.0f;
     int first_mismatch_set = 0;
+    int native_code_sidecar_hits = 0;
     float dbg_ref[4] = {0}, dbg_gpu[4] = {0};
     if (native_code_mode) {
         native_codes = (uint16_t *)malloc((size_t)native_code_count * sizeof(uint16_t));
@@ -49212,6 +49213,17 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             return 0;
         }
         for (uint32_t slot = 0; slot < n_experts; slot++) {
+            ds4_d8f_native_code_record native_rec;
+            if (ds4_d8f_get_down_native_codes(&file, experts[slot], &native_rec) &&
+                native_rec.rows >= rows &&
+                native_rec.groups == groups &&
+                native_rec.bytes >= rows * groups * sizeof(uint16_t)) {
+                memcpy(native_codes + (uint64_t)slot * rows * groups,
+                       file.map + native_rec.offset,
+                       (size_t)rows * groups * sizeof(uint16_t));
+                native_code_sidecar_hits++;
+                continue;
+            }
             ds4_d8f_record rec;
             ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &rec);
             for (uint32_t row = 0; row < rows; row++) {
@@ -49383,10 +49395,12 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         }
     }
     fprintf(stderr,
-            "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s code_mode=%s gather_tile=%u score=%.2f MiB code=%.2f MiB pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
+            "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s code_mode=%s code_source=%s sidecar_hits=%d gather_tile=%u score=%.2f MiB code=%.2f MiB pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
             n_experts, rows, n_tokens, rounds, max_k,
             half_score ? "f16" : "f32",
             native_code_mode ? "native_u16" : "bitpack",
+            native_code_mode ? (native_code_sidecar_hits == (int)n_experts ? "sidecar" : "predecode") : "bitpack",
+            native_code_sidecar_hits,
             gather_tile_rows,
             (double)(score_count * score_bytes_per_value) / 1048576.0,
             native_code_mode ? (double)(native_code_count * sizeof(uint16_t)) / 1048576.0 : 0.0,
