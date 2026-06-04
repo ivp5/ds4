@@ -905,6 +905,8 @@ struct D8FSparseDownRecordLite {
   uint k;
   uint unique_count;
   uint max_group_unique;
+  uint inverse_unpacked_offset;
+  uint reserved0;
   ulong group_prefix_offset;
   ulong inverse_offset_table_offset;
   ulong unique_code_offset;
@@ -1021,6 +1023,7 @@ kernel void d8f_down_sparse_gather_selected_batch(
   device const float *score                     [[buffer(7)]],
   device float *out                             [[buffer(8)]],
   constant D8FSparseDownArgs &args              [[buffer(9)]],
+  device const ushort *unpacked_inverse         [[buffer(10)]],
   threadgroup float *partial                    [[threadgroup(0)]],
   uint tid [[thread_index_in_threadgroup]],
   ushort tiisg [[thread_index_in_simdgroup]],
@@ -1048,9 +1051,15 @@ kernel void d8f_down_sparse_gather_selected_batch(
         const uint inv_start = inverse_offsets[group];
         const uint inv_end = inverse_offsets[group + 1u];
         if (group_unique != 0u && unique_end <= srec.unique_count && inv_end >= inv_start) {
-          const uint bits = d8fs_ceil_log2(group_unique);
-          device const uchar *inverse = sparse_pack + srec.inverse_bits_offset + ulong(inv_start);
-          const uint local = d8fs_bitpack_get(inverse, row * bits, bits);
+          uint local = 0xffffffffu;
+          if ((srec.flags & 2u) != 0u) {
+            local = uint(unpacked_inverse[ulong(srec.inverse_unpacked_offset) +
+                                          ulong(row) * ulong(groups) + ulong(group)]);
+          } else {
+            const uint bits = d8fs_ceil_log2(group_unique);
+            device const uchar *inverse = sparse_pack + srec.inverse_bits_offset + ulong(inv_start);
+            local = d8fs_bitpack_get(inverse, row * bits, bits);
+          }
           if (local < group_unique) {
             acc += rw * score[(ulong(token * args.n_selected + slot) * ulong(groups) + ulong(group)) *
                               ulong(args.max_group_unique) + ulong(local)];
