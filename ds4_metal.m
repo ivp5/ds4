@@ -51198,6 +51198,28 @@ static float ds4_m1r_f16_to_f32(uint16_t h) {
     return value;
 }
 
+static uint16_t ds4_m1r_f32_to_f16(float f) {
+    union {
+        float f;
+        uint32_t u;
+    } v = { .f = f };
+    const uint32_t sign = (v.u >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((v.u >> 23) & 0xffu) - 127 + 15;
+    uint32_t mant = v.u & 0x7fffffu;
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        const uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half_mant = mant >> shift;
+        if ((mant >> (shift - 1)) & 1u) half_mant++;
+        return (uint16_t)(sign | half_mant);
+    }
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
+    if (mant & 0x1000u) half++;
+    return (uint16_t)half;
+}
+
 static uint16_t ds4_m1r_u16(const uint8_t *p) {
     return (uint16_t)p[0] | (uint16_t)((uint16_t)p[1] << 8);
 }
@@ -53393,7 +53415,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         for (uint32_t slot = 0; slot < n_experts; slot++) {
             ds4_d8f_record rec;
             ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &rec);
-            total_i8_bytes += (uint64_t)rec.k * 8u + (uint64_t)rec.k * sizeof(float);
+            total_i8_bytes += (uint64_t)rec.k * 8u + (uint64_t)rec.k * sizeof(uint16_t);
             i8_codebook_total += rec.k;
         }
         if (!i8_recs || total_i8_bytes > UINT32_MAX) {
@@ -53434,7 +53456,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             i8_recs[slot].offset = i8_offset;
             i8_recs[slot].scale_offset = i8_offset + rec.k * 8u;
             i8_recs[slot].reserved = 0u;
-            float *slot_scales = (float *)(void *)(i8_codebooks + i8_recs[slot].scale_offset);
+            uint16_t *slot_scales = (uint16_t *)(void *)(i8_codebooks + i8_recs[slot].scale_offset);
             for (uint32_t code = 0; code < rec.k; code++) {
                 float max_abs_code = 0.0f;
                 for (uint32_t d = 0; d < 8u; d++) {
@@ -53472,29 +53494,31 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                         }
                     }
                 }
-                slot_scales[code] = chosen_scale;
+                const uint16_t scale_bits = ds4_m1r_f32_to_f16(chosen_scale);
+                const float chosen_scale_q = ds4_m1r_f16_to_f32(scale_bits);
+                slot_scales[code] = scale_bits;
                 double ss_src = 0.0;
                 double ss_diff = 0.0;
                 for (uint32_t d = 0; d < 8u; d++) {
                     const uint32_t i = code * 8u + d;
                     const float v = ds4_m1r_f16_to_f32(ds4_m1r_u16(cb + (uint64_t)i * 2u));
-                    float qf = roundf(v / chosen_scale);
+                    float qf = chosen_scale_q > 0.0f ? roundf(v / chosen_scale_q) : 0.0f;
                     if (qf > 127.0f) qf = 127.0f;
                     if (qf < -127.0f) qf = -127.0f;
                     i8_codebooks[i8_offset + i] = (int8_t)qf;
-                    const double recon = (double)((int8_t)qf) * (double)chosen_scale;
+                    const double recon = (double)((int8_t)qf) * (double)chosen_scale_q;
                     const double diff = recon - (double)v;
                     ss_src += (double)v * (double)v;
                     ss_diff += diff * diff;
                 }
                 const double rel_l2 = sqrt(ss_diff / (ss_src + 1e-24));
-                if (rel_l2 <= i8_max_rel) {
+                if (chosen_scale_q > 0.0f && rel_l2 <= i8_max_rel) {
                     i8_codebook_kept++;
                 } else {
-                    slot_scales[code] = 0.0f;
+                    slot_scales[code] = 0u;
                 }
             }
-            i8_offset += rec.k * 8u + rec.k * (uint32_t)sizeof(float);
+            i8_offset += rec.k * 8u + rec.k * (uint32_t)sizeof(uint16_t);
         }
     }
     @autoreleasepool {
@@ -53579,7 +53603,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                     [enc setThreadgroupMemoryLength:direct_tile_rows * 8u * sizeof(float) atIndex:0];
                     if (use_direct_i8_cbsram) {
                         [enc setThreadgroupMemoryLength:2048u * 8u * sizeof(int8_t) atIndex:1];
-                        [enc setThreadgroupMemoryLength:2048u * sizeof(float) atIndex:2];
+                        [enc setThreadgroupMemoryLength:2048u * sizeof(uint16_t) atIndex:2];
                     } else if (use_direct_cbsram) {
                         [enc setThreadgroupMemoryLength:1024u * 8u * sizeof(uint16_t) atIndex:1];
                     }
@@ -53742,7 +53766,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                         [enc setThreadgroupMemoryLength:direct_tile_rows * 8u * sizeof(float) atIndex:0];
                         if (use_direct_i8_cbsram) {
                             [enc setThreadgroupMemoryLength:2048u * 8u * sizeof(int8_t) atIndex:1];
-                            [enc setThreadgroupMemoryLength:2048u * sizeof(float) atIndex:2];
+                            [enc setThreadgroupMemoryLength:2048u * sizeof(uint16_t) atIndex:2];
                         } else if (use_direct_cbsram) {
                             [enc setThreadgroupMemoryLength:1024u * 8u * sizeof(uint16_t) atIndex:1];
                         }
@@ -55756,7 +55780,7 @@ static int ds4_d8f_runtime_down_i8_codebook_build(ds4_d8f_file *file,
         if (!ds4_d8f_get_record(file, DS4_D8F_DOWN, expert, &down)) continue;
         if (down.k == 0u || down.k > 2048u) continue;
         total_bytes64 += (uint64_t)down.k * 8u +
-                         (uint64_t)down.k * sizeof(float);
+                         (uint64_t)down.k * sizeof(uint16_t);
         total_codes += down.k;
     }
     if (total_bytes64 == 0u || total_bytes64 > UINT32_MAX) return 0;
@@ -55780,7 +55804,7 @@ static int ds4_d8f_runtime_down_i8_codebook_build(ds4_d8f_file *file,
         recs[expert].offset = offset;
         recs[expert].scale_offset = offset + down.k * 8u;
         recs[expert].reserved = 0u;
-        float *scales = (float *)(void *)(bytes + recs[expert].scale_offset);
+        uint16_t *scales = (uint16_t *)(void *)(bytes + recs[expert].scale_offset);
         const uint8_t *cb = file->map + down.codebook_offset;
         for (uint32_t code = 0; code < down.k; code++) {
             float max_abs = 0.0f;
@@ -55791,26 +55815,28 @@ static int ds4_d8f_runtime_down_i8_codebook_build(ds4_d8f_file *file,
                 if (av > max_abs) max_abs = av;
             }
             const float scale = max_abs > 0.0f ? max_abs / 127.0f : 0.0f;
-            scales[code] = scale;
+            const uint16_t scale_bits = ds4_m1r_f32_to_f16(scale);
+            const float scale_q = ds4_m1r_f16_to_f32(scale_bits);
+            scales[code] = scale_bits;
             int use_i8 = 1;
             for (uint32_t d = 0; d < 8u; d++) {
-                int q = scale > 0.0f ? (int)lrintf(values[d] / scale) : 0;
+                int q = scale_q > 0.0f ? (int)lrintf(values[d] / scale_q) : 0;
                 if (q < -127) q = -127;
                 if (q > 127) q = 127;
                 bytes[recs[expert].offset + code * 8u + d] = (int8_t)q;
-                const float recon = (float)q * scale;
+                const float recon = (float)q * scale_q;
                 const float denom = fmaxf(fabsf(values[d]), 1.0e-6f);
                 if ((double)fabsf(recon - values[d]) > max_rel * (double)denom) {
                     use_i8 = 0;
                 }
             }
-            if (use_i8) {
+            if (use_i8 && scale_q > 0.0f) {
                 kept++;
             } else {
-                scales[code] = 0.0f;
+                scales[code] = 0u;
             }
         }
-        offset = recs[expert].scale_offset + down.k * (uint32_t)sizeof(float);
+        offset = recs[expert].scale_offset + down.k * (uint32_t)sizeof(uint16_t);
     }
     id<MTLBuffer> rec_buf = [g_device newBufferWithBytes:recs
                                                   length:sizeof(recs)
@@ -56709,7 +56735,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                     const uint32_t i8_tg_mems[3] = {
                         down_tg_mem,
                         2048u * 8u * (uint32_t)sizeof(int8_t),
-                        2048u * (uint32_t)sizeof(float),
+                        2048u * (uint32_t)sizeof(uint16_t),
                     };
 	                    packet_icb_ready =
 	                        ds4_icb_slot_record_command_tgmems_barrier(&g_d8f_packet_icb_slot, packet_down_cmd, down_pso,
@@ -56838,7 +56864,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             [enc setThreadgroupMemoryLength:down_tg_mem atIndex:0];
             if (down_native_i8_cbsram) {
                 [enc setThreadgroupMemoryLength:2048u * 8u * sizeof(int8_t) atIndex:1];
-                [enc setThreadgroupMemoryLength:2048u * sizeof(float) atIndex:2];
+                [enc setThreadgroupMemoryLength:2048u * sizeof(uint16_t) atIndex:2];
             }
             [enc dispatchThreadgroups:down_grid threadsPerThreadgroup:packet_tg];
             if (rank1_split_sidecar) {
