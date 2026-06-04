@@ -91,6 +91,7 @@ static id<MTLComputePipelineState> g_unary_fill_pipeline;
 static id<MTLComputePipelineState> g_unary_fill_f16_pipeline;
 static id<MTLComputePipelineState> g_bin_mul_scalar_pipeline;
 static id<MTLComputePipelineState> g_bin_div_row_pipeline;
+static id<MTLComputePipelineState> g_rms_norm_weight_rope_tail_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
@@ -3093,6 +3094,20 @@ typedef struct {
  float beta_slow;
 } ds4_gpu_f16_matvec_rope_args;
 
+typedef struct {
+ int32_t head_dim;
+ int32_t n_rot;
+ int32_t pos;
+ int32_t n_ctx_orig;
+ float eps;
+ float freq_base;
+ float freq_scale;
+ float ext_factor;
+ float attn_factor;
+ float beta_fast;
+ float beta_slow;
+} ds4_gpu_rms_norm_rope_args;
+
 static ds4_gpu_q8_0_matvec_args ds4_gpu_make_q8_0_mv_args(uint64_t in_dim, uint64_t out_dim) {
  const uint64_t row_bytes = (in_dim / 32u) * 34u;
  return (ds4_gpu_q8_0_matvec_args) {
@@ -4670,6 +4685,22 @@ int ds4_gpu_init(void) {
  [[error localizedDescription] UTF8String]);
  g_queue = nil;
  g_device = nil;
+	 return 0;
+	 }
+
+ fn = [library newFunctionWithName:@"kernel_dsv4_rms_norm_weight_rope_tail_f32"];
+ if (!fn) {
+ fprintf(stderr, "ds4: Metal kernel_dsv4_rms_norm_weight_rope_tail_f32 function not found\n");
+ g_queue = nil;
+ g_device = nil;
+ return 0;
+ }
+ g_rms_norm_weight_rope_tail_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+ if (!g_rms_norm_weight_rope_tail_pipeline) {
+ fprintf(stderr, "ds4: Metal kernel_dsv4_rms_norm_weight_rope_tail_f32 pipeline failed: %s\n",
+ [[error localizedDescription] UTF8String]);
+ g_queue = nil;
+ g_device = nil;
  return 0;
  }
 
@@ -5906,6 +5937,7 @@ fprintf(stderr,
  g_unary_fill_f16_pipeline = nil;
  g_rms_norm_pipeline = nil;
  g_rms_norm_plain_pipeline = nil;
+ g_rms_norm_weight_rope_tail_pipeline = nil;
  g_hc_rms_f16_mix_pipeline = nil;
  g_hc_rms_f16_mix_split_sum_norm_pipeline = nil;
  g_dsv4_qkv_rms_norm_pipeline = nil;
@@ -8890,6 +8922,83 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
  return 1;
 }
 
+int ds4_gpu_rms_norm_weight_rope_tail_tensor(
+ ds4_gpu_tensor *x,
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t weight_offset,
+ uint32_t head_dim,
+ uint32_t n_rot,
+ uint32_t pos,
+ uint32_t n_ctx_orig,
+ float eps,
+ float freq_base,
+ float freq_scale,
+ float ext_factor,
+ float attn_factor,
+ float beta_fast,
+ float beta_slow) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (!x || head_dim == 0 || n_rot > head_dim || (n_rot & 1u) != 0) return 0;
+ if (!g_rms_norm_weight_rope_tail_pipeline) return 0;
+
+ @autoreleasepool {
+ id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+ const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+ if (!xbuf || ds4_gpu_tensor_bytes(x) < row_bytes) {
+ fprintf(stderr, "ds4: Metal weighted RMS/RoPE received undersized activation buffer\n");
+ return 0;
+ }
+ if (!ds4_gpu_range_resolvable(model_map, model_size, weight_offset, row_bytes)) {
+ fprintf(stderr, "ds4: Metal weighted RMS/RoPE weight range is outside the mapped model\n");
+ return 0;
+ }
+
+ uint64_t inner_offset = 0;
+ id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, row_bytes, &inner_offset);
+ if (!wbuf) return 0;
+
+ ds4_gpu_rms_norm_rope_args args = {
+  .head_dim = (int32_t)head_dim,
+  .n_rot = (int32_t)n_rot,
+  .pos = (int32_t)pos,
+  .n_ctx_orig = (int32_t)n_ctx_orig,
+  .eps = eps,
+  .freq_base = freq_base,
+  .freq_scale = freq_scale,
+  .ext_factor = ext_factor,
+  .attn_factor = attn_factor,
+  .beta_fast = beta_fast,
+  .beta_slow = beta_slow,
+ };
+
+ NSUInteger nth = head_dim < 256u ? (NSUInteger)head_dim : 256u;
+ if (nth > g_rms_norm_weight_rope_tail_pipeline.maxTotalThreadsPerThreadgroup) {
+  nth = g_rms_norm_weight_rope_tail_pipeline.maxTotalThreadsPerThreadgroup;
+ }
+ if (nth == 0) nth = 1u;
+
+ int owned = 0;
+ id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+ if (!cb) return 0;
+
+ id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+ [enc setComputePipelineState:g_rms_norm_weight_rope_tail_pipeline];
+ [enc setBytes:&args length:sizeof(args) atIndex:0];
+ [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+ [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:2];
+ [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
+ [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+ [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+ ds4_gpu_end_compute_encoder(cb, enc);
+
+ if (!ds4_gpu_finish_command_buffer(cb, owned, "weighted RMS norm + RoPE tail")) return 0;
+ }
+
+ return 1;
+}
+
 int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
  ds4_gpu_tensor *q_out,
  const ds4_gpu_tensor *q,
@@ -11840,7 +11949,42 @@ int ds4_gpu_compressor_update_tensor(
  head_dim,
  ratio);
  if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "compressor DS4 softmax pool");
- if (ok) {
+ static int rms_rope_env_checked = 0;
+ static int rms_rope_env_active = 0;
+ if (!rms_rope_env_checked) {
+ rms_rope_env_active = getenv("DS4_METAL_ENABLE_COMPRESSOR_RMS_ROPE_FUSION") != NULL ? 1 : 0;
+ rms_rope_env_checked = 1;
+ if (rms_rope_env_active) {
+ fprintf(stderr, "ds4: compressor weighted RMSNorm + RoPE fused path active\n");
+ }
+ }
+ const uint32_t comp_pos = pos + 1u - ratio;
+ int rms_rope_fused = 0;
+ if (ok && rms_rope_env_active) {
+ rms_rope_fused = ds4_gpu_rms_norm_weight_rope_tail_tensor(comp_row_view,
+ model_map,
+ model_size,
+ norm_offset,
+ head_dim,
+ n_rot,
+ comp_pos,
+ n_ctx_orig,
+ rms_eps,
+ freq_base,
+ freq_scale,
+ ext_factor,
+ attn_factor,
+ beta_fast,
+ beta_slow);
+ if (!rms_rope_fused) {
+  static int rms_rope_fallback_logged = 0;
+  if (!rms_rope_fallback_logged) {
+   rms_rope_fallback_logged = 1;
+   fprintf(stderr, "ds4: compressor weighted RMSNorm + RoPE fused path fell back\n");
+  }
+ }
+ }
+ if (ok && !rms_rope_fused) {
  ok = ds4_gpu_rms_norm_weight_rows_tensor(comp_row_view,
  comp_row_view,
  model_map,
@@ -11849,9 +11993,7 @@ int ds4_gpu_compressor_update_tensor(
  head_dim,
  1,
  rms_eps) != 0;
- }
  if (ok) {
- const uint32_t comp_pos = pos + 1u - ratio;
  ok = ds4_gpu_rope_tail_tensor(comp_row_view,
  1,
  1,
@@ -11866,6 +12008,7 @@ int ds4_gpu_compressor_update_tensor(
  attn_factor,
  beta_fast,
  beta_slow) != 0;
+ }
  }
  if (ok && ratio == 4u) {
  cb = ds4_gpu_command_buffer(&owned);
