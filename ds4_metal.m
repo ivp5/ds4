@@ -53124,7 +53124,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         uint32_t k;
         uint32_t offset;
         uint32_t scale_offset;
-        uint32_t keep_offset;
+        uint32_t reserved;
     } d8f_lut_i8_codebook_lite;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!ds4_d8f_down_lut_classic_pipeline_init()) return 0;
@@ -53393,7 +53393,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         for (uint32_t slot = 0; slot < n_experts; slot++) {
             ds4_d8f_record rec;
             ds4_d8f_get_record(&file, DS4_D8F_DOWN, experts[slot], &rec);
-            total_i8_bytes += (uint64_t)rec.k * 8u + (uint64_t)rec.k * sizeof(float) + (uint64_t)rec.k;
+            total_i8_bytes += (uint64_t)rec.k * 8u + (uint64_t)rec.k * sizeof(float);
             i8_codebook_total += rec.k;
         }
         if (!i8_recs || total_i8_bytes > UINT32_MAX) {
@@ -53433,9 +53433,8 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             i8_recs[slot].k = rec.k;
             i8_recs[slot].offset = i8_offset;
             i8_recs[slot].scale_offset = i8_offset + rec.k * 8u;
-            i8_recs[slot].keep_offset = i8_recs[slot].scale_offset + rec.k * (uint32_t)sizeof(float);
+            i8_recs[slot].reserved = 0u;
             float *slot_scales = (float *)(void *)(i8_codebooks + i8_recs[slot].scale_offset);
-            uint8_t *slot_keep = (uint8_t *)(void *)(i8_codebooks + i8_recs[slot].keep_offset);
             for (uint32_t code = 0; code < rec.k; code++) {
                 float max_abs_code = 0.0f;
                 for (uint32_t d = 0; d < 8u; d++) {
@@ -53489,10 +53488,13 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                     ss_diff += diff * diff;
                 }
                 const double rel_l2 = sqrt(ss_diff / (ss_src + 1e-24));
-                slot_keep[code] = rel_l2 <= i8_max_rel ? 1u : 0u;
-                if (slot_keep[code]) i8_codebook_kept++;
+                if (rel_l2 <= i8_max_rel) {
+                    i8_codebook_kept++;
+                } else {
+                    slot_scales[code] = 0.0f;
+                }
             }
-            i8_offset += rec.k * 8u + rec.k * (uint32_t)sizeof(float) + rec.k;
+            i8_offset += rec.k * 8u + rec.k * (uint32_t)sizeof(float);
         }
     }
     @autoreleasepool {
@@ -53578,7 +53580,6 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                     if (use_direct_i8_cbsram) {
                         [enc setThreadgroupMemoryLength:2048u * 8u * sizeof(int8_t) atIndex:1];
                         [enc setThreadgroupMemoryLength:2048u * sizeof(float) atIndex:2];
-                        [enc setThreadgroupMemoryLength:2048u * sizeof(uint8_t) atIndex:3];
                     } else if (use_direct_cbsram) {
                         [enc setThreadgroupMemoryLength:1024u * 8u * sizeof(uint16_t) atIndex:1];
                     }
@@ -53742,7 +53743,6 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                         if (use_direct_i8_cbsram) {
                             [enc setThreadgroupMemoryLength:2048u * 8u * sizeof(int8_t) atIndex:1];
                             [enc setThreadgroupMemoryLength:2048u * sizeof(float) atIndex:2];
-                            [enc setThreadgroupMemoryLength:2048u * sizeof(uint8_t) atIndex:3];
                         } else if (use_direct_cbsram) {
                             [enc setThreadgroupMemoryLength:1024u * 8u * sizeof(uint16_t) atIndex:1];
                         }
@@ -55237,7 +55237,7 @@ typedef struct ds4_d8f_runtime_i8_codebook_lite {
     uint32_t k;
     uint32_t offset;
     uint32_t scale_offset;
-    uint32_t keep_offset;
+    uint32_t reserved;
 } ds4_d8f_runtime_i8_codebook_lite;
 static ds4_d8f_runtime_record_lite g_d8f_runtime_record_staging[ds4_d8f_recbuf_record_count];
 
@@ -55756,8 +55756,7 @@ static int ds4_d8f_runtime_down_i8_codebook_build(ds4_d8f_file *file,
         if (!ds4_d8f_get_record(file, DS4_D8F_DOWN, expert, &down)) continue;
         if (down.k == 0u || down.k > 2048u) continue;
         total_bytes64 += (uint64_t)down.k * 8u +
-                         (uint64_t)down.k * sizeof(float) +
-                         (uint64_t)down.k;
+                         (uint64_t)down.k * sizeof(float);
         total_codes += down.k;
     }
     if (total_bytes64 == 0u || total_bytes64 > UINT32_MAX) return 0;
@@ -55780,9 +55779,8 @@ static int ds4_d8f_runtime_down_i8_codebook_build(ds4_d8f_file *file,
         recs[expert].k = down.k;
         recs[expert].offset = offset;
         recs[expert].scale_offset = offset + down.k * 8u;
-        recs[expert].keep_offset = recs[expert].scale_offset + down.k * (uint32_t)sizeof(float);
+        recs[expert].reserved = 0u;
         float *scales = (float *)(void *)(bytes + recs[expert].scale_offset);
-        uint8_t *keep = (uint8_t *)(void *)(bytes + recs[expert].keep_offset);
         const uint8_t *cb = file->map + down.codebook_offset;
         for (uint32_t code = 0; code < down.k; code++) {
             float max_abs = 0.0f;
@@ -55806,10 +55804,13 @@ static int ds4_d8f_runtime_down_i8_codebook_build(ds4_d8f_file *file,
                     use_i8 = 0;
                 }
             }
-            keep[code] = use_i8 ? 1u : 0u;
-            if (use_i8) kept++;
+            if (use_i8) {
+                kept++;
+            } else {
+                scales[code] = 0.0f;
+            }
         }
-        offset = recs[expert].keep_offset + down.k;
+        offset = recs[expert].scale_offset + down.k * (uint32_t)sizeof(float);
     }
     id<MTLBuffer> rec_buf = [g_device newBufferWithBytes:recs
                                                   length:sizeof(recs)
@@ -56705,17 +56706,16 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                 packet_icb_gate_only = 1;
             } else if (packet_icb_ready) {
                 if (down_native_i8_cbsram) {
-                    const uint32_t i8_tg_mems[4] = {
+                    const uint32_t i8_tg_mems[3] = {
                         down_tg_mem,
                         2048u * 8u * (uint32_t)sizeof(int8_t),
                         2048u * (uint32_t)sizeof(float),
-                        2048u * (uint32_t)sizeof(uint8_t),
                     };
 	                    packet_icb_ready =
 	                        ds4_icb_slot_record_command_tgmems_barrier(&g_d8f_packet_icb_slot, packet_down_cmd, down_pso,
 	                                                                   down_bufs, down_offs, down_n,
 	                                                                   down_grid, packet_tg,
-	                                                                   i8_tg_mems, 4,
+	                                                                   i8_tg_mems, 3,
 	                                                                   packet_icb_range_possible,
 	                                                                   down_extra, 8);
 	                } else {
@@ -56839,7 +56839,6 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             if (down_native_i8_cbsram) {
                 [enc setThreadgroupMemoryLength:2048u * 8u * sizeof(int8_t) atIndex:1];
                 [enc setThreadgroupMemoryLength:2048u * sizeof(float) atIndex:2];
-                [enc setThreadgroupMemoryLength:2048u * sizeof(uint8_t) atIndex:3];
             }
             [enc dispatchThreadgroups:down_grid threadsPerThreadgroup:packet_tg];
             if (rank1_split_sidecar) {

@@ -895,7 +895,7 @@ struct D8FDownLutI8CodebookLite {
   uint k;
   uint offset;
   uint scale_offset;
-  uint keep_offset;
+  uint reserved;
 };
 
 inline float d8f_dot8_codebook_texbuf(texture_buffer<half, access::read> codebook_tex,
@@ -1098,8 +1098,8 @@ kernel void d8f_down_lut_score_i8_selected_batch(
       ulong(slot) * ulong(args.mid_slot_stride);
   const device char *cb = i8_codebook + ulong(i8.offset) + ulong(code) * 8ul;
   const device float *i8_scales = (const device float *)(i8_codebook + ulong(i8.scale_offset));
-  const device uchar *i8_keep = (const device uchar *)(i8_codebook + ulong(i8.keep_offset));
-  if (i8_keep[code] == 0u) {
+  const float scale = i8_scales[code];
+  if (scale == 0.0f) {
     const device half *hcb = (const device half *)(pack + rec.codebook_offset + ulong(code) * 16ul);
     score[out_index] =
         float(hcb[0]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 0u) +
@@ -1112,7 +1112,6 @@ kernel void d8f_down_lut_score_i8_selected_batch(
         float(hcb[7]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 7u);
     return;
   }
-  const float scale = i8_scales[code];
   score[out_index] =
       scale * (
       float(cb[0]) * d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 0u) +
@@ -1855,7 +1854,6 @@ kernel void d8f_down_lut_direct_codes_i8_selected_batch_tile16_cbsram2048(
   threadgroup float *partial        [[threadgroup(0)]],
   threadgroup char *cb_cache        [[threadgroup(1)]],
   threadgroup float *scale_cache    [[threadgroup(2)]],
-  threadgroup uchar *keep_cache     [[threadgroup(3)]],
   uint tid [[thread_index_in_threadgroup]],
   ushort tiisg [[thread_index_in_simdgroup]],
   ushort sgitg [[simdgroup_index_in_threadgroup]],
@@ -1878,12 +1876,10 @@ kernel void d8f_down_lut_direct_codes_i8_selected_batch_tile16_cbsram2048(
     if (use_i8_cache) {
       const device char *i8_cb = i8_codebook + ulong(i8.offset);
       const device float *i8_scales = (const device float *)(i8_codebook + ulong(i8.scale_offset));
-      const device uchar *i8_keep = (const device uchar *)(i8_codebook + ulong(i8.keep_offset));
       const uint cb_vals = i8.k << 3;
       for (uint ci = tid; ci < cb_vals; ci += 256u) cb_cache[ci] = i8_cb[ci];
       for (uint ci = tid; ci < i8.k; ci += 256u) {
         scale_cache[ci] = i8_scales[ci];
-        keep_cache[ci] = i8_keep[ci];
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       for (uint group = tid; group < groups; group += 256u) {
@@ -1901,9 +1897,9 @@ kernel void d8f_down_lut_direct_codes_i8_selected_batch_tile16_cbsram2048(
           if (row >= args.rows) continue;
           const uint code = uint(codes[(ulong(slot) * ulong(args.rows) + ulong(row)) * ulong(groups) + ulong(group)]);
           if (code >= rec.k) continue;
-          if (code < i8.k && keep_cache[code] != 0u) {
+          const float scale = code < i8.k ? scale_cache[code] : 0.0f;
+          if (scale != 0.0f) {
             threadgroup const char *cb = cb_cache + ulong(code) * 8ul;
-            const float scale = scale_cache[code];
             acc[rr] += scale * (
                 float(cb[0]) * m0 +
                 float(cb[1]) * m1 +
@@ -2634,7 +2630,6 @@ kernel void d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_i8_c
   threadgroup float *partial             [[threadgroup(0)]],
   threadgroup char *cb_cache             [[threadgroup(1)]],
   threadgroup float *scale_cache         [[threadgroup(2)]],
-  threadgroup uchar *keep_cache          [[threadgroup(3)]],
   uint tid [[thread_index_in_threadgroup]],
   ushort tiisg [[thread_index_in_simdgroup]],
   ushort sgitg [[simdgroup_index_in_threadgroup]],
@@ -2673,12 +2668,10 @@ kernel void d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_i8_c
     if (use_i8_cache) {
       const device char *i8_cb = i8_codebook + ulong(i8.offset);
       const device float *i8_scales = (const device float *)(i8_codebook + ulong(i8.scale_offset));
-      const device uchar *i8_keep = (const device uchar *)(i8_codebook + ulong(i8.keep_offset));
       const uint cb_vals = i8.k << 3;
       for (uint ci = tid; ci < cb_vals; ci += 256u) cb_cache[ci] = i8_cb[ci];
       for (uint ci = tid; ci < i8.k; ci += 256u) {
         scale_cache[ci] = i8_scales[ci];
-        keep_cache[ci] = i8_keep[ci];
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -2716,9 +2709,9 @@ kernel void d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_i8_c
           code = (w >> shift) & rec.mask;
         }
         if (code >= rec.k) continue;
-        if (use_i8_cache && code < i8.k && keep_cache[code] != 0u) {
+        const float scale = (use_i8_cache && code < i8.k) ? scale_cache[code] : 0.0f;
+        if (scale != 0.0f) {
           threadgroup const char *cb = cb_cache + ulong(code) * 8ul;
-          const float scale = scale_cache[code];
           acc[rr] += rw * scale * (
               float(cb[0]) * m0 + float(cb[1]) * m1 +
               float(cb[2]) * m2 + float(cb[3]) * m3 +
