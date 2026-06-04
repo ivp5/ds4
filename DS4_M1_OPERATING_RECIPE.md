@@ -240,6 +240,12 @@ bit-exact, 54.408 → 52.421 ms/fwd, 1.04×.
 **MTL4 status** (per ds4_pillars.h doc):
 - COMPUTE path productive on M1 Max (polar_dot canary: 83 ns/packet
   at 7776 packets; max_abs_err = 0).
+- Indirect compute dispatch is productive when it collapses many tiny host
+  dispatches: `--indirect-dispatch-canary 262144 1 5` measured tiny 1322.936 ms
+  vs direct 0.642 ms vs indirect-prefilled 0.605 ms, exact output. H3385 sparse
+  score uses this; H3384 primary has no sparse sidecar by default.
+- Object/mesh dispatch is not a compute-fusion win on M1 Max:
+  `--mesh-dispatch-canary 1024 5` measured host 3.479 ms vs mesh 5.321 ms.
 - ML pipeline path NOT productive on M1 Max (raises NSInvalidArgumentException
   on normal MSL kernels — needs ML-compatible executable shape, only
   accessible from Core ML model, not custom compute kernel).
