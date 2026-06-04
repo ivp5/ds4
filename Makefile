@@ -35,8 +35,8 @@ METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework Meta
 # entrypoints against them.
 LEGACY_CODEC_OBJS = ds4_metal_vqb2_fp16.o ds4_vqb2_reader.o ds4_vqb2_pack.o ds4_cdx3_reader.o
 LEGACY_CODEC_CPU_OBJS = ds4_vqb2_reader.o ds4_vqb2_pack.o ds4_cdx3_reader.o
-CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_metal.o ds4_mpsgraph.o ds4_expert_table.o ds4_inflight.o ds4_moe_route_log.o $(LEGACY_CODEC_OBJS) ds4_watersic_pack.o ds4_nonrouted_pack.o ds4_d8m_reader.o ds4_d8f_reader.o ds4_d8fs_reader.o ds4_prefix_cache.o $(JOURNAL_OBJ)
-CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_inflight.o $(LEGACY_CODEC_CPU_OBJS) ds4_watersic_pack.o ds4_nonrouted_pack.o ds4_d8m_reader.o ds4_d8f_reader.o ds4_d8fs_reader.o ds4_prefix_cache.o $(JOURNAL_OBJ)
+CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_metal.o ds4_mpsgraph.o ds4_expert_table.o ds4_inflight.o ds4_moe_route_log.o $(LEGACY_CODEC_OBJS) ds4_nonrouted_pack.o ds4_d8m_reader.o ds4_d8f_reader.o ds4_d8fs_reader.o ds4_prefix_cache.o $(JOURNAL_OBJ)
+CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o ds4_inflight.o $(LEGACY_CODEC_CPU_OBJS) ds4_nonrouted_pack.o ds4_d8m_reader.o ds4_d8f_reader.o ds4_d8fs_reader.o ds4_prefix_cache.o $(JOURNAL_OBJ)
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda

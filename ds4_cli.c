@@ -2814,60 +2814,6 @@ int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--routed-mm-dispatch-probe")) {
         return ds4_gpu_mtl4_routed_mm_dispatch_probe() ? 0 : 1;
     }
-    /* --watersic-canary [N_PKTS [N_SEL [N_TOTAL [ROWS [COLS [R [ROUNDS]]]]]]] :
-     * silv 2026-05-28 task #769 — WaterSIC scalar-quant decode-matmul kernel
-     * (QMM-II arxiv 2605.13768 Algorithm 3). Cross-checks vs CPU scalar reference
-     * + measures GFLOP/s. Defaults match one DS4 V4 layer event:
-     *   64 packets × 6/256 selected × 128 rows × 2048 cols × R=4 × 20 rounds.
-     * R ∈ {2, 4, 8}. n_cols * R must be a multiple of 8. */
-    if (argc >= 2 && !strcmp(argv[1], "--watersic-canary")) {
-        extern int ds4_gpu_mtl4_watersic_decode_matmul_fp16_canary(
-            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
-        const uint32_t np    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
-        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128;
-        const uint32_t cols  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
-        const uint32_t R     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 4;
-        const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 20;
-        return ds4_gpu_mtl4_watersic_decode_matmul_fp16_canary(np, nsel, ntot, rows, cols, R, r) ? 0 : 1;
-    }
-    /* --watersic-gate-up-canary [N_PKTS [N_SEL [N_TOTAL [ROWS [COLS [R [CLAMP [ROUNDS]]]]]]]] :
-     * silv 2026-05-28 task #770 — fused gate+up+SwiGLU CODA-style kernel
-     * (arxiv 2605.19269). Single Metal kernel: 2× MAC (decode gate + decode up)
-     * + 2× α scale (epilogue) + clamp + SiLU + multiply. Replaces 2 matmul
-     * kernels + 1 SwiGLU kernel + 2 HBM round trips. Defaults match DS4 V4
-     * FFN layer: 64 pkts × 6/256 × 128 rows × 2048 cols × R=4 × clamp=10 × 5 rounds. */
-    if (argc >= 2 && !strcmp(argv[1], "--watersic-gate-up-canary")) {
-        extern int ds4_gpu_mtl4_watersic_gate_up_swiglu_canary(
-            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t);
-        const uint32_t np    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
-        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128;
-        const uint32_t cols  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
-        const uint32_t R     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 4;
-        const float clamp    = (argc >= 9) ? (float)atof(argv[8]) : 10.0f;
-        const uint32_t r     = (argc >=10) ? (uint32_t)atoi(argv[9]) : 5;
-        return ds4_gpu_mtl4_watersic_gate_up_swiglu_canary(np, nsel, ntot, rows, cols, R, clamp, r) ? 0 : 1;
-    }
-    /* --watersic-down-canary [N_PKTS [N_SEL [N_TOTAL [ROWS [COLS [R [ROUNDS]]]]]]] :
-     * silv 2026-05-28 task #770 — down-proj + α-scale + route-weight-scale CODA
-     * kernel. Per (packet, slot, row): matmul + 2× scaling epilogue. Output is
-     * per-slot routed value; caller aggregates across slots separately. Defaults
-     * match DS4 V4 down-proj layer: 64 pkts × 6/256 × 4096 rows × 2048 cols × R=4. */
-    if (argc >= 2 && !strcmp(argv[1], "--watersic-down-canary")) {
-        extern int ds4_gpu_mtl4_watersic_down_routed_canary(
-            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
-        const uint32_t np    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nsel  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 6;
-        const uint32_t ntot  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t rows  = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 4096;
-        const uint32_t cols  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
-        const uint32_t R     = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 4;
-        const uint32_t r     = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 5;
-        return ds4_gpu_mtl4_watersic_down_routed_canary(np, nsel, ntot, rows, cols, R, r) ? 0 : 1;
-    }
     /* --nonrouted-inspect PATH : silv 2026-05-28 — open + summarize a
      * .pack file built by /Users/silv/cl/tlp/montyneg/ds4/nonrouted/
      * pack_nonrouted.py from DS4 V4 bf16 safetensors. */
