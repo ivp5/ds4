@@ -2113,15 +2113,12 @@ int ds4_gpu_mtl4_routed_mm_dispatch_probe(void);
  * code; reads codebook + packed codes from GPU memory, outputs fp16 pairs.
  * k ∈ {4, 16, 64, 256} → bit_width ∈ {2, 4, 6, 8}. Canary builds a synthetic
  * packet, decodes, and cross-checks against expected (re, im) values. */
-int ds4_gpu_mtl4_vqb2_decode_fp16_canary(uint32_t n_codes, uint32_t k_val);
 
 /* silv 2026-05-28 ICB Phase 8: VQB2 decoder ICB record/replay bench.
  * Runs `n_packets` decodes × `rounds` iterations via (a) direct compute
  * dispatch and (b) classic-MTL ICB executeCommandsInBuffer; reports both
  * wall times and the speedup. Cross-checks ICB output bit-exact against
  * direct output. Forces DS4_ICB_VQB2_DECODE=1 internally during bench. */
-int ds4_gpu_mtl4_vqb2_decode_icb_bench(uint32_t n_packets, uint32_t n_codes_per_packet,
-                                       uint32_t k_val, uint32_t rounds);
 
 /* silv 2026-05-28 — selected-expert VQB2 decoder.
  *
@@ -2133,29 +2130,14 @@ int ds4_gpu_mtl4_vqb2_decode_icb_bench(uint32_t n_packets, uint32_t n_codes_per_
  * Canary builds a synthetic packet where code[e][i] = (e+i)%k (distinct
  * per expert), runs the selected-decode for an evenly-spread subset, and
  * cross-checks per-expert ground truth. */
-int ds4_gpu_mtl4_vqb2_decode_fp16_selected_canary(uint32_t n_selected,
-                                                  uint32_t n_experts_total,
-                                                  uint32_t n_rows,
-                                                  uint32_t n_pairs,
-                                                  uint32_t k_val);
 
 /* silv 2026-05-28 stacked-speedup bench — isolates compute-reduction axis
  * (full → selected decode) from encoder-amortization axis (per-packet →
  * batched). Reports A, B, C times and per-axis multipliers. */
-int ds4_gpu_mtl4_vqb2_decode_stacked_speedup_bench(uint32_t n_packets,
-                                                   uint32_t n_selected,
-                                                   uint32_t n_experts_total,
-                                                   uint32_t n_rows,
-                                                   uint32_t n_pairs,
-                                                   uint32_t k_val,
-                                                   uint32_t rounds);
 
 /* silv 2026-05-28 — no-op write diagnostic. Localizes whether the 2.2 GB/s
  * wall is from decoder-specific work or pure write throughput at this
  * dispatch shape. Same args + grid as decoders; writes a constant half2. */
-int ds4_gpu_mtl4_vqb2_noop_write_bench(uint32_t n_packets, uint32_t n_selected,
-                                       uint32_t n_rows, uint32_t n_pairs,
-                                       uint32_t rounds);
 
 /* silv 2026-05-28 — FUSED decode-matmul. Decodes VQB2 codes inline inside
  * the matmul inner loop; no intermediate fp16 weight store. The
@@ -2163,13 +2145,6 @@ int ds4_gpu_mtl4_vqb2_noop_write_bench(uint32_t n_packets, uint32_t n_selected,
  * the noop-write diagnostic. Output is [n_packets][n_selected][n_rows] fp16
  * computed as out[p][s][r] = sum_pair X[pair*2:(pair+1)*2] · decode(p,e,r,pair).
  * Canary cross-checks each output against a CPU scalar reference. */
-int ds4_gpu_mtl4_vqb2_decode_matmul_fp16_canary(uint32_t n_packets,
-                                                uint32_t n_selected,
-                                                uint32_t n_experts_total,
-                                                uint32_t n_rows,
-                                                uint32_t n_pairs,
-                                                uint32_t k_val,
-                                                uint32_t rounds);
 
 /* CDX3-native MTL4 decode-matmul canary. Opens a real DS4-CDX3 pack/index,
  * runs one record's D8 codebook + log-U8 scales + bitpacked indices directly
@@ -2482,22 +2457,8 @@ int ds4_gpu_mtl4_vqb2_pack_dispatch_layer(void *pack_mtlbuf,
  * (1 codes blob with multiple entries spaced by entry_stride bytes), wraps
  * it as MTLBuffer, runs the layer dispatch primitive, cross-checks each
  * output against CPU scalar reference. */
-int ds4_gpu_mtl4_vqb2_pack_fused_canary(uint32_t n_entries,
-                                        uint32_t n_selected,
-                                        uint32_t n_experts_in_packet,
-                                        uint32_t n_rows,
-                                        uint32_t n_pairs,
-                                        uint32_t k_val,
-                                        uint32_t rounds);
 
 /* Head-to-head: cached MTL4 vs classic ICB on the same shape. */
-int ds4_gpu_mtl4_vqb2_pack_icb_bench(uint32_t n_entries,
-                                     uint32_t n_selected,
-                                     uint32_t n_experts_in_packet,
-                                     uint32_t n_rows,
-                                     uint32_t n_pairs,
-                                     uint32_t k_val,
-                                     uint32_t rounds);
 
 /* Production bind-pack + dispatcher (silv 2026-05-28 task #759).
  *
@@ -2524,8 +2485,6 @@ int  ds4_metal_vqb2_fused_dispatch_kind_strided(uint32_t layer, uint32_t kind_id
                                                  uint32_t *out_n_pairs);
 int  ds4_metal_vqb2_fused_bind_smoke(const char *pack_path, const char *index_csv_path,
                                      uint32_t layer, uint32_t kind_id);
-int  ds4_metal_vqb2_fused_microbench(const char *pack_path, const char *index_csv_path,
-                                     uint32_t layer, uint32_t kind_id, uint32_t rounds);
 
 /* silv 2026-05-28 task #761 — per-layer coverage bitmask.
  *   bit 0 = GATE bound  (any row_block present for kind_id=0)
@@ -2635,13 +2594,6 @@ int ds4_mtl4_run_canary(void *pipeline,             /* id<MTLComputePipelineStat
  *   K=16  → 8 codes/thread  (32-bit packed nibbles)
  *   K=256 → 4 codes/thread  (32-bit packed bytes)
  * Cross-checks bit-exactness against scalar output. K∈{4,16,256}. */
-int ds4_gpu_mtl4_vqb2_decode_vectorized_bench(uint32_t n_packets,
-                                              uint32_t n_selected,
-                                              uint32_t n_experts_total,
-                                              uint32_t n_rows,
-                                              uint32_t n_pairs,
-                                              uint32_t k_val,
-                                              uint32_t rounds);
 
 /* silv 2026-05-28 task #742 — wide-tile audit canary.
  * Routes R tokens to a single expert (htpe[0]=R, hids[0..R-1]={0..R-1}),
