@@ -41,7 +41,7 @@ DEFAULT_ACTS = REPO_ROOT / "tmp" / "20260601_actaware_nvidia" / "acts_L36_L42_81
 if str(REPO_ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "tools"))
 
-from ds4_d8f_weight_compare import decode_d8f, load_source, read_record  # noqa: E402
+from ds4_d8f import decode_d8f, load_source, read_record  # noqa: E402
 from ds4_logprob_margin_gate import analyze as analyze_logprobs  # noqa: E402
 from ds4_logprob_margin_gate import load_steps  # noqa: E402
 from ds4_safetensors import SafetensorStore  # noqa: E402

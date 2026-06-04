@@ -29,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "tools"))
 
-from ds4_d8f_weight_compare import decode_d8f, load_source, read_record  # noqa: E402
+from ds4_d8f import decode_d8f, load_source, read_record  # noqa: E402
 from ds4_head_margin_sensitivity import (  # noqa: E402
     DEFAULT_ACTS,
     MODEL_DIR,

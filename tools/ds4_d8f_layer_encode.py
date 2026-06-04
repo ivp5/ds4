@@ -38,23 +38,22 @@ if str(LIB_ROOT) not in sys.path:
 
 import ds4_mlx_lib as mlx_lib  # noqa: E402
 
+from ds4_d8f import (  # noqa: E402
+    EXPERTS,
+    FUSED_MAGIC,
+    HEADER_BYTES,
+    K_FIELDS,
+    PROJECTION_NAMES,
+    PROJECTIONS,
+    RECORD_BYTES,
+    RECORD_STRUCT,
+    SHAPES,
+    SOURCE_STEMS,
+    empty_record_table,
+)
 
-FUSED_MAGIC = b"DS4D8F1\0"
-HEADER_BYTES = 4096
-EXPERTS = 256
-PROJECTIONS = {"gate": 0, "up": 1, "down": 2}
-PROJECTION_NAMES = {v: k for k, v in PROJECTIONS.items()}
-SOURCE_STEMS = {"gate": "w1", "up": "w3", "down": "w2"}
-K_FIELDS = {"gate": "K_gate", "up": "K_up", "down": "K_down"}
-RECORD_BYTES = 64
-RECORD_STRUCT = struct.Struct("<IIIIIIQQQIIII")
 GROUP = 8
 INDEX_GUARD_BYTES = 4
-SHAPES = {
-    "gate": (2048, 4096),
-    "up": (2048, 4096),
-    "down": (4096, 2048),
-}
 DEFAULT_ALLOCATION = REPO_ROOT / "tmp" / "20260604_quant_runtime" / "h3371_reconstructed" / "ds4_52gb_allocation_h3371_general_fit_no_overlay.npy"
 DEFAULT_ACTS = Path("/Users/silv/cl/tlp_codex/deployed_acts_richcalib_8192tok_20260530T231858.npz")
 
@@ -83,15 +82,6 @@ def rewrite_header(handle, header: dict[str, Any]) -> None:
     handle.write(struct.pack("<II", 1, len(raw)))
     handle.write(raw)
     handle.write(b"\0" * (HEADER_BYTES - 16 - len(raw)))
-
-
-def empty_record_table() -> bytearray:
-    table = bytearray(RECORD_BYTES * len(PROJECTIONS) * EXPERTS)
-    for projection in range(len(PROJECTIONS)):
-        for expert in range(EXPERTS):
-            offset = (projection * EXPERTS + expert) * RECORD_BYTES
-            RECORD_STRUCT.pack_into(table, offset, projection, expert, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-    return table
 
 
 def bits_for_k(k: int) -> int:
