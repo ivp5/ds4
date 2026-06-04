@@ -57499,8 +57499,16 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
         }
         const int down_tile32_requested =
             ds4_gpu_d8f_down_tile32_enabled_for_layer(layer, rank1_sidecar_active);
+        const int sparse_down_requested =
+            ds4_gpu_d8f_runtime_sparse_down_enabled_for_layer(layer, n_tokens) &&
+            g_d8f_runtime_sparse_buf &&
+            g_d8f_runtime_sparse_rec_buf &&
+            g_d8f_runtime_sparse_max_group_unique > 0u &&
+            g_d8f_down_sparse_score_selected_batch_classic_pipeline &&
+            g_d8f_down_sparse_gather_selected_batch_classic_pipeline;
         const int rank1_split_requested = rank1_sidecar_active &&
-            ds4_gpu_d8f_rank1_split_sidecar_enabled(n_tokens);
+            (ds4_gpu_d8f_rank1_split_sidecar_enabled(n_tokens) ||
+             sparse_down_requested);
         const int rank1_split_sidecar = rank1_split_requested &&
             !half_mid && !preweight_mid &&
             g_d8f_down_rank1_dot_batch_classic_pipeline &&
@@ -57534,10 +57542,10 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             g_d8f_runtime_i8_codebook_buf &&
             g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_i8_cbsram_classic_pipeline;
         const int down_sparse_recbuf =
-            !rank1_sidecar_active &&
+            (!rank1_sidecar_active || rank1_split_sidecar) &&
             !down_tile32_recbuf &&
             !half_mid && recbuf_enabled && !preweight_mid && down_tile16 &&
-            ds4_gpu_d8f_runtime_sparse_down_enabled_for_layer(layer, n_tokens) &&
+            sparse_down_requested &&
             g_d8f_runtime_sparse_buf &&
             g_d8f_runtime_sparse_rec_buf &&
             g_d8f_runtime_sparse_max_group_unique > 0u &&
@@ -57687,6 +57695,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             ds4_gpu_env_bool("DS4_D8F_RANK1_SPLIT_PACKET_ICB");
         const int rank1_split_packet_icb = rank1_split_sidecar &&
             !down_native_i8_cbsram &&
+            !down_sparse_recbuf &&
             ds4_gpu_env_bool("DS4_D8F_RANK1_SPLIT_PACKET_ICB_DISABLE") <= 0 &&
             (rank1_split_packet_icb_policy >= 0 ?
              rank1_split_packet_icb_policy > 0 :
@@ -58000,6 +58009,18 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                                                         n_experts)) {
                     encode_ok = 0;
                 }
+                if (encode_ok && rank1_split_sidecar) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    [enc setComputePipelineState:g_d8f_down_rank1_axpy_batch_classic_pipeline];
+                    [enc setBuffer:g_d8f_runtime_buf offset:0 atIndex:0];
+                    [enc setBuffer:selBuf offset:sel_off atIndex:1];
+                    [enc setBuffer:outBuf offset:out_off atIndex:2];
+                    [enc setBuffer:g_d8f_runtime_sidecar_dot_buf offset:0 atIndex:3];
+                    [enc setBuffer:g_d8f_runtime_down_args_buf offset:0 atIndex:4];
+                    [enc setBuffer:weightBuf offset:weight_off atIndex:5];
+                    [enc dispatchThreadgroups:MTLSizeMake((ds4_down_out_dim + 255u) >> 8, n_tokens, 1)
+                        threadsPerThreadgroup:packet_tg];
+                }
             } else {
             if (down_native_pack2d_warm) {
                 [enc setComputePipelineState:g_d8f_down_native_pack2d_warm_classic_pipeline];
@@ -58056,8 +58077,8 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
         static int s_d8f_inline_notice = 0;
         if (ok == 0 && !s_d8f_inline_notice) {
             s_d8f_inline_notice = 1;
-            fprintf(stderr, "ds4: D8F inline Metal routed organ enabled; MTL4 external path remains fallback; half_mid=%d gateup_tile4=%d down_tile32=%d down_native_tex=%d down_native_pack2d=%d down_native_pack2d_warm=%d down_native_compact_tex=%d down_i8_cbsram=%d i8_keep=%u/%u i8_bytes=%.2fMiB down_cbsram=%u rank1_split=%d\n",
-                    half_mid, gateup_tile4, down_tile32_recbuf, down_native_recbuf, down_native_pack2d, down_native_pack2d_warm, down_native_compact_tex,
+            fprintf(stderr, "ds4: D8F inline Metal routed organ enabled; MTL4 external path remains fallback; half_mid=%d gateup_tile4=%d down_tile32=%d down_sparse=%d down_native_tex=%d down_native_pack2d=%d down_native_pack2d_warm=%d down_native_compact_tex=%d down_i8_cbsram=%d i8_keep=%u/%u i8_bytes=%.2fMiB down_cbsram=%u rank1_split=%d\n",
+                    half_mid, gateup_tile4, down_tile32_recbuf, down_sparse_recbuf, down_native_recbuf, down_native_pack2d, down_native_pack2d_warm, down_native_compact_tex,
                     down_native_i8_cbsram, g_d8f_runtime_i8_kept, g_d8f_runtime_i8_total,
                     (double)g_d8f_runtime_i8_codebook_bytes / 1048576.0,
                     down_cbsram_k_cap, rank1_split_sidecar);

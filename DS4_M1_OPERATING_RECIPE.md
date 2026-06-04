@@ -163,7 +163,7 @@ they pass real selected-layer D8F, overlap, and fidelity gates.
 |------|------|--------|------------|
 | `ds4flash.gguf` (IQ2_XXS w2 imatrix) | 86.7 GB | Production | Full AIME P01-P10 reachable |
 | `DeepSeek-V4-Flash_H3384_H3382_all43_route_hotblock_sidecar_top6_down_native_codes_D8F_800kctx_probe_20260604` | 41 GB physical / 48.9 GiB logical | Current default SOTA pack | H3384 hot-block D8F + top6 native down-code sidecars; no-flag CLI selects it when present |
-| `DeepSeek-V4-Flash_H3385_H3384_sparse_groupcode_sidecars_D8F_800kctx_probe_20260604` | 487 MB overlay | Experimental next-gen sidecar | Exact sparse group-code sidecars with C reader; not primary until Metal sparse path passes full decode/AIME gates |
+| `DeepSeek-V4-Flash_H3385_H3384_sparse_groupcode_sidecars_D8F_800kctx_probe_20260604` | 487 MB overlay | Experimental next-gen sidecar | Exact sparse group-code sidecars with C reader; sparse+rank1 Metal path passes selected-layer exactness canaries but is still slower than native-code sidecars, so not primary until full decode/AIME gates improve |
 | `DS4-trim50-asym-with-metadata.gguf` | 26 GB | Path A trim | **4× gen speedup BUT arithmetic carry breaks** (shifts cite v_P+5 vs v_P+9 collapse) |
 | Q4_K_M-XL 153 GB | 153 GB | doesn't fit | — |
 | `MLX-Qwen3.5-9B-DS-V4-Flash-4bit` | 5 GB | distill, MLX | side-by-side proposer |
