@@ -151,6 +151,54 @@ def priority_rows(payload: dict[str, Any], layers: set[int], score_mode: str) ->
     return rows, score_meta
 
 
+def choose_rows(
+    rows: list[dict[str, Any]],
+    direction_index: dict[int, dict[str, set[int] | set[str]]],
+    top_total: int,
+    max_per_layer: int,
+    relax_cap_to_fill_budget: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[int, int], bool]:
+    chosen: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    delayed_by_cap: list[dict[str, Any]] = []
+    chosen_pairs: set[tuple[int, int]] = set()
+    per_layer_counts: dict[int, int] = {}
+    for row in rows:
+        layer = int(row["layer"])
+        expert = int(row["expert"])
+        if not valid_direction(direction_index, layer, expert):
+            rejected.append({**row, "reason": "missing_direction_or_not_down_below"})
+            continue
+        if max_per_layer > 0 and per_layer_counts.get(layer, 0) >= max_per_layer:
+            delayed_by_cap.append(row)
+            continue
+        chosen.append(row)
+        chosen_pairs.add((layer, expert))
+        per_layer_counts[layer] = per_layer_counts.get(layer, 0) + 1
+        if len(chosen) >= top_total:
+            rejected.extend({**row, "reason": "not_reached"} for row in delayed_by_cap)
+            return chosen, rejected, per_layer_counts, False
+    relaxed_fill = False
+    if relax_cap_to_fill_budget and max_per_layer > 0 and len(chosen) < top_total:
+        relaxed_fill = True
+        for row in delayed_by_cap:
+            layer = int(row["layer"])
+            expert = int(row["expert"])
+            if (layer, expert) in chosen_pairs:
+                continue
+            chosen.append({**row, "cap_relaxed": True})
+            chosen_pairs.add((layer, expert))
+            per_layer_counts[layer] = per_layer_counts.get(layer, 0) + 1
+            if len(chosen) >= top_total:
+                break
+    rejected.extend(
+        {**row, "reason": "max_per_layer"}
+        for row in delayed_by_cap
+        if (int(row["layer"]), int(row["expert"])) not in chosen_pairs
+    )
+    return chosen, rejected, per_layer_counts, relaxed_fill
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--priority-json", type=Path, required=True)
@@ -161,6 +209,7 @@ def main() -> int:
     parser.add_argument("--max-per-layer", type=int, default=0)
     parser.add_argument("--include-existing-pack-dir", type=Path, default=None)
     parser.add_argument("--score-mode", choices=("lognormal", "raw"), default="lognormal")
+    parser.add_argument("--relax-cap-to-fill-budget", action="store_true")
     args = parser.parse_args()
 
     if args.out_dir.exists() and any(args.out_dir.iterdir()):
@@ -170,22 +219,13 @@ def main() -> int:
     payload = json.loads(args.priority_json.read_text(encoding="utf-8"))
     rows, score_meta = priority_rows(payload, layers, args.score_mode)
     direction_index = load_direction_index(args.source_data_dir, layers)
-    chosen: list[dict[str, Any]] = []
-    rejected: list[dict[str, Any]] = []
-    per_layer_counts: dict[int, int] = {}
-    for row in rows:
-        layer = int(row["layer"])
-        expert = int(row["expert"])
-        if not valid_direction(direction_index, layer, expert):
-            rejected.append({**row, "reason": "missing_direction_or_not_down_below"})
-            continue
-        if args.max_per_layer > 0 and per_layer_counts.get(layer, 0) >= args.max_per_layer:
-            rejected.append({**row, "reason": "max_per_layer"})
-            continue
-        chosen.append(row)
-        per_layer_counts[layer] = per_layer_counts.get(layer, 0) + 1
-        if len(chosen) >= args.top_total:
-            break
+    chosen, rejected, per_layer_counts, cap_relaxed = choose_rows(
+        rows,
+        direction_index,
+        args.top_total,
+        args.max_per_layer,
+        args.relax_cap_to_fill_budget,
+    )
 
     existing_added: list[dict[str, Any]] = []
     if args.include_existing_pack_dir is not None:
@@ -206,6 +246,7 @@ def main() -> int:
                     "rank1_harm": 0.2,
                     "route_mass": 0.0,
                     "priority": 1.0e-9,
+                    "selection_score": 1.0e-9,
                     "already_sidecar": True,
                     "source": "existing_sidecar",
                 }
@@ -251,6 +292,8 @@ def main() -> int:
         "layers": sorted(layers),
         "top_total": args.top_total,
         "max_per_layer": args.max_per_layer,
+        "relax_cap_to_fill_budget": args.relax_cap_to_fill_budget,
+        "cap_relaxed_to_fill_budget": cap_relaxed,
         "score_meta": score_meta,
         "include_existing_pack_dir": str(args.include_existing_pack_dir) if args.include_existing_pack_dir else None,
         "link_modes": sorted(link_modes),
