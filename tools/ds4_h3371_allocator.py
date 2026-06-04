@@ -27,6 +27,7 @@ GROUP = 8
 ROUTED_ROWS = 2048
 ROUTED_COLS = 4096
 DOWN_SCALE_BYTES = 4096
+INDEX_GUARD_BYTES = 4
 WEIGHTS_PER_PROJECTION = ROUTED_ROWS * ROUTED_COLS
 GROUPS_PER_PROJECTION = WEIGHTS_PER_PROJECTION // GROUP
 DEFAULT_INPUT = Path("tmp/20260602_codec_general/ds4_52gb_allocation_h3216_l39_downprotected_l40_42_gateup_floor.npy")
@@ -45,7 +46,7 @@ def projection_bpw(k: int) -> float:
 def record_payload_bytes(k: int, *, down: bool) -> int:
     bits = int(math.ceil(math.log2(k)))
     codebook_bytes = k * GROUP * 2
-    index_bytes = (GROUPS_PER_PROJECTION * bits + 7) // 8
+    index_bytes = (GROUPS_PER_PROJECTION * bits + 7) // 8 + INDEX_GUARD_BYTES
     return codebook_bytes + index_bytes + (DOWN_SCALE_BYTES if down else 0)
 
 
@@ -84,6 +85,21 @@ def update_down_fields(allocation: np.ndarray) -> None:
         allocation["codec_down"][:] = "VQ-D8"
     if "cbtrain_down" in allocation.dtype.names:
         allocation["cbtrain_down"][:] = "act-aware"
+
+
+def update_gateup_fields(allocation: np.ndarray) -> None:
+    for projection in ("gate", "up"):
+        k_field = f"K_{projection}"
+        bpw_field = f"bpw_{projection}"
+        codec_field = f"codec_{projection}"
+        cbtrain_field = f"cbtrain_{projection}"
+        if bpw_field in allocation.dtype.names:
+            for k in np.unique(allocation[k_field]):
+                allocation[bpw_field][allocation[k_field] == k] = projection_bpw(int(k))
+        if codec_field in allocation.dtype.names:
+            allocation[codec_field][:] = "VQ-D8"
+        if cbtrain_field in allocation.dtype.names:
+            allocation[cbtrain_field][:] = "plain"
 
 
 def weakest_l40_down_rows(allocation: np.ndarray, count: int) -> np.ndarray:
@@ -143,12 +159,63 @@ def build_h3371(source: np.ndarray, l40_k256_count: int) -> tuple[np.ndarray, di
     return allocation, manifest
 
 
+def promote_late_hot_gateup(allocation: np.ndarray,
+                            manifest: dict[str, Any],
+                            route_threshold: float,
+                            gate_k: int,
+                            up_k: int) -> None:
+    if route_threshold <= 0.0:
+        return
+    mask = (
+        (allocation["layer"] >= 40) &
+        (allocation["layer"] <= 42) &
+        (allocation["route_mass"] >= route_threshold)
+    )
+    before = allocation[mask].copy()
+    allocation["K_gate"][mask] = np.maximum(allocation["K_gate"][mask], gate_k)
+    allocation["K_up"][mask] = np.maximum(allocation["K_up"][mask], up_k)
+    update_gateup_fields(allocation)
+    rows = []
+    for row in before[np.argsort(before["route_mass"])[::-1]]:
+        current = allocation[(allocation["layer"] == row["layer"]) & (allocation["expert"] == row["expert"])][0]
+        rows.append({
+            "layer": int(row["layer"]),
+            "expert": int(row["expert"]),
+            "rank": int(row["rank"]) if "rank" in allocation.dtype.names else 0,
+            "route_mass": float(row["route_mass"]),
+            "old_K_gate": int(row["K_gate"]),
+            "new_K_gate": int(current["K_gate"]),
+            "old_K_up": int(row["K_up"]),
+            "new_K_up": int(current["K_up"]),
+            "K_down": int(current["K_down"]),
+        })
+    manifest["target"] = "H3372_H3371_late_route_hot_gateup_repair"
+    manifest["rule"].append(
+        f"promote L40-L42 route_mass>={route_threshold:g} gate/up to at least K{gate_k}/K{up_k}"
+    )
+    manifest["late_route_hot_gateup_promotions"] = {
+        "route_threshold": route_threshold,
+        "gate_k_floor": gate_k,
+        "up_k_floor": up_k,
+        "count": int(mask.sum()),
+        "rows": rows,
+    }
+    manifest["k_hist"] = {
+        "gate": k_hist(allocation, "K_gate"),
+        "up": k_hist(allocation, "K_up"),
+        "down": k_hist(allocation, "K_down"),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--template-pack", type=Path, default=DEFAULT_TEMPLATE_PACK)
     parser.add_argument("--l40-k256-count", type=int, default=186)
+    parser.add_argument("--late-hot-gateup-threshold", type=float, default=0.0)
+    parser.add_argument("--late-hot-gate-k", type=int, default=2048)
+    parser.add_argument("--late-hot-up-k", type=int, default=4096)
     args = parser.parse_args()
 
     source = np.load(args.input, allow_pickle=False)
@@ -160,6 +227,11 @@ def main() -> int:
         raise SystemExit(f"allocation missing required fields: {sorted(missing)}")
 
     allocation, manifest = build_h3371(source, args.l40_k256_count)
+    promote_late_hot_gateup(allocation,
+                            manifest,
+                            args.late_hot_gateup_threshold,
+                            args.late_hot_gate_k,
+                            args.late_hot_up_k)
     before_routed = routed_payload_bytes(source)
     after_routed = routed_payload_bytes(allocation)
     extras = template_bytes(args.template_pack)
@@ -177,8 +249,9 @@ def main() -> int:
     }
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    npy_path = args.out_dir / "ds4_52gb_allocation_h3371_general_fit_no_overlay.npy"
-    json_path = args.out_dir / "h3371_general_fit_no_overlay_manifest.json"
+    tag = "h3372_late_route_hot_gateup_repair" if args.late_hot_gateup_threshold > 0.0 else "h3371_general_fit_no_overlay"
+    npy_path = args.out_dir / f"ds4_52gb_allocation_{tag}.npy"
+    json_path = args.out_dir / f"{tag}_manifest.json"
     if npy_path.exists() or json_path.exists():
         raise SystemExit(f"refusing to overwrite existing outputs in {args.out_dir}")
     np.save(npy_path, allocation)
