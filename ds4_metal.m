@@ -9060,6 +9060,101 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
  return 1;
 }
 
+int ds4_gpu_head_norm_rope_canary(uint32_t n_tok,
+                                  uint32_t n_head,
+                                  uint32_t head_dim,
+                                  uint32_t n_rot,
+                                  uint32_t rounds) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_head_norm_rope_tail_pipeline_init()) return 0;
+    if (!n_tok || !n_head || !head_dim || n_rot > head_dim || (n_rot & 1u) != 0u) return 0;
+    if (rounds == 0) rounds = 1;
+
+    const uint64_t count = (uint64_t)n_tok * n_head * head_dim;
+    if (count == 0 || count > (1ull << 28)) return 0;
+    float *input_host = (float *)calloc((size_t)count, sizeof(float));
+    float *direct_host = (float *)calloc((size_t)count, sizeof(float));
+    float *fused_host = (float *)calloc((size_t)count, sizeof(float));
+    if (!input_host || !direct_host || !fused_host) {
+        free(input_host);
+        free(direct_host);
+        free(fused_host);
+        return 0;
+    }
+    for (uint64_t i = 0; i < count; i++) {
+        input_host[i] = ((float)((int)(i % 37u)) - 18.0f) * 0.03125f;
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        ds4_gpu_tensor *direct = ds4_gpu_tensor_alloc(count * sizeof(float));
+        ds4_gpu_tensor *fused = ds4_gpu_tensor_alloc(count * sizeof(float));
+        int setup_ok = direct && fused;
+        if (setup_ok) setup_ok = ds4_gpu_tensor_write(direct, 0, input_host, count * sizeof(float)) > 0;
+        if (setup_ok) setup_ok = ds4_gpu_tensor_write(fused, 0, input_host, count * sizeof(float)) > 0;
+
+        fprintf(stderr,
+                "ds4: head-norm-rope canary START tokens=%u heads=%u head_dim=%u n_rot=%u rounds=%u\n",
+                n_tok, n_head, head_dim, n_rot, rounds);
+
+        int direct_ok = setup_ok;
+        const double direct_start_ms = ds4_gpu_now_ms();
+        for (uint32_t iter = 0; direct_ok && iter < rounds; iter++) {
+            direct_ok = ds4_gpu_head_rms_norm_tensor(direct, n_tok, n_head, head_dim, 1.0e-6f) != 0;
+            if (direct_ok) {
+                direct_ok = ds4_gpu_rope_tail_tensor(direct, n_tok, n_head, head_dim, n_rot,
+                                                     17u, 4096u, false,
+                                                     10000.0f, 1.0f, 0.0f, 1.0f,
+                                                     32.0f, 1.0f) != 0;
+            }
+        }
+        const double direct_ms = ds4_gpu_now_ms() - direct_start_ms;
+
+        int fused_ok = setup_ok;
+        const double fused_start_ms = ds4_gpu_now_ms();
+        for (uint32_t iter = 0; fused_ok && iter < rounds; iter++) {
+            fused_ok = ds4_gpu_head_rms_norm_rope_tail_tensor(fused, n_tok, n_head, head_dim, n_rot,
+                                                             17u, 4096u, 1.0e-6f,
+                                                             10000.0f, 1.0f, 0.0f, 1.0f,
+                                                             32.0f, 1.0f) != 0;
+        }
+        const double fused_ms = ds4_gpu_now_ms() - fused_start_ms;
+
+        if (direct_ok && fused_ok &&
+            ds4_gpu_tensor_read(direct, 0, direct_host, count * sizeof(float)) > 0 &&
+            ds4_gpu_tensor_read(fused, 0, fused_host, count * sizeof(float)) > 0) {
+            uint64_t mismatches = 0;
+            float max_abs = 0.0f;
+            float max_rel = 0.0f;
+            for (uint64_t i = 0; i < count; i++) {
+                const float delta = fabsf(direct_host[i] - fused_host[i]);
+                const float denom = fabsf(direct_host[i]) + 1.0e-6f;
+                const float rel = delta / denom;
+                if (delta > max_abs) max_abs = delta;
+                if (rel > max_rel) max_rel = rel;
+                if (delta > 2.0e-5f && rel > 2.0e-5f) mismatches++;
+            }
+            const double direct_per = direct_ms / (double)rounds;
+            const double fused_per = fused_ms / (double)rounds;
+            rc = mismatches == 0;
+            fprintf(stderr,
+                    "ds4: head-norm-rope canary direct=%.3f ms/round fused=%.3f ms/round speedup=%.2fx "
+                    "max_abs=%.3e max_rel=%.3e mismatches=%llu/%llu %s\n",
+                    direct_per, fused_per, fused_per > 0.0 ? direct_per / fused_per : 0.0,
+                    (double)max_abs, (double)max_rel,
+                    (unsigned long long)mismatches,
+                    (unsigned long long)count,
+                    rc ? "PASS" : "FAIL");
+        }
+        ds4_gpu_tensor_free(direct);
+        ds4_gpu_tensor_free(fused);
+    }
+    free(input_host);
+    free(direct_host);
+    free(fused_host);
+    return rc;
+}
+
 int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
  ds4_gpu_tensor *x,
  uint32_t n_tok,

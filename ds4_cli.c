@@ -167,9 +167,11 @@ static void usage(FILE *fp) {
         "      Embedded MTP stays available when policy permits. D8F spec-decode is\n"
         "      disabled by default after H2758/H2759 measured verifier slower than baseline;\n"
         "      set DS4_MTP_SPEC_FORCE=1 to force it.\n"
-        "      FP8 attention-output one-command-buffer HC fusion and FP8 shared-down\n"
-        "      HC fusion are default-on; disable with DS4_DISABLE_FP8_ATTN_OUT_ONECB_HC=1\n"
-        "      or DS4_METAL_DISABLE_SHARED_DOWN_FP8_HC_FUSION=1.\n"
+        "      Q head RMSNorm+RoPE, FP8 attention-output one-command-buffer HC fusion,\n"
+        "      and FP8 shared-down HC fusion are default-on; disable with\n"
+        "      DS4_METAL_DISABLE_Q_HEAD_NORM_ROPE_FUSION=1,\n"
+        "      DS4_DISABLE_FP8_ATTN_OUT_ONECB_HC=1, or\n"
+        "      DS4_METAL_DISABLE_SHARED_DOWN_FP8_HC_FUSION=1.\n"
         "  --power N\n"
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
@@ -2212,6 +2214,16 @@ int main(int argc, char **argv) {
         const uint32_t n_tokens = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 1u;
         const uint32_t rounds   = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
         return ds4_gpu_fp8_hc_fuse_canary(in_dim, out_dim, n_tokens, rounds) ? 0 : 1;
+    }
+    /* --head-norm-rope-canary [tokens [heads [head_dim [n_rot [rounds]]]]]
+     * Validates fused Q head RMSNorm + RoPE against the two-dispatch reference. */
+    if (argc >= 2 && !strcmp(argv[1], "--head-norm-rope-canary")) {
+        const uint32_t n_tok    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 1u;
+        const uint32_t n_head   = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 64u;
+        const uint32_t head_dim = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
+        const uint32_t n_rot    = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 64u;
+        const uint32_t rounds   = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 8u;
+        return ds4_gpu_head_norm_rope_canary(n_tok, n_head, head_dim, n_rot, rounds) ? 0 : 1;
     }
     /* --mtl4-icb-execute-canary [n_floats [rounds]] : proves the MTL4 encoder can replay
      * a classic MTLICB command when the MTL4 pipeline was compiled with ICB support. */

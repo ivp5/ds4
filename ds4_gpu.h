@@ -1286,6 +1286,11 @@ int ds4_gpu_fp8_hc_fuse_canary(uint32_t in_dim,
                                uint32_t out_dim,
                                uint32_t n_tokens,
                                uint32_t rounds);
+int ds4_gpu_head_norm_rope_canary(uint32_t n_tok,
+                                  uint32_t n_head,
+                                  uint32_t head_dim,
+                                  uint32_t n_rot,
+                                  uint32_t rounds);
 /* MTL4 canary: record a compute command into classic MTLICB, replay it from an MTL4 compute encoder. */
 int ds4_gpu_mtl4_icb_execute_canary(uint32_t n_floats, uint32_t rounds);
 

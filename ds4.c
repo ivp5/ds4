@@ -11981,8 +11981,8 @@ static bool metal_graph_use_reference_qkv_norm(void) {
 }
 
 static bool metal_graph_use_q_head_norm_rope(void) {
- static int cache = -1;
- return metal_graph_env_flag("DS4_METAL_ENABLE_Q_HEAD_NORM_ROPE_FUSION", &cache);
+ static int disable_cache = -1;
+ return !metal_graph_env_flag("DS4_METAL_DISABLE_Q_HEAD_NORM_ROPE_FUSION", &disable_cache);
 }
 
 static bool metal_graph_use_reference_compressor_pair_proj(void) {
