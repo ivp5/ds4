@@ -167,7 +167,7 @@ they pass real selected-layer D8F, overlap, and fidelity gates.
 | File | Size | Status | Capability |
 |------|------|--------|------------|
 | `ds4flash.gguf` (IQ2_XXS w2 imatrix) | 86.7 GB | Production | Full AIME P01-P10 reachable |
-| `DeepSeek-V4-Flash_H3384_H3382_all43_route_hotblock_sidecar_top6_down_native_codes_D8F_800kctx_probe_20260604` | 41 GB file / ~17.6 GB process RSS during current smoke / ~46 GB peak system wired during prefill | Default speed candidate, **not fidelity SOTA** | H3384 hot-block D8F + top6 native down-code sidecars; no-flag CLI can discover it, but normal generation is blocked before model load because agent2 A194-A203 and local `--coherence-gate` show dynamic AIME echo collapse |
+| `DeepSeek-V4-Flash_H3384_H3382_all43_route_hotblock_sidecar_top6_down_native_codes_D8F_800kctx_probe_20260604` | 41 GB file / ~17.6 GB process RSS during current smoke / ~46 GB peak system wired during prefill | Default speed candidate, **not fidelity SOTA** | H3384 hot-block D8F + top6 native down-code sidecars; no-flag CLI can discover it, but normal generation is blocked before model load because agent2 A194-A203 and local `--coherence-gate` show dynamic AIME echo collapse; temp=0.6 echo (`and and and } $ $ $`) and local temp=0.6 seed=1 malformed-burst failure at token 13 mean this is codec/runtime recurrence, not a greedy-only attractor |
 | `DeepSeek-V4-Flash_H3385_H3384_sparse_groupcode_sidecars_D8F_800kctx_probe_20260604` | 487 MB hardlink overlay on H3384 | Experimental sparse sidecar overlay, **not a self-contained flat-pack** | D8F payloads are hardlinks to H3384 and the directory lacks the metadata GGUF + non-routed pack required by `--flat-pack`; sparse+rank1 Metal selected-layer canaries are exact but slower than native-code sidecars and inherit H3384 coherence risk |
 | `DS4-trim50-asym-with-metadata.gguf` | 26 GB | Path A trim | **4× gen speedup BUT arithmetic carry breaks** (shifts cite v_P+5 vs v_P+9 collapse) |
 | Q4_K_M-XL 153 GB | 153 GB | doesn't fit | — |
@@ -372,7 +372,7 @@ Deferred:
 
 ## Operating doctrine summary
 
-1. **No flags/env discover H3384 + Metal + PRIME + prefill auto** when the H3384 flat-pack is present, but auto-selected H3384 now refuses normal generation until `--coherence-gate` passes; use explicit `--flat-pack` or `DS4_ALLOW_UNCERTIFIED_H3384=1` only for speed-only experiments
+1. **No flags/env discover H3384 + Metal + PRIME + prefill auto** when the H3384 flat-pack is present, but auto-selected H3384 now refuses normal generation until greedy and sampled `--coherence-gate` passes; use explicit `--flat-pack` or `DS4_ALLOW_UNCERTIFIED_H3384=1` only for speed-only experiments
 2. **Use `--prefill-metal-phases 0` only for A/B**; Metal default is `auto`, and external D8F normalizes to phase-free GPU runtime when no GGUF routed residency needs swapping
 3. **For chat/agentic: add `--kv-disk-dir`** (9× speedup on repeat)
 4. **For forensics: build JOURNAL=1** (append-only SQLite trace)

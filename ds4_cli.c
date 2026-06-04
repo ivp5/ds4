@@ -218,7 +218,8 @@ static void usage(FILE *fp) {
         "  --stop-repeat-sentence\n"
         "      Stop generation when an answer sentence repeats. Off by default.\n"
         "  --coherence-gate\n"
-        "      Greedy 40-token dynamic echo gate for codec candidates; exits nonzero on token loops.\n"
+        "      40-token dynamic echo gate for codec candidates; greedy by default, sampled when\n"
+        "      --temp/--presence-penalty are set. Exits nonzero on token loops.\n"
         "  --coherence-gate-tokens N\n"
         "      Token budget for --coherence-gate. Default: 40\n"
         "  --seed N\n"
@@ -714,6 +715,10 @@ typedef struct {
     token_printer printer;
     int tokens[512];
     int n_tokens;
+    int symbol_token_run;
+    size_t visible_chars;
+    size_t ascii_alnum_chars;
+    size_t symbol_chars;
     bool tripped;
     char reason[320];
 } coherence_gate_state;
@@ -739,7 +744,7 @@ static void coherence_gate_note_token(coherence_gate_state *g, int token) {
         g->tokens[(int)(sizeof(g->tokens) / sizeof(g->tokens[0])) - 1] = token;
     }
     for (int ngram = 1; ngram <= 6; ngram++) {
-        const int repeats = ngram == 1 ? 4 : 3;
+        const int repeats = 3;
         if (coherence_gate_repeated_ngram(g->tokens, g->n_tokens, ngram, repeats)) {
             g->tripped = true;
             snprintf(g->reason, sizeof(g->reason),
@@ -750,14 +755,71 @@ static void coherence_gate_note_token(coherence_gate_state *g, int token) {
     }
 }
 
+static bool coherence_gate_symbol_byte(unsigned char c) {
+    if (c >= 0x80) return true;
+    switch (c) {
+        case '\\': case '/': case '{': case '}': case '[': case ']':
+        case '(': case ')': case '$': case '*': case '_': case '`':
+        case '|': case '^': case '=': case '<': case '>': case ';':
+        case ':': case '"':
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void coherence_gate_note_text(coherence_gate_state *g, const char *text, size_t len) {
+    if (!g || g->tripped || !text) return;
+    size_t token_visible = 0;
+    size_t token_alnum = 0;
+    size_t token_symbol = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c <= 0x20) continue;
+        token_visible++;
+        if ((c >= '0' && c <= '9') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z')) {
+            token_alnum++;
+        }
+        if (coherence_gate_symbol_byte(c)) {
+            token_symbol++;
+        }
+    }
+    g->visible_chars += token_visible;
+    g->ascii_alnum_chars += token_alnum;
+    g->symbol_chars += token_symbol;
+    if (token_visible > 0 && token_alnum == 0 && token_symbol > 0) {
+        g->symbol_token_run++;
+    } else if (token_alnum > 0) {
+        g->symbol_token_run = 0;
+    }
+    if (g->n_tokens >= 8 && g->symbol_token_run >= 6) {
+        g->tripped = true;
+        snprintf(g->reason, sizeof(g->reason),
+                 "coherence-gate malformed burst: %d consecutive symbol-only tokens by generated token %d",
+                 g->symbol_token_run, g->n_tokens);
+        return;
+    }
+    if (g->n_tokens >= 16 && g->visible_chars >= 32 &&
+        g->ascii_alnum_chars * 4 < g->visible_chars &&
+        g->symbol_chars * 2 >= g->visible_chars) {
+        g->tripped = true;
+        snprintf(g->reason, sizeof(g->reason),
+                 "coherence-gate malformed text: ascii_alnum=%zu visible=%zu symbol=%zu by generated token %d",
+                 g->ascii_alnum_chars, g->visible_chars, g->symbol_chars, g->n_tokens);
+    }
+}
+
 static void coherence_gate_emit_token(void *ud, int token) {
     coherence_gate_state *g = ud;
     size_t len = 0;
     char *text = ds4_token_text(g->printer.engine, token, &len);
     token_printer_write_text(&g->printer, text, len);
     fflush(g->printer.fp);
-    free(text);
     coherence_gate_note_token(g, token);
+    coherence_gate_note_text(g, text, len);
+    free(text);
 }
 
 static int run_coherence_gate_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
@@ -791,6 +853,22 @@ static int run_coherence_gate_generation(ds4_engine *engine, const cli_config *c
     int room = ds4_session_ctx(session) - ds4_session_pos(session);
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
+    const bool sampled_gate = cfg->gen.temperature > 0.0f ||
+                              cfg->gen.presence_penalty > 0.0f;
+    uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
+        ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    if (sampled_gate) {
+        fprintf(stderr,
+                "ds4: coherence-gate sampled mode temp=%.4g top_p=%.4g min_p=%.4g "
+                "presence=%.4g seed=%llu\n",
+                (double)cfg->gen.temperature,
+                (double)cfg->gen.top_p,
+                (double)cfg->gen.min_p,
+                (double)cfg->gen.presence_penalty,
+                (unsigned long long)rng);
+    } else {
+        fprintf(stderr, "ds4: coherence-gate greedy mode\n");
+    }
 
     coherence_gate_state gate = {
         .printer = {
@@ -807,7 +885,15 @@ static int run_coherence_gate_generation(ds4_engine *engine, const cli_config *c
     int generated = 0;
     int rc = 0;
     while (generated < max_tokens && !cli_interrupt_requested()) {
-        int token = ds4_session_argmax(session);
+        int token = sampled_gate ?
+            ds4_session_sample_with_presence_penalty(session,
+                                                     cfg->gen.temperature,
+                                                     0,
+                                                     cfg->gen.top_p,
+                                                     cfg->gen.min_p,
+                                                     cfg->gen.presence_penalty,
+                                                     &rng) :
+            ds4_session_argmax(session);
         if (token == ds4_token_eos(engine)) break;
         coherence_gate_emit_token(&gate, token);
         generated++;
@@ -826,11 +912,11 @@ static int run_coherence_gate_generation(ds4_engine *engine, const cli_config *c
         rc = 3;
     }
     if (rc == 0) {
-        fprintf(stderr, "ds4: coherence-gate PASS generated=%d budget=%d elapsed=%.3fs\n",
-                generated, max_tokens, dt);
+        fprintf(stderr, "ds4: coherence-gate PASS mode=%s generated=%d budget=%d elapsed=%.3fs\n",
+                sampled_gate ? "sampled" : "greedy", generated, max_tokens, dt);
     } else if (gate.tripped) {
-        fprintf(stderr, "ds4: coherence-gate FAIL generated=%d budget=%d elapsed=%.3fs\n",
-                generated, max_tokens, dt);
+        fprintf(stderr, "ds4: coherence-gate FAIL mode=%s generated=%d budget=%d elapsed=%.3fs\n",
+                sampled_gate ? "sampled" : "greedy", generated, max_tokens, dt);
     }
     ds4_session_free(session);
     return rc;
@@ -1428,7 +1514,9 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
                cfg->gen.presence_penalty > 0.0f ||
                ds4_engine_mtp_draft_tokens(engine) > 1) {
         if (cfg->gen.coherence_gate) {
-            fprintf(stderr, "ds4: --coherence-gate uses deterministic greedy decode; ignoring sampling/spec settings\n");
+            if (ds4_engine_mtp_draft_tokens(engine) > 1) {
+                fprintf(stderr, "ds4: --coherence-gate ignores MTP speculative drafting; sampling params are still respected\n");
+            }
             rc = run_coherence_gate_generation(engine, cfg, &prompt);
         } else {
             rc = run_sampled_generation(engine, cfg, &prompt);
@@ -1952,7 +2040,7 @@ static void apply_default_h3384_speed_candidate(cli_config *cfg) {
     cfg->default_pack_auto_selected = true;
     fprintf(stderr,
             "ds4: default H3384 speed candidate selected: hotblock/native-down D8F "
-            "(not fidelity SOTA; normal generation is blocked until coherence is certified)\n");
+            "(not fidelity SOTA; normal generation is blocked until greedy+sampled coherence are certified)\n");
 }
 
 static void cli_config_free(cli_config *cfg) {
