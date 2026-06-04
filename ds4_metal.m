@@ -3,6 +3,7 @@
 #import <objc/runtime.h>
 
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -399,6 +400,9 @@ static int ds4_icb_slot_record_command_barrier(ds4_icb_slot_t *slot,
                                                       n_extras);
 }
 
+static _Atomic uint64_t g_ds4_icb_execute_count = 0;
+static _Atomic uint64_t g_ds4_icb_command_count = 0;
+
 /* Execute a range of recorded commands on the given encoder. The caller
  * is responsible for `useResource` declarations on the encoder before
  * calling (resources MUST be marked used before executeCommandsInBuffer).
@@ -409,6 +413,8 @@ static int ds4_icb_slot_execute(ds4_icb_slot_t *slot,
                                 NSUInteger start_cmd, NSUInteger n_cmds) {
     if (!slot || !slot->icb || !enc) return 0;
     if (start_cmd + n_cmds > slot->max_commands) return 0;
+    atomic_fetch_add_explicit(&g_ds4_icb_execute_count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_ds4_icb_command_count, (uint64_t)n_cmds, memory_order_relaxed);
     [enc executeCommandsInBuffer:slot->icb withRange:NSMakeRange(start_cmd, n_cmds)];
     return 1;
 }
@@ -568,7 +574,6 @@ static NSMutableArray<id<MTLBuffer>> *g_transient_buffers;
 static id g_model_residency_set;
 static id<MTLBuffer> g_flash_attn_mask_buffer;
 /* research cb-create + forward counters. DS4_CB_COUNT=1 prints at cleanup. */
-#include <stdatomic.h>
 static _Atomic uint64_t g_ds4_cb_create_count = 0;
 static _Atomic uint64_t g_ds4_forward_count = 0;
 static _Atomic uint64_t g_ds4_d8f_inline_count = 0;
@@ -647,7 +652,8 @@ static void ds4_swizzle_dispatch_count_once(id enc) {
 }
 
 uint64_t ds4_dispcount_now(void) {
- return atomic_load_explicit(&g_ds4_dispatch_count, memory_order_relaxed);
+ return atomic_load_explicit(&g_ds4_dispatch_count, memory_order_relaxed) +
+        atomic_load_explicit(&g_ds4_icb_command_count, memory_order_relaxed);
 }
 
 static inline id<MTLCommandBuffer> ds4_gpu_create_cb_counted(void) {
@@ -6032,9 +6038,16 @@ void ds4_gpu_cleanup(void) {
  if (getenv("DS4_DISPATCH_COUNT")) {
  const uint64_t dispatches = atomic_load_explicit(&g_ds4_dispatch_count,
  memory_order_relaxed);
+ const uint64_t icb_execs = atomic_load_explicit(&g_ds4_icb_execute_count,
+ memory_order_relaxed);
+ const uint64_t icb_cmds = atomic_load_explicit(&g_ds4_icb_command_count,
+ memory_order_relaxed);
  fprintf(stderr,
- "ds4: dispatch_count: encoded %llu Metal compute dispatches\n",
- (unsigned long long)dispatches);
+ "ds4: dispatch_count: direct %llu ICB_exec %llu ICB_cmds %llu effective_gpu_cmds %llu\n",
+ (unsigned long long)dispatches,
+ (unsigned long long)icb_execs,
+ (unsigned long long)icb_cmds,
+ (unsigned long long)(dispatches + icb_cmds));
  }
 
  if (getenv("DS4_DENSE_ICB_COUNT")) {
@@ -57244,6 +57257,8 @@ int ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(const char *d8f_path,
                         gateup_recbuf, down_tile16_recbuf, down_tile32_recbuf);
             }
             atomic_fetch_add_explicit(&g_ds4_d8f_packet_icb_range_count, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_ds4_icb_execute_count, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_ds4_icb_command_count, 2, memory_order_relaxed);
             [enc executeCommandsInBuffer:g_d8f_packet_icb_slot.icb withRange:NSMakeRange(packet_gate_cmd, 2)];
         } else {
             gateAt = ds4_mtl4_pool_acquire(gate_arg_count);
