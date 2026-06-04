@@ -1491,6 +1491,18 @@ static int ds4_gpu_env_default_on(const char *name, const char *disable_name) {
  return 1;
 }
 
+static int ds4_gpu_max_fusion_enabled(void) {
+ static int initialized = 0;
+ static int enabled = 0;
+ if (!initialized) {
+  enabled =
+   ds4_gpu_env_bool("DS4_METAL_GRAPH_MAX_FUSION") > 0 ||
+   ds4_gpu_env_bool("DS4_MAX_FUSION") > 0;
+  initialized = 1;
+ }
+ return enabled;
+}
+
 static inline uint64_t ds4_gpu_layer_bit(uint32_t layer) {
  return layer < 64u ? (1ull << layer) : 0ull;
 }
@@ -1541,7 +1553,7 @@ static void ds4_gpu_d8f_env_init(void) {
  g_ds4_d8f_env.half_mid_decode = ds4_gpu_env_bool("DS4_D8F_HALF_MID_DECODE");
  g_ds4_d8f_env.classic_packet_icb = ds4_gpu_env_bool("DS4_D8F_CLASSIC_PACKET_ICB");
  g_ds4_d8f_env.mtl4_packet_icb = ds4_gpu_env_bool("DS4_D8F_MTL4_PACKET_ICB");
- if (ds4_gpu_env_bool("DS4_PRIME_PATH") > 0) {
+ if (ds4_gpu_env_bool("DS4_PRIME_PATH") > 0 || ds4_gpu_max_fusion_enabled()) {
   if (g_ds4_d8f_env.classic_packet_icb < 0) g_ds4_d8f_env.classic_packet_icb = 1;
   if (g_ds4_d8f_env.mtl4_packet_icb < 0) g_ds4_d8f_env.mtl4_packet_icb = 0;
  }
@@ -1708,6 +1720,13 @@ static int ds4_gpu_d8f_classic_packet_icb_enabled(void) {
 static int ds4_gpu_d8f_mtl4_packet_icb_enabled(void) {
  ds4_gpu_d8f_env_init();
  return g_ds4_d8f_env.mtl4_packet_icb > 0;
+}
+
+static int ds4_gpu_d8f_runtime_i8_cbsram_enabled(void) {
+ if (ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_I8_CBSRAM_DISABLE") > 0) return 0;
+ const int explicit_i8 = ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_I8_CBSRAM");
+ if (explicit_i8 >= 0) return explicit_i8 > 0;
+ return ds4_gpu_max_fusion_enabled();
 }
 
 static int ds4_gpu_mpp_available(void) {
@@ -55697,7 +55716,7 @@ static int ds4_d8f_runtime_cache_prepare(uint32_t layer, const char *path) {
                 layer);
         g_d8f_runtime_layer_compact_codebook_buf[layer] = compact_codebook_buf;
     }
-    if (ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_I8_CBSRAM") > 0) {
+    if (ds4_gpu_d8f_runtime_i8_cbsram_enabled()) {
         id<MTLBuffer> i8_rec_buf = nil;
         id<MTLBuffer> i8_codebook_buf = nil;
         uint32_t i8_bytes = 0;
@@ -56228,7 +56247,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
         const int down_native_i8_cbsram =
             !down_tile32_recbuf &&
             !half_mid && recbuf_enabled && !preweight_mid && down_tile16 &&
-            ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_I8_CBSRAM") > 0 &&
+            ds4_gpu_d8f_runtime_i8_cbsram_enabled() &&
             g_d8f_runtime_rec_buf &&
             g_d8f_runtime_i8_rec_buf &&
             g_d8f_runtime_i8_codebook_buf &&
