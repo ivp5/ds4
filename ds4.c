@@ -12001,8 +12001,11 @@ static bool metal_graph_use_reference_qkv_norm(void) {
 }
 
 static bool metal_graph_use_q_head_norm_rope(void) {
+ static int enable_cache = -1;
  static int disable_cache = -1;
- return !metal_graph_env_flag("DS4_METAL_DISABLE_Q_HEAD_NORM_ROPE_FUSION", &disable_cache);
+ return (ds4_metal_graph_max_fusion_enabled() ||
+         metal_graph_env_flag("DS4_METAL_ENABLE_Q_HEAD_NORM_ROPE_FUSION", &enable_cache)) &&
+        !metal_graph_env_flag("DS4_METAL_DISABLE_Q_HEAD_NORM_ROPE_FUSION", &disable_cache);
 }
 
 static bool metal_graph_use_indexer_q_rope_fusion(void) {
@@ -12052,8 +12055,10 @@ static bool metal_graph_use_reference_attn_out_hc(void) {
 }
 
 static bool metal_graph_use_fp8_attn_out_onecb_hc(void) {
+ static int enable_cache = -1;
  static int disable_cache = -1;
- return !metal_graph_env_flag("DS4_DISABLE_FP8_ATTN_OUT_ONECB_HC", &disable_cache);
+ return metal_graph_env_flag("DS4_ENABLE_FP8_ATTN_OUT_ONECB_HC", &enable_cache) &&
+        !metal_graph_env_flag("DS4_DISABLE_FP8_ATTN_OUT_ONECB_HC", &disable_cache);
 }
 
 static bool metal_graph_use_fp8_shared_down_hc(void) {
