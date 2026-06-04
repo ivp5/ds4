@@ -75,7 +75,10 @@ static MPSGraphCompilationDescriptor *ds4_mpsgraph_compile_descriptor(void) {
 }
 
 static bool ds4_mpsgraph_async_batch_enabled(void) {
-    return getenv("DS4_MPSGRAPH_ASYNC_BATCH") != NULL;
+    if (getenv("DS4_MPSGRAPH_ASYNC_BATCH_DISABLE")) return false;
+    const char *value = getenv("DS4_MPSGRAPH_ASYNC_BATCH");
+    if (value && value[0] == '0' && value[1] == '\0') return false;
+    return true;
 }
 
 static const char *ds4_mpsgraph_execution_mode(void) {
