@@ -146,6 +146,11 @@ packed-index path. The useful production-facing lever is async batching:
 On H3355 L26 selected-six canaries it improved same-window down and gate/up
 throughput while preserving `bad=0` correctness.
 
+`scaledDotProductAttention(query,key,value,mask,scale)` is exact but not a DS4
+prefill replacement on M1 Max. 2026-06-04 canary: Q=1,K=128,D=512 gained 1.068×,
+Q=1,K=512 was flat/slower, and prefill-ish Q=16/32,K=512 lost about 2× vs
+explicit MPSGraph QKᵀ/softmax/PV. Keep it as a decode probe, not primary MLA/SWA.
+
 CoreML owns ANE placement for shared high-B branches. `MLComputePlan` verifies
 actual ANE placement for shared packages; CoreML output backings plus MPSGraph
 shared-event queueing are the current overlap route.
