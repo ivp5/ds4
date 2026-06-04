@@ -4073,6 +4073,14 @@ typedef struct {
  uint64_t dst_token_stride;
  uint64_t dst_head_stride;
  float scale;
+ uint32_t rope_n_rot;
+ uint32_t rope_n_ctx_orig;
+ float rope_freq_base;
+ float rope_freq_scale;
+ float rope_ext_factor;
+ float rope_attn_factor;
+ float rope_beta_fast;
+ float rope_beta_slow;
 } ds4_gpu_dsv4_indexed_attention_args;
 
 typedef struct {
@@ -14672,7 +14680,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
  return 1;
 }
 
-int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+static int ds4_gpu_attention_indexed_mixed_batch_heads_tensor_impl(
  ds4_gpu_tensor *heads,
  const void *model_map,
  uint64_t model_size,
@@ -14692,7 +14700,15 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
  uint32_t window,
  uint32_t ratio,
  uint32_t n_head,
- uint32_t head_dim) {
+ uint32_t head_dim,
+ uint32_t rope_n_rot,
+ uint32_t rope_n_ctx_orig,
+ float rope_freq_base,
+ float rope_freq_scale,
+ float rope_ext_factor,
+ float rope_attn_factor,
+ float rope_beta_fast,
+ float rope_beta_slow) {
  if (!g_initialized && !ds4_gpu_init()) return 0;
  if (!heads || !model_map || !q || !raw_kv || !comp_kv || !topk ||
  n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -14795,6 +14811,14 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
  .dst_token_stride = (uint64_t)n_head * row_bytes,
  .dst_head_stride = row_bytes,
  .scale = (1.0f / sqrtf((float)head_dim)) * ds4_attn_scale_mult(),
+ .rope_n_rot = rope_n_rot,
+ .rope_n_ctx_orig = rope_n_ctx_orig,
+ .rope_freq_base = rope_freq_base,
+ .rope_freq_scale = rope_freq_scale,
+ .rope_ext_factor = rope_ext_factor,
+ .rope_attn_factor = rope_attn_factor,
+ .rope_beta_fast = rope_beta_fast,
+ .rope_beta_slow = rope_beta_slow,
  };
 
  int owned = 0;
@@ -14836,6 +14860,325 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
  }
 
  return 1;
+}
+
+int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+ ds4_gpu_tensor *heads,
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t sinks_offset,
+ const ds4_gpu_tensor *q,
+ const ds4_gpu_tensor *raw_kv,
+ const ds4_gpu_tensor *comp_kv,
+ uint32_t comp_kv_f16,
+ const ds4_gpu_tensor *topk,
+ uint32_t n_tokens,
+ uint32_t pos0,
+ uint32_t n_raw,
+ uint32_t raw_cap,
+ uint32_t raw_start,
+ uint32_t n_comp,
+ uint32_t top_k,
+ uint32_t window,
+ uint32_t ratio,
+ uint32_t n_head,
+ uint32_t head_dim) {
+ return ds4_gpu_attention_indexed_mixed_batch_heads_tensor_impl(heads,
+ model_map,
+ model_size,
+ sinks_offset,
+ q,
+ raw_kv,
+ comp_kv,
+ comp_kv_f16,
+ topk,
+ n_tokens,
+ pos0,
+ n_raw,
+ raw_cap,
+ raw_start,
+ n_comp,
+ top_k,
+ window,
+ ratio,
+ n_head,
+ head_dim,
+ 0,
+ 0,
+ 0.0f,
+ 0.0f,
+ 0.0f,
+ 0.0f,
+ 0.0f,
+ 0.0f);
+}
+
+int ds4_gpu_attention_indexed_mixed_batch_heads_rope_tensor(
+ ds4_gpu_tensor *heads,
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t sinks_offset,
+ const ds4_gpu_tensor *q,
+ const ds4_gpu_tensor *raw_kv,
+ const ds4_gpu_tensor *comp_kv,
+ uint32_t comp_kv_f16,
+ const ds4_gpu_tensor *topk,
+ uint32_t n_tokens,
+ uint32_t pos0,
+ uint32_t n_raw,
+ uint32_t raw_cap,
+ uint32_t raw_start,
+ uint32_t n_comp,
+ uint32_t top_k,
+ uint32_t window,
+ uint32_t ratio,
+ uint32_t n_head,
+ uint32_t head_dim,
+ uint32_t n_rot,
+ uint32_t n_ctx_orig,
+ float freq_base,
+ float freq_scale,
+ float ext_factor,
+ float attn_factor,
+ float beta_fast,
+ float beta_slow) {
+ if (n_rot == 0 || n_rot > head_dim || (n_rot & 3u) != 0u) return 0;
+ return ds4_gpu_attention_indexed_mixed_batch_heads_tensor_impl(heads,
+ model_map,
+ model_size,
+ sinks_offset,
+ q,
+ raw_kv,
+ comp_kv,
+ comp_kv_f16,
+ topk,
+ n_tokens,
+ pos0,
+ n_raw,
+ raw_cap,
+ raw_start,
+ n_comp,
+ top_k,
+ window,
+ ratio,
+ n_head,
+ head_dim,
+ n_rot,
+ n_ctx_orig,
+ freq_base,
+ freq_scale,
+ ext_factor,
+ attn_factor,
+ beta_fast,
+ beta_slow);
+}
+
+int ds4_gpu_indexed_attn_rope_canary(uint32_t rounds) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (rounds == 0) rounds = 1;
+ const uint32_t n_tokens = 1u;
+ const uint32_t n_head = 8u;
+ const uint32_t head_dim = 512u;
+ const uint32_t n_rot = 64u;
+ const uint32_t n_raw = 8u;
+ const uint32_t raw_cap = 8u;
+ const uint32_t raw_start = 0u;
+ const uint32_t n_comp = 16u;
+ const uint32_t top_k = 16u;
+ const uint32_t pos0 = 128u;
+ const uint32_t ratio = 4u;
+ const uint32_t window = 0u;
+ const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
+ const uint64_t raw_count = (uint64_t)raw_cap * head_dim;
+ const uint64_t comp_count = (uint64_t)n_comp * head_dim;
+ const uint64_t topk_count = (uint64_t)n_tokens * top_k;
+ float *q_host = (float *)calloc((size_t)q_count, sizeof(float));
+ float *raw_host = (float *)calloc((size_t)raw_count, sizeof(float));
+ float *comp_host = (float *)calloc((size_t)comp_count, sizeof(float));
+ int32_t *topk_host = (int32_t *)calloc((size_t)topk_count, sizeof(int32_t));
+ float *direct_host = (float *)calloc((size_t)q_count, sizeof(float));
+ float *fused_host = (float *)calloc((size_t)q_count, sizeof(float));
+ if (!q_host || !raw_host || !comp_host || !topk_host || !direct_host || !fused_host) {
+ free(q_host); free(raw_host); free(comp_host); free(topk_host); free(direct_host); free(fused_host);
+ return 0;
+ }
+ for (uint64_t i = 0; i < q_count; i++) {
+ q_host[i] = ((float)((int)(i % 31u)) - 15.0f) * 0.003f;
+ }
+ for (uint64_t i = 0; i < raw_count; i++) {
+ raw_host[i] = ((float)((int)(i % 43u)) - 21.0f) * 0.004f;
+ }
+ for (uint64_t i = 0; i < comp_count; i++) {
+ comp_host[i] = ((float)((int)(i % 47u)) - 23.0f) * 0.0035f;
+ }
+ for (uint64_t i = 0; i < topk_count; i++) {
+ topk_host[i] = (int32_t)i;
+ }
+
+ const size_t page = (size_t)getpagesize();
+ const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
+ const size_t sink_padded = (size_t)((sink_bytes + page - 1u) & ~((uint64_t)page - 1u));
+ float *sinks_host = NULL;
+ if (posix_memalign((void **)&sinks_host, page, sink_padded) != 0 || !sinks_host) {
+ free(q_host); free(raw_host); free(comp_host); free(topk_host); free(direct_host); free(fused_host);
+ return 0;
+ }
+ memset(sinks_host, 0, sink_padded);
+ void *sinks_opaque = ds4_gpu_wrap_heap_bytes(sinks_host, (uint64_t)sink_padded);
+ const uint32_t view_before = g_model_view_count;
+ if (!sinks_opaque ||
+ !ds4_gpu_register_tensor_view(sinks_host, sink_bytes, 0, sink_bytes, sinks_opaque)) {
+ if (sinks_opaque) ds4_gpu_release_heap_buffer(sinks_opaque);
+ free(sinks_host);
+ free(q_host); free(raw_host); free(comp_host); free(topk_host); free(direct_host); free(fused_host);
+ return 0;
+ }
+
+ int rc = 0;
+ @autoreleasepool {
+ ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+ ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+ ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+ ds4_gpu_tensor *topk = ds4_gpu_tensor_alloc(topk_count * sizeof(int32_t));
+ ds4_gpu_tensor *direct = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+ ds4_gpu_tensor *fused = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+ int setup_ok = q && raw && comp && topk && direct && fused;
+ if (setup_ok) setup_ok = ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) > 0;
+ if (setup_ok) setup_ok = ds4_gpu_tensor_write(raw, 0, raw_host, raw_count * sizeof(float)) > 0;
+ if (setup_ok) setup_ok = ds4_gpu_tensor_write(comp, 0, comp_host, comp_count * sizeof(float)) > 0;
+ if (setup_ok) setup_ok = ds4_gpu_tensor_write(topk, 0, topk_host, topk_count * sizeof(int32_t)) > 0;
+
+ fprintf(stderr,
+ "ds4: indexed-attn-rope canary START heads=%u head_dim=%u raw=%u comp=%u top_k=%u rounds=%u\n",
+ n_head, head_dim, n_raw, n_comp, top_k, rounds);
+
+ int direct_ok = setup_ok;
+ const double direct_start_ms = ds4_gpu_now_ms();
+ for (uint32_t iter = 0; direct_ok && iter < rounds; iter++) {
+ direct_ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(direct,
+ sinks_host,
+ sink_bytes,
+ 0,
+ q,
+ raw,
+ comp,
+ 0,
+ topk,
+ n_tokens,
+ pos0,
+ n_raw,
+ raw_cap,
+ raw_start,
+ n_comp,
+ top_k,
+ window,
+ ratio,
+ n_head,
+ head_dim) != 0;
+ if (direct_ok) {
+ direct_ok = ds4_gpu_rope_tail_tensor(direct,
+ n_tokens,
+ n_head,
+ head_dim,
+ n_rot,
+ pos0,
+ 4096u,
+ true,
+ 10000.0f,
+ 1.0f,
+ 0.0f,
+ 1.0f,
+ 32.0f,
+ 1.0f) != 0;
+ }
+ }
+ const double direct_ms = ds4_gpu_now_ms() - direct_start_ms;
+
+ int fused_ok = setup_ok;
+ const double fused_start_ms = ds4_gpu_now_ms();
+ for (uint32_t iter = 0; fused_ok && iter < rounds; iter++) {
+ fused_ok = ds4_gpu_attention_indexed_mixed_batch_heads_rope_tensor(fused,
+ sinks_host,
+ sink_bytes,
+ 0,
+ q,
+ raw,
+ comp,
+ 0,
+ topk,
+ n_tokens,
+ pos0,
+ n_raw,
+ raw_cap,
+ raw_start,
+ n_comp,
+ top_k,
+ window,
+ ratio,
+ n_head,
+ head_dim,
+ n_rot,
+ 4096u,
+ 10000.0f,
+ 1.0f,
+ 0.0f,
+ 1.0f,
+ 32.0f,
+ 1.0f) != 0;
+ }
+ const double fused_ms = ds4_gpu_now_ms() - fused_start_ms;
+
+ if (direct_ok && fused_ok &&
+ ds4_gpu_tensor_read(direct, 0, direct_host, q_count * sizeof(float)) > 0 &&
+ ds4_gpu_tensor_read(fused, 0, fused_host, q_count * sizeof(float)) > 0) {
+ uint64_t mismatches = 0;
+ float max_abs = 0.0f;
+ float max_rel = 0.0f;
+ for (uint64_t i = 0; i < q_count; i++) {
+ const float delta = fabsf(direct_host[i] - fused_host[i]);
+ const float denom = fabsf(direct_host[i]) + 1.0e-6f;
+ const float rel = delta / denom;
+ if (delta > max_abs) max_abs = delta;
+ if (rel > max_rel) max_rel = rel;
+ if (delta > 2.0e-5f && rel > 2.0e-5f) mismatches++;
+ }
+ const double direct_per = direct_ms / (double)rounds;
+ const double fused_per = fused_ms / (double)rounds;
+ rc = mismatches == 0;
+ fprintf(stderr,
+ "ds4: indexed-attn-rope canary direct=%.3f ms/round fused=%.3f ms/round speedup=%.2fx "
+ "max_abs=%.3e max_rel=%.3e mismatches=%llu/%llu %s\n",
+ direct_per,
+ fused_per,
+ fused_per > 0.0 ? direct_per / fused_per : 0.0,
+ (double)max_abs,
+ (double)max_rel,
+ (unsigned long long)mismatches,
+ (unsigned long long)q_count,
+ rc ? "PASS" : "FAIL");
+ }
+ ds4_gpu_tensor_free(q);
+ ds4_gpu_tensor_free(raw);
+ ds4_gpu_tensor_free(comp);
+ ds4_gpu_tensor_free(topk);
+ ds4_gpu_tensor_free(direct);
+ ds4_gpu_tensor_free(fused);
+ }
+
+ if (g_model_view_count == view_before + 1u &&
+ g_model_views[view_before].model_map == sinks_host &&
+ g_model_views[view_before].model_size == sink_bytes) {
+ g_model_views[view_before].buffer = nil;
+ g_model_views[view_before].model_map = NULL;
+ g_model_views[view_before].model_size = 0;
+ g_model_views[view_before].model_offset = 0;
+ g_model_views[view_before].bytes = 0;
+ g_model_view_count = view_before;
+ }
+ ds4_gpu_release_heap_buffer(sinks_opaque);
+ free(sinks_host);
+ free(q_host); free(raw_host); free(comp_host); free(topk_host); free(direct_host); free(fused_host);
+ return rc;
 }
 
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(

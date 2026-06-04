@@ -167,11 +167,12 @@ static void usage(FILE *fp) {
         "      Embedded MTP stays available when policy permits. D8F spec-decode is\n"
         "      disabled by default after H2758/H2759 measured verifier slower than baseline;\n"
         "      set DS4_MTP_SPEC_FORCE=1 to force it.\n"
-        "      Q head RMSNorm+RoPE, KV RoPE+FP8/raw-store, FP8 attention-output\n"
-        "      one-command-buffer HC fusion, and FP8 shared-down HC fusion are\n"
-        "      default-on; disable with\n"
+        "      Q head RMSNorm+RoPE, KV RoPE+FP8/raw-store, indexed attention+\n"
+        "      inverse-RoPE, FP8 attention-output one-command-buffer HC fusion,\n"
+        "      and FP8 shared-down HC fusion are default-on; disable with\n"
         "      DS4_METAL_DISABLE_Q_HEAD_NORM_ROPE_FUSION=1,\n"
         "      DS4_METAL_DISABLE_KV_ROPE_STORE_FUSION=1,\n"
+        "      DS4_METAL_DISABLE_INDEXED_ATTN_ROPE_FUSION=1,\n"
         "      DS4_DISABLE_FP8_ATTN_OUT_ONECB_HC=1, or\n"
         "      DS4_METAL_DISABLE_SHARED_DOWN_FP8_HC_FUSION=1.\n"
         "  --power N\n"
@@ -2226,6 +2227,13 @@ int main(int argc, char **argv) {
         const uint32_t n_rot    = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 64u;
         const uint32_t rounds   = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 8u;
         return ds4_gpu_head_norm_rope_canary(n_tok, n_head, head_dim, n_rot, rounds) ? 0 : 1;
+    }
+    /* --indexed-attn-rope-canary [rounds]
+     * Validates fused indexed decode attention + inverse RoPE against the
+     * attention-then-RoPE two-dispatch reference. */
+    if (argc >= 2 && !strcmp(argv[1], "--indexed-attn-rope-canary")) {
+        const uint32_t rounds = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8u;
+        return ds4_gpu_indexed_attn_rope_canary(rounds) ? 0 : 1;
     }
     /* --mtl4-icb-execute-canary [n_floats [rounds]] : proves the MTL4 encoder can replay
      * a classic MTLICB command when the MTL4 pipeline was compiled with ICB support. */

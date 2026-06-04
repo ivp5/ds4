@@ -64,7 +64,88 @@ struct ds4_metal_args_dsv4_indexed_attention {
  uint64_t dst_token_stride;
  uint64_t dst_head_stride;
  float scale;
+ uint32_t rope_n_rot;
+ uint32_t rope_n_ctx_orig;
+ float rope_freq_base;
+ float rope_freq_scale;
+ float rope_ext_factor;
+ float rope_attn_factor;
+ float rope_beta_fast;
+ float rope_beta_slow;
 };
+
+static float dsv4_attn_rope_yarn_ramp(const float low, const float high, const int i0) {
+    const float y = (float)i0 / 2.0f;
+    return high == low ? 0.0f : min(1.0f, max(0.0f, (y - low) / (high - low)));
+}
+
+static float dsv4_attn_rope_yarn_corr_factor(int n_dims, int n_ctx_orig, float n_rot, float base) {
+    return n_dims * log((float)n_ctx_orig / (2.0f * M_PI_F * n_rot)) / (2.0f * log(base));
+}
+
+static void dsv4_attn_rope_yarn_corr_dims(int n_dims, int n_ctx_orig, float freq_base,
+                                          float beta_fast, float beta_slow,
+                                          thread float *corr0, thread float *corr1) {
+    *corr0 = max(0.0f, floor(dsv4_attn_rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_fast, freq_base)));
+    *corr1 = min((float)n_dims - 1.0f, ceil(dsv4_attn_rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_slow, freq_base)));
+}
+
+static void dsv4_attn_rope_yarn(float theta_extrap, float freq_scale,
+                                float corr0, float corr1, int i0,
+                                float ext_factor, float mscale,
+                                thread float *cos_theta,
+                                thread float *sin_theta) {
+    float theta = theta_extrap;
+    if (ext_factor != 0.0f) {
+        const float theta_interp = freq_scale == 0.0f ? theta_extrap : theta_extrap / freq_scale;
+        const float ramp_mix = dsv4_attn_rope_yarn_ramp(corr0, corr1, i0) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+    }
+    *cos_theta = cos(theta) * mscale;
+    *sin_theta = sin(theta) * mscale;
+}
+
+static inline float2 dsv4_attn_inverse_rope_pair(float2 x,
+                                                 uint rel_i0,
+                                                 uint qpos,
+                                                 constant ds4_metal_args_dsv4_indexed_attention &args,
+                                                 float corr0,
+                                                 float corr1) {
+    const float inv_ndims = -1.0f / (float)args.rope_n_rot;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+    const float theta = (float)qpos * exp2(inv_ndims * (float)rel_i0 * log2(args.rope_freq_base));
+#else
+    const float theta = (float)qpos * pow(args.rope_freq_base, inv_ndims * (float)rel_i0);
+#endif
+    float cos_theta;
+    float sin_theta;
+    dsv4_attn_rope_yarn(theta, args.rope_freq_scale, corr0, corr1, (int)rel_i0,
+                        args.rope_ext_factor, args.rope_attn_factor,
+                        &cos_theta, &sin_theta);
+    sin_theta = -sin_theta;
+    return float2(x.x * cos_theta - x.y * sin_theta,
+                  x.x * sin_theta + x.y * cos_theta);
+}
+
+static inline float4 dsv4_attn_inverse_rope_tail4(float4 v,
+                                                  uint vec_idx,
+                                                  uint qpos,
+                                                  constant ds4_metal_args_dsv4_indexed_attention &args,
+                                                  float corr0,
+                                                  float corr1) {
+    if (args.rope_n_rot == 0u || args.rope_n_rot > 512u || (args.rope_n_rot & 3u) != 0u) {
+        return v;
+    }
+    const int n_nope = 512 - (int)args.rope_n_rot;
+    const int dim0 = (int)vec_idx * 4;
+    if (dim0 < n_nope || dim0 + 3 >= 512) {
+        return v;
+    }
+    const uint rel0 = (uint)(dim0 - n_nope);
+    const float2 xy = dsv4_attn_inverse_rope_pair(v.xy, rel0, qpos, args, corr0, corr1);
+    const float2 zw = dsv4_attn_inverse_rope_pair(v.zw, rel0 + 2u, qpos, args, corr0, corr1);
+    return float4(xy.x, xy.y, zw.x, zw.y);
+}
 
 struct ds4_metal_args_dsv4_indexer_scores_fused {
  uint32_t n_comp;
@@ -805,13 +886,32 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8(
  dsv4_attend_sink(((device const float *)sinks)[head], M, S, o0, o1, o2, o3);
 
  const float inv_s = S == 0.0f ? 0.0f : 1.0f/S;
+ float4 v0 = o0 * inv_s;
+ float4 v1 = o1 * inv_s;
+ float4 v2 = o2 * inv_s;
+ float4 v3 = o3 * inv_s;
+ if (args.rope_n_rot != 0u) {
+ float corr0;
+ float corr1;
+ dsv4_attn_rope_yarn_corr_dims((int)args.rope_n_rot,
+ (int)args.rope_n_ctx_orig,
+ args.rope_freq_base,
+ args.rope_beta_fast,
+ args.rope_beta_slow,
+ &corr0,
+ &corr1);
+ v0 = dsv4_attn_inverse_rope_tail4(v0, lane + 0u, qpos, args, corr0, corr1);
+ v1 = dsv4_attn_inverse_rope_tail4(v1, lane + 32u, qpos, args, corr0, corr1);
+ v2 = dsv4_attn_inverse_rope_tail4(v2, lane + 64u, qpos, args, corr0, corr1);
+ v3 = dsv4_attn_inverse_rope_tail4(v3, lane + 96u, qpos, args, corr0, corr1);
+ }
  device float4 *dst4 = (device float4 *)(dst +
  (uint64_t)token * args.dst_token_stride +
  (uint64_t)head * args.dst_head_stride);
- dst4[lane + 0] = o0 * inv_s;
- dst4[lane + 32] = o1 * inv_s;
- dst4[lane + 64] = o2 * inv_s;
- dst4[lane + 96] = o3 * inv_s;
+ dst4[lane + 0] = v0;
+ dst4[lane + 32] = v1;
+ dst4[lane + 64] = v2;
+ dst4[lane + 96] = v3;
 }
 
 // Decode specialization: stages sixteen selected rows at once, consumes them
@@ -909,13 +1009,32 @@ static inline void dsv4_attend_heads8_rb16_inline(
  dsv4_attend_sink(((device const float *)sinks)[head], M, S, o0, o1, o2, o3);
 
  const float inv_s = S == 0.0f ? 0.0f : 1.0f/S;
+ float4 v0 = o0 * inv_s;
+ float4 v1 = o1 * inv_s;
+ float4 v2 = o2 * inv_s;
+ float4 v3 = o3 * inv_s;
+ if (args.rope_n_rot != 0u) {
+ float corr0;
+ float corr1;
+ dsv4_attn_rope_yarn_corr_dims((int)args.rope_n_rot,
+ (int)args.rope_n_ctx_orig,
+ args.rope_freq_base,
+ args.rope_beta_fast,
+ args.rope_beta_slow,
+ &corr0,
+ &corr1);
+ v0 = dsv4_attn_inverse_rope_tail4(v0, lane + 0u, qpos, args, corr0, corr1);
+ v1 = dsv4_attn_inverse_rope_tail4(v1, lane + 32u, qpos, args, corr0, corr1);
+ v2 = dsv4_attn_inverse_rope_tail4(v2, lane + 64u, qpos, args, corr0, corr1);
+ v3 = dsv4_attn_inverse_rope_tail4(v3, lane + 96u, qpos, args, corr0, corr1);
+ }
  device float4 *dst4 = (device float4 *)(dst +
  (uint64_t)token * args.dst_token_stride +
  (uint64_t)head * args.dst_head_stride);
- dst4[lane + 0] = o0 * inv_s;
- dst4[lane + 32] = o1 * inv_s;
- dst4[lane + 64] = o2 * inv_s;
- dst4[lane + 96] = o3 * inv_s;
+ dst4[lane + 0] = v0;
+ dst4[lane + 32] = v1;
+ dst4[lane + 64] = v2;
+ dst4[lane + 96] = v3;
 }
 
 kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(

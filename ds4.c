@@ -11990,6 +11990,11 @@ static bool metal_graph_use_q_head_norm_rope(void) {
  return !metal_graph_env_flag("DS4_METAL_DISABLE_Q_HEAD_NORM_ROPE_FUSION", &disable_cache);
 }
 
+static bool metal_graph_use_indexed_attn_rope_fusion(void) {
+ static int disable_cache = -1;
+ return !metal_graph_env_flag("DS4_METAL_DISABLE_INDEXED_ATTN_ROPE_FUSION", &disable_cache);
+}
+
 static bool metal_graph_use_reference_compressor_pair_proj(void) {
  static int cache = -1;
  return metal_graph_env_flag("DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
@@ -14124,9 +14129,48 @@ static bool metal_graph_encode_decode_layer(
  }
  DS4_METAL_PROFILE_DECODE_STAGE("compressor_indexer");
 
+ int indexed_attn_rope_fused = 0;
  if (ok) {
  const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
  if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
+ if (metal_graph_use_indexed_attn_rope_fusion() &&
+ !metal_graph_debug_wants("kqv_out", il, pos)) {
+ indexed_attn_rope_fused = ds4_gpu_attention_indexed_mixed_batch_heads_rope_tensor(
+ g->heads,
+ model->map,
+ model->size,
+ layer->attn_sinks->abs_offset,
+ g->q,
+ raw_cache,
+ g->layer_attn_comp_cache[il],
+ metal_graph_attn_comp_cache_is_f16(),
+ comp_selected,
+ 1,
+ pos,
+ n_raw,
+ raw_cap,
+ raw_start,
+ n_comp,
+ n_selected,
+ g->raw_window,
+ ds4_layer_compress_ratio(il),
+ DS4_N_HEAD,
+ DS4_N_HEAD_DIM,
+ DS4_N_ROT,
+ compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+ freq_base,
+ freq_scale,
+ ext_factor,
+ attn_factor,
+ DS4_ROPE_YARN_BETA_FAST,
+ DS4_ROPE_YARN_BETA_SLOW);
+ static int indexed_attn_rope_logged = 0;
+ if (indexed_attn_rope_fused && !indexed_attn_rope_logged) {
+ indexed_attn_rope_logged = 1;
+ fprintf(stderr, "ds4: indexed attention + inverse RoPE fused path active\n");
+ }
+ }
+ if (!indexed_attn_rope_fused) {
  ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
  g->heads,
  model->map,
@@ -14148,6 +14192,7 @@ static bool metal_graph_encode_decode_layer(
  ds4_layer_compress_ratio(il),
  DS4_N_HEAD,
  DS4_N_HEAD_DIM) != 0;
+ }
  if (ok && decode_index_stage_profile) {
  ok = metal_graph_indexer_stage_profile_boundary("decode_attention",
  il,
@@ -14172,10 +14217,10 @@ static bool metal_graph_encode_decode_layer(
  }
  }
  DS4_METAL_PROFILE_DECODE_STAGE("attention");
- if (ok) {
+ if (ok && !indexed_attn_rope_fused) {
  metal_graph_debug_dump_tensor("kqv_out", g->heads, q_dim, il, pos);
  }
- if (ok) ok = ds4_gpu_rope_tail_tensor(g->heads,
+ if (ok && !indexed_attn_rope_fused) ok = ds4_gpu_rope_tail_tensor(g->heads,
  1, DS4_N_HEAD, DS4_N_HEAD_DIM,
  DS4_N_ROT, pos,
  compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
