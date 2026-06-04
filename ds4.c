@@ -12005,6 +12005,13 @@ static bool metal_graph_use_decode_attn_rope_fusion(void) {
  return !metal_graph_env_flag("DS4_METAL_DISABLE_DECODE_ATTN_ROPE_FUSION", &disable_cache);
 }
 
+static bool metal_graph_use_router_matmul_select_fusion(void) {
+ static int enable_cache = -1;
+ static int disable_cache = -1;
+ return metal_graph_env_flag("DS4_METAL_ENABLE_ROUTER_MATMUL_SELECT_FUSION", &enable_cache) &&
+        !metal_graph_env_flag("DS4_METAL_DISABLE_ROUTER_MATMUL_SELECT_FUSION", &disable_cache);
+}
+
 static bool metal_graph_use_reference_compressor_pair_proj(void) {
  static int cache = -1;
  return metal_graph_env_flag("DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
@@ -14650,7 +14657,45 @@ static bool metal_graph_encode_decode_layer(
   *   (c) router as separate two-phase: pre-encode CPU compute writes
   *       router_logits buffer; encode skips router matmul and goes
   *       straight to router_select. */
- if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
+ int router_matmul_select_fused = 0;
+ if (ok && !g->quality &&
+     metal_graph_use_router_matmul_select_fusion() &&
+     layer->ffn_gate_inp &&
+     layer->ffn_gate_inp->type == DS4_TENSOR_F16 &&
+     layer->ffn_gate_inp->storage.metal_buffer == NULL &&
+     layer->ffn_gate_inp->dim[0] == DS4_N_EMBD &&
+     layer->ffn_gate_inp->dim[1] == DS4_N_EXPERT) {
+  router_matmul_select_fused = ds4_gpu_router_matmul_select_f16_tensor(
+  g->router_selected,
+  g->router_weights,
+  g->router_probs,
+  g->router_logits,
+  model->map,
+  model->size,
+  layer->ffn_gate_inp->abs_offset,
+  layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
+  layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
+  layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
+  (uint32_t)token,
+  DS4_N_EMBD,
+  layer->ffn_exp_probs_b != NULL,
+  layer->ffn_gate_tid2eid != NULL,
+  g->ffn_norm);
+  static int router_matmul_select_logged = 0;
+  if (router_matmul_select_fused && !router_matmul_select_logged) {
+   router_matmul_select_logged = 1;
+   fprintf(stderr,
+           "ds4: router F16 matvec+select fusion enabled by DS4_METAL_ENABLE_ROUTER_MATMUL_SELECT_FUSION=1\n");
+  }
+  static int router_matmul_select_fallback_logged = 0;
+  if (!router_matmul_select_fused && !router_matmul_select_fallback_logged) {
+   router_matmul_select_fallback_logged = 1;
+   fprintf(stderr,
+           "ds4: router F16 matvec+select fusion was eligible but failed; falling back to matvec + router_select\n");
+  }
+ }
+ if (ok && !router_matmul_select_fused) {
+ ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
  DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
  if (ok) ok = ds4_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
  model->map, model->size,
@@ -14666,6 +14711,7 @@ static bool metal_graph_encode_decode_layer(
  layer->ffn_exp_probs_b != NULL,
  layer->ffn_gate_tid2eid != NULL,
  g->router_logits) != 0;
+ }
  DS4_METAL_PROFILE_DECODE_STAGE("router");
  if (ok) {
  metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);

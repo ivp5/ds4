@@ -973,7 +973,25 @@ int ds4_gpu_router_select_tensor(
         bool                    hash_mode,
         const ds4_gpu_tensor *logits);
 
+int ds4_gpu_router_matmul_select_f16_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        ds4_gpu_tensor       *logits,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                bias_offset,
+        uint64_t                hash_offset,
+        uint32_t                hash_rows,
+        uint32_t                token,
+        uint32_t                in_dim,
+        bool                    has_bias,
+        bool                    hash_mode,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_router_select_fused_canary(void);
+int ds4_gpu_router_matmul_select_fused_canary(uint32_t in_dim);
 
 int ds4_gpu_router_select_batch_tensor(
         ds4_gpu_tensor       *selected,

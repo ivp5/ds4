@@ -170,6 +170,15 @@ struct ds4_metal_args_dsv4_router_select_one {
  uint32_t hash_rows;
 };
 
+struct ds4_metal_args_dsv4_router_matmul_select_one {
+ uint32_t in_dim;
+ uint32_t has_bias;
+ uint32_t hash_mode;
+ uint32_t use_token_buffer;
+ uint32_t token;
+ uint32_t hash_rows;
+};
+
 struct ds4_metal_args_dsv4_directional_steering_project {
  uint32_t width;
  uint32_t rows;
@@ -434,6 +443,87 @@ kernel void kernel_dsv4_router_select_one_fused(
  }
  sum = max(sum, 6.103515625e-5f);
  weights[tid] = prob_values[(uint)expert] / sum * 1.5f;
+ }
+}
+
+// Experimental decode router full front-door fusion. One threadgroup computes
+// the 4096x256 F16 router matvec, sqrt(softplus), top-6/hash selection, and
+// selected-weight normalization. This removes the preceding F16 matvec dispatch
+// plus router-select dispatch, but intentionally stays opt-in because a single
+// threadgroup gives up the generic matvec kernel's output-row parallelism.
+kernel void kernel_dsv4_router_matmul_select_one_f16(
+ constant ds4_metal_args_dsv4_router_matmul_select_one & args,
+ device const half *router_weight,
+ device const float *x,
+ device float *logits,
+ device float *probs,
+ device int32_t *selected,
+ device float *weights,
+ device const float *bias,
+ device const int32_t *hash,
+ device const int32_t *tokens,
+ threadgroup float *scratch [[threadgroup(0)]],
+ ushort tid [[thread_index_in_threadgroup]],
+ ushort lane [[thread_index_in_simdgroup]]) {
+ if (tid >= 32u || args.in_dim == 0u) return;
+
+ threadgroup float *prob_values = scratch;
+ threadgroup float *sel_scores = scratch + 256;
+ threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 512);
+
+ for (uint expert = 0u; expert < 256u; expert++) {
+  float acc = 0.0f;
+  device const half *row = router_weight + (uint64_t)expert * (uint64_t)args.in_dim;
+  for (uint i = lane; i < args.in_dim; i += 32u) {
+   acc += float(row[i]) * x[i];
+  }
+  acc = simd_sum(acc);
+  if (lane == 0u) {
+   const float sp = acc > 20.0f ? acc : log(1.0f + exp(acc));
+   const float p = sqrt(sp);
+   logits[expert] = acc;
+   probs[expert] = p;
+   prob_values[expert] = p;
+   sel_scores[expert] = args.has_bias ? p + bias[expert] : p;
+   idx[expert] = (int32_t)expert;
+  }
+ }
+ threadgroup_barrier(mem_flags::mem_threadgroup);
+
+ if (tid == 0u) {
+  int32_t top_idx[6];
+  float top_prob[6];
+  for (uint slot = 0u; slot < 6u; slot++) {
+   if (args.hash_mode) {
+    const uint token = args.use_token_buffer ? (uint)tokens[0] : args.token;
+    const uint row = min(token, args.hash_rows - 1u);
+    top_idx[slot] = hash[row * 6u + slot];
+    top_prob[slot] = prob_values[(uint)top_idx[slot]];
+   } else {
+    int32_t best = 0;
+    float best_score = -FLT_MAX;
+    for (uint expert = 0u; expert < 256u; expert++) {
+     bool already_selected = false;
+     for (uint prev = 0u; prev < slot; prev++) {
+      already_selected = already_selected || top_idx[prev] == (int32_t)expert;
+     }
+     const float score = already_selected ? -FLT_MAX : sel_scores[expert];
+     if (score > best_score || (score == best_score && expert < (uint)best)) {
+      best_score = score;
+      best = (int32_t)expert;
+     }
+    }
+    top_idx[slot] = best;
+    top_prob[slot] = prob_values[(uint)best];
+   }
+  }
+  float sum = 0.0f;
+  for (uint slot = 0u; slot < 6u; slot++) sum += top_prob[slot];
+  sum = max(sum, 6.103515625e-5f);
+  for (uint slot = 0u; slot < 6u; slot++) {
+   selected[slot] = top_idx[slot];
+   weights[slot] = top_prob[slot] / sum * 1.5f;
+  }
  }
 }
 

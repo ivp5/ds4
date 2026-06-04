@@ -2348,6 +2348,11 @@ int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--router-select-fused-canary")) {
         return ds4_gpu_router_select_fused_canary() ? 0 : 1;
     }
+    /* --router-matmul-select-fused-canary [in_dim] : experimental F16 router matvec+select fuse */
+    if (argc >= 2 && !strcmp(argv[1], "--router-matmul-select-fused-canary")) {
+        const uint32_t in_dim = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 512;
+        return ds4_gpu_router_matmul_select_fused_canary(in_dim) ? 0 : 1;
+    }
     /* --hc-rms-f16-mix-canary [out_dim [in_dim]] : fuses HC RMSNorm + tiny F16 matvec */
     if (argc >= 2 && !strcmp(argv[1], "--hc-rms-f16-mix-canary")) {
         const uint32_t out_dim = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 24;
