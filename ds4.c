@@ -12085,7 +12085,8 @@ static bool metal_graph_use_fp8_shared_down_hc(void) {
 static bool metal_graph_use_top_only_argmax_decode(void) {
  static int enable_cache = -1;
  static int disable_cache = -1;
- return (ds4_metal_graph_max_fusion_enabled() ||
+ return (ds4_prime_path_enabled() ||
+         ds4_metal_graph_max_fusion_enabled() ||
          metal_graph_env_flag("DS4_METAL_ENABLE_TOP_ONLY_ARGMAX", &enable_cache)) &&
         !metal_graph_env_flag("DS4_METAL_DISABLE_TOP_ONLY_ARGMAX", &disable_cache);
 }

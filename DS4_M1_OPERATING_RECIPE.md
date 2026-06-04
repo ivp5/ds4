@@ -198,16 +198,18 @@ Reversible via `mv` if a future pillar-orchestration need emerges.
 Build verified clean both modes (default + JOURNAL=1). ds4-bench
 shrunk 840KB → 837KB.
 
-**The REAL ICB record→replay mechanisms live IN-PLACE in `ds4_metal.m`**
-as four independent opt-in pipelines:
+**The REAL ICB record→replay mechanisms live IN-PLACE in `ds4_metal.m`**.
+Current PRIME/default policy is measured-path-first, not dispatch-count-first:
 
-| ICB Pipeline | Env var | Status | Location |
-|--------------|---------|--------|----------|
-| route_remap (43 layers × per-token) | `DS4_ICB_ACTIVE` | wired in-place | ds4_metal.m:14717 |
-| topk_mask (2-kernel) | `DS4_ICB_TOPK_MASK` | opt-in, "measurement pending" | ds4_metal.m:5554 |
-| softplus_sqrt | `DS4_ICB_SOFTPLUS` | opt-in, "measurement pending" | ds4_metal.m:12642 |
-| route_weights_one | `DS4_ICB_WEIGHTS_ONE` | opt-in, "caller pays useResource cost" | ds4_metal.m:14590 |
-| route_finalize_one (Phase 5) | (none?) | check ds4_metal.m | — |
+| ICB / replay path | Env var | Status |
+|-------------------|---------|--------|
+| route_remap (43 layers × per-token) | `DS4_ICB_ACTIVE` | default-on; disable with `DS4_ICB_ACTIVE=0` or `DS4_ICB_ACTIVE_DISABLE=1` |
+| softplus_sqrt | `DS4_ICB_SOFTPLUS` | default-on in decode router-select fallback; fused router-select usually bypasses it |
+| topk_mask (2-kernel) | `DS4_ICB_TOPK_MASK` | default-on when that mask path is selected |
+| dense Q8_0 single-token matvec | `DS4_DENSE_MATVEC_ICB` | PRIME/default; disable with `DS4_DENSE_MATVEC_ICB_DISABLE=1` |
+| D8F classic packet ICB replay | `DS4_D8F_CLASSIC_PACKET_ICB` | PRIME/default; native texture down is gate-only ICB plus direct textured down |
+| D8F texture-free packet range replay | `DS4_D8F_PACKET_ICB_RANGE` | PRIME/default where eligible; disable with `DS4_D8F_PACKET_ICB_RANGE_DISABLE=1` |
+| route_weights_one | `DS4_ICB_WEIGHTS_ONE` | opt-in only; measured loser on the 6-thread decode kernel |
 
 **Fusion kernels (not ICB but related)**:
 
@@ -215,6 +217,19 @@ as four independent opt-in pipelines:
 |--------|------------------------------|
 | router_select_fusion | `DS4_METAL_DISABLE_ROUTER_SELECT_FUSION` |
 | routed_pair_swiglu_fusion | `DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION` |
+| KV RoPE+store | `DS4_METAL_DISABLE_KV_ROPE_STORE_FUSION` |
+| indexed/decode attention inverse-RoPE | `DS4_METAL_DISABLE_INDEXED_ATTN_ROPE_FUSION`, `DS4_METAL_DISABLE_DECODE_ATTN_ROPE_FUSION` |
+| FP8 shared-down HC | `DS4_METAL_DISABLE_SHARED_DOWN_FP8_HC_FUSION` |
+| top-only greedy argmax | `DS4_METAL_DISABLE_TOP_ONLY_ARGMAX` |
+
+**D8F native-down texture/cache defaults**:
+- Native down readers default on for layers `0,20,25,26,37` at `n_tokens<=4`.
+- Compact texture atlas defaults on for layers `20,37`.
+- Pack-offset 2D texture defaults on for layer `26`.
+- Gather, prewarm, private compact texture, i8 CBSRAM, sparse H3385, rank1 split
+  packet replay, FP8 attention-output one-CB, Q-head RMSNorm+RoPE, indexer-Q
+  RoPE, router matmul+select, and compressor RMS+RoPE stay opt-in until they
+  pass full-runtime or matching selected-organ gates.
 
 **Hot-expert F16 cache (was Pillar B)**: `ds4_hot_expert_init` has zero
 call sites in main inference. Bitmap + manifest loader sits unused.
@@ -230,12 +245,13 @@ takes up build time + 8244 lines of declarations).
 
 **Operating recipe** for the ACTUAL ICB pipelines:
 ```bash
-# PRIME default: route_remap, softplus_sqrt, topk_mask, dense Q8_0 matvec,
-# and D8F packet ICB are automatic where their measured policy says yes.
+# PRIME default: H3384 GPU-resident pack, split-2 overlap, measured decode
+# fusions, D8F native-down texture/cache gates, dense Q8_0 matvec ICB,
+# D8F packet ICB replay/range where eligible, and top-only greedy argmax.
 ./ds4 --metal --flat-pack /path/to/H3384 ...
 
 # Comparison baseline: turn PRIME-only replay off explicitly.
-DS4_PRIME_PATH=0 DS4_DENSE_MATVEC_ICB_DISABLE=1 \
+DS4_PRIME_PATH=0 DS4_DENSE_MATVEC_ICB_DISABLE=1 DS4_METAL_DISABLE_TOP_ONLY_ARGMAX=1 \
   ./ds4 --metal --flat-pack /path/to/H3384 ...
 
 # Known loser on decode remains opt-in: caller pays useResource cost on a
