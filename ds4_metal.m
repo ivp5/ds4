@@ -7921,6 +7921,286 @@ int ds4_gpu_dense_matvec_icb_bench(uint32_t M, uint32_t N, uint32_t n_gemv, uint
  }
 }
 
+int ds4_gpu_mesh_dispatch_canary(uint32_t n_groups, uint32_t rounds) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (n_groups == 0) n_groups = 1024;
+ if (rounds == 0) rounds = 20;
+ if (n_groups > 1024u) {
+  fprintf(stderr,
+          "ds4: mesh-dispatch canary rejects n_groups=%u; M1 object->mesh spawn is verified only through 1024 groups\n",
+          n_groups);
+  return 0;
+ }
+ @autoreleasepool {
+  static const char *msl =
+  "#include <metal_stdlib>\n"
+  "using namespace metal;\n"
+  "kernel void writeK(device float *out [[buffer(0)]], constant uint& slot [[buffer(1)]], uint t [[thread_position_in_threadgroup]]) {\n"
+  " if (t == 0) out[slot] = float(slot) + 0.25f;\n"
+  "}\n"
+  "struct VOut { float4 p [[position]]; };\n"
+  "struct Payload { uint n; };\n"
+  "using mesh_t = metal::mesh<VOut, void, 3, 1, topology::triangle>;\n"
+  "[[object, max_total_threadgroups_per_mesh_grid(1024)]]\n"
+  "void objMain(object_data Payload& pl [[payload]], mesh_grid_properties mgp, constant uint& n [[buffer(0)]]) {\n"
+  " pl.n = n; mgp.set_threadgroups_per_grid(uint3(n, 1, 1));\n"
+  "}\n"
+  "[[mesh]]\n"
+  "void meshMain(mesh_t out, const object_data Payload& pl [[payload]], device float *result [[buffer(1)]], uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {\n"
+  " if (tid == 0 && tg < pl.n) result[tg] = float(tg) + 0.25f;\n"
+  " out.set_primitive_count(0);\n"
+  "}\n"
+  "[[fragment]] float4 fragMain() { return float4(0); }\n";
+  NSError *err = nil;
+  NSString *src = [NSString stringWithUTF8String:msl];
+  id<MTLLibrary> lib = [g_device newLibraryWithSource:src options:nil error:&err];
+  if (!lib) {
+   fprintf(stderr, "ds4: mesh-dispatch canary library build failed: %s\n",
+           err.localizedDescription.UTF8String);
+   return 0;
+  }
+  id<MTLFunction> write_fn = [lib newFunctionWithName:@"writeK"];
+  id<MTLComputePipelineState> compute_pso =
+   [g_device newComputePipelineStateWithFunction:write_fn error:&err];
+  if (!compute_pso) {
+   fprintf(stderr, "ds4: mesh-dispatch compute pso failed: %s\n",
+           err.localizedDescription.UTF8String);
+   return 0;
+  }
+  MTLMeshRenderPipelineDescriptor *mesh_desc = [MTLMeshRenderPipelineDescriptor new];
+  mesh_desc.objectFunction = [lib newFunctionWithName:@"objMain"];
+  mesh_desc.meshFunction = [lib newFunctionWithName:@"meshMain"];
+  mesh_desc.fragmentFunction = [lib newFunctionWithName:@"fragMain"];
+  mesh_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  id<MTLRenderPipelineState> mesh_pso =
+   [g_device newRenderPipelineStateWithMeshDescriptor:mesh_desc
+                                              options:MTLPipelineOptionNone
+                                           reflection:nil
+                                                error:&err];
+  if (!mesh_pso) {
+   fprintf(stderr, "ds4: mesh-dispatch render pso failed: %s\n",
+           err.localizedDescription.UTF8String);
+   return 0;
+  }
+  const NSUInteger bytes = (NSUInteger)n_groups * sizeof(float);
+  id<MTLBuffer> host_out = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+  id<MTLBuffer> mesh_out = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+  if (!host_out || !mesh_out) return 0;
+  memset(host_out.contents, 0, bytes);
+  memset(mesh_out.contents, 0, bytes);
+  MTLTextureDescriptor *td =
+   [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                      width:8
+                                                     height:8
+                                                  mipmapped:NO];
+  td.usage = MTLTextureUsageRenderTarget;
+  td.storageMode = MTLStorageModePrivate;
+  id<MTLTexture> target = [g_device newTextureWithDescriptor:td];
+  if (!target) return 0;
+  MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+  rp.colorAttachments[0].texture = target;
+  rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+  rp.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+  double host_min_ms = DBL_MAX;
+  double mesh_min_ms = DBL_MAX;
+  for (uint32_t r = 0; r < rounds; r++) {
+   const double t0 = ds4_gpu_now_ms();
+   id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+   [enc setComputePipelineState:compute_pso];
+   [enc setBuffer:host_out offset:0 atIndex:0];
+   for (uint32_t s = 0; s < n_groups; s++) {
+    [enc setBytes:&s length:sizeof(s) atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+   }
+   [enc endEncoding];
+   [cb commit];
+   [cb waitUntilCompleted];
+   if (cb.status != MTLCommandBufferStatusCompleted) return 0;
+   const double dt = ds4_gpu_now_ms() - t0;
+   if (dt < host_min_ms) host_min_ms = dt;
+  }
+  for (uint32_t r = 0; r < rounds; r++) {
+   const double t0 = ds4_gpu_now_ms();
+   id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+   id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+   uint32_t n = n_groups;
+   [enc setRenderPipelineState:mesh_pso];
+   [enc setObjectBytes:&n length:sizeof(n) atIndex:0];
+   [enc setMeshBuffer:mesh_out offset:0 atIndex:1];
+   [enc drawMeshThreadgroups:MTLSizeMake(1, 1, 1)
+    threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1)
+      threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
+   [enc endEncoding];
+   [cb commit];
+   [cb waitUntilCompleted];
+   if (cb.status != MTLCommandBufferStatusCompleted) return 0;
+   const double dt = ds4_gpu_now_ms() - t0;
+   if (dt < mesh_min_ms) mesh_min_ms = dt;
+  }
+  const float *host = (const float *)host_out.contents;
+  const float *mesh = (const float *)mesh_out.contents;
+  uint32_t host_mismatch = 0;
+  uint32_t mesh_mismatch = 0;
+  for (uint32_t i = 0; i < n_groups; i++) {
+   const float expected = (float)i + 0.25f;
+   if (host[i] != expected) host_mismatch++;
+   if (mesh[i] != expected) mesh_mismatch++;
+  }
+  fprintf(stderr,
+          "ds4: mesh-dispatch canary groups=%u rounds=%u host=%.4f ms mesh=%.4f ms speedup=%.2fx host_mismatch=%u mesh_mismatch=%u last_host=%.2f last_mesh=%.2f %s\n",
+          n_groups, rounds, host_min_ms, mesh_min_ms,
+          mesh_min_ms > 0.0 ? host_min_ms / mesh_min_ms : 0.0,
+          host_mismatch, mesh_mismatch,
+          host[n_groups - 1u], mesh[n_groups - 1u],
+          (host_mismatch == 0 && mesh_mismatch == 0) ? "PASS" : "FAIL");
+  return host_mismatch == 0 && mesh_mismatch == 0;
+ }
+}
+
+int ds4_gpu_indirect_dispatch_canary(uint32_t n_groups, uint32_t work, uint32_t rounds) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (n_groups == 0) n_groups = 1024;
+ if (rounds == 0) rounds = 20;
+ if (n_groups > 65536u) {
+  fprintf(stderr, "ds4: indirect-dispatch canary rejects n_groups=%u; cap is 65536 for this no-model probe\n",
+          n_groups);
+  return 0;
+ }
+ @autoreleasepool {
+  static const char *msl =
+  "#include <metal_stdlib>\n"
+  "using namespace metal;\n"
+  "inline float work_fn(uint w, uint t) { float a = 0.0001f * float(t + 1); for (uint i = 0; i < w; i++) a = fma(a, 1.0001f, 0.0001f); return a; }\n"
+  "kernel void slotK(device float *out [[buffer(0)]], constant uint& slot [[buffer(1)]], constant uint& w [[buffer(2)]], uint t [[thread_position_in_threadgroup]]) {\n"
+  " float a = work_fn(w, t); float r = simd_sum(a); if (t == 0) out[slot] = float(slot) + 0.25f + r;\n"
+  "}\n"
+  "kernel void gridK(device float *out [[buffer(0)]], constant uint& w [[buffer(2)]], uint tg [[threadgroup_position_in_grid]], uint t [[thread_position_in_threadgroup]]) {\n"
+  " float a = work_fn(w, t); float r = simd_sum(a); if (t == 0) out[tg] = float(tg) + 0.25f + r;\n"
+  "}\n"
+  "kernel void setCount(device uint *args [[buffer(0)]], constant uint& n [[buffer(1)]], uint t [[thread_position_in_grid]]) {\n"
+  " if (t == 0) { args[0] = n; args[1] = 1u; args[2] = 1u; }\n"
+  "}\n";
+  NSError *err = nil;
+  id<MTLLibrary> lib =
+   [g_device newLibraryWithSource:[NSString stringWithUTF8String:msl] options:nil error:&err];
+  if (!lib) {
+   fprintf(stderr, "ds4: indirect-dispatch library build failed: %s\n",
+           err.localizedDescription.UTF8String);
+   return 0;
+  }
+  id<MTLComputePipelineState> slot_pso =
+   [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"slotK"] error:&err];
+  id<MTLComputePipelineState> grid_pso =
+   [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gridK"] error:&err];
+  id<MTLComputePipelineState> count_pso =
+   [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"setCount"] error:&err];
+  if (!slot_pso || !grid_pso || !count_pso) {
+   fprintf(stderr, "ds4: indirect-dispatch pso build failed: %s\n",
+           err.localizedDescription.UTF8String);
+   return 0;
+  }
+  const NSUInteger bytes = (NSUInteger)n_groups * sizeof(float);
+  id<MTLBuffer> out_a = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+  id<MTLBuffer> out_b = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+  id<MTLBuffer> out_c = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+  id<MTLBuffer> indirect = [g_device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+  if (!out_a || !out_b || !out_c || !indirect) return 0;
+  memset(out_a.contents, 0, bytes);
+  memset(out_b.contents, 0, bytes);
+  memset(out_c.contents, 0, bytes);
+  double tiny_min_ms = DBL_MAX;
+  double direct_min_ms = DBL_MAX;
+  double indirect_min_ms = DBL_MAX;
+  for (uint32_t r = 0; r < rounds; r++) {
+   const double t0 = ds4_gpu_now_ms();
+   id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+   [enc setComputePipelineState:slot_pso];
+   [enc setBuffer:out_a offset:0 atIndex:0];
+   [enc setBytes:&work length:sizeof(work) atIndex:2];
+   for (uint32_t s = 0; s < n_groups; s++) {
+    [enc setBytes:&s length:sizeof(s) atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+   }
+   [enc endEncoding];
+   [cb commit];
+   [cb waitUntilCompleted];
+   if (cb.status != MTLCommandBufferStatusCompleted) return 0;
+   const double dt = ds4_gpu_now_ms() - t0;
+   if (dt < tiny_min_ms) tiny_min_ms = dt;
+  }
+  for (uint32_t r = 0; r < rounds; r++) {
+   const double t0 = ds4_gpu_now_ms();
+   id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+   [enc setComputePipelineState:grid_pso];
+   [enc setBuffer:out_b offset:0 atIndex:0];
+   [enc setBytes:&work length:sizeof(work) atIndex:2];
+   [enc dispatchThreadgroups:MTLSizeMake(n_groups, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+   [enc endEncoding];
+   [cb commit];
+   [cb waitUntilCompleted];
+   if (cb.status != MTLCommandBufferStatusCompleted) return 0;
+   const double dt = ds4_gpu_now_ms() - t0;
+   if (dt < direct_min_ms) direct_min_ms = dt;
+  }
+  for (uint32_t r = 0; r < rounds; r++) {
+   const double t0 = ds4_gpu_now_ms();
+   id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+   uint32_t n = n_groups;
+   [enc setComputePipelineState:count_pso];
+   [enc setBuffer:indirect offset:0 atIndex:0];
+   [enc setBytes:&n length:sizeof(n) atIndex:1];
+   [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+   [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+   [enc setComputePipelineState:grid_pso];
+   [enc setBuffer:out_c offset:0 atIndex:0];
+   [enc setBytes:&work length:sizeof(work) atIndex:2];
+   [enc dispatchThreadgroupsWithIndirectBuffer:indirect
+                          indirectBufferOffset:0
+                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+   [enc endEncoding];
+   [cb commit];
+   [cb waitUntilCompleted];
+   if (cb.status != MTLCommandBufferStatusCompleted) return 0;
+   const double dt = ds4_gpu_now_ms() - t0;
+   if (dt < indirect_min_ms) indirect_min_ms = dt;
+  }
+  const float *a = (const float *)out_a.contents;
+  const float *b = (const float *)out_b.contents;
+  const float *c = (const float *)out_c.contents;
+  uint32_t mism_ab = 0;
+  uint32_t mism_ac = 0;
+  float max_ab = 0.0f;
+  float max_ac = 0.0f;
+  for (uint32_t i = 0; i < n_groups; i++) {
+   const float dab = fabsf(a[i] - b[i]);
+   const float dac = fabsf(a[i] - c[i]);
+   if (dab > max_ab) max_ab = dab;
+   if (dac > max_ac) max_ac = dac;
+   if (dab > 1e-5f) mism_ab++;
+   if (dac > 1e-5f) mism_ac++;
+  }
+  fprintf(stderr,
+          "ds4: indirect-dispatch canary groups=%u work=%u rounds=%u tiny=%.3f ms direct=%.3f ms indirect=%.3f ms tiny/direct=%.1fx tiny/indirect=%.1fx indirect/direct=%.2f mism_ab=%u mism_ac=%u max_ab=%.3e max_ac=%.3e last={%.2f,%.2f,%.2f} %s\n",
+          n_groups, work, rounds,
+          tiny_min_ms, direct_min_ms, indirect_min_ms,
+          direct_min_ms > 0.0 ? tiny_min_ms / direct_min_ms : 0.0,
+          indirect_min_ms > 0.0 ? tiny_min_ms / indirect_min_ms : 0.0,
+          direct_min_ms > 0.0 ? indirect_min_ms / direct_min_ms : 0.0,
+          mism_ab, mism_ac, (double)max_ab, (double)max_ac,
+          a[n_groups - 1u], b[n_groups - 1u], c[n_groups - 1u],
+          (mism_ab == 0 && mism_ac == 0) ? "PASS" : "FAIL");
+  return mism_ab == 0 && mism_ac == 0;
+ }
+}
+
 int ds4_gpu_matmul_q8_0_tensor(
  ds4_gpu_tensor *out,
  const void *model_map,

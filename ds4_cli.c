@@ -2196,6 +2196,17 @@ int main(int argc, char **argv) {
         const uint32_t n_iter = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 30;
         return ds4_gpu_dense_matvec_icb_bench(M, N, n_gemv, n_iter) ? 0 : 1;
     }
+    if (argc >= 2 && !strcmp(argv[1], "--mesh-dispatch-canary")) {
+        const uint32_t n_groups = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 1024;
+        const uint32_t rounds = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 20;
+        return ds4_gpu_mesh_dispatch_canary(n_groups, rounds) ? 0 : 1;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--indirect-dispatch-canary")) {
+        const uint32_t n_groups = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 1024;
+        const uint32_t work = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
+        const uint32_t rounds = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 20;
+        return ds4_gpu_indirect_dispatch_canary(n_groups, work, rounds) ? 0 : 1;
+    }
     /* --fp8-attn-out-icb-canary [group_dim [rank [n_groups [out_dim [n_tokens [rounds [mode]]]]]]]
      * Mode 0 preserves direct A-then-B command-buffer boundaries through ICB replay.
      * Mode 1 executes A and B in one command buffer with an in-encoder barrier.

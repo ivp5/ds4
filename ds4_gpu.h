@@ -1417,6 +1417,10 @@ int ds4_gpu_mtl4_polar_dot_canary(uint32_t packets, uint32_t pairs);
 int ds4_gpu_dense_matvec_icb_canary(uint32_t M, uint32_t N);
 /* ICB dense-path speed bench (task #822) — A/B ms/forward, direct vs ICB cached-replay, no model. */
 int ds4_gpu_dense_matvec_icb_bench(uint32_t M, uint32_t N, uint32_t n_gemv, uint32_t n_iter);
+/* Mesh/object dispatch amplifier canary — host N compute dispatches vs one object→mesh draw. */
+int ds4_gpu_mesh_dispatch_canary(uint32_t n_groups, uint32_t rounds);
+/* Indirect compute dispatch canary — host N tiny dispatches vs one direct grid vs one GPU-count indirect grid. */
+int ds4_gpu_indirect_dispatch_canary(uint32_t n_groups, uint32_t work, uint32_t rounds);
 /* FP8 attention-output ICB canary — direct A→B vs ICB replay, no model load. */
 int ds4_gpu_fp8_attn_out_icb_canary(uint32_t group_dim,
                                     uint32_t rank,
