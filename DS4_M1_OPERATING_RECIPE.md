@@ -167,8 +167,8 @@ they pass real selected-layer D8F, overlap, and fidelity gates.
 | File | Size | Status | Capability |
 |------|------|--------|------------|
 | `ds4flash.gguf` (IQ2_XXS w2 imatrix) | 86.7 GB | Production | Full AIME P01-P10 reachable |
-| `DeepSeek-V4-Flash_H3384_H3382_all43_route_hotblock_sidecar_top6_down_native_codes_D8F_800kctx_probe_20260604` | 41 GB physical / 48.9 GiB logical | Current default SOTA pack | H3384 hot-block D8F + top6 native down-code sidecars; no-flag CLI selects it when present |
-| `DeepSeek-V4-Flash_H3385_H3384_sparse_groupcode_sidecars_D8F_800kctx_probe_20260604` | 487 MB overlay | Experimental next-gen sidecar | Exact sparse group-code sidecars with C reader; sparse+rank1 Metal path passes selected-layer exactness canaries but is still slower than native-code sidecars, so not primary until full decode/AIME gates improve |
+| `DeepSeek-V4-Flash_H3384_H3382_all43_route_hotblock_sidecar_top6_down_native_codes_D8F_800kctx_probe_20260604` | 41 GB file / ~17.6 GB process RSS during current smoke / ~46 GB peak system wired during prefill | Default runnable speed pack, **not fidelity SOTA** | H3384 hot-block D8F + top6 native down-code sidecars; no-flag CLI selects it when present, but agent2 A194-A203 reports dynamic AIME echo collapse, so promotion now requires `--coherence-gate` |
+| `DeepSeek-V4-Flash_H3385_H3384_sparse_groupcode_sidecars_D8F_800kctx_probe_20260604` | 487 MB overlay on H3384 | Experimental next-gen sidecar, **inherits H3384 coherence risk** | Exact sparse group-code sidecars with C reader; sparse+rank1 Metal path passes selected-layer exactness canaries but is still slower than native-code sidecars and cannot be primary until the dynamic coherence gate passes |
 | `DS4-trim50-asym-with-metadata.gguf` | 26 GB | Path A trim | **4× gen speedup BUT arithmetic carry breaks** (shifts cite v_P+5 vs v_P+9 collapse) |
 | Q4_K_M-XL 153 GB | 153 GB | doesn't fit | — |
 | `MLX-Qwen3.5-9B-DS-V4-Flash-4bit` | 5 GB | distill, MLX | side-by-side proposer |
@@ -372,7 +372,7 @@ Deferred:
 
 ## Operating doctrine summary
 
-1. **No flags/env default to H3384 + Metal + PRIME + prefill auto** when the H3384 flat-pack is present
+1. **No flags/env discover H3384 + Metal + PRIME + prefill auto** when the H3384 flat-pack is present, but auto-selected H3384 now refuses normal generation until `--coherence-gate` passes; use explicit `--flat-pack` or `DS4_ALLOW_UNCERTIFIED_H3384=1` only for speed-only experiments
 2. **Use `--prefill-metal-phases 0` only for A/B**; Metal default is `auto`, and external D8F normalizes to phase-free GPU runtime when no GGUF routed residency needs swapping
 3. **For chat/agentic: add `--kv-disk-dir`** (9× speedup on repeat)
 4. **For forensics: build JOURNAL=1** (append-only SQLite trace)
@@ -389,12 +389,15 @@ Checked `github.com/Anemll/ds4-ssd` `main-alpha` (pushed 2026-06-04). Its
 headline SSD path is a sidecar package with routed expert slot banks, async
 pread/readahead, prefill slot prefetch, optional disk KV, and machine profiles
 whose environment defaults never override user exports. That is a different
-artifact class from H3384: H3384 is already a <=52GB resident flat D8F pack, so
-SSD slot banking is not automatically faster and should not replace the default
-without a local selected-layer/end-to-end win.
+artifact class from H3384: current H3384 smoke shows ~17.6 GB process RSS while
+Metal wired memory grows during prefill, so "fits" must be reported as live RSS
++ wired pressure, not inferred from a 52GB file-budget slogan. SSD slot banking
+is not automatically faster and should not replace the default without a local
+selected-layer/end-to-end win and coherence gate pass.
 
-Borrowed now: make the measured resident default explicit — H3384 + Metal +
-PRIME + `prefill-metal-phases auto`. Fork lesson kept for future sidecar work:
+Borrowed now: make the measured runnable default explicit — H3384 + Metal +
+PRIME + `prefill-metal-phases auto`, with dynamic coherence still uncertified.
+Fork lesson kept for future sidecar work:
 M1-class profiles keep ANE routed prefill off unless measured; 16K prefill
 chunks require raw-cap headroom (`128 + chunk`, aligned), and SSD/I/O knobs
 should be profile defaults with user env winning, not hidden cargo-cult flags.

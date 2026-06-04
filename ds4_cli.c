@@ -51,6 +51,8 @@ typedef struct {
     int imatrix_max_tokens;
     bool stop_repeat_sentence;
     int stop_repeat_sentence_min_chars;
+    bool coherence_gate;
+    int coherence_gate_tokens;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
@@ -68,6 +70,7 @@ typedef struct {
     bool inspect;
     bool backend_explicit;
     bool model_or_pack_explicit;
+    bool default_pack_auto_selected;
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
@@ -183,6 +186,9 @@ static void usage(FILE *fp) {
         "      Disable native D8F down readers with DS4_D8F_RUNTIME_NATIVE_DOWN_DISABLE=1;\n"
         "      defaults cover layers 0,20,25,26,37 for token batches <=4,\n"
         "      compact texture on 20,37, and pack2D on 26.\n"
+        "      Auto-selected H3384 is blocked for normal generation until coherence\n"
+        "      is certified; set DS4_ALLOW_UNCERTIFIED_H3384=1 for speed-only runs\n"
+        "      or pass --flat-pack explicitly.\n"
         "      Q head RMSNorm+RoPE and FP8 attention-output one-command-buffer\n"
         "      HC fusion are opt-in with DS4_METAL_ENABLE_Q_HEAD_NORM_ROPE_FUSION=1\n"
         "      and DS4_ENABLE_FP8_ATTN_OUT_ONECB_HC=1, or via max-fusion.\n"
@@ -211,6 +217,10 @@ static void usage(FILE *fp) {
         "      Subtract F once from each prior token's logit. Default: 0\n"
         "  --stop-repeat-sentence\n"
         "      Stop generation when an answer sentence repeats. Off by default.\n"
+        "  --coherence-gate\n"
+        "      Greedy 40-token dynamic echo gate for codec candidates; exits nonzero on token loops.\n"
+        "  --coherence-gate-tokens N\n"
+        "      Token budget for --coherence-gate. Default: 40\n"
         "  --seed N\n"
         "      Sampling seed for reproducible non-greedy runs. Default: time-based\n"
         "  --think\n"
@@ -698,6 +708,132 @@ static bool repeat_guard_scan(repeat_sentence_guard *g) {
         g->text[g->len] = '\0';
     }
     return true;
+}
+
+typedef struct {
+    token_printer printer;
+    int tokens[512];
+    int n_tokens;
+    bool tripped;
+    char reason[320];
+} coherence_gate_state;
+
+static bool coherence_gate_repeated_ngram(const int *tokens, int n_tokens, int ngram, int repeats) {
+    if (ngram <= 0 || repeats <= 1 || n_tokens < ngram * repeats) return false;
+    const int start = n_tokens - ngram;
+    for (int r = 1; r < repeats; r++) {
+        const int other = start - r * ngram;
+        for (int i = 0; i < ngram; i++) {
+            if (tokens[start + i] != tokens[other + i]) return false;
+        }
+    }
+    return true;
+}
+
+static void coherence_gate_note_token(coherence_gate_state *g, int token) {
+    if (!g || g->tripped) return;
+    if (g->n_tokens < (int)(sizeof(g->tokens) / sizeof(g->tokens[0]))) {
+        g->tokens[g->n_tokens++] = token;
+    } else {
+        memmove(g->tokens, g->tokens + 1, (sizeof(g->tokens) - sizeof(g->tokens[0])));
+        g->tokens[(int)(sizeof(g->tokens) / sizeof(g->tokens[0])) - 1] = token;
+    }
+    for (int ngram = 1; ngram <= 6; ngram++) {
+        const int repeats = ngram == 1 ? 4 : 3;
+        if (coherence_gate_repeated_ngram(g->tokens, g->n_tokens, ngram, repeats)) {
+            g->tripped = true;
+            snprintf(g->reason, sizeof(g->reason),
+                     "coherence-gate echo: repeated %d-token pattern %d times by generated token %d",
+                     ngram, repeats, g->n_tokens);
+            return;
+        }
+    }
+}
+
+static void coherence_gate_emit_token(void *ud, int token) {
+    coherence_gate_state *g = ud;
+    size_t len = 0;
+    char *text = ds4_token_text(g->printer.engine, token, &len);
+    token_printer_write_text(&g->printer, text, len);
+    fflush(g->printer.fp);
+    free(text);
+    coherence_gate_note_token(g, token);
+}
+
+static int run_coherence_gate_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ds4: --coherence-gate requires a session backend\n");
+        return 1;
+    }
+
+    char err[160];
+    cli_prefill_progress progress = {
+        .base_tokens = 0,
+        .input_tokens = prompt->len,
+        .use_color = ds4_log_is_tty(stderr),
+    };
+    ds4_session_set_progress(session, cli_prefill_progress_cb, &progress);
+    ds4_session_set_display_progress(session,
+                                     progress.use_color ? cli_prefill_progress_cb : NULL,
+                                     progress.use_color ? &progress : NULL);
+    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+        ds4_session_set_progress(session, NULL, NULL);
+        ds4_session_set_display_progress(session, NULL, NULL);
+        fprintf(stderr, "ds4: coherence gate prompt processing failed: %s\n", err);
+        ds4_session_free(session);
+        return 1;
+    }
+    ds4_session_set_progress(session, NULL, NULL);
+    ds4_session_set_display_progress(session, NULL, NULL);
+
+    int max_tokens = cfg->gen.coherence_gate_tokens > 0 ? cfg->gen.coherence_gate_tokens : 40;
+    int room = ds4_session_ctx(session) - ds4_session_pos(session);
+    if (room <= 1) max_tokens = 0;
+    else if (max_tokens > room - 1) max_tokens = room - 1;
+
+    coherence_gate_state gate = {
+        .printer = {
+            .engine = engine,
+            .fp = stdout,
+            .format_thinking = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
+            .in_think = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
+            .use_color = isatty(fileno(stdout)) != 0,
+            .last_output_newline = true,
+        },
+    };
+
+    const double t0 = cli_now_sec();
+    int generated = 0;
+    int rc = 0;
+    while (generated < max_tokens && !cli_interrupt_requested()) {
+        int token = ds4_session_argmax(session);
+        if (token == ds4_token_eos(engine)) break;
+        coherence_gate_emit_token(&gate, token);
+        generated++;
+        if (gate.tripped || generated >= max_tokens) break;
+        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: coherence gate decode failed: %s\n", err);
+            rc = 1;
+            break;
+        }
+    }
+    generation_done(&gate.printer);
+    if (cli_interrupt_requested()) cli_interrupt_clear();
+    const double dt = cli_now_sec() - t0;
+    if (rc == 0 && gate.tripped) {
+        fprintf(stderr, "ds4: %s\n", gate.reason);
+        rc = 3;
+    }
+    if (rc == 0) {
+        fprintf(stderr, "ds4: coherence-gate PASS generated=%d budget=%d elapsed=%.3fs\n",
+                generated, max_tokens, dt);
+    } else if (gate.tripped) {
+        fprintf(stderr, "ds4: coherence-gate FAIL generated=%d budget=%d elapsed=%.3fs\n",
+                generated, max_tokens, dt);
+    }
+    ds4_session_free(session);
+    return rc;
 }
 
 static bool cli_env_enabled(const char *name) {
@@ -1279,10 +1415,26 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
+    } else if (cfg->default_pack_auto_selected &&
+               !cfg->gen.coherence_gate &&
+               !cli_env_enabled("DS4_ALLOW_UNCERTIFIED_H3384")) {
+        fprintf(stderr,
+                "ds4: refusing normal generation on auto-selected H3384: "
+                "agent2 A194-A203 and local --coherence-gate show dynamic echo collapse. "
+                "Run --coherence-gate, pass --flat-pack explicitly for speed-only experiments, "
+                "or set DS4_ALLOW_UNCERTIFIED_H3384=1.\n");
+        rc = 2;
     } else if (cfg->gen.temperature > 0.0f ||
                cfg->gen.presence_penalty > 0.0f ||
                ds4_engine_mtp_draft_tokens(engine) > 1) {
-        rc = run_sampled_generation(engine, cfg, &prompt);
+        if (cfg->gen.coherence_gate) {
+            fprintf(stderr, "ds4: --coherence-gate uses deterministic greedy decode; ignoring sampling/spec settings\n");
+            rc = run_coherence_gate_generation(engine, cfg, &prompt);
+        } else {
+            rc = run_sampled_generation(engine, cfg, &prompt);
+        }
+    } else if (cfg->gen.coherence_gate) {
+        rc = run_coherence_gate_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
             .engine = engine,
@@ -1797,7 +1949,10 @@ static void apply_default_sota_flat_pack(cli_config *cfg) {
         "DeepSeek-V4-Flash_H3384_H3382_all43_route_hotblock_sidecar_top6_down_native_codes_D8F_800kctx_probe_20260604";
     if (!flat_pack_dir_usable(default_pack)) return;
     apply_flat_pack_dir(cfg, default_pack, "default flat-pack");
-    fprintf(stderr, "ds4: default SOTA pack selected: H3384 hotblock/native-down D8F\n");
+    cfg->default_pack_auto_selected = true;
+    fprintf(stderr,
+            "ds4: default runnable speed pack selected: H3384 hotblock/native-down D8F "
+            "(codec coherence not certified; run --coherence-gate before promotion)\n");
 }
 
 static void cli_config_free(cli_config *cfg) {
@@ -1831,6 +1986,7 @@ static cli_config parse_options(int argc, char **argv) {
             .min_p = DS4_DEFAULT_MIN_P,
             .dump_logprobs_top_k = 20,
             .stop_repeat_sentence_min_chars = 24,
+            .coherence_gate_tokens = 40,
             .think_mode = DS4_THINK_HIGH,
         },
     };
@@ -1885,6 +2041,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.presence_penalty = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
         } else if (!strcmp(arg, "--stop-repeat-sentence")) {
             c.gen.stop_repeat_sentence = true;
+        } else if (!strcmp(arg, "--coherence-gate")) {
+            c.gen.coherence_gate = true;
+        } else if (!strcmp(arg, "--coherence-gate-tokens")) {
+            c.gen.coherence_gate_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
@@ -3750,6 +3910,30 @@ int main(int argc, char **argv) {
         return ds4_gpu_mtl4_hc_weighted_sum_canary(n_embd, n_hc, n_tokens) ? 0 : 1;
     }
     cli_config cfg = parse_options(argc, argv);
+    const bool h3384_diagnostic =
+        cfg.inspect ||
+        cfg.gen.dump_tokens ||
+        cfg.gen.dump_logits_path ||
+        cfg.gen.dump_logprobs_path ||
+        cfg.gen.perplexity_file_path ||
+        cfg.gen.imatrix_output_path ||
+        cfg.gen.head_test ||
+        cfg.gen.first_token_test ||
+        cfg.gen.metal_graph_test ||
+        cfg.gen.metal_graph_full_test ||
+        cfg.gen.metal_graph_prompt_test;
+    if (cfg.default_pack_auto_selected &&
+        !cfg.gen.coherence_gate &&
+        !h3384_diagnostic &&
+        !cli_env_enabled("DS4_ALLOW_UNCERTIFIED_H3384")) {
+        fprintf(stderr,
+                "ds4: refusing normal generation on auto-selected H3384 before model load: "
+                "agent2 A194-A203 and local --coherence-gate show dynamic echo collapse. "
+                "Run --coherence-gate, pass --flat-pack explicitly for speed-only experiments, "
+                "or set DS4_ALLOW_UNCERTIFIED_H3384=1.\n");
+        cli_config_free(&cfg);
+        return 2;
+    }
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
             fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
