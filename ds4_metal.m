@@ -57545,12 +57545,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             (!rank1_sidecar_active || rank1_split_sidecar) &&
             !down_tile32_recbuf &&
             !half_mid && recbuf_enabled && !preweight_mid && down_tile16 &&
-            sparse_down_requested &&
-            g_d8f_runtime_sparse_buf &&
-            g_d8f_runtime_sparse_rec_buf &&
-            g_d8f_runtime_sparse_max_group_unique > 0u &&
-            g_d8f_down_sparse_score_selected_batch_classic_pipeline &&
-            g_d8f_down_sparse_gather_selected_batch_classic_pipeline;
+            sparse_down_requested;
         const int down_sparse_indirect_score =
             down_sparse_recbuf &&
             ds4_gpu_d8f_runtime_sparse_indirect_score_enabled() &&
