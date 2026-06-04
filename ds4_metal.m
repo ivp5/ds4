@@ -29,6 +29,7 @@
 #include "ds4_cdx3_reader.h"
 #include "ds4_d8m_reader.h"
 #include "ds4_d8f_reader.h"
+#include "ds4_d8fs_reader.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -205,7 +206,7 @@ typedef struct {
 } ds4_icb_slot_signature_t;
 
 #ifndef DS4_ICB_SLOT_MAX_COMMANDS
-#define DS4_ICB_SLOT_MAX_COMMANDS 320
+#define DS4_ICB_SLOT_MAX_COMMANDS 512
 #endif
 
 typedef struct {
@@ -1883,6 +1884,37 @@ static int ds4_gpu_d8f_runtime_native_down_enabled_for_layer(uint32_t layer,
     if (has_allow) return 1;
     if (token_count > default_max_tokens) return 0;
     return ds4_gpu_layer_mask_has(default_mask, layer);
+}
+
+static int ds4_gpu_d8f_runtime_sparse_down_enabled_for_layer(uint32_t layer,
+                                                             uint32_t token_count) {
+    if (ds4_gpu_env_bool("DS4_D8F_RUNTIME_SPARSE_DOWN_DISABLE") > 0) return 0;
+    if (layer >= 64u) return 0;
+    static int parsed = 0;
+    static int has_allow = 0;
+    static int has_disable = 0;
+    static uint64_t allow_mask = 0ull;
+    static uint64_t disable_mask = 0ull;
+    if (!parsed) {
+        const char *allow_csv = getenv("DS4_D8F_RUNTIME_SPARSE_DOWN_LAYERS");
+        const char *disable_csv = getenv("DS4_D8F_RUNTIME_SPARSE_DOWN_DISABLE_LAYERS");
+        has_allow = (allow_csv && allow_csv[0]) ? 1 : 0;
+        has_disable = (disable_csv && disable_csv[0]) ? 1 : 0;
+        allow_mask = has_allow ? ds4_gpu_d8f_layer_mask_from_csv(allow_csv) : 0ull;
+        disable_mask = has_disable ? ds4_gpu_d8f_layer_mask_from_csv(disable_csv) : 0ull;
+        parsed = 1;
+    }
+    if (has_allow && ((allow_mask >> layer) & 1ull) == 0ull) return 0;
+    if (has_disable && ((disable_mask >> layer) & 1ull)) return 0;
+    const uint32_t min_tokens =
+        ds4_gpu_env_u32("DS4_D8F_RUNTIME_SPARSE_DOWN_MIN_TOKENS", 1u);
+    const uint32_t max_tokens =
+        ds4_gpu_env_u32("DS4_D8F_RUNTIME_SPARSE_DOWN_MAX_TOKENS", 1u);
+    if (token_count < min_tokens || token_count > max_tokens) return 0;
+    const int explicit_sparse = ds4_gpu_env_bool("DS4_D8F_RUNTIME_SPARSE_DOWN");
+    if (explicit_sparse == 0) return 0;
+    if (explicit_sparse > 0) return 1;
+    return has_allow;
 }
 
 static int ds4_gpu_d8f_runtime_native_down_pack2d_enabled_for_layer(uint32_t layer) {
@@ -52328,6 +52360,8 @@ static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_pack2d_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_compact_tex_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_i8_cbsram_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sparse_score_selected_batch_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sparse_gather_selected_batch_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_native_pack2d_warm_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile32_recbuf_classic_pipeline;
@@ -52423,6 +52457,10 @@ static int ds4_d8f_classic_pipeline_init(void) {
             ds4_gpu_get_pipeline_direct("d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_compact_tex");
         g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_i8_cbsram_classic_pipeline =
             ds4_gpu_get_pipeline_direct("d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_i8_cbsram");
+        g_d8f_down_sparse_score_selected_batch_classic_pipeline =
+            ds4_gpu_get_pipeline_direct("d8f_down_sparse_score_selected_batch");
+        g_d8f_down_sparse_gather_selected_batch_classic_pipeline =
+            ds4_gpu_get_pipeline_direct("d8f_down_sparse_gather_selected_batch");
         g_d8f_down_native_pack2d_warm_classic_pipeline =
             ds4_gpu_get_pipeline_direct("d8f_down_native_pack2d_warm");
         g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram_classic_pipeline =
@@ -55278,7 +55316,32 @@ typedef struct ds4_d8f_runtime_i8_codebook_lite {
     uint32_t scale_offset;
     uint32_t reserved;
 } ds4_d8f_runtime_i8_codebook_lite;
+typedef struct ds4_d8f_runtime_sparse_down_lite {
+    uint32_t flags;
+    uint32_t rows;
+    uint32_t groups;
+    uint32_t k;
+    uint32_t unique_count;
+    uint32_t max_group_unique;
+    uint64_t group_prefix_offset;
+    uint64_t inverse_offset_table_offset;
+    uint64_t unique_code_offset;
+    uint64_t inverse_bits_offset;
+} ds4_d8f_runtime_sparse_down_lite;
+typedef struct ds4_d8f_runtime_sparse_down_args {
+    uint32_t rows;
+    uint32_t in_dim;
+    uint32_t n_selected;
+    uint32_t n_tokens;
+    uint32_t mid_slot_stride;
+    uint32_t mid_token_stride;
+    uint32_t out_token_stride;
+    uint32_t route_token_stride;
+    uint32_t selected_token_stride;
+    uint32_t max_group_unique;
+} ds4_d8f_runtime_sparse_down_args;
 static ds4_d8f_runtime_record_lite g_d8f_runtime_record_staging[ds4_d8f_recbuf_record_count];
+static ds4_d8f_runtime_sparse_down_lite g_d8f_runtime_sparse_record_staging[256];
 
 static void ds4_d8f_runtime_record_lite_from_record(ds4_d8f_runtime_record_lite *dst,
                                                     const ds4_d8f_record *src) {
@@ -55297,7 +55360,12 @@ static void ds4_d8f_runtime_record_lite_from_record(ds4_d8f_runtime_record_lite 
 }
 static char g_d8f_runtime_layer_path[ds4_d8f_runtime_layer_cap][4096];
 static ds4_d8f_file g_d8f_runtime_layer_file[ds4_d8f_runtime_layer_cap];
+static ds4_d8fs_file g_d8f_runtime_layer_sparse_file[ds4_d8f_runtime_layer_cap];
 static id<MTLBuffer> g_d8f_runtime_layer_buf[ds4_d8f_runtime_layer_cap];
+static id<MTLBuffer> g_d8f_runtime_layer_sparse_buf[ds4_d8f_runtime_layer_cap];
+static id<MTLBuffer> g_d8f_runtime_layer_sparse_rec_buf[ds4_d8f_runtime_layer_cap];
+static uint32_t g_d8f_runtime_layer_sparse_max_group_unique[ds4_d8f_runtime_layer_cap];
+static uint32_t g_d8f_runtime_layer_sparse_live_records[ds4_d8f_runtime_layer_cap];
 static id<MTLTexture> g_d8f_runtime_layer_texbuf[ds4_d8f_runtime_layer_cap];
 static id<MTLTexture> g_d8f_runtime_layer_pack2d_tex[ds4_d8f_runtime_layer_cap];
 static id<MTLBuffer> g_d8f_runtime_layer_compact_codebook_buf[ds4_d8f_runtime_layer_cap];
@@ -55308,8 +55376,19 @@ static uint32_t g_d8f_runtime_layer_i8_codebook_bytes[ds4_d8f_runtime_layer_cap]
 static uint32_t g_d8f_runtime_layer_i8_kept[ds4_d8f_runtime_layer_cap];
 static uint32_t g_d8f_runtime_layer_i8_total[ds4_d8f_runtime_layer_cap];
 static id<MTLBuffer> g_d8f_runtime_layer_rec_buf[ds4_d8f_runtime_layer_cap];
+static id<MTLBuffer> g_d8f_runtime_layer_gate_args_buf[ds4_d8f_runtime_layer_cap];
+static id<MTLBuffer> g_d8f_runtime_layer_down_args_buf[ds4_d8f_runtime_layer_cap];
+static id<MTLBuffer> g_d8f_runtime_layer_down_base_args_buf[ds4_d8f_runtime_layer_cap];
+static id<MTLBuffer> g_d8f_runtime_layer_sparse_args_buf[ds4_d8f_runtime_layer_cap];
 static int g_d8f_runtime_layer_open[ds4_d8f_runtime_layer_cap];
+static int g_d8f_runtime_layer_sparse_open[ds4_d8f_runtime_layer_cap];
 static id<MTLBuffer> g_d8f_runtime_rec_buf;
+static id<MTLBuffer> g_d8f_runtime_sparse_buf;
+static id<MTLBuffer> g_d8f_runtime_sparse_rec_buf;
+static id<MTLBuffer> g_d8f_runtime_sparse_score_buf;
+static NSUInteger g_d8f_runtime_sparse_score_bytes;
+static uint32_t g_d8f_runtime_sparse_max_group_unique;
+static uint32_t g_d8f_runtime_sparse_live_records;
 static id<MTLBuffer> g_d8f_runtime_i8_rec_buf;
 static id<MTLBuffer> g_d8f_runtime_i8_codebook_buf;
 static uint32_t g_d8f_runtime_i8_codebook_bytes;
@@ -55323,6 +55402,7 @@ static id<MTLBuffer> g_d8f_runtime_sidecar_dot_buf;
 static id<MTLBuffer> g_d8f_runtime_gate_args_buf;
 static id<MTLBuffer> g_d8f_runtime_down_args_buf;
 static id<MTLBuffer> g_d8f_runtime_down_base_args_buf;
+static id<MTLBuffer> g_d8f_runtime_sparse_args_buf;
 static id<MTLResidencySet> g_d8f_runtime_scratch_rs;
 static uint32_t g_d8f_runtime_scratch_token_cap;
 static uint32_t g_d8f_runtime_scratch_expert_cap;
@@ -55342,9 +55422,6 @@ static void ds4_d8f_runtime_scratch_reset(void) {
     }
     g_d8f_runtime_mid_buf = nil;
     g_d8f_runtime_sidecar_dot_buf = nil;
-    g_d8f_runtime_gate_args_buf = nil;
-    g_d8f_runtime_down_args_buf = nil;
-    g_d8f_runtime_down_base_args_buf = nil;
     g_d8f_runtime_scratch_token_cap = 0;
     g_d8f_runtime_scratch_expert_cap = 0;
     g_d8f_runtime_scratch_half_mid = 0;
@@ -55369,8 +55446,6 @@ static int ds4_d8f_runtime_scratch_prepare(uint32_t n_tokens, uint32_t n_experts
     half_mid = half_mid ? 1 : 0;
     rank1_sidecar = rank1_sidecar ? 1 : 0;
     if (g_d8f_runtime_scratch_rs && g_d8f_runtime_mid_buf &&
-        g_d8f_runtime_gate_args_buf && g_d8f_runtime_down_args_buf &&
-        g_d8f_runtime_down_base_args_buf &&
         (!rank1_sidecar || g_d8f_runtime_sidecar_dot_buf) &&
         g_d8f_runtime_scratch_token_cap >= n_tokens &&
         g_d8f_runtime_scratch_expert_cap >= n_experts &&
@@ -55386,17 +55461,12 @@ static int ds4_d8f_runtime_scratch_prepare(uint32_t n_tokens, uint32_t n_experts
         g_d8f_runtime_sidecar_dot_buf = [g_device newBufferWithLength:dot_bytes
                                                               options:MTLResourceStorageModeShared];
     }
-    g_d8f_runtime_gate_args_buf = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
-    g_d8f_runtime_down_args_buf = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
-    g_d8f_runtime_down_base_args_buf = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
-    if (!g_d8f_runtime_mid_buf || (rank1_sidecar && !g_d8f_runtime_sidecar_dot_buf) ||
-        !g_d8f_runtime_gate_args_buf || !g_d8f_runtime_down_args_buf ||
-        !g_d8f_runtime_down_base_args_buf) {
+    if (!g_d8f_runtime_mid_buf || (rank1_sidecar && !g_d8f_runtime_sidecar_dot_buf)) {
         ds4_d8f_runtime_scratch_reset();
         return 0;
     }
     MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-    rsDesc.initialCapacity = rank1_sidecar ? 5 : 4;
+    rsDesc.initialCapacity = rank1_sidecar ? 2 : 1;
     NSError *rsErr = nil;
     g_d8f_runtime_scratch_rs = [g_device newResidencySetWithDescriptor:rsDesc error:&rsErr];
     if (!g_d8f_runtime_scratch_rs) {
@@ -55405,14 +55475,11 @@ static int ds4_d8f_runtime_scratch_prepare(uint32_t n_tokens, uint32_t n_experts
         ds4_d8f_runtime_scratch_reset();
         return 0;
     }
-    id<MTLAllocation> allocs[5] = {
+    id<MTLAllocation> allocs[2] = {
         g_d8f_runtime_mid_buf,
-        g_d8f_runtime_gate_args_buf,
-        g_d8f_runtime_down_args_buf,
-        g_d8f_runtime_down_base_args_buf,
         nil
     };
-    NSUInteger alloc_count = 4;
+    NSUInteger alloc_count = 1;
     if (rank1_sidecar) allocs[alloc_count++] = g_d8f_runtime_sidecar_dot_buf;
     [g_d8f_runtime_scratch_rs addAllocations:allocs count:alloc_count];
     [g_d8f_runtime_scratch_rs commit];
@@ -55473,6 +55540,16 @@ static void ds4_d8f_runtime_active_clear(void) {
     g_d8f_runtime_pack2d_warm_buf = nil;
     g_d8f_runtime_pack2d_warm_bytes = 0;
     g_d8f_runtime_rec_buf = nil;
+    g_d8f_runtime_sparse_buf = nil;
+    g_d8f_runtime_sparse_rec_buf = nil;
+    g_d8f_runtime_sparse_score_buf = nil;
+    g_d8f_runtime_sparse_score_bytes = 0;
+    g_d8f_runtime_sparse_max_group_unique = 0;
+    g_d8f_runtime_sparse_live_records = 0;
+    g_d8f_runtime_gate_args_buf = nil;
+    g_d8f_runtime_down_args_buf = nil;
+    g_d8f_runtime_down_base_args_buf = nil;
+    g_d8f_runtime_sparse_args_buf = nil;
     g_d8f_runtime_rs = nil;
     g_d8f_runtime_path[0] = '\0';
     g_d8f_runtime_layer = UINT32_MAX;
@@ -55481,11 +55558,24 @@ static void ds4_d8f_runtime_active_clear(void) {
 
 static void ds4_d8f_runtime_layer_reset(uint32_t layer) {
     if (layer >= ds4_d8f_runtime_layer_cap) return;
-    if (g_d8f_runtime_pack_rs && (g_d8f_runtime_layer_buf[layer] || g_d8f_runtime_layer_rec_buf[layer])) {
-        id<MTLAllocation> allocs[2];
+    if (g_d8f_runtime_pack_rs && (g_d8f_runtime_layer_buf[layer] ||
+                                  g_d8f_runtime_layer_rec_buf[layer] ||
+                                  g_d8f_runtime_layer_sparse_buf[layer] ||
+                                  g_d8f_runtime_layer_sparse_rec_buf[layer] ||
+                                  g_d8f_runtime_layer_gate_args_buf[layer] ||
+                                  g_d8f_runtime_layer_down_args_buf[layer] ||
+                                  g_d8f_runtime_layer_down_base_args_buf[layer] ||
+                                  g_d8f_runtime_layer_sparse_args_buf[layer])) {
+        id<MTLAllocation> allocs[8];
         NSUInteger count = 0;
         if (g_d8f_runtime_layer_buf[layer]) allocs[count++] = g_d8f_runtime_layer_buf[layer];
         if (g_d8f_runtime_layer_rec_buf[layer]) allocs[count++] = g_d8f_runtime_layer_rec_buf[layer];
+        if (g_d8f_runtime_layer_sparse_buf[layer]) allocs[count++] = g_d8f_runtime_layer_sparse_buf[layer];
+        if (g_d8f_runtime_layer_sparse_rec_buf[layer]) allocs[count++] = g_d8f_runtime_layer_sparse_rec_buf[layer];
+        if (g_d8f_runtime_layer_gate_args_buf[layer]) allocs[count++] = g_d8f_runtime_layer_gate_args_buf[layer];
+        if (g_d8f_runtime_layer_down_args_buf[layer]) allocs[count++] = g_d8f_runtime_layer_down_args_buf[layer];
+        if (g_d8f_runtime_layer_down_base_args_buf[layer]) allocs[count++] = g_d8f_runtime_layer_down_base_args_buf[layer];
+        if (g_d8f_runtime_layer_sparse_args_buf[layer]) allocs[count++] = g_d8f_runtime_layer_sparse_args_buf[layer];
         if (count) {
             [g_d8f_runtime_pack_rs removeAllocations:allocs count:count];
             [g_d8f_runtime_pack_rs commit];
@@ -55496,6 +55586,10 @@ static void ds4_d8f_runtime_layer_reset(uint32_t layer) {
         }
     }
     g_d8f_runtime_layer_buf[layer] = nil;
+    g_d8f_runtime_layer_sparse_buf[layer] = nil;
+    g_d8f_runtime_layer_sparse_rec_buf[layer] = nil;
+    g_d8f_runtime_layer_sparse_max_group_unique[layer] = 0;
+    g_d8f_runtime_layer_sparse_live_records[layer] = 0;
     g_d8f_runtime_layer_texbuf[layer] = nil;
     g_d8f_runtime_layer_pack2d_tex[layer] = nil;
     g_d8f_runtime_layer_compact_codebook_buf[layer] = nil;
@@ -55506,12 +55600,21 @@ static void ds4_d8f_runtime_layer_reset(uint32_t layer) {
     g_d8f_runtime_layer_i8_kept[layer] = 0;
     g_d8f_runtime_layer_i8_total[layer] = 0;
     g_d8f_runtime_layer_rec_buf[layer] = nil;
+    g_d8f_runtime_layer_gate_args_buf[layer] = nil;
+    g_d8f_runtime_layer_down_args_buf[layer] = nil;
+    g_d8f_runtime_layer_down_base_args_buf[layer] = nil;
+    g_d8f_runtime_layer_sparse_args_buf[layer] = nil;
     if (g_d8f_runtime_layer_open[layer]) {
         ds4_d8f_close(&g_d8f_runtime_layer_file[layer]);
     }
+    if (g_d8f_runtime_layer_sparse_open[layer]) {
+        ds4_d8fs_close(&g_d8f_runtime_layer_sparse_file[layer]);
+    }
     memset(&g_d8f_runtime_layer_file[layer], 0, sizeof(g_d8f_runtime_layer_file[layer]));
+    memset(&g_d8f_runtime_layer_sparse_file[layer], 0, sizeof(g_d8f_runtime_layer_sparse_file[layer]));
     g_d8f_runtime_layer_path[layer][0] = '\0';
     g_d8f_runtime_layer_open[layer] = 0;
+    g_d8f_runtime_layer_sparse_open[layer] = 0;
     if (g_d8f_runtime_layer == layer) ds4_d8f_runtime_active_clear();
 }
 
@@ -55534,6 +55637,10 @@ static void ds4_d8f_runtime_cache_reset(void) {
 static void ds4_d8f_runtime_activate_layer(uint32_t layer) {
     g_d8f_runtime_file = g_d8f_runtime_layer_file[layer];
     g_d8f_runtime_buf = g_d8f_runtime_layer_buf[layer];
+    g_d8f_runtime_sparse_buf = g_d8f_runtime_layer_sparse_buf[layer];
+    g_d8f_runtime_sparse_rec_buf = g_d8f_runtime_layer_sparse_rec_buf[layer];
+    g_d8f_runtime_sparse_max_group_unique = g_d8f_runtime_layer_sparse_max_group_unique[layer];
+    g_d8f_runtime_sparse_live_records = g_d8f_runtime_layer_sparse_live_records[layer];
     g_d8f_runtime_texbuf = g_d8f_runtime_layer_texbuf[layer];
     g_d8f_runtime_pack2d_tex = g_d8f_runtime_layer_pack2d_tex[layer];
     g_d8f_runtime_compact_codebook_buf = g_d8f_runtime_layer_compact_codebook_buf[layer];
@@ -55544,6 +55651,10 @@ static void ds4_d8f_runtime_activate_layer(uint32_t layer) {
     g_d8f_runtime_i8_kept = g_d8f_runtime_layer_i8_kept[layer];
     g_d8f_runtime_i8_total = g_d8f_runtime_layer_i8_total[layer];
     g_d8f_runtime_rec_buf = g_d8f_runtime_layer_rec_buf[layer];
+    g_d8f_runtime_gate_args_buf = g_d8f_runtime_layer_gate_args_buf[layer];
+    g_d8f_runtime_down_args_buf = g_d8f_runtime_layer_down_args_buf[layer];
+    g_d8f_runtime_down_base_args_buf = g_d8f_runtime_layer_down_base_args_buf[layer];
+    g_d8f_runtime_sparse_args_buf = g_d8f_runtime_layer_sparse_args_buf[layer];
     g_d8f_runtime_rs = g_d8f_runtime_pack_rs;
     snprintf(g_d8f_runtime_path, sizeof(g_d8f_runtime_path), "%s",
              g_d8f_runtime_layer_path[layer]);
@@ -55567,7 +55678,7 @@ static void ds4_d8f_runtime_layer_queue_detach(uint32_t layer) {
 static int ds4_d8f_runtime_pack_residency_prepare(uint32_t layer) {
     if (!g_d8f_runtime_pack_rs) {
         MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = ds4_d8f_runtime_layer_cap * 2;
+        rsDesc.initialCapacity = ds4_d8f_runtime_layer_cap * 8;
         NSError *err = nil;
         g_d8f_runtime_pack_rs = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
         if (!g_d8f_runtime_pack_rs) {
@@ -55576,8 +55687,17 @@ static int ds4_d8f_runtime_pack_residency_prepare(uint32_t layer) {
             return 0;
         }
     }
-    id<MTLAllocation> allocs[2] = { g_d8f_runtime_layer_buf[layer], g_d8f_runtime_layer_rec_buf[layer] };
-    [g_d8f_runtime_pack_rs addAllocations:allocs count:2];
+    id<MTLAllocation> allocs[8];
+    NSUInteger alloc_count = 0;
+    if (g_d8f_runtime_layer_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_buf[layer];
+    if (g_d8f_runtime_layer_rec_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_rec_buf[layer];
+    if (g_d8f_runtime_layer_sparse_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_sparse_buf[layer];
+    if (g_d8f_runtime_layer_sparse_rec_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_sparse_rec_buf[layer];
+    if (g_d8f_runtime_layer_gate_args_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_gate_args_buf[layer];
+    if (g_d8f_runtime_layer_down_args_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_down_args_buf[layer];
+    if (g_d8f_runtime_layer_down_base_args_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_down_base_args_buf[layer];
+    if (g_d8f_runtime_layer_sparse_args_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_sparse_args_buf[layer];
+    [g_d8f_runtime_pack_rs addAllocations:allocs count:alloc_count];
     [g_d8f_runtime_pack_rs commit];
     const uint64_t allocated = (uint64_t)[g_d8f_runtime_pack_rs allocatedSize];
     const uint64_t delta = allocated > g_d8f_runtime_pack_rs_requested_bytes
@@ -55585,7 +55705,7 @@ static int ds4_d8f_runtime_pack_residency_prepare(uint32_t layer) {
     if (delta) {
         extern int ds4_mem_would_overcommit(uint64_t);
         if (!getenv("DS4_FORCE_FULL_RESIDENCY") && ds4_mem_would_overcommit(delta)) {
-            [g_d8f_runtime_pack_rs removeAllocations:allocs count:2];
+            [g_d8f_runtime_pack_rs removeAllocations:allocs count:alloc_count];
             [g_d8f_runtime_pack_rs commit];
             fprintf(stderr,
                     "ds4: D8F consolidated residency SKIPPED L%u delta=%.3f GB total=%.3f GB; "
@@ -55770,6 +55890,106 @@ static id<MTLTexture> ds4_d8f_runtime_new_compact_down_codebook_texture(ds4_d8f_
     }
     if (out_buf) *out_buf = texture_buf;
     return tex;
+}
+
+static int ds4_d8f_runtime_sparse_sidecar_path(const char *d8f_path,
+                                               uint32_t layer,
+                                               char *out,
+                                               size_t out_cap) {
+    if (!out || out_cap == 0) return 0;
+    out[0] = '\0';
+    const char *tmpl = getenv("DS4_D8FS_PACK_TEMPLATE");
+    if (tmpl && tmpl[0]) {
+        if (strchr(tmpl, '%')) {
+            snprintf(out, out_cap, tmpl, layer);
+        } else {
+            snprintf(out, out_cap, "%s", tmpl);
+        }
+        return out[0] != '\0';
+    }
+    if (!d8f_path || !d8f_path[0]) return 0;
+    const char *slash = strrchr(d8f_path, '/');
+    if (!slash) {
+        snprintf(out, out_cap, "ds4_L%02u_down_sparse_groupcode_top6.d8fs", layer);
+        return 1;
+    }
+    const size_t dir_len = (size_t)(slash - d8f_path);
+    snprintf(out, out_cap, "%.*s/ds4_L%02u_down_sparse_groupcode_top6.d8fs",
+             (int)dir_len, d8f_path, layer);
+    return 1;
+}
+
+static int ds4_d8f_runtime_sparse_down_load(uint32_t layer,
+                                            const char *d8f_path,
+                                            ds4_d8fs_file *out_file,
+                                            id<MTLBuffer> *out_sparse_buf,
+                                            id<MTLBuffer> *out_rec_buf,
+                                            uint32_t *out_max_group_unique,
+                                            uint32_t *out_live_records) {
+    if (out_sparse_buf) *out_sparse_buf = nil;
+    if (out_rec_buf) *out_rec_buf = nil;
+    if (out_max_group_unique) *out_max_group_unique = 0;
+    if (out_live_records) *out_live_records = 0;
+    if (!out_file || layer >= ds4_d8f_runtime_layer_cap) return 0;
+    memset(out_file, 0, sizeof(*out_file));
+    out_file->fd = -1;
+    char sparse_path[4096];
+    if (!ds4_d8f_runtime_sparse_sidecar_path(d8f_path, layer, sparse_path, sizeof(sparse_path))) return 0;
+    if (access(sparse_path, R_OK) != 0) return 0;
+    ds4_d8fs_file sparse_file;
+    if (!ds4_d8fs_open(sparse_path, &sparse_file)) return 0;
+    if (sparse_file.layer != layer) {
+        fprintf(stderr,
+                "ds4_d8fs: refusing sidecar layer mismatch path=%s header=%u expected=%u\n",
+                sparse_path, sparse_file.layer, layer);
+        ds4_d8fs_close(&sparse_file);
+        return 0;
+    }
+    ds4_d8f_runtime_sparse_down_lite recs[256];
+    memset(recs, 0, sizeof(recs));
+    uint32_t max_group_unique = 0;
+    uint32_t live_records = 0;
+    for (uint32_t expert = 0; expert < 256u; expert++) {
+        ds4_d8fs_record rec;
+        if (!ds4_d8fs_get_record(&sparse_file, expert, &rec)) continue;
+        recs[expert].flags = 1u;
+        recs[expert].rows = rec.rows;
+        recs[expert].groups = rec.groups;
+        recs[expert].k = rec.k;
+        recs[expert].unique_count = rec.unique_count;
+        recs[expert].max_group_unique = rec.max_group_unique;
+        recs[expert].group_prefix_offset = rec.group_prefix_offset;
+        recs[expert].inverse_offset_table_offset = rec.inverse_offset_table_offset;
+        recs[expert].unique_code_offset = rec.unique_code_offset;
+        recs[expert].inverse_bits_offset = rec.inverse_bits_offset;
+        if (rec.max_group_unique > max_group_unique) max_group_unique = rec.max_group_unique;
+        live_records++;
+    }
+    if (live_records == 0 || max_group_unique == 0) {
+        ds4_d8fs_close(&sparse_file);
+        return 0;
+    }
+    id<MTLBuffer> sparse_buf = [g_device newBufferWithBytesNoCopy:(void *)sparse_file.map
+                                                           length:sparse_file.size
+                                                          options:MTLResourceStorageModeShared
+                                                      deallocator:nil];
+    id<MTLBuffer> rec_buf = [g_device newBufferWithBytes:recs
+                                                  length:sizeof(recs)
+                                                 options:MTLResourceStorageModeShared];
+    if (!sparse_buf || !rec_buf) {
+        ds4_d8fs_close(&sparse_file);
+        return 0;
+    }
+    *out_file = sparse_file;
+    if (out_sparse_buf) *out_sparse_buf = sparse_buf;
+    if (out_rec_buf) *out_rec_buf = rec_buf;
+    if (out_max_group_unique) *out_max_group_unique = max_group_unique;
+    if (out_live_records) *out_live_records = live_records;
+    fprintf(stderr,
+            "ds4_d8fs: runtime sparse down sidecar L%u live=%u max_group_unique=%u sparse=%.3f MiB path=%s\n",
+            layer, live_records, max_group_unique,
+            (double)sparse_file.size / 1048576.0, sparse_path);
+    return 1;
 }
 
 static int ds4_d8f_runtime_down_i8_codebook_build(ds4_d8f_file *file,
@@ -56036,6 +56256,40 @@ static int ds4_d8f_runtime_cache_prepare(uint32_t layer, const char *path) {
         ds4_d8f_runtime_layer_reset(layer);
         return 0;
     }
+    g_d8f_runtime_layer_gate_args_buf[layer] =
+        [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+    g_d8f_runtime_layer_down_args_buf[layer] =
+        [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+    g_d8f_runtime_layer_down_base_args_buf[layer] =
+        [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+    g_d8f_runtime_layer_sparse_args_buf[layer] =
+        [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    if (!g_d8f_runtime_layer_gate_args_buf[layer] ||
+        !g_d8f_runtime_layer_down_args_buf[layer] ||
+        !g_d8f_runtime_layer_down_base_args_buf[layer] ||
+        !g_d8f_runtime_layer_sparse_args_buf[layer]) {
+        ds4_d8f_runtime_layer_reset(layer);
+        return 0;
+    }
+    if (ds4_gpu_d8f_runtime_sparse_down_enabled_for_layer(layer, 1u)) {
+        id<MTLBuffer> sparse_buf = nil;
+        id<MTLBuffer> sparse_rec_buf = nil;
+        uint32_t sparse_max_group_unique = 0;
+        uint32_t sparse_live_records = 0;
+        if (ds4_d8f_runtime_sparse_down_load(layer,
+                                             path,
+                                             &g_d8f_runtime_layer_sparse_file[layer],
+                                             &sparse_buf,
+                                             &sparse_rec_buf,
+                                             &sparse_max_group_unique,
+                                             &sparse_live_records)) {
+            g_d8f_runtime_layer_sparse_buf[layer] = sparse_buf;
+            g_d8f_runtime_layer_sparse_rec_buf[layer] = sparse_rec_buf;
+            g_d8f_runtime_layer_sparse_max_group_unique[layer] = sparse_max_group_unique;
+            g_d8f_runtime_layer_sparse_live_records[layer] = sparse_live_records;
+            g_d8f_runtime_layer_sparse_open[layer] = 1;
+        }
+    }
     g_d8f_runtime_layer_texbuf[layer] =
         ds4_d8f_runtime_new_pack_texture_buffer(g_d8f_runtime_layer_buf[layer],
                                                 (NSUInteger)file->size,
@@ -56167,6 +56421,99 @@ static int ds4_d8f_runtime_rank1_sidecar_supported_or_fail(uint32_t layer,
             "L%u count=%u path=%s caller=%s; set DS4_D8F_IGNORE_RANK1=1 only for diagnostics\n",
             layer, sidecar_count, path ? path : "(null)", caller ? caller : "unknown");
     return 0;
+}
+
+static int ds4_d8f_runtime_sparse_score_buffer_prepare(uint32_t n_tokens,
+                                                       uint32_t n_selected,
+                                                       uint32_t groups,
+                                                       uint32_t max_group_unique) {
+    if (n_tokens == 0 || n_selected == 0 || groups == 0 || max_group_unique == 0) return 0;
+    const uint64_t values =
+        (uint64_t)n_tokens * (uint64_t)n_selected * (uint64_t)groups * (uint64_t)max_group_unique;
+    const uint64_t bytes = values * sizeof(float);
+    if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return 0;
+    if (g_d8f_runtime_sparse_score_buf && g_d8f_runtime_sparse_score_bytes >= (NSUInteger)bytes) {
+        return 1;
+    }
+    g_d8f_runtime_sparse_score_buf = [g_device newBufferWithLength:(NSUInteger)bytes
+                                                           options:MTLResourceStorageModeShared];
+    g_d8f_runtime_sparse_score_bytes = g_d8f_runtime_sparse_score_buf ? (NSUInteger)bytes : 0u;
+    if (!g_d8f_runtime_sparse_score_buf) {
+        fprintf(stderr,
+                "ds4_d8fs: sparse score scratch allocation failed bytes=%.3f MiB\n",
+                (double)bytes / 1048576.0);
+        return 0;
+    }
+    return 1;
+}
+
+static int ds4_d8f_runtime_sparse_down_encode(id<MTLComputeCommandEncoder> enc,
+                                              id<MTLBuffer> selBuf,
+                                              NSUInteger sel_off,
+                                              id<MTLBuffer> weightBuf,
+                                              NSUInteger weight_off,
+                                              id<MTLBuffer> outBuf,
+                                              NSUInteger out_off,
+                                              uint32_t n_tokens,
+                                              uint32_t n_selected,
+                                              uint32_t rows,
+                                              uint32_t in_dim,
+                                              uint32_t mid_slot_stride,
+                                              uint32_t mid_token_stride,
+                                              uint32_t out_token_stride,
+                                              uint32_t route_token_stride,
+                                              uint32_t selected_token_stride) {
+    if (!enc || !g_d8f_runtime_sparse_buf || !g_d8f_runtime_sparse_rec_buf ||
+        !g_d8f_runtime_rec_buf || !g_d8f_runtime_mid_buf || !g_d8f_runtime_sparse_args_buf ||
+        !selBuf || !weightBuf || !outBuf ||
+        !g_d8f_down_sparse_score_selected_batch_classic_pipeline ||
+        !g_d8f_down_sparse_gather_selected_batch_classic_pipeline) return 0;
+    const uint32_t groups = in_dim >> 3;
+    const uint32_t max_group_unique = g_d8f_runtime_sparse_max_group_unique;
+    if (rows == 0 || groups == 0 || max_group_unique == 0) return 0;
+    if (!ds4_d8f_runtime_sparse_score_buffer_prepare(n_tokens, n_selected, groups, max_group_unique)) {
+        return 0;
+    }
+    ds4_d8f_runtime_sparse_down_args args = {
+        rows,
+        in_dim,
+        n_selected,
+        n_tokens,
+        mid_slot_stride,
+        mid_token_stride,
+        out_token_stride,
+        route_token_stride,
+        selected_token_stride,
+        max_group_unique,
+    };
+    memcpy(g_d8f_runtime_sparse_args_buf.contents, &args, sizeof(args));
+    [enc setComputePipelineState:g_d8f_down_sparse_score_selected_batch_classic_pipeline];
+    [enc setBuffer:g_d8f_runtime_sparse_buf offset:0 atIndex:0];
+    [enc setBuffer:g_d8f_runtime_buf offset:0 atIndex:1];
+    [enc setBuffer:g_d8f_runtime_sparse_rec_buf offset:0 atIndex:2];
+    [enc setBuffer:g_d8f_runtime_rec_buf offset:0 atIndex:3];
+    [enc setBuffer:g_d8f_runtime_mid_buf offset:0 atIndex:4];
+    [enc setBuffer:selBuf offset:sel_off atIndex:5];
+    [enc setBuffer:g_d8f_runtime_sparse_score_buf offset:0 atIndex:6];
+    [enc setBuffer:g_d8f_runtime_sparse_args_buf offset:0 atIndex:7];
+    [enc dispatchThreads:MTLSizeMake(max_group_unique, groups, n_tokens * n_selected)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [enc setComputePipelineState:g_d8f_down_sparse_gather_selected_batch_classic_pipeline];
+    [enc setBuffer:g_d8f_runtime_sparse_buf offset:0 atIndex:0];
+    [enc setBuffer:g_d8f_runtime_buf offset:0 atIndex:1];
+    [enc setBuffer:g_d8f_runtime_sparse_rec_buf offset:0 atIndex:2];
+    [enc setBuffer:g_d8f_runtime_rec_buf offset:0 atIndex:3];
+    [enc setBuffer:g_d8f_runtime_mid_buf offset:0 atIndex:4];
+    [enc setBuffer:selBuf offset:sel_off atIndex:5];
+    [enc setBuffer:weightBuf offset:weight_off atIndex:6];
+    [enc setBuffer:g_d8f_runtime_sparse_score_buf offset:0 atIndex:7];
+    [enc setBuffer:outBuf offset:out_off atIndex:8];
+    [enc setBuffer:g_d8f_runtime_sparse_args_buf offset:0 atIndex:9];
+    [enc setThreadgroupMemoryLength:8u * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(rows, n_tokens, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    return 1;
 }
 
 int ds4_gpu_mtl4_d8f_rowblock_interleave_canary(const char *d8f_path,
@@ -56597,13 +56944,23 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             g_d8f_runtime_i8_rec_buf &&
             g_d8f_runtime_i8_codebook_buf &&
             g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_i8_cbsram_classic_pipeline;
+        const int down_sparse_recbuf =
+            !rank1_sidecar_active &&
+            !down_tile32_recbuf &&
+            !half_mid && recbuf_enabled && !preweight_mid && down_tile16 &&
+            ds4_gpu_d8f_runtime_sparse_down_enabled_for_layer(layer, n_tokens) &&
+            g_d8f_runtime_sparse_buf &&
+            g_d8f_runtime_sparse_rec_buf &&
+            g_d8f_runtime_sparse_max_group_unique > 0u &&
+            g_d8f_down_sparse_score_selected_batch_classic_pipeline &&
+            g_d8f_down_sparse_gather_selected_batch_classic_pipeline;
         const int down_native_pack2d =
-            down_native_recbuf && !down_native_i8_cbsram &&
+            down_native_recbuf && !down_native_i8_cbsram && !down_sparse_recbuf &&
             ds4_gpu_d8f_runtime_native_down_pack2d_enabled_for_layer(layer) &&
             g_d8f_runtime_pack2d_tex &&
             g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_pack2d_classic_pipeline;
         const int down_native_compact_tex =
-            down_native_recbuf && !down_native_i8_cbsram &&
+            down_native_recbuf && !down_native_i8_cbsram && !down_sparse_recbuf &&
             down_compact_tex_requested;
         const NSUInteger down_pack2d_warm_bytes =
             (NSUInteger)n_tokens * (NSUInteger)n_experts * 8192u * sizeof(float);
@@ -56613,6 +56970,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             g_d8f_down_native_pack2d_warm_classic_pipeline &&
             ds4_d8f_runtime_pack2d_warm_buffer_ensure(down_pack2d_warm_bytes);
         const int down_tile16_recbuf = !down_tile32_recbuf &&
+            !down_sparse_recbuf &&
             !down_native_recbuf &&
             !down_native_i8_cbsram &&
             recbuf_enabled && !preweight_mid && down_tile16 &&
@@ -56631,7 +56989,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             rank1_sidecar_active && !half_mid && recbuf_enabled && !preweight_mid && down_tile8 &&
             g_d8f_runtime_rec_buf &&
             g_d8f_down_sum_selected_weighted_batch_tile8_recbuf_classic_pipeline;
-        const int down_any_recbuf = down_tile8_recbuf || down_tile16_recbuf || down_tile32_recbuf || down_native_recbuf || down_native_i8_cbsram;
+        const int down_any_recbuf = down_tile8_recbuf || down_tile16_recbuf || down_tile32_recbuf || down_native_recbuf || down_native_i8_cbsram || down_sparse_recbuf;
         if (rank1_split_sidecar) {
             atomic_fetch_add_explicit(&g_ds4_d8f_rank1_split_count, 1, memory_order_relaxed);
             if (down_any_recbuf) {
@@ -56660,9 +57018,24 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             down_base_args.sidecar_rank_max = 0u;
             down_base_args.sidecar_dot_stride = 0u;
         }
+        ds4_d8f_runtime_sparse_down_args sparse_down_args = {
+            ds4_down_out_dim,
+            ds4_mid_dim,
+            n_experts,
+            n_tokens,
+            ds4_mid_dim,
+            n_experts * ds4_mid_dim,
+            ds4_down_out_dim,
+            n_experts,
+            n_experts,
+            g_d8f_runtime_sparse_max_group_unique,
+        };
         memcpy(g_d8f_runtime_gate_args_buf.contents, &gate_args, sizeof(gate_args));
         memcpy(g_d8f_runtime_down_args_buf.contents, &down_args, sizeof(down_args));
         memcpy(g_d8f_runtime_down_base_args_buf.contents, &down_base_args, sizeof(down_base_args));
+        if (g_d8f_runtime_sparse_args_buf) {
+            memcpy(g_d8f_runtime_sparse_args_buf.contents, &sparse_down_args, sizeof(sparse_down_args));
+        }
         id<MTLBuffer> down_arg_buf = rank1_split_sidecar ?
             g_d8f_runtime_down_base_args_buf : g_d8f_runtime_down_args_buf;
         const int rank1_runtime_support = rank1_sidecar_active &&
@@ -56723,14 +57096,15 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             (rank1_split_packet_icb_policy >= 0 ?
              rank1_split_packet_icb_policy > 0 :
              ds4_gpu_max_fusion_enabled());
-        const NSUInteger packet_base_cmd = rank1_split_packet_icb ?
-            (NSUInteger)86u + (NSUInteger)layer * 4u :
-            (NSUInteger)layer * 2u;
+        const NSUInteger packet_base_cmd = (NSUInteger)layer * 4u;
         const NSUInteger packet_gate_cmd = packet_base_cmd;
+        const NSUInteger packet_sparse_score_cmd = packet_base_cmd + 1u;
+        const NSUInteger packet_sparse_gather_cmd = packet_base_cmd + 2u;
         const NSUInteger packet_rank1_dot_cmd = packet_base_cmd + 1u;
-        const NSUInteger packet_down_cmd = packet_base_cmd + (rank1_split_packet_icb ? 2u : 1u);
+        const NSUInteger packet_down_cmd = packet_base_cmd + (rank1_split_packet_icb ? 2u : (down_sparse_recbuf ? 2u : 1u));
         const NSUInteger packet_rank1_axpy_cmd = packet_base_cmd + 3u;
-        const NSUInteger packet_last_cmd = rank1_split_packet_icb ? packet_rank1_axpy_cmd : packet_down_cmd;
+        const NSUInteger packet_last_cmd = rank1_split_packet_icb ? packet_rank1_axpy_cmd :
+            (down_sparse_recbuf ? packet_sparse_gather_cmd : packet_down_cmd);
 	        int packet_icb_ready = 0;
 	        int packet_icb_gate_only = 0;
 	        const int rank1_packet_icb_policy = ds4_gpu_env_bool("DS4_D8F_RANK1_PACKET_ICB");
@@ -56742,11 +57116,17 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
 	            ds4_gpu_d8f_packet_icb_range_enabled();
 	        const int packet_icb_range_possible =
 	            packet_icb_range_requested && !packet_icb_gate_only_requested && !rank1_split_packet_icb;
+        const int packet_icb_down_ready = down_sparse_recbuf ?
+            (g_d8f_down_sparse_score_selected_batch_classic_pipeline &&
+             g_d8f_down_sparse_gather_selected_batch_classic_pipeline &&
+             g_d8f_runtime_sparse_args_buf) :
+            (down_pso != nil);
 	        if (n_tokens == 1u &&
 	            (packet_icb_gate_only_requested || down_native_i8_cbsram || !down_native_recbuf) &&
             (rank1_split_packet_icb ||
              (!rank1_split_sidecar && (!rank1_sidecar_active || rank1_packet_icb_requested))) &&
-            (rank1_packet_icb_requested || ds4_gpu_d8f_classic_packet_icb_enabled()) && gate_pso && down_pso &&
+            (rank1_packet_icb_requested || ds4_gpu_d8f_classic_packet_icb_enabled()) &&
+            gate_pso && packet_icb_down_ready &&
             (!rank1_split_packet_icb || (g_d8f_down_rank1_dot_batch_classic_pipeline &&
                                          g_d8f_down_rank1_axpy_batch_classic_pipeline)) &&
             packet_last_cmd < (NSUInteger)ds4_d8f_packet_icb_cmds &&
@@ -56824,13 +57204,66 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
 	                                                        down_grid, packet_tg, down_tg_mem,
 	                                                        1,
 	                                                        down_extra, 8) &&
-                    ds4_icb_slot_record_command_barrier(&g_d8f_packet_icb_slot, packet_rank1_axpy_cmd,
-                                                        g_d8f_down_rank1_axpy_batch_classic_pipeline,
-                                                        axpy_bufs, axpy_offs, axpy_n,
-                                                        MTLSizeMake((ds4_down_out_dim + 255u) >> 8, n_tokens, 1),
-                                                        packet_tg, 0u,
-                                                        1,
-                                                        axpy_extra, 8);
+	                    ds4_icb_slot_record_command_barrier(&g_d8f_packet_icb_slot, packet_rank1_axpy_cmd,
+	                                                        g_d8f_down_rank1_axpy_batch_classic_pipeline,
+	                                                        axpy_bufs, axpy_offs, axpy_n,
+	                                                        MTLSizeMake((ds4_down_out_dim + 255u) >> 8, n_tokens, 1),
+	                                                        packet_tg, 0u,
+	                                                        1,
+	                                                        axpy_extra, 8);
+            } else if (packet_icb_ready && down_sparse_recbuf) {
+                const uint32_t sparse_groups = ds4_mid_dim >> 3;
+                const uint32_t sparse_max_group_unique = g_d8f_runtime_sparse_max_group_unique;
+                if (!ds4_d8f_runtime_sparse_score_buffer_prepare(n_tokens,
+                                                                 n_experts,
+                                                                 sparse_groups,
+                                                                 sparse_max_group_unique)) {
+                    packet_icb_ready = 0;
+                } else {
+                    __unsafe_unretained id<MTLBuffer> score_bufs[8] = { nil };
+                    NSUInteger score_offs[8] = { 0 };
+                    NSUInteger score_n = 0;
+                    score_bufs[score_n] = g_d8f_runtime_sparse_buf; score_offs[score_n++] = 0;
+                    score_bufs[score_n] = g_d8f_runtime_buf; score_offs[score_n++] = 0;
+                    score_bufs[score_n] = g_d8f_runtime_sparse_rec_buf; score_offs[score_n++] = 0;
+                    score_bufs[score_n] = g_d8f_runtime_rec_buf; score_offs[score_n++] = 0;
+                    score_bufs[score_n] = g_d8f_runtime_mid_buf; score_offs[score_n++] = 0;
+                    score_bufs[score_n] = selBuf; score_offs[score_n++] = sel_off;
+                    score_bufs[score_n] = g_d8f_runtime_sparse_score_buf; score_offs[score_n++] = 0;
+                    score_bufs[score_n] = g_d8f_runtime_sparse_args_buf; score_offs[score_n++] = 0;
+                    __unsafe_unretained id<MTLBuffer> gather_bufs[10] = { nil };
+                    NSUInteger gather_offs[10] = { 0 };
+                    NSUInteger gather_n = 0;
+                    gather_bufs[gather_n] = g_d8f_runtime_sparse_buf; gather_offs[gather_n++] = 0;
+                    gather_bufs[gather_n] = g_d8f_runtime_buf; gather_offs[gather_n++] = 0;
+                    gather_bufs[gather_n] = g_d8f_runtime_sparse_rec_buf; gather_offs[gather_n++] = 0;
+                    gather_bufs[gather_n] = g_d8f_runtime_rec_buf; gather_offs[gather_n++] = 0;
+                    gather_bufs[gather_n] = g_d8f_runtime_mid_buf; gather_offs[gather_n++] = 0;
+                    gather_bufs[gather_n] = selBuf; gather_offs[gather_n++] = sel_off;
+                    gather_bufs[gather_n] = weightBuf; gather_offs[gather_n++] = weight_off;
+                    gather_bufs[gather_n] = g_d8f_runtime_sparse_score_buf; gather_offs[gather_n++] = 0;
+                    gather_bufs[gather_n] = outBuf; gather_offs[gather_n++] = out_off;
+                    gather_bufs[gather_n] = g_d8f_runtime_sparse_args_buf; gather_offs[gather_n++] = 0;
+                    uint64_t score_extra[8] = { layer, n_tokens, n_experts, sparse_groups, sparse_max_group_unique, 1u, 0u, 0u };
+                    uint64_t gather_extra[8] = { layer, n_tokens, n_experts, sparse_groups, sparse_max_group_unique, 1u, 0u, 0u };
+                    packet_icb_ready =
+                        ds4_icb_slot_record_command_barrier(
+                            &g_d8f_packet_icb_slot, packet_sparse_score_cmd,
+                            g_d8f_down_sparse_score_selected_batch_classic_pipeline,
+                            score_bufs, score_offs, score_n,
+                            MTLSizeMake((sparse_max_group_unique + 255u) >> 8,
+                                        sparse_groups,
+                                        n_tokens * n_experts),
+                            packet_tg, 0u, 1,
+                            score_extra, 8) &&
+                        ds4_icb_slot_record_command_barrier(
+                            &g_d8f_packet_icb_slot, packet_sparse_gather_cmd,
+                            g_d8f_down_sparse_gather_selected_batch_classic_pipeline,
+                            gather_bufs, gather_offs, gather_n,
+                            MTLSizeMake(ds4_down_out_dim, n_tokens, 1),
+                            packet_tg, 8u * (uint32_t)sizeof(float), 1,
+                            gather_extra, 8);
+                }
             } else if (packet_icb_ready && packet_icb_gate_only_requested) {
                 packet_icb_gate_only = 1;
             } else if (packet_icb_ready) {
@@ -56873,15 +57306,16 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
 	            static int s_d8f_classic_packet_icb_notice = 0;
 	            if (!s_d8f_classic_packet_icb_notice) {
 	                s_d8f_classic_packet_icb_notice = 1;
-	                fprintf(stderr,
-	                        "ds4: D8F classic in-graph packet ICB enabled "
-	                        "(gateup_recbuf=%d down_recbuf=%d down_cbsram=%u half_mid=%d down_tile32=%d down_native=%d rank1_split=%d gate_only=%d range=%d)\n",
-	                        gateup_recbuf, down_tile16_recbuf || down_native_recbuf, down_cbsram_k_cap,
-	                        half_mid, down_tile32_recbuf, down_native_recbuf, rank1_split_sidecar,
-	                        packet_icb_gate_only, packet_icb_range_replay);
-	            }
-	            if (packet_icb_range_replay) {
-	                const NSUInteger packet_cmd_count = rank1_split_packet_icb ? 4u : 2u;
+		                fprintf(stderr,
+		                        "ds4: D8F classic in-graph packet ICB enabled "
+		                        "(gateup_recbuf=%d down_recbuf=%d down_sparse=%d down_cbsram=%u half_mid=%d down_tile32=%d down_native=%d rank1_split=%d gate_only=%d range=%d)\n",
+		                        gateup_recbuf, down_tile16_recbuf || down_native_recbuf || down_sparse_recbuf,
+                                down_sparse_recbuf, down_cbsram_k_cap,
+		                        half_mid, down_tile32_recbuf, down_native_recbuf, rank1_split_sidecar,
+		                        packet_icb_gate_only, packet_icb_range_replay);
+		            }
+		            if (packet_icb_range_replay) {
+		                const NSUInteger packet_cmd_count = rank1_split_packet_icb ? 4u : (down_sparse_recbuf ? 3u : 2u);
 	                atomic_fetch_add_explicit(&g_ds4_d8f_packet_icb_range_count, 1, memory_order_relaxed);
 	                ds4_icb_slot_use_resources(&g_d8f_packet_icb_slot, enc,
 	                                           packet_gate_cmd, packet_cmd_count,
@@ -56903,10 +57337,15 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
 	                    ds4_icb_slot_use_resources(&g_d8f_packet_icb_slot, enc,
 	                                               packet_rank1_axpy_cmd, 1,
 	                                               MTLResourceUsageRead | MTLResourceUsageWrite);
-	                    ds4_icb_slot_execute(&g_d8f_packet_icb_slot, enc, packet_rank1_axpy_cmd, 1);
-	                } else if (!packet_icb_gate_only) {
-	                    ds4_icb_slot_use_resources(&g_d8f_packet_icb_slot, enc,
-	                                               packet_down_cmd, 1,
+		                    ds4_icb_slot_execute(&g_d8f_packet_icb_slot, enc, packet_rank1_axpy_cmd, 1);
+		                } else if (down_sparse_recbuf) {
+		                    ds4_icb_slot_use_resources(&g_d8f_packet_icb_slot, enc,
+		                                               packet_sparse_score_cmd, 2,
+		                                               MTLResourceUsageRead | MTLResourceUsageWrite);
+		                    ds4_icb_slot_execute(&g_d8f_packet_icb_slot, enc, packet_sparse_score_cmd, 2);
+		                } else if (!packet_icb_gate_only) {
+		                    ds4_icb_slot_use_resources(&g_d8f_packet_icb_slot, enc,
+		                                               packet_down_cmd, 1,
 	                                               MTLResourceUsageRead | MTLResourceUsageWrite);
 	                    ds4_icb_slot_execute(&g_d8f_packet_icb_slot, enc, packet_down_cmd, 1);
 	                }
@@ -56939,7 +57378,27 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                 [enc dispatchThreadgroups:MTLSizeMake(n_experts, n_tokens, 1) threadsPerThreadgroup:packet_tg];
             }
         }
-        if (!packet_icb_ready || packet_icb_gate_only) {
+        if (ok == 0 && (!packet_icb_ready || packet_icb_gate_only)) {
+            if (down_sparse_recbuf) {
+                if (!ds4_d8f_runtime_sparse_down_encode(enc,
+                                                        selBuf,
+                                                        sel_off,
+                                                        weightBuf,
+                                                        weight_off,
+                                                        outBuf,
+                                                        out_off,
+                                                        n_tokens,
+                                                        n_experts,
+                                                        ds4_down_out_dim,
+                                                        ds4_mid_dim,
+                                                        ds4_mid_dim,
+                                                        n_experts * ds4_mid_dim,
+                                                        ds4_down_out_dim,
+                                                        n_experts,
+                                                        n_experts)) {
+                    ok = -1;
+                }
+            } else {
             if (down_native_pack2d_warm) {
                 [enc setComputePipelineState:g_d8f_down_native_pack2d_warm_classic_pipeline];
                 [enc setTexture:g_d8f_runtime_pack2d_tex atIndex:0];
@@ -56982,6 +57441,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                 [enc setBuffer:weightBuf offset:weight_off atIndex:5];
                 [enc dispatchThreadgroups:MTLSizeMake((ds4_down_out_dim + 255u) >> 8, n_tokens, 1)
                     threadsPerThreadgroup:packet_tg];
+            }
             }
         }
         if (!packet_icb_ready) {
