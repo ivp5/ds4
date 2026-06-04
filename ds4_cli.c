@@ -115,6 +115,18 @@ static int cli_parse_selected_experts(int argc,
     return 0;
 }
 
+static uint32_t cli_arg_u32(int argc, char **argv, int arg_index, uint32_t fallback) {
+    return argc > arg_index ? (uint32_t)atoi(argv[arg_index]) : fallback;
+}
+
+static int cli_arg_i32(int argc, char **argv, int arg_index, int fallback) {
+    return argc > arg_index ? atoi(argv[arg_index]) : fallback;
+}
+
+static float cli_arg_f32(int argc, char **argv, int arg_index, float fallback) {
+    return argc > arg_index ? strtof(argv[arg_index], NULL) : fallback;
+}
+
 static void usage(FILE *fp) {
     fprintf(fp,
         "Usage: ds4 [(-p PROMPT | --prompt-file FILE)] [options]\n"
@@ -2546,11 +2558,7 @@ int main(int argc, char **argv) {
      * passes if max abs diff < 1e-4. First of 74-kernel classic → MTL4
      * sweep; validates the storage-class migration pattern (constant →
      * device const args_ptr) on the smallest viable kernel. */
-    if (argc >= 2 && !strcmp(argv[1], "--softplus-sqrt-canary")) {
-        const uint32_t n_rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
-        const uint32_t n_cols = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_softplus_sqrt_canary(n_rows, n_cols) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--softplus-sqrt-canary")) return ds4_gpu_mtl4_softplus_sqrt_canary(cli_arg_u32(argc, argv, 2, 8), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --router-weights-one-canary : silv 2026-05-27 task #671. MTL4 port
      * of kernel_dsv4_router_weights_one (metal/dsv4_misc.metal:263). */
     if (argc >= 2 && !strcmp(argv[1], "--router-weights-one-canary")) {
@@ -2559,174 +2567,76 @@ int main(int argc, char **argv) {
     /* --topk-mask-canary [ne0 [ne1]] : silv 2026-05-27 task #672. MTL4 port
      * of kernel_dsv4_topk_mask (metal/dsv4_misc.metal:346). Verifies dst
      * filled with -INFINITY at every position. */
-    if (argc >= 2 && !strcmp(argv[1], "--topk-mask-canary")) {
-        const uint32_t ne0 = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 256;
-        const uint32_t ne1 = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
-        return ds4_gpu_mtl4_topk_mask_canary(ne0, ne1) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--topk-mask-canary")) return ds4_gpu_mtl4_topk_mask_canary(cli_arg_u32(argc, argv, 2, 256), cli_arg_u32(argc, argv, 3, 16)) ? 0 : 1;
     /* --icb-dense-canary [M [N]] : task #822. Bit-exact check that ICB record→replay of the
      * dense Q8_0 matvec equals direct dispatch (only the dispatch mechanism differs). De-risks
      * the production wiring of the ICB dense-path (the 50 t/s lever). Expect "BIT-EXACT PASS". */
-    if (argc >= 2 && !strcmp(argv[1], "--icb-dense-canary")) {
-        const uint32_t M = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4096;
-        const uint32_t N = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 4096;
-        return ds4_gpu_dense_matvec_icb_canary(M, N) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--icb-dense-canary")) return ds4_gpu_dense_matvec_icb_canary(cli_arg_u32(argc, argv, 2, 4096), cli_arg_u32(argc, argv, 3, 4096)) ? 0 : 1;
     /* --icb-dense-bench [M [N [n_gemv [n_iter]]]] : task #822. A/B the per-forward dispatch cost of
      * the dense GEMV batch — DIRECT (re-encode each forward) vs ICB (cached replay). Tests the
      * ledger's "dispatch-bound" diagnosis = the 50 t/s lever, with NO model load. n_gemv defaults to
      * 258 (43 layers × 6 dense GEMVs); a speedup > 1 confirms ICB amortization is real before wiring. */
-    if (argc >= 2 && !strcmp(argv[1], "--icb-dense-bench")) {
-        const uint32_t M      = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4096;
-        const uint32_t N      = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 4096;
-        const uint32_t n_gemv = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 258;
-        const uint32_t n_iter = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 30;
-        return ds4_gpu_dense_matvec_icb_bench(M, N, n_gemv, n_iter) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--mesh-dispatch-canary")) {
-        const uint32_t n_groups = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 1024;
-        const uint32_t rounds = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 20;
-        return ds4_gpu_mesh_dispatch_canary(n_groups, rounds) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--indirect-dispatch-canary")) {
-        const uint32_t n_groups = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 1024;
-        const uint32_t work = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        const uint32_t rounds = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 20;
-        return ds4_gpu_indirect_dispatch_canary(n_groups, work, rounds) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--icb-dense-bench")) return ds4_gpu_dense_matvec_icb_bench(cli_arg_u32(argc, argv, 2, 4096), cli_arg_u32(argc, argv, 3, 4096), cli_arg_u32(argc, argv, 4, 258), cli_arg_u32(argc, argv, 5, 30)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--mesh-dispatch-canary")) return ds4_gpu_mesh_dispatch_canary(cli_arg_u32(argc, argv, 2, 1024), cli_arg_u32(argc, argv, 3, 20)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--indirect-dispatch-canary")) return ds4_gpu_indirect_dispatch_canary(cli_arg_u32(argc, argv, 2, 1024), cli_arg_u32(argc, argv, 3, 256), cli_arg_u32(argc, argv, 4, 20)) ? 0 : 1;
     /* --fp8-attn-out-icb-canary [group_dim [rank [n_groups [out_dim [n_tokens [rounds [mode]]]]]]]
      * Mode 0 preserves direct A-then-B command-buffer boundaries through ICB replay.
      * Mode 1 executes A and B in one command buffer with an in-encoder barrier.
      * Mode 2 executes A+B as one ICB range with a barrier on the dependent B command. */
-    if (argc >= 2 && !strcmp(argv[1], "--fp8-attn-out-icb-canary")) {
-        const uint32_t group_dim = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
-        const uint32_t rank      = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
-        const uint32_t n_groups  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
-        const uint32_t out_dim   = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 512;
-        const uint32_t n_tokens  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1;
-        const uint32_t rounds    = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 20;
-        const uint32_t mode      = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 0;
-        return ds4_gpu_fp8_attn_out_icb_canary(group_dim, rank, n_groups, out_dim, n_tokens, rounds, mode) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--fp8-attn-out-icb-canary")) return ds4_gpu_fp8_attn_out_icb_canary(cli_arg_u32(argc, argv, 2, 128), cli_arg_u32(argc, argv, 3, 16), cli_arg_u32(argc, argv, 4, 8), cli_arg_u32(argc, argv, 5, 512), cli_arg_u32(argc, argv, 6, 1), cli_arg_u32(argc, argv, 7, 20), cli_arg_u32(argc, argv, 8, 0)) ? 0 : 1;
     /* --fp8-hc-fuse-canary [in_dim [out_dim [n_tokens [rounds]]]]
      * Tests the real next seam after H2937: eliminate the FP8 B output
      * materialization→separate HC-expand launch by expanding HC in the
      * row-final thread of the FP8 B matmul. Defaults to actual decode shape. */
-    if (argc >= 2 && !strcmp(argv[1], "--fp8-hc-fuse-canary")) {
-        const uint32_t in_dim   = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8192u;
-        const uint32_t out_dim  = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 4096u;
-        const uint32_t n_tokens = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 1u;
-        const uint32_t rounds   = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
-        return ds4_gpu_fp8_hc_fuse_canary(in_dim, out_dim, n_tokens, rounds) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--fp8-hc-fuse-canary")) return ds4_gpu_fp8_hc_fuse_canary(cli_arg_u32(argc, argv, 2, 8192u), cli_arg_u32(argc, argv, 3, 4096u), cli_arg_u32(argc, argv, 4, 1u), cli_arg_u32(argc, argv, 5, 20u)) ? 0 : 1;
     /* --head-norm-rope-canary [tokens [heads [head_dim [n_rot [rounds]]]]]
      * Validates fused Q head RMSNorm + RoPE against the two-dispatch reference. */
-    if (argc >= 2 && !strcmp(argv[1], "--head-norm-rope-canary")) {
-        const uint32_t n_tok    = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 1u;
-        const uint32_t n_head   = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 64u;
-        const uint32_t head_dim = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
-        const uint32_t n_rot    = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 64u;
-        const uint32_t rounds   = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 8u;
-        return ds4_gpu_head_norm_rope_canary(n_tok, n_head, head_dim, n_rot, rounds) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--head-norm-rope-canary")) return ds4_gpu_head_norm_rope_canary(cli_arg_u32(argc, argv, 2, 1u), cli_arg_u32(argc, argv, 3, 64u), cli_arg_u32(argc, argv, 4, 128u), cli_arg_u32(argc, argv, 5, 64u), cli_arg_u32(argc, argv, 6, 8u)) ? 0 : 1;
     /* --indexer-q-rope-canary [in_dim [heads [head_dim [n_rot [rounds]]]]]
      * Validates fused F16 indexer-Q matvec + RoPE against matvec then RoPE. */
-    if (argc >= 2 && !strcmp(argv[1], "--indexer-q-rope-canary")) {
-        const uint32_t in_dim   = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 1536u;
-        const uint32_t n_head   = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 64u;
-        const uint32_t head_dim = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
-        const uint32_t n_rot    = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 64u;
-        const uint32_t rounds   = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 8u;
-        return ds4_gpu_indexer_q_rope_canary(in_dim, n_head, head_dim, n_rot, rounds) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--indexer-q-rope-canary")) return ds4_gpu_indexer_q_rope_canary(cli_arg_u32(argc, argv, 2, 1536u), cli_arg_u32(argc, argv, 3, 64u), cli_arg_u32(argc, argv, 4, 128u), cli_arg_u32(argc, argv, 5, 64u), cli_arg_u32(argc, argv, 6, 8u)) ? 0 : 1;
     /* --indexed-attn-rope-canary [rounds]
      * Validates fused indexed decode attention + inverse RoPE against the
      * attention-then-RoPE two-dispatch reference. */
-    if (argc >= 2 && !strcmp(argv[1], "--indexed-attn-rope-canary")) {
-        const uint32_t rounds = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8u;
-        return ds4_gpu_indexed_attn_rope_canary(rounds) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--indexed-attn-rope-canary")) return ds4_gpu_indexed_attn_rope_canary(cli_arg_u32(argc, argv, 2, 8u)) ? 0 : 1;
     /* --decode-attn-rope-canary [n_comp [rounds]]
      * Validates raw/gathered FlashAttention reduce + inverse RoPE fusion. */
-    if (argc >= 2 && !strcmp(argv[1], "--decode-attn-rope-canary")) {
-        const uint32_t n_comp = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 0u;
-        const uint32_t rounds = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 8u;
-        return ds4_gpu_decode_attn_rope_canary(n_comp, rounds) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--decode-attn-rope-canary")) return ds4_gpu_decode_attn_rope_canary(cli_arg_u32(argc, argv, 2, 0u), cli_arg_u32(argc, argv, 3, 8u)) ? 0 : 1;
     /* --mtl4-icb-execute-canary [n_floats [rounds]] : proves the MTL4 encoder can replay
      * a classic MTLICB command when the MTL4 pipeline was compiled with ICB support. */
-    if (argc >= 2 && !strcmp(argv[1], "--mtl4-icb-execute-canary")) {
-        const uint32_t n_floats = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 65536u;
-        const uint32_t rounds   = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 200u;
-        return ds4_gpu_mtl4_icb_execute_canary(n_floats, rounds) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mtl4-icb-execute-canary")) return ds4_gpu_mtl4_icb_execute_canary(cli_arg_u32(argc, argv, 2, 65536u), cli_arg_u32(argc, argv, 3, 200u)) ? 0 : 1;
     /* --topk-mask-scatter-canary [n_topk [n_tokens [n_comp]]] : silv 2026-05-27
      * task #673. MTL4 port of kernel_dsv4_topk_mask_scatter
      * (metal/dsv4_misc.metal:366). Scatters 0.0 at selected (idx, token)
      * positions in dst mask. Expected 3 zeroed per token (3 valid topk indices). */
-    if (argc >= 2 && !strcmp(argv[1], "--topk-mask-scatter-canary")) {
-        const uint32_t n_topk = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 6;
-        const uint32_t n_tokens = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
-        const uint32_t n_comp = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
-        return ds4_gpu_mtl4_topk_mask_scatter_canary(n_topk, n_tokens, n_comp) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--topk-mask-scatter-canary")) return ds4_gpu_mtl4_topk_mask_scatter_canary(cli_arg_u32(argc, argv, 2, 6), cli_arg_u32(argc, argv, 3, 16), cli_arg_u32(argc, argv, 4, 64)) ? 0 : 1;
     /* --indexer-weighted-sum-canary [ne0 [ne1 [n_heads]]] : task #674
      * MTL4 port of kernel_dsv4_indexer_weighted_sum (dsv4_misc.metal:1340). */
-    if (argc >= 2 && !strcmp(argv[1], "--indexer-weighted-sum-canary")) {
-        const uint32_t ne0 = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
-        const uint32_t ne1 = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
-        const uint32_t n_heads = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
-        return ds4_gpu_mtl4_indexer_weighted_sum_canary(ne0, ne1, n_heads) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--indexer-weighted-sum-canary")) return ds4_gpu_mtl4_indexer_weighted_sum_canary(cli_arg_u32(argc, argv, 2, 8), cli_arg_u32(argc, argv, 3, 16), cli_arg_u32(argc, argv, 4, 64)) ? 0 : 1;
     /* --dir-steering-canary [width [rows]] : task #675 MTL4 port of
      * kernel_dsv4_directional_steering_project_f32 (dsv4_misc.metal:106). */
-    if (argc >= 2 && !strcmp(argv[1], "--dir-steering-canary")) {
-        const uint32_t width = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4096;
-        const uint32_t rows = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
-        return ds4_gpu_mtl4_dir_steering_canary(width, rows) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--dir-steering-canary")) return ds4_gpu_mtl4_dir_steering_canary(cli_arg_u32(argc, argv, 2, 4096), cli_arg_u32(argc, argv, 3, 16)) ? 0 : 1;
     /* --sort-i32-rows-canary [top_k [n_rows]] : task #676 MTL4 port of
      * kernel_dsv4_sort_i32_rows_asc (dsv4_misc.metal:388). top_k must be
      * power-of-2 and ≤ 256. */
-    if (argc >= 2 && !strcmp(argv[1], "--sort-i32-rows-canary")) {
-        const uint32_t top_k = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n_rows = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        return ds4_gpu_mtl4_sort_i32_rows_canary(top_k, n_rows) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--sort-i32-rows-canary")) return ds4_gpu_mtl4_sort_i32_rows_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32)) ? 0 : 1;
     /* --router-remap-canary [n_tokens] : task #677 MTL4 port of
      * kernel_dsv4_router_weights_with_remap (dsv4_misc.metal:210). Identity
      * remap; verifies weights renormalize to 0.25 per slot. */
-    if (argc >= 2 && !strcmp(argv[1], "--router-remap-canary")) {
-        const uint32_t n_tokens = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4;
-        return ds4_gpu_mtl4_router_remap_canary(n_tokens) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--router-remap-canary")) return ds4_gpu_mtl4_router_remap_canary(cli_arg_u32(argc, argv, 2, 4)) ? 0 : 1;
     /* --ratio4-shift-canary [width] : task #678 MTL4 port of
      * kernel_dsv4_ratio4_shift_f32 (dsv4_kv.metal:271). Tiny KV
      * ratio-4 state shift on 4*width elements. */
-    if (argc >= 2 && !strcmp(argv[1], "--ratio4-shift-canary")) {
-        const uint32_t width = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
-        return ds4_gpu_mtl4_ratio4_shift_canary(width) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--ratio4-shift-canary")) return ds4_gpu_mtl4_ratio4_shift_canary(cli_arg_u32(argc, argv, 2, 128)) ? 0 : 1;
     /* --amortized-canary [n_iter] : task #679 demonstrates ArgumentTable
      * pool amortization. Runs N back-to-back dispatches using the pool;
      * reports alloc_count vs acquire_count. Pool-hit rate should be
      * (N-1)/N after warm-up (1 alloc, N acquires). */
-    if (argc >= 2 && !strcmp(argv[1], "--amortized-canary")) {
-        const uint32_t n_iter = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 100;
-        return ds4_gpu_mtl4_router_weights_one_amortized_canary(n_iter) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--amortized-canary")) return ds4_gpu_mtl4_router_weights_one_amortized_canary(cli_arg_u32(argc, argv, 2, 100)) ? 0 : 1;
     /* --compressor-store-one-canary [width] : task #680 MTL4 port. */
-    if (argc >= 2 && !strcmp(argv[1], "--compressor-store-one-canary")) {
-        const uint32_t width = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 256;
-        return ds4_gpu_mtl4_compressor_store_one_canary(width) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--compressor-store-one-canary")) return ds4_gpu_mtl4_compressor_store_one_canary(cli_arg_u32(argc, argv, 2, 256)) ? 0 : 1;
     /* --softmax-pool-canary [ne0 [ne1 [n_rows]]] : task #681 MTL4 port. */
-    if (argc >= 2 && !strcmp(argv[1], "--softmax-pool-canary")) {
-        const uint32_t ne0 = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        const uint32_t ne1 = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 8;
-        const uint32_t n_rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 32;
-        return ds4_gpu_mtl4_softmax_pool_canary(ne0, ne1, n_rows) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--softmax-pool-canary")) return ds4_gpu_mtl4_softmax_pool_canary(cli_arg_u32(argc, argv, 2, 16), cli_arg_u32(argc, argv, 3, 8), cli_arg_u32(argc, argv, 4, 32)) ? 0 : 1;
     /* --moe-matmul-init-canary : task #682 MTL4 port of
      * kernel_mul_mm_id_fp16_pair_swiglu_f32 (moe.metal:1282). Pipeline-
      * init smoke test; full output canary multi-turn. */
@@ -2739,25 +2649,15 @@ int main(int argc, char **argv) {
         return ds4_gpu_mtl4_moe_matmul_full_canary() ? 0 : 1;
     }
     /* --router-finalize-one-canary [has_bias=0|1] : task #684 */
-    if (argc >= 2 && !strcmp(argv[1], "--router-finalize-one-canary")) {
-        const int has_bias = (argc >= 3) ? atoi(argv[2]) : 0;
-        return ds4_gpu_mtl4_router_finalize_one_canary(has_bias) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--router-finalize-one-canary")) return ds4_gpu_mtl4_router_finalize_one_canary(cli_arg_i32(argc, argv, 2, 0)) ? 0 : 1;
     /* --router-select-fused-canary : classic Metal decode router 3->1 dispatch fuse */
     if (argc >= 2 && !strcmp(argv[1], "--router-select-fused-canary")) {
         return ds4_gpu_router_select_fused_canary() ? 0 : 1;
     }
     /* --router-matmul-select-fused-canary [in_dim] : experimental F16 router matvec+select fuse */
-    if (argc >= 2 && !strcmp(argv[1], "--router-matmul-select-fused-canary")) {
-        const uint32_t in_dim = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 512;
-        return ds4_gpu_router_matmul_select_fused_canary(in_dim) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--router-matmul-select-fused-canary")) return ds4_gpu_router_matmul_select_fused_canary(cli_arg_u32(argc, argv, 2, 512)) ? 0 : 1;
     /* --hc-rms-f16-mix-canary [out_dim [in_dim]] : fuses HC RMSNorm + tiny F16 matvec */
-    if (argc >= 2 && !strcmp(argv[1], "--hc-rms-f16-mix-canary")) {
-        const uint32_t out_dim = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 24;
-        const uint32_t in_dim = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16384;
-        return ds4_gpu_hc_rms_norm_f16_mix_canary(out_dim, in_dim) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--hc-rms-f16-mix-canary")) return ds4_gpu_hc_rms_norm_f16_mix_canary(cli_arg_u32(argc, argv, 2, 24), cli_arg_u32(argc, argv, 3, 16384)) ? 0 : 1;
     /* --hc-full-prelude-canary : fuses HC RMS/F16 mix + split + sum + RMSNorm */
     if (argc >= 2 && !strcmp(argv[1], "--hc-full-prelude-canary")) {
         return ds4_gpu_hc_full_prelude_canary() ? 0 : 1;
@@ -2771,75 +2671,32 @@ int main(int argc, char **argv) {
         return ds4_gpu_output_hc_full_canary() ? 0 : 1;
     }
     /* --qkv-rms-norm-canary [q_n [kv_n]] : task #685 per-layer Q+KV RMSNorm */
-    if (argc >= 2 && !strcmp(argv[1], "--qkv-rms-norm-canary")) {
-        const uint32_t q_n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 1024;
-        const uint32_t kv_n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 512;
-        return ds4_gpu_mtl4_qkv_rms_norm_canary(q_n, kv_n) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--qkv-rms-norm-canary")) return ds4_gpu_mtl4_qkv_rms_norm_canary(cli_arg_u32(argc, argv, 2, 1024), cli_arg_u32(argc, argv, 3, 512)) ? 0 : 1;
     /* --soft-max-4-canary [n] : task #678 row-softmax float4 vectorized */
-    if (argc >= 2 && !strcmp(argv[1], "--soft-max-4-canary")) {
-        const uint32_t n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 512;
-        return ds4_gpu_mtl4_soft_max_4_canary(n) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--soft-max-4-canary")) return ds4_gpu_mtl4_soft_max_4_canary(cli_arg_u32(argc, argv, 2, 512)) ? 0 : 1;
     /* --hc-expand4-canary [n_embd [n_tokens]] : task #679 HC=4 block-expand */
-    if (argc >= 2 && !strcmp(argv[1], "--hc-expand4-canary")) {
-        const uint32_t n_embd = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
-        const uint32_t n_tokens = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 4;
-        return ds4_gpu_mtl4_hc_expand4_canary(n_embd, n_tokens) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--hc-expand4-canary")) return ds4_gpu_mtl4_hc_expand4_canary(cli_arg_u32(argc, argv, 2, 128), cli_arg_u32(argc, argv, 3, 4)) ? 0 : 1;
     /* --indexer-score-one-direct-canary [n_comp] : task #680 decode-only DS4 indexer */
-    if (argc >= 2 && !strcmp(argv[1], "--indexer-score-one-direct-canary")) {
-        const uint32_t n_comp = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 32;
-        return ds4_gpu_mtl4_indexer_score_one_direct_canary(n_comp) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--indexer-score-one-direct-canary")) return ds4_gpu_mtl4_indexer_score_one_direct_canary(cli_arg_u32(argc, argv, 2, 32)) ? 0 : 1;
     /* --soft-max-canary [n] : task #683 non-vectorized softmax */
     if (argc >= 2 && !strcmp(argv[1], "--soft-max-canary")) {
         const uint32_t n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 511;  /* odd width to differ from soft_max_4 */
         return ds4_gpu_mtl4_soft_max_canary(n) ? 0 : 1;
     }
     /* --fp8-kv-quantize-canary [n_rows [n_full [n_rot]]] : task #684 FP8 KV round-trip */
-    if (argc >= 2 && !strcmp(argv[1], "--fp8-kv-quantize-canary")) {
-        const uint32_t n_rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4;
-        const uint32_t n_full = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 192;
-        const uint32_t n_rot = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
-        return ds4_gpu_mtl4_fp8_kv_quantize_canary(n_rows, n_full, n_rot) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--fp8-kv-quantize-canary")) return ds4_gpu_mtl4_fp8_kv_quantize_canary(cli_arg_u32(argc, argv, 2, 4), cli_arg_u32(argc, argv, 3, 192), cli_arg_u32(argc, argv, 4, 64)) ? 0 : 1;
     /* --indexer-hadamard-fp4-canary [n_rows] : task #685b Walsh-Hadamard + FP4 */
-    if (argc >= 2 && !strcmp(argv[1], "--indexer-hadamard-fp4-canary")) {
-        const uint32_t n_rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
-        return ds4_gpu_mtl4_indexer_hadamard_fp4_canary(n_rows) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--indexer-hadamard-fp4-canary")) return ds4_gpu_mtl4_indexer_hadamard_fp4_canary(cli_arg_u32(argc, argv, 2, 8)) ? 0 : 1;
     /* --kv-fp8-store-canary [head_dim [n_rot]] : task #686 KV finalizer + FP16 mirror */
-    if (argc >= 2 && !strcmp(argv[1], "--kv-fp8-store-canary")) {
-        const uint32_t head_dim = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 192;
-        const uint32_t n_rot = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 64;
-        return ds4_gpu_mtl4_kv_fp8_store_canary(head_dim, n_rot) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--kv-fp8-store-canary")) return ds4_gpu_mtl4_kv_fp8_store_canary(cli_arg_u32(argc, argv, 2, 192), cli_arg_u32(argc, argv, 3, 64)) ? 0 : 1;
     /* --kv-rope-store-canary [head_dim [n_rot [rounds]]] : fused KV RoPE + FP8/raw cache finalizer */
-    if (argc >= 2 && !strcmp(argv[1], "--kv-rope-store-canary")) {
-        const uint32_t head_dim = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
-        const uint32_t n_rot = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 64;
-        const uint32_t rounds = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
-        return ds4_gpu_kv_rope_store_canary(head_dim, n_rot, rounds) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--kv-rope-store-canary")) return ds4_gpu_kv_rope_store_canary(cli_arg_u32(argc, argv, 2, 128), cli_arg_u32(argc, argv, 3, 64), cli_arg_u32(argc, argv, 4, 8)) ? 0 : 1;
     /* --moe-swiglu-weight-canary [rows [width]] : task #687 routed MoE activation */
-    if (argc >= 2 && !strcmp(argv[1], "--moe-swiglu-weight-canary")) {
-        const uint32_t rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
-        const uint32_t width = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_moe_swiglu_weight_canary(rows, width) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--moe-swiglu-weight-canary")) return ds4_gpu_mtl4_moe_swiglu_weight_canary(cli_arg_u32(argc, argv, 2, 8), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --moe-sum6-canary [tokens [width]] : task #688 6-buffer MoE finalize */
-    if (argc >= 2 && !strcmp(argv[1], "--moe-sum6-canary")) {
-        const uint32_t tokens = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4;
-        const uint32_t width = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 512;
-        return ds4_gpu_mtl4_moe_sum6_canary(tokens, width) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--moe-sum6-canary")) return ds4_gpu_mtl4_moe_sum6_canary(cli_arg_u32(argc, argv, 2, 4), cli_arg_u32(argc, argv, 3, 512)) ? 0 : 1;
     /* --moe-swiglu-weight-f16-canary [rows [width]] : task #689 FP16 mid variant */
-    if (argc >= 2 && !strcmp(argv[1], "--moe-swiglu-weight-f16-canary")) {
-        const uint32_t rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
-        const uint32_t width = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_moe_swiglu_weight_f16_canary(rows, width) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--moe-swiglu-weight-f16-canary")) return ds4_gpu_mtl4_moe_swiglu_weight_f16_canary(cli_arg_u32(argc, argv, 2, 8), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --moe-swiglu-weight-f16-rowblock-canary [n_rows [n_sel [n_rb]]] : codex
      * H2186/H2187 row-block-aware SwiGLU self-test. Defaults are the DS4-Flash
      * shape (n_rows=128, n_sel=6, n_rb=16). Uses position-dependent gate
@@ -2874,36 +2731,15 @@ int main(int argc, char **argv) {
         return ds4_metal_vqb2_fused_sum_step_kahan_canary(out_dim, large_scale) ? 0 : 1;
     }
     /* --hc-split-sinkhorn-canary [n_rows [iters]] : task #690 Sinkhorn 4×4 */
-    if (argc >= 2 && !strcmp(argv[1], "--hc-split-sinkhorn-canary")) {
-        const uint32_t n_rows = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t iters = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 1;
-        return ds4_gpu_mtl4_hc_split_sinkhorn_canary(n_rows, iters) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--hc-split-sinkhorn-canary")) return ds4_gpu_mtl4_hc_split_sinkhorn_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 1)) ? 0 : 1;
     /* --get-rows-f32-canary [n_table_rows [row_width [n_ids]]] : task #691 */
-    if (argc >= 2 && !strcmp(argv[1], "--get-rows-f32-canary")) {
-        const uint32_t ntab = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 32;
-        const uint32_t rw   = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 128;
-        const uint32_t nid  = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
-        return ds4_gpu_mtl4_get_rows_f32_canary(ntab, rw, nid) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--get-rows-f32-canary")) return ds4_gpu_mtl4_get_rows_f32_canary(cli_arg_u32(argc, argv, 2, 32), cli_arg_u32(argc, argv, 3, 128), cli_arg_u32(argc, argv, 4, 8)) ? 0 : 1;
     /* --argsort-f32-i32-desc-canary [row_n [top_k]] : task #692 bitonic argsort */
-    if (argc >= 2 && !strcmp(argv[1], "--argsort-f32-i32-desc-canary")) {
-        const uint32_t row_n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t top_k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 8;
-        return ds4_gpu_mtl4_argsort_f32_i32_desc_canary(row_n, top_k) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--argsort-f32-i32-desc-canary")) return ds4_gpu_mtl4_argsort_f32_i32_desc_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 8)) ? 0 : 1;
     /* --cpy-f32-f32-canary [n_rows [row_width]] : task #693 typed copy */
-    if (argc >= 2 && !strcmp(argv[1], "--cpy-f32-f32-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_cpy_f32_f32_canary(nr, rw) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--cpy-f32-f32-canary")) return ds4_gpu_mtl4_cpy_f32_f32_canary(cli_arg_u32(argc, argv, 2, 16), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --hc-split-weighted-sum-canary [n_rows [n_embd]] : task #694 fused HC */
-    if (argc >= 2 && !strcmp(argv[1], "--hc-split-weighted-sum-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        const uint32_t ne = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 512;
-        return ds4_gpu_mtl4_hc_split_weighted_sum_canary(nr, ne) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--hc-split-weighted-sum-canary")) return ds4_gpu_mtl4_hc_split_weighted_sum_canary(cli_arg_u32(argc, argv, 2, 16), cli_arg_u32(argc, argv, 3, 512)) ? 0 : 1;
     /* --rope-tail-f32-canary [head_dim [n_rot [mode]]] : task #695 partial RoPE+YaRN */
     if (argc >= 2 && !strcmp(argv[1], "--rope-tail-f32-canary")) {
         const uint32_t hd = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 192;
@@ -2912,287 +2748,91 @@ int main(int argc, char **argv) {
         return ds4_gpu_mtl4_rope_tail_f32_canary(hd, nr, m) ? 0 : 1;
     }
     /* --concat-canary [n0 [n1 [n_rows]]] : task #696 concat along dim 0 */
-    if (argc >= 2 && !strcmp(argv[1], "--concat-canary")) {
-        const uint32_t n0 = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n1 = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 128;
-        const uint32_t nr = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
-        return ds4_gpu_mtl4_concat_canary(n0, n1, nr) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--concat-canary")) return ds4_gpu_mtl4_concat_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 128), cli_arg_u32(argc, argv, 4, 8)) ? 0 : 1;
     /* --hc-split-weighted-sum-norm4-canary [n_rows] : task #697 fused HC+RMSNorm at 4096 */
-    if (argc >= 2 && !strcmp(argv[1], "--hc-split-weighted-sum-norm4-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
-        return ds4_gpu_mtl4_hc_split_weighted_sum_norm4_canary(nr) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--hc-split-weighted-sum-norm4-canary")) return ds4_gpu_mtl4_hc_split_weighted_sum_norm4_canary(cli_arg_u32(argc, argv, 2, 8)) ? 0 : 1;
     /* --hc-expand-canary [n_embd [n_hc [n_tokens]]] : task #698 generic-HC variant */
-    if (argc >= 2 && !strcmp(argv[1], "--hc-expand-canary")) {
-        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
-        const uint32_t nh = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 8;
-        const uint32_t nt = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 4;
-        return ds4_gpu_mtl4_hc_expand_canary(ne, nh, nt) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--hc-expand-canary")) return ds4_gpu_mtl4_hc_expand_canary(cli_arg_u32(argc, argv, 2, 128), cli_arg_u32(argc, argv, 3, 8), cli_arg_u32(argc, argv, 4, 4)) ? 0 : 1;
     /* --hadamard16-wide-canary [n_rows [blocks_per_row]] : task #699 wide batched Hadamard */
-    if (argc >= 2 && !strcmp(argv[1], "--hadamard16-wide-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 4;
-        const uint32_t bpr = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        return ds4_gpu_mtl4_hadamard16_wide_canary(nr, bpr) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--hadamard16-wide-canary")) return ds4_gpu_mtl4_hadamard16_wide_canary(cli_arg_u32(argc, argv, 2, 4), cli_arg_u32(argc, argv, 3, 32)) ? 0 : 1;
     /* --argsort-merge-desc-canary [len [top_k]] : task #700 multi-block merge */
-    if (argc >= 2 && !strcmp(argv[1], "--argsort-merge-desc-canary")) {
-        const uint32_t len = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 32;
-        const uint32_t top_k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
-        return ds4_gpu_mtl4_argsort_merge_f32_i32_desc_canary(len, top_k) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--argsort-merge-desc-canary")) return ds4_gpu_mtl4_argsort_merge_f32_i32_desc_canary(cli_arg_u32(argc, argv, 2, 32), cli_arg_u32(argc, argv, 3, 16)) ? 0 : 1;
     /* --cpy-f32-f16-canary [n_rows [row_width]] : task #702 f32→f16 typed copy */
-    if (argc >= 2 && !strcmp(argv[1], "--cpy-f32-f16-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_cpy_f32_f16_canary(nr, rw) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--cpy-f32-f16-canary")) return ds4_gpu_mtl4_cpy_f32_f16_canary(cli_arg_u32(argc, argv, 2, 16), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --cpy-f16-f32-canary [n_rows [row_width]] : task #703 f16→f32 typed copy */
-    if (argc >= 2 && !strcmp(argv[1], "--cpy-f16-f32-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_cpy_f16_f32_canary(nr, rw) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--cpy-f16-f32-canary")) return ds4_gpu_mtl4_cpy_f16_f32_canary(cli_arg_u32(argc, argv, 2, 16), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --sum-rows-canary [n_rows [row_width]] : task #704 row-sum reduction */
-    if (argc >= 2 && !strcmp(argv[1], "--sum-rows-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_sum_rows_f32_f32_canary(nr, rw) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--sum-rows-canary")) return ds4_gpu_mtl4_sum_rows_f32_f32_canary(cli_arg_u32(argc, argv, 2, 16), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --set-rows-canary [n_src [row_width]] : task #705 KV-cache scatter */
-    if (argc >= 2 && !strcmp(argv[1], "--set-rows-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_set_rows_f32_i32_canary(nr, rw) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--set-rows-canary")) return ds4_gpu_mtl4_set_rows_f32_i32_canary(cli_arg_u32(argc, argv, 2, 16), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --map0-ne20-8-canary [n_experts [n_tokens]] : task #706 MoE routing-table builder */
-    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-8-canary")) {
-        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_8_canary(ne, nt) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-8-canary")) return ds4_gpu_mtl4_mul_mm_id_map0_ne20_8_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32)) ? 0 : 1;
     /* --repeat-canary [src_r [src_c [r_fac [c_fac]]]] : task #707 broadcast kernel */
-    if (argc >= 2 && !strcmp(argv[1], "--repeat-canary")) {
-        const uint32_t sr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
-        const uint32_t sc = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
-        const uint32_t rf = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 4;
-        const uint32_t cf = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        return ds4_gpu_mtl4_repeat_f32_canary(sr, sc, rf, cf) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--repeat-canary")) return ds4_gpu_mtl4_repeat_f32_canary(cli_arg_u32(argc, argv, 2, 8), cli_arg_u32(argc, argv, 3, 16), cli_arg_u32(argc, argv, 4, 4), cli_arg_u32(argc, argv, 5, 2)) ? 0 : 1;
     /* --swiglu-canary [n_rows [row_width [alpha [limit]]]] : task #708 SwiGLU activation */
-    if (argc >= 2 && !strcmp(argv[1], "--swiglu-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 64;
-        const float al = (argc >= 5) ? (float)atof(argv[4]) : 1.0f;
-        const float li = (argc >= 6) ? (float)atof(argv[5]) : 0.0f;
-        return ds4_gpu_mtl4_swiglu_f32_canary(nr, rw, al, li) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--swiglu-canary")) return ds4_gpu_mtl4_swiglu_f32_canary(cli_arg_u32(argc, argv, 2, 8), cli_arg_u32(argc, argv, 3, 64), cli_arg_f32(argc, argv, 4, 1.0f), cli_arg_f32(argc, argv, 5, 0.0f)) ? 0 : 1;
     /* --rms-norm-mul-canary [n_rows [row_width [eps]]] : task #709 RMSNorm + weight */
-    if (argc >= 2 && !strcmp(argv[1], "--rms-norm-mul-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        const float ep = (argc >= 5) ? (float)atof(argv[4]) : 1.0e-5f;
-        return ds4_gpu_mtl4_rms_norm_mul_f32_4_canary(nr, rw, ep) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--rms-norm-mul-canary")) return ds4_gpu_mtl4_rms_norm_mul_f32_4_canary(cli_arg_u32(argc, argv, 2, 8), cli_arg_u32(argc, argv, 3, 256), cli_arg_f32(argc, argv, 4, 1.0e-5f)) ? 0 : 1;
     /* --rms-norm-canary [n_rows [row_width [eps]]] : task #710 RMSNorm only */
-    if (argc >= 2 && !strcmp(argv[1], "--rms-norm-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        const float ep = (argc >= 5) ? (float)atof(argv[4]) : 1.0e-5f;
-        return ds4_gpu_mtl4_rms_norm_f32_4_canary(nr, rw, ep) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--rms-norm-canary")) return ds4_gpu_mtl4_rms_norm_f32_4_canary(cli_arg_u32(argc, argv, 2, 8), cli_arg_u32(argc, argv, 3, 256), cli_arg_f32(argc, argv, 4, 1.0e-5f)) ? 0 : 1;
     /* --get-rows-f16-canary [n_table [row_width [n_ids]]] : task #711 f16 embedding lookup */
-    if (argc >= 2 && !strcmp(argv[1], "--get-rows-f16-canary")) {
-        const uint32_t nt = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 32;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 128;
-        const uint32_t ni = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
-        return ds4_gpu_mtl4_get_rows_f16_canary(nt, rw, ni) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--get-rows-f16-canary")) return ds4_gpu_mtl4_get_rows_f16_canary(cli_arg_u32(argc, argv, 2, 32), cli_arg_u32(argc, argv, 3, 128), cli_arg_u32(argc, argv, 4, 8)) ? 0 : 1;
     /* --get-rows-i32-canary [n_table [row_width [n_ids]]] : task #712 i32 lookup */
-    if (argc >= 2 && !strcmp(argv[1], "--get-rows-i32-canary")) {
-        const uint32_t nt = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 32;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 128;
-        const uint32_t ni = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
-        return ds4_gpu_mtl4_get_rows_i32_canary(nt, rw, ni) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--get-rows-i32-canary")) return ds4_gpu_mtl4_get_rows_i32_canary(cli_arg_u32(argc, argv, 2, 32), cli_arg_u32(argc, argv, 3, 128), cli_arg_u32(argc, argv, 4, 8)) ? 0 : 1;
     /* --bin-add-canary [n_rows [row_width]] : task #713 residual-add */
-    if (argc >= 2 && !strcmp(argv[1], "--bin-add-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_bin_fuse_add_f32_canary(nr, rw) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--bin-add-canary")) return ds4_gpu_mtl4_bin_fuse_add_f32_canary(cli_arg_u32(argc, argv, 2, 16), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --bin-sub-canary [n_rows [row_width]] : task #714 subtract */
-    if (argc >= 2 && !strcmp(argv[1], "--bin-sub-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_bin_fuse_sub_f32_canary(nr, rw) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--bin-sub-canary")) return ds4_gpu_mtl4_bin_fuse_sub_f32_canary(cli_arg_u32(argc, argv, 2, 16), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --bin-mul-canary [n_rows [row_width]] : task #715 multiply */
-    if (argc >= 2 && !strcmp(argv[1], "--bin-mul-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_bin_fuse_mul_f32_canary(nr, rw) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--bin-mul-canary")) return ds4_gpu_mtl4_bin_fuse_mul_f32_canary(cli_arg_u32(argc, argv, 2, 16), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --bin-div-canary [n_rows [row_width]] : task #716 divide */
-    if (argc >= 2 && !strcmp(argv[1], "--bin-div-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_bin_fuse_div_f32_canary(nr, rw) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--bin-div-canary")) return ds4_gpu_mtl4_bin_fuse_div_f32_canary(cli_arg_u32(argc, argv, 2, 16), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --bin-add-cb-canary [n_rows [row_width]] : task #717 bias-add */
-    if (argc >= 2 && !strcmp(argv[1], "--bin-add-cb-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_bin_fuse_add_cb_f32_canary(nr, rw) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--bin-add-cb-canary")) return ds4_gpu_mtl4_bin_fuse_add_cb_f32_canary(cli_arg_u32(argc, argv, 2, 16), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --bin-mul-cb-canary [n_rows [row_width]] : task #718 per-channel scale */
-    if (argc >= 2 && !strcmp(argv[1], "--bin-mul-cb-canary")) {
-        const uint32_t nr = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        const uint32_t rw = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_bin_fuse_mul_cb_f32_canary(nr, rw) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--bin-mul-cb-canary")) return ds4_gpu_mtl4_bin_fuse_mul_cb_f32_canary(cli_arg_u32(argc, argv, 2, 16), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --map0-ne20-{10,16,22}-canary [n_experts [n_tokens]] : tasks #719/#720/#721 */
-    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-10-canary")) {
-        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_10_canary(ne, nt) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-16-canary")) {
-        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_16_canary(ne, nt) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-22-canary")) {
-        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_22_canary(ne, nt) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-10-canary")) return ds4_gpu_mtl4_mul_mm_id_map0_ne20_10_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-16-canary")) return ds4_gpu_mtl4_mul_mm_id_map0_ne20_16_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-22-canary")) return ds4_gpu_mtl4_mul_mm_id_map0_ne20_22_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32)) ? 0 : 1;
     /* --map0-ne20-{1,2,4,5,6}-canary [n_experts [n_tokens]] : tasks #729-#733 */
-    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-1-canary")) {
-        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_1_canary(ne, nt) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-2-canary")) {
-        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_2_canary(ne, nt) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-4-canary")) {
-        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_4_canary(ne, nt) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-5-canary")) {
-        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_5_canary(ne, nt) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-6-canary")) {
-        const uint32_t ne = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t nt = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        return ds4_gpu_mtl4_mul_mm_id_map0_ne20_6_canary(ne, nt) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-1-canary")) return ds4_gpu_mtl4_mul_mm_id_map0_ne20_1_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-2-canary")) return ds4_gpu_mtl4_mul_mm_id_map0_ne20_2_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-4-canary")) return ds4_gpu_mtl4_mul_mm_id_map0_ne20_4_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-5-canary")) return ds4_gpu_mtl4_mul_mm_id_map0_ne20_5_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--map0-ne20-6-canary")) return ds4_gpu_mtl4_mul_mm_id_map0_ne20_6_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32)) ? 0 : 1;
     /* --mul-mv-canary [M [N]] : task #722 first FC-aware MTL4 port (f32 matvec) */
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mv-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_mul_mv_f32_f32_canary(m, n) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mv-canary")) return ds4_gpu_mtl4_mul_mv_f32_f32_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --mul-mv-q8-0-canary [M [N]] : task #723 Q8_0 matvec */
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mv-q8-0-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_mul_mv_q8_0_f32_canary(m, n) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mv-q8-0-canary")) return ds4_gpu_mtl4_mul_mv_q8_0_f32_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --gate-up-swiglu-q8-0-canary [M [N [clamp]]] : task #724 fused Q8_0 SwiGLU */
-    if (argc >= 2 && !strcmp(argv[1], "--gate-up-swiglu-q8-0-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        const float cv = (argc >= 5) ? (float)atof(argv[4]) : 0.0f;
-        return ds4_gpu_mtl4_dsv4_shared_gate_up_swiglu_q8_0_canary(m, n, cv) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--gate-up-swiglu-q8-0-canary")) return ds4_gpu_mtl4_dsv4_shared_gate_up_swiglu_q8_0_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256), cli_arg_f32(argc, argv, 4, 0.0f)) ? 0 : 1;
     /* --q8-hc-expand4-canary [M [N]] : task #725 Q8_0 matvec + 4-channel HC expand */
-    if (argc >= 2 && !strcmp(argv[1], "--q8-hc-expand4-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_dsv4_q8_hc_expand4_q8_0_canary(m, n) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--q8-hc-expand4-canary")) return ds4_gpu_mtl4_dsv4_q8_hc_expand4_q8_0_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --mul-mv-f16-canary [M [N]] : task #727 FP16 matvec */
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mv-f16-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_mul_mv_f16_f32_canary(m, n) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mv-f16-canary")) return ds4_gpu_mtl4_mul_mv_f16_f32_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --mul-mv-bf16-canary [M [N]] : #796 Increment 1 BF16 matvec */
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mv-bf16-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_mul_mv_bf16_f32_canary(m, n) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mv-bf16-canary")) return ds4_gpu_mtl4_mul_mv_bf16_f32_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --matmul-f16-storage-canary [M [N]] : #796 Increment 2b cross-validate */
-    if (argc >= 2 && !strcmp(argv[1], "--matmul-f16-storage-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_matmul_f16_storage_canary(m, n) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--matmul-f16-storage-canary")) return ds4_gpu_mtl4_matmul_f16_storage_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --via-tensor-canary [M [N [n_tok]]] : #796 Increment 2c/2d end-to-end dispatcher */
-    if (argc >= 2 && !strcmp(argv[1], "--via-tensor-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 1;
-        return ds4_via_tensor_canary_mt(m, n, k) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--via-tensor-canary")) return ds4_via_tensor_canary_mt(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256), cli_arg_u32(argc, argv, 4, 1)) ? 0 : 1;
     /* --via-tensor-q8-0-canary [M [N [n_tok]]] : #796 Increment 3 Q8_0 dispatcher */
-    if (argc >= 2 && !strcmp(argv[1], "--via-tensor-q8-0-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 1;
-        return ds4_via_tensor_q8_0_canary(m, n, k) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--via-tensor-q8-0-canary")) return ds4_via_tensor_q8_0_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256), cli_arg_u32(argc, argv, 4, 1)) ? 0 : 1;
     /* --via-tensor-bf16-canary [M [N]] : #796 Increment 4 BF16 dispatcher */
-    if (argc >= 2 && !strcmp(argv[1], "--via-tensor-bf16-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_via_tensor_bf16_canary(m, n) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--via-tensor-bf16-canary")) return ds4_via_tensor_bf16_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --via-tensor-source-exact-bf16-canary [M [N]] : #796 Increment 5a SEVERE TEST */
-    if (argc >= 2 && !strcmp(argv[1], "--via-tensor-source-exact-bf16-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_via_tensor_source_exact_bf16_canary(m, n) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--via-tensor-source-exact-bf16-canary")) return ds4_via_tensor_source_exact_bf16_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --shared-down-hc-expand4-canary [M [N]] : task #728 */
-    if (argc >= 2 && !strcmp(argv[1], "--shared-down-hc-expand4-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        return ds4_gpu_mtl4_dsv4_shared_down_hc_expand4_q8_0_canary(m, n) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--shared-down-hc-expand4-canary")) return ds4_gpu_mtl4_dsv4_shared_down_hc_expand4_q8_0_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256)) ? 0 : 1;
     /* --lane-diag [nthreads] : MTL4 lane-execution diagnostic */
-    if (argc >= 2 && !strcmp(argv[1], "--lane-diag")) {
-        const uint32_t n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
-        return ds4_gpu_mtl4_lane_diag_canary(n) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--lane-diag")) return ds4_gpu_mtl4_lane_diag_canary(cli_arg_u32(argc, argv, 2, 128)) ? 0 : 1;
     /* --mma-iso [n_simdgroups] : MTL4 simdgroup MMA isolation test */
-    if (argc >= 2 && !strcmp(argv[1], "--mma-iso")) {
-        const uint32_t n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 1;
-        return ds4_gpu_mtl4_mma_iso_canary(n) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mma-iso")) return ds4_gpu_mtl4_mma_iso_canary(cli_arg_u32(argc, argv, 2, 1)) ? 0 : 1;
     /* --indexer-scores-tiled-canary [n_tokens [n_comp [n_head]]] : #730 unblocks #701 */
-    if (argc >= 2 && !strcmp(argv[1], "--indexer-scores-tiled-canary")) {
-        const uint32_t nt = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
-        const uint32_t nc = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t nh = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 1;
-        return ds4_gpu_mtl4_indexer_scores_tiled_f32_canary(nt, nc, nh) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--indexer-scores-tiled-canary")) return ds4_gpu_mtl4_indexer_scores_tiled_f32_canary(cli_arg_u32(argc, argv, 2, 8), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 1)) ? 0 : 1;
     /* --indexer-scores-tiled-half-canary : #731 half-precision variant */
-    if (argc >= 2 && !strcmp(argv[1], "--indexer-scores-tiled-half-canary")) {
-        const uint32_t nt = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 8;
-        const uint32_t nc = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t nh = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 1;
-        return ds4_gpu_mtl4_indexer_scores_tiled_canary(nt, nc, nh) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--indexer-scores-tiled-half-canary")) return ds4_gpu_mtl4_indexer_scores_tiled_canary(cli_arg_u32(argc, argv, 2, 8), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 1)) ? 0 : 1;
     /* --d8f-mpsgraph-lut-down-canary <d8f> [EXPERTS_CSV [rows [rounds [mode]]]]
      * Real D8F VQ-GEMV loophole canary: table=x[groups,8]@codebook[8,k],
      * gather(table, idx), reduce groups. mode=0 fp16 path, mode=1 fp32 path (M1 default). */
@@ -3249,143 +2889,36 @@ int main(int argc, char **argv) {
 #endif
     }
     /* --mul-mm-f16-canary [M [N [K]]] : #732 dense FP16 matmul */
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-f16-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
-        return ds4_gpu_mtl4_mul_mm_f16_f32_canary(m, n, k) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-f16-canary")) return ds4_gpu_mtl4_mul_mm_f16_f32_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 64)) ? 0 : 1;
     /* --mul-mm-q8-0-canary [M [N [K]]] : #733 Q8_0 dense matmul */
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-q8-0-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
-        return ds4_gpu_mtl4_mul_mm_q8_0_f32_canary(m, n, k) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-q8-0-canary")) return ds4_gpu_mtl4_mul_mm_q8_0_f32_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 64)) ? 0 : 1;
     /* --mul-mm-id-q8-0-canary [M [N [K [E]]]] : #734 Q8_0 routed MoE matmul */
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q8-0-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
-        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        return ds4_gpu_mtl4_mul_mm_id_q8_0_f32_canary(m, n, k, e) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q8-0-canary")) return ds4_gpu_mtl4_mul_mm_id_q8_0_f32_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 64), cli_arg_u32(argc, argv, 5, 2)) ? 0 : 1;
     /* --mul-mm-id-iq2-xxs-canary [M [N [K [E]]]] : #735 IQ2_XXS routed MoE matmul */
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-iq2-xxs-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        return ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_canary(m, n, k, e) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-iq2-xxs-canary")) return ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 256), cli_arg_u32(argc, argv, 5, 2)) ? 0 : 1;
     /* --mul-mm-id-iq2-xxs-n64-canary [M [N [K [E]]]] : #739 IQ2_XXS routed n64 */
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-iq2-xxs-n64-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        return ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_n64_canary(m, n, k, e) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-iq2-xxs-n64-canary")) return ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_n64_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 256), cli_arg_u32(argc, argv, 5, 2)) ? 0 : 1;
     /* --mul-mm-id-iq2-xxs-n128-canary [M [N [K [E]]]] : #740 IQ2_XXS routed n128 */
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-iq2-xxs-n128-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        return ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_n128_canary(m, n, k, e) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-iq2-xxs-n128-canary")) return ds4_gpu_mtl4_mul_mm_id_iq2_xxs_f32_n128_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 256), cli_arg_u32(argc, argv, 5, 2)) ? 0 : 1;
     /* #742-#747 wide-tile canaries for Q8_0 / Q4_K / Q2_K × {n64, n128} */
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q8-0-n64-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
-        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        return ds4_gpu_mtl4_mul_mm_id_q8_0_f32_n64_canary(m, n, k, e) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q8-0-n128-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
-        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        return ds4_gpu_mtl4_mul_mm_id_q8_0_f32_n128_canary(m, n, k, e) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q4-k-n64-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        return ds4_gpu_mtl4_mul_mm_id_q4_K_f32_n64_canary(m, n, k, e) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q4-k-n128-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        return ds4_gpu_mtl4_mul_mm_id_q4_K_f32_n128_canary(m, n, k, e) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q2-k-n64-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        return ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n64_canary(m, n, k, e) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q2-k-n128-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        return ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n128_canary(m, n, k, e) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q8-0-n64-canary")) return ds4_gpu_mtl4_mul_mm_id_q8_0_f32_n64_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 64), cli_arg_u32(argc, argv, 5, 2)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q8-0-n128-canary")) return ds4_gpu_mtl4_mul_mm_id_q8_0_f32_n128_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 64), cli_arg_u32(argc, argv, 5, 2)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q4-k-n64-canary")) return ds4_gpu_mtl4_mul_mm_id_q4_K_f32_n64_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 256), cli_arg_u32(argc, argv, 5, 2)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q4-k-n128-canary")) return ds4_gpu_mtl4_mul_mm_id_q4_K_f32_n128_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 256), cli_arg_u32(argc, argv, 5, 2)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q2-k-n64-canary")) return ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n64_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 256), cli_arg_u32(argc, argv, 5, 2)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q2-k-n128-canary")) return ds4_gpu_mtl4_mul_mm_id_q2_K_f32_n128_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 256), cli_arg_u32(argc, argv, 5, 2)) ? 0 : 1;
     /* #742 wide-tile audit: routes R tokens to 1 expert; tests all 3 widths */
-    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        const uint32_t r = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
-        return ds4_gpu_mtl4_wide_tile_audit_iq2_xxs(m, k, r) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit")) return ds4_gpu_mtl4_wide_tile_audit_iq2_xxs(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256), cli_arg_u32(argc, argv, 4, 64)) ? 0 : 1;
     /* Classic Metal counterpart — tests antirez upstream kernels */
-    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit-classic")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        const uint32_t r = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
-        return ds4_gpu_classic_wide_tile_audit_iq2_xxs(m, k, r) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit-classic")) return ds4_gpu_classic_wide_tile_audit_iq2_xxs(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256), cli_arg_u32(argc, argv, 4, 64)) ? 0 : 1;
     /* Per-quant wide-tile audits — verify n64/n128 fixes work at R>32 */
-    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit-q8-0")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 64;
-        const uint32_t r = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
-        return ds4_gpu_mtl4_wide_tile_audit_q8_0(m, k, r) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit-q4-k")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        const uint32_t r = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
-        return ds4_gpu_mtl4_wide_tile_audit_q4_K(m, k, r) ? 0 : 1;
-    }
-    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit-q2-k")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t k = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 256;
-        const uint32_t r = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 64;
-        return ds4_gpu_mtl4_wide_tile_audit_q2_K(m, k, r) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit-q8-0")) return ds4_gpu_mtl4_wide_tile_audit_q8_0(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 64), cli_arg_u32(argc, argv, 4, 64)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit-q4-k")) return ds4_gpu_mtl4_wide_tile_audit_q4_K(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256), cli_arg_u32(argc, argv, 4, 64)) ? 0 : 1;
+    if (argc >= 2 && !strcmp(argv[1], "--wide-tile-audit-q2-k")) return ds4_gpu_mtl4_wide_tile_audit_q2_K(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 256), cli_arg_u32(argc, argv, 4, 64)) ? 0 : 1;
     /* --mul-mm-id-q4-k-canary [M [N [K [E]]]] : #736 Q4_K routed MoE matmul */
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q4-k-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        return ds4_gpu_mtl4_mul_mm_id_q4_K_f32_canary(m, n, k, e) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q4-k-canary")) return ds4_gpu_mtl4_mul_mm_id_q4_K_f32_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 256), cli_arg_u32(argc, argv, 5, 2)) ? 0 : 1;
     /* --mul-mm-id-q2-k-canary [M [N [K [E]]]] : #737 Q2_K routed MoE matmul */
-    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q2-k-canary")) {
-        const uint32_t m = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 64;
-        const uint32_t n = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        const uint32_t k = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 256;
-        const uint32_t e = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        return ds4_gpu_mtl4_mul_mm_id_q2_K_f32_canary(m, n, k, e) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--mul-mm-id-q2-k-canary")) return ds4_gpu_mtl4_mul_mm_id_q2_K_f32_canary(cli_arg_u32(argc, argv, 2, 64), cli_arg_u32(argc, argv, 3, 32), cli_arg_u32(argc, argv, 4, 256), cli_arg_u32(argc, argv, 5, 2)) ? 0 : 1;
     /* --routed-mm-dispatch-probe : silv 2026-05-28 I-1 wiring smoke test.
      * Pair with DS4_METAL_LOG_ROUTED_MM=1 to see per-pick log lines confirming
      * the MTL4 redirect for wide-tile (n64/n128) fires correctly. */
@@ -3757,12 +3290,7 @@ int main(int argc, char **argv) {
         return ds4_prefix_cache_phase1_self_test() ? 0 : 1;
     }
     /* --hc-weighted-sum-canary [n_embd [n_hc [n_tokens]]] : task #683 */
-    if (argc >= 2 && !strcmp(argv[1], "--hc-weighted-sum-canary")) {
-        const uint32_t n_embd = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
-        const uint32_t n_hc = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 4;
-        const uint32_t n_tokens = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
-        return ds4_gpu_mtl4_hc_weighted_sum_canary(n_embd, n_hc, n_tokens) ? 0 : 1;
-    }
+    if (argc >= 2 && !strcmp(argv[1], "--hc-weighted-sum-canary")) return ds4_gpu_mtl4_hc_weighted_sum_canary(cli_arg_u32(argc, argv, 2, 128), cli_arg_u32(argc, argv, 3, 4), cli_arg_u32(argc, argv, 4, 8)) ? 0 : 1;
     cli_config cfg = parse_options(argc, argv);
     const bool h3384_diagnostic =
         cfg.inspect ||
