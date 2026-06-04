@@ -85,16 +85,31 @@ def lognormal_z(value: float, fit: dict[str, float]) -> float:
     return (math.log(max(float(value), 1.0e-12)) - fit["mean"]) / fit["sigma"]
 
 
-def valid_direction(data_dir: Path, layer: int, expert: int) -> bool:
-    targeting_path = data_dir / f"targeting_L{layer}.json"
-    dirs_path = data_dir / f"dirs_L{layer}.npz"
-    if not targeting_path.exists() or not dirs_path.exists():
+def load_direction_index(data_dir: Path, layers: set[int]) -> dict[int, dict[str, set[int] | set[str]]]:
+    index: dict[int, dict[str, set[int] | set[str]]] = {}
+    for layer in layers:
+        targeting_path = data_dir / f"targeting_L{layer}.json"
+        dirs_path = data_dir / f"dirs_L{layer}.npz"
+        if not targeting_path.exists() or not dirs_path.exists():
+            index[layer] = {"down_below": set(), "dirs": set()}
+            continue
+        targeting = json.loads(targeting_path.read_text(encoding="utf-8"))
+        dirs = np.load(dirs_path)
+        try:
+            index[layer] = {
+                "down_below": {int(value) for value in targeting.get("down_below", [])},
+                "dirs": set(dirs.files),
+            }
+        finally:
+            dirs.close()
+    return index
+
+
+def valid_direction(direction_index: dict[int, dict[str, set[int] | set[str]]], layer: int, expert: int) -> bool:
+    layer_index = direction_index.get(layer)
+    if not layer_index:
         return False
-    targeting = json.loads(targeting_path.read_text(encoding="utf-8"))
-    if expert not in {int(value) for value in targeting.get("down_below", [])}:
-        return False
-    dirs = np.load(dirs_path)
-    return f"L{layer}_e{expert}_u" in dirs.files
+    return expert in layer_index["down_below"] and f"L{layer}_e{expert}_u" in layer_index["dirs"]
 
 
 def priority_rows(payload: dict[str, Any], layers: set[int], score_mode: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -154,13 +169,14 @@ def main() -> int:
     layers = set(parse_layers(args.layers))
     payload = json.loads(args.priority_json.read_text(encoding="utf-8"))
     rows, score_meta = priority_rows(payload, layers, args.score_mode)
+    direction_index = load_direction_index(args.source_data_dir, layers)
     chosen: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     per_layer_counts: dict[int, int] = {}
     for row in rows:
         layer = int(row["layer"])
         expert = int(row["expert"])
-        if not valid_direction(args.source_data_dir, layer, expert):
+        if not valid_direction(direction_index, layer, expert):
             rejected.append({**row, "reason": "missing_direction_or_not_down_below"})
             continue
         if args.max_per_layer > 0 and per_layer_counts.get(layer, 0) >= args.max_per_layer:
@@ -179,7 +195,7 @@ def main() -> int:
                 pair = (layer, expert)
                 if pair in chosen_pairs:
                     continue
-                if not valid_direction(args.source_data_dir, layer, expert):
+                if not valid_direction(direction_index, layer, expert):
                     rejected.append({"layer": layer, "expert": expert, "source": "existing_sidecar", "reason": "missing_direction_or_not_down_below"})
                     continue
                 row = {
