@@ -24080,6 +24080,84 @@ static size_t engine_collect_cpu_moe_routed_ranges(const ds4_engine *e,
 }
 
 #ifndef DS4_NO_GPU
+static bool engine_tensor_is_cpu_routed(const ds4_engine *e,
+ const ds4_tensor *t) {
+ if (!e || !t) return false;
+ for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+  if (!e->cpu_moe_layer[il]) continue;
+  const ds4_layer_weights *L = &e->weights.layer[il];
+  if (t == L->ffn_gate_exps ||
+      t == L->ffn_up_exps ||
+      t == L->ffn_down_exps) {
+   return true;
+  }
+ }
+ return false;
+}
+
+static bool engine_audit_metal_model_views(const ds4_engine *e,
+ const char *label) {
+ if (!e) return false;
+ uint64_t checked = 0;
+ uint64_t storage_checked = 0;
+ uint64_t cpu_routed_skipped = 0;
+ uint64_t missing = 0;
+ const int verbose = (e->cpu_moe || e->ssd_stream_iq2xxs ||
+                      getenv("DS4_MODEL_VIEW_AUDIT") != NULL);
+ for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+  const ds4_tensor *t = &e->model.tensors[i];
+  if (t->bytes == 0 && t->storage.length == 0) continue;
+  if (engine_tensor_is_cpu_routed(e, t)) {
+   cpu_routed_skipped++;
+   continue;
+  }
+  const uint64_t bytes = (t->storage.metal_buffer && t->storage.length != 0)
+                       ? t->storage.length
+                       : t->bytes;
+  if (bytes == 0) continue;
+  if (ds4_gpu_model_range_resolvable(e->model.map,
+                                     e->model.size,
+                                     t->abs_offset,
+                                     bytes)) {
+   checked++;
+   if (t->storage.metal_buffer) storage_checked++;
+   continue;
+  }
+  if (missing < 12) {
+   fprintf(stderr,
+    "ds4: Metal model-view audit miss: tensor=%.*s offset=%llu bytes=%llu "
+    "storage=%s label=%s\n",
+    (int)t->name.len, t->name.ptr,
+    (unsigned long long)t->abs_offset,
+    (unsigned long long)bytes,
+    t->storage.metal_buffer ? "yes" : "no",
+    label ? label : "startup");
+  }
+  missing++;
+ }
+ if (missing != 0) {
+  fprintf(stderr,
+   "ds4: Metal model-view audit FAILED (%s): missing=%llu checked=%llu "
+   "storage=%llu cpu_routed_skipped=%llu. Refusing silent mis-mapped weights.\n",
+   label ? label : "startup",
+   (unsigned long long)missing,
+   (unsigned long long)checked,
+   (unsigned long long)storage_checked,
+   (unsigned long long)cpu_routed_skipped);
+  return false;
+ }
+ if (verbose) {
+  fprintf(stderr,
+   "ds4: Metal model-view audit OK (%s): checked=%llu storage=%llu "
+   "cpu_routed_skipped=%llu\n",
+   label ? label : "startup",
+   (unsigned long long)checked,
+   (unsigned long long)storage_checked,
+   (unsigned long long)cpu_routed_skipped);
+ }
+ return true;
+}
+
 /* Register Metal model views over the full tensor-data range.
  *
  * silv 2026-05-28 engineer-roster simplification (Knuth/Carmack/Linus/Pearl):
@@ -25705,6 +25783,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
            opt->d8m_down_pack_template);
   }
  }
+
+#ifndef DS4_NO_GPU
+ if (graph_backend &&
+     !engine_audit_metal_model_views(e, "engine-open-final")) {
+  ds4_engine_close(e);
+  *out = NULL;
+  return 1;
+ }
+#endif
 
  *out = e;
  return 0;

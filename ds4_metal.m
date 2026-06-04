@@ -6939,6 +6939,15 @@ static int ds4_gpu_range_resolvable(
  return offset <= model_size && bytes <= model_size - offset;
 }
 
+int ds4_gpu_model_range_resolvable(
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t offset,
+ uint64_t bytes) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ return ds4_gpu_range_resolvable(model_map, model_size, offset, bytes);
+}
+
 int ds4_gpu_indexer_score_one_tensor(
  ds4_gpu_tensor *scores,
  const ds4_gpu_tensor *q,
