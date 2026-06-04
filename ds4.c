@@ -11975,6 +11975,11 @@ static bool metal_graph_use_reference_kv_decode(void) {
  return metal_graph_env_flag("DS4_METAL_DISABLE_KV_FUSION", &cache);
 }
 
+static bool metal_graph_use_kv_rope_store_fusion(void) {
+ static int disable_cache = -1;
+ return !metal_graph_env_flag("DS4_METAL_DISABLE_KV_ROPE_STORE_FUSION", &disable_cache);
+}
+
 static bool metal_graph_use_reference_qkv_norm(void) {
  static int cache = -1;
  return metal_graph_env_flag("DS4_METAL_DISABLE_QKV_NORM_FUSION", &cache);
@@ -13826,7 +13831,33 @@ static bool metal_graph_encode_decode_layer(
  metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
  }
  }
- if (ok) ok = ds4_gpu_rope_tail_tensor(g->kv, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+ int kv_rope_store_fused = 0;
+ if (ok &&
+ metal_graph_use_kv_rope_store_fusion() &&
+ !metal_graph_use_reference_kv_decode() &&
+ !metal_graph_debug_wants("KVrope", il, pos)) {
+ kv_rope_store_fused = ds4_gpu_kv_rope_fp8_store_raw_tensor(g->kv,
+ raw_cache,
+ raw_cap,
+ raw_row,
+ DS4_N_HEAD_DIM,
+ DS4_N_ROT,
+ pos,
+ compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+ freq_base,
+ freq_scale,
+ ext_factor,
+ attn_factor,
+ DS4_ROPE_YARN_BETA_FAST,
+ DS4_ROPE_YARN_BETA_SLOW);
+ static int kv_rope_store_fused_logged = 0;
+ if (kv_rope_store_fused && !kv_rope_store_fused_logged) {
+ kv_rope_store_fused_logged = 1;
+ fprintf(stderr, "ds4: KV RoPE + FP8/raw-store fused path active\n");
+ }
+ }
+ if (ok && !kv_rope_store_fused) {
+ ok = ds4_gpu_rope_tail_tensor(g->kv, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
  DS4_N_ROT, pos,
  compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
  false, freq_base, freq_scale, ext_factor, attn_factor,
@@ -13834,10 +13865,8 @@ static bool metal_graph_encode_decode_layer(
  if (ok) {
  metal_graph_debug_dump_tensor("KVrope", g->kv, DS4_N_HEAD_DIM, il, pos);
  }
- /* RoPE stays as the exact standalone kernel above. The decode fusion
- * starts after that, where FP8 KV quantization and raw-cache storage can
- * share one pass without changing the trigonometric path. */
  if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
+ }
  DS4_METAL_PROFILE_DECODE_STAGE("kv_path");
  if (ok) {
  metal_graph_debug_dump_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);

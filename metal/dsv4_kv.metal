@@ -31,6 +31,20 @@ struct ds4_metal_args_dsv4_kv_fp8_store {
     int32_t raw_row;
 };
 
+struct ds4_metal_args_dsv4_kv_rope_fp8_store {
+    int32_t head_dim;
+    int32_t n_rot;
+    int32_t raw_row;
+    int32_t pos;
+    int32_t n_ctx_orig;
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+};
+
 struct ds4_metal_args_dsv4_indexer_qat {
     uint32_t n_rows;
     uint32_t head_dim;
@@ -256,6 +270,116 @@ kernel void kernel_dsv4_kv_fp8_store_f32(
     }
 
     for (int i = n_nope + tid; i < head_dim; i += 64) {
+#ifdef DS4_METAL_KV_RAW_F32
+        raw[i] = kv[i];
+#else
+        raw[i] = (float)((half)kv[i]);
+#endif
+    }
+}
+
+static float dsv4_kv_rope_yarn_ramp(const float low, const float high, const int i0) {
+    const float y = (i0 / 2 - low) / max(0.001f, high - low);
+    return 1.0f - min(1.0f, max(0.0f, y));
+}
+
+static float dsv4_kv_rope_yarn_corr_factor(int n_dims, int n_ctx_orig, float n_rot, float base) {
+    return n_dims * log(n_ctx_orig / (n_rot * 2.0f * M_PI_F)) / (2.0f * log(base));
+}
+
+static void dsv4_kv_rope_yarn_corr_dims(int n_dims, int n_ctx_orig, float freq_base,
+                                        float beta_fast, float beta_slow, float dims[2]) {
+    dims[0] = max(0.0f, floor(dsv4_kv_rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_fast, freq_base)));
+    dims[1] = min(n_dims - 1.0f, ceil(dsv4_kv_rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_slow, freq_base)));
+}
+
+static void dsv4_kv_rope_yarn(float theta_extrap, float freq_scale, float corr_dims[2],
+                              int i0, float ext_factor, float mscale,
+                              thread float *cos_theta, thread float *sin_theta) {
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        float ramp_mix = dsv4_kv_rope_yarn_ramp(corr_dims[0], corr_dims[1], i0) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * log(1.0f / freq_scale);
+    }
+    *cos_theta = cos(theta) * mscale;
+    *sin_theta = sin(theta) * mscale;
+}
+
+// Decode-side KV finalizer including the preceding partial RoPE. This is a
+// one-row kernel, so the threadgroup barrier is sufficient between RoPE and
+// raw-cache writes; no cross-threadgroup ordering is needed.
+kernel void kernel_dsv4_kv_rope_fp8_store_f32(
+        constant ds4_metal_args_dsv4_kv_rope_fp8_store & args,
+        device        float * kv,
+        device        float * raw_cache,
+        threadgroup   float * scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    const int head_dim = args.head_dim;
+    const int n_rot = args.n_rot;
+    const int n_nope = head_dim - n_rot;
+    if (head_dim <= 0 || n_rot < 0 || n_nope < 0 || tid >= 64 || (n_rot & 1) != 0) {
+        return;
+    }
+
+    device float *raw = raw_cache + (int64_t)args.raw_row * head_dim;
+    float corr_dims[2];
+    dsv4_kv_rope_yarn_corr_dims(n_rot, args.n_ctx_orig, args.freq_base,
+                                args.beta_fast, args.beta_slow, corr_dims);
+    const float theta_base = (float)args.pos;
+    const float inv_ndims = -1.0f / (float)n_rot;
+    const int n_pair = n_rot >> 1;
+    for (int pair = (int)tid; pair < n_pair; pair += 64) {
+        const int r = pair << 1;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta = theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
+#else
+        const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)r);
+#endif
+        float cos_theta;
+        float sin_theta;
+        dsv4_kv_rope_yarn(theta, args.freq_scale, corr_dims, r, args.ext_factor,
+                          args.attn_factor, &cos_theta, &sin_theta);
+        const int j0 = n_nope + r;
+        const int j1 = j0 + 1;
+        const float x0 = kv[j0];
+        const float x1 = kv[j1];
+        kv[j0] = x0 * cos_theta - x1 * sin_theta;
+        kv[j1] = x0 * sin_theta + x1 * cos_theta;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int off = 0; off < n_nope; off += 64) {
+        float v = 0.0f;
+        if (off + (int)tid < n_nope) {
+            v = kv[off + tid];
+            scratch[tid] = abs(v);
+        } else {
+            scratch[tid] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const float amax = max(scratch[0], 1.0e-4f);
+        const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
+        if (off + (int)tid < n_nope) {
+            const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
+            kv[off + tid] = q;
+#ifdef DS4_METAL_KV_RAW_F32
+            raw[off + tid] = q;
+#else
+            raw[off + tid] = (float)((half)q);
+#endif
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int i = n_nope + (int)tid; i < head_dim; i += 64) {
 #ifdef DS4_METAL_KV_RAW_F32
         raw[i] = kv[i];
 #else

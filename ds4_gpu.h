@@ -483,6 +483,21 @@ int ds4_gpu_kv_fp8_store_raw_tensor(
  uint32_t row,
  uint32_t head_dim,
  uint32_t n_rot);
+int ds4_gpu_kv_rope_fp8_store_raw_tensor(
+ ds4_gpu_tensor *kv,
+ ds4_gpu_tensor *raw_cache,
+ uint32_t raw_cap,
+ uint32_t row,
+ uint32_t head_dim,
+ uint32_t n_rot,
+ uint32_t pos,
+ uint32_t n_ctx_orig,
+ float freq_base,
+ float freq_scale,
+ float ext_factor,
+ float attn_factor,
+ float beta_fast,
+ float beta_slow);
 
 /* Reference/raw-cache primitive kept for prefill and diagnostics. Decode uses
  * ds4_gpu_kv_fp8_store_raw_tensor unless a diagnostic reference path is
@@ -1291,6 +1306,9 @@ int ds4_gpu_head_norm_rope_canary(uint32_t n_tok,
                                   uint32_t head_dim,
                                   uint32_t n_rot,
                                   uint32_t rounds);
+int ds4_gpu_kv_rope_store_canary(uint32_t head_dim,
+                                 uint32_t n_rot,
+                                 uint32_t rounds);
 /* MTL4 canary: record a compute command into classic MTLICB, replay it from an MTL4 compute encoder. */
 int ds4_gpu_mtl4_icb_execute_canary(uint32_t n_floats, uint32_t rounds);
 

@@ -109,6 +109,7 @@ static id<MTLComputePipelineState> g_rope_tail_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_fp8_kv_quantize_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_qat_pipeline;
 static id<MTLComputePipelineState> g_dsv4_kv_fp8_store_pipeline;
+static id<MTLComputePipelineState> g_dsv4_kv_rope_fp8_store_pipeline;
 static id<MTLComputePipelineState> g_dsv4_ratio4_shift_pipeline;
 static id<MTLComputePipelineState> g_dsv4_softmax_pool_pipeline;
 static id<MTLComputePipelineState> g_soft_max_f32_pipeline;
@@ -3893,6 +3894,20 @@ typedef struct {
 } ds4_gpu_dsv4_kv_fp8_store_args;
 
 typedef struct {
+ int32_t head_dim;
+ int32_t n_rot;
+ int32_t raw_row;
+ int32_t pos;
+ int32_t n_ctx_orig;
+ float freq_base;
+ float freq_scale;
+ float ext_factor;
+ float attn_factor;
+ float beta_fast;
+ float beta_slow;
+} ds4_gpu_dsv4_kv_rope_fp8_store_args;
+
+typedef struct {
  uint32_t n_rows;
  uint32_t head_dim;
  uint64_t row_stride;
@@ -4397,6 +4412,22 @@ int ds4_gpu_init(void) {
  g_dsv4_kv_fp8_store_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
  if (!g_dsv4_kv_fp8_store_pipeline) {
  fprintf(stderr, "ds4: Metal kernel_dsv4_kv_fp8_store_f32 pipeline failed: %s\n",
+ [[error localizedDescription] UTF8String]);
+ g_queue = nil;
+ g_device = nil;
+ return 0;
+ }
+
+ fn = [library newFunctionWithName:@"kernel_dsv4_kv_rope_fp8_store_f32"];
+ if (!fn) {
+ fprintf(stderr, "ds4: Metal kernel_dsv4_kv_rope_fp8_store_f32 function not found\n");
+ g_queue = nil;
+ g_device = nil;
+ return 0;
+ }
+ g_dsv4_kv_rope_fp8_store_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+ if (!g_dsv4_kv_rope_fp8_store_pipeline) {
+ fprintf(stderr, "ds4: Metal kernel_dsv4_kv_rope_fp8_store_f32 pipeline failed: %s\n",
  [[error localizedDescription] UTF8String]);
  g_queue = nil;
  g_device = nil;
@@ -5865,6 +5896,7 @@ fprintf(stderr,
  g_dsv4_fp8_kv_quantize_pipeline = nil;
  g_dsv4_indexer_qat_pipeline = nil;
  g_dsv4_kv_fp8_store_pipeline = nil;
+ g_dsv4_kv_rope_fp8_store_pipeline = nil;
  g_dsv4_ratio4_shift_pipeline = nil;
  g_dsv4_softmax_pool_pipeline = nil;
  g_soft_max_f32_pipeline = nil;
@@ -9545,6 +9577,180 @@ int ds4_gpu_kv_fp8_store_raw_tensor(
  }
 
  return 1;
+}
+
+int ds4_gpu_kv_rope_fp8_store_raw_tensor(
+ ds4_gpu_tensor *kv,
+ ds4_gpu_tensor *raw_cache,
+ uint32_t raw_cap,
+ uint32_t row,
+ uint32_t head_dim,
+ uint32_t n_rot,
+ uint32_t pos,
+ uint32_t n_ctx_orig,
+ float freq_base,
+ float freq_scale,
+ float ext_factor,
+ float attn_factor,
+ float beta_fast,
+ float beta_slow) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (!kv || !raw_cache || raw_cap == 0 || row >= raw_cap || head_dim == 0 ||
+ n_rot > head_dim || (n_rot & 1u) != 0 || raw_cap > INT32_MAX) {
+ return 0;
+ }
+
+ @autoreleasepool {
+ id<MTLBuffer> kvbuf = ds4_gpu_tensor_buffer(kv);
+ id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_cache);
+ const uint64_t kv_bytes = (uint64_t)head_dim * sizeof(float);
+ const uint64_t raw_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
+ if (!kvbuf || !rawbuf ||
+ ds4_gpu_tensor_bytes(kv) < kv_bytes ||
+ ds4_gpu_tensor_bytes(raw_cache) < raw_bytes) {
+ fprintf(stderr, "ds4: Metal fused KV RoPE/FP8/raw-store received undersized buffers\n");
+ return 0;
+ }
+
+ ds4_gpu_dsv4_kv_rope_fp8_store_args args = {
+ .head_dim = (int32_t)head_dim,
+ .n_rot = (int32_t)n_rot,
+ .raw_row = (int32_t)row,
+ .pos = (int32_t)pos,
+ .n_ctx_orig = (int32_t)n_ctx_orig,
+ .freq_base = freq_base,
+ .freq_scale = freq_scale,
+ .ext_factor = ext_factor,
+ .attn_factor = attn_factor,
+ .beta_fast = beta_fast,
+ .beta_slow = beta_slow,
+ };
+
+ int owned = 0;
+ id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+ if (!cb) return 0;
+
+ id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+ [enc setComputePipelineState:g_dsv4_kv_rope_fp8_store_pipeline];
+ [enc setBytes:&args length:sizeof(args) atIndex:0];
+ [enc setBuffer:kvbuf offset:ds4_gpu_tensor_offset(kv) atIndex:1];
+ [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_cache) atIndex:2];
+ [enc setThreadgroupMemoryLength:64u * sizeof(float) atIndex:0];
+ [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+ threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+ ds4_gpu_end_compute_encoder(cb, enc);
+
+ if (!ds4_gpu_finish_command_buffer(cb, owned, "KV RoPE/FP8/raw-store fused")) return 0;
+ }
+
+ return 1;
+}
+
+int ds4_gpu_kv_rope_store_canary(uint32_t head_dim,
+                                 uint32_t n_rot,
+                                 uint32_t rounds) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (!head_dim || n_rot > head_dim || (n_rot & 1u) != 0u) return 0;
+ if (rounds == 0) rounds = 1;
+ const uint32_t raw_cap = 4u;
+ const uint32_t raw_row = 2u;
+ const uint64_t kv_count = head_dim;
+ const uint64_t raw_count = (uint64_t)raw_cap * head_dim;
+ float *input_host = (float *)calloc((size_t)kv_count, sizeof(float));
+ float *direct_kv_host = (float *)calloc((size_t)kv_count, sizeof(float));
+ float *fused_kv_host = (float *)calloc((size_t)kv_count, sizeof(float));
+ float *direct_raw_host = (float *)calloc((size_t)raw_count, sizeof(float));
+ float *fused_raw_host = (float *)calloc((size_t)raw_count, sizeof(float));
+ if (!input_host || !direct_kv_host || !fused_kv_host || !direct_raw_host || !fused_raw_host) {
+ free(input_host); free(direct_kv_host); free(fused_kv_host);
+ free(direct_raw_host); free(fused_raw_host);
+ return 0;
+ }
+ for (uint64_t i = 0; i < kv_count; i++) {
+ input_host[i] = ((float)((int)(i % 29u)) - 14.0f) * 0.0625f;
+ }
+
+ int rc = 0;
+ @autoreleasepool {
+ ds4_gpu_tensor *direct_kv = ds4_gpu_tensor_alloc(kv_count * sizeof(float));
+ ds4_gpu_tensor *fused_kv = ds4_gpu_tensor_alloc(kv_count * sizeof(float));
+ ds4_gpu_tensor *direct_raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+ ds4_gpu_tensor *fused_raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+ int setup_ok = direct_kv && fused_kv && direct_raw && fused_raw;
+ if (setup_ok) setup_ok = ds4_gpu_tensor_write(direct_kv, 0, input_host, kv_count * sizeof(float)) > 0;
+ if (setup_ok) setup_ok = ds4_gpu_tensor_write(fused_kv, 0, input_host, kv_count * sizeof(float)) > 0;
+ if (setup_ok) setup_ok = ds4_gpu_tensor_fill_f32(direct_raw, 0.0f, raw_count) != 0;
+ if (setup_ok) setup_ok = ds4_gpu_tensor_fill_f32(fused_raw, 0.0f, raw_count) != 0;
+
+ fprintf(stderr,
+ "ds4: kv-rope-store canary START head_dim=%u n_rot=%u rounds=%u\n",
+ head_dim, n_rot, rounds);
+
+ int direct_ok = setup_ok;
+ const double direct_start_ms = ds4_gpu_now_ms();
+ for (uint32_t iter = 0; direct_ok && iter < rounds; iter++) {
+ direct_ok = ds4_gpu_rope_tail_tensor(direct_kv, 1, 1, head_dim, n_rot,
+ 17u, 4096u, false, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f) != 0;
+ if (direct_ok) {
+ direct_ok = ds4_gpu_kv_fp8_store_raw_tensor(direct_kv, direct_raw,
+ raw_cap, raw_row, head_dim, n_rot) != 0;
+ }
+ }
+ const double direct_ms = ds4_gpu_now_ms() - direct_start_ms;
+
+ int fused_ok = setup_ok;
+ const double fused_start_ms = ds4_gpu_now_ms();
+ for (uint32_t iter = 0; fused_ok && iter < rounds; iter++) {
+ fused_ok = ds4_gpu_kv_rope_fp8_store_raw_tensor(fused_kv, fused_raw,
+ raw_cap, raw_row, head_dim, n_rot,
+ 17u, 4096u, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f) != 0;
+ }
+ const double fused_ms = ds4_gpu_now_ms() - fused_start_ms;
+
+ if (direct_ok && fused_ok &&
+ ds4_gpu_tensor_read(direct_kv, 0, direct_kv_host, kv_count * sizeof(float)) > 0 &&
+ ds4_gpu_tensor_read(fused_kv, 0, fused_kv_host, kv_count * sizeof(float)) > 0 &&
+ ds4_gpu_tensor_read(direct_raw, 0, direct_raw_host, raw_count * sizeof(float)) > 0 &&
+ ds4_gpu_tensor_read(fused_raw, 0, fused_raw_host, raw_count * sizeof(float)) > 0) {
+ uint64_t kv_mismatch = 0, raw_mismatch = 0;
+ float kv_max_abs = 0.0f, raw_max_abs = 0.0f;
+ for (uint64_t i = 0; i < kv_count; i++) {
+ const float delta = fabsf(direct_kv_host[i] - fused_kv_host[i]);
+ if (delta > kv_max_abs) kv_max_abs = delta;
+ if (delta > 2.0e-5f) kv_mismatch++;
+ }
+ for (uint64_t i = 0; i < raw_count; i++) {
+ const float delta = fabsf(direct_raw_host[i] - fused_raw_host[i]);
+ if (delta > raw_max_abs) raw_max_abs = delta;
+ if (delta > 2.0e-5f) raw_mismatch++;
+ }
+ const double direct_per = direct_ms / (double)rounds;
+ const double fused_per = fused_ms / (double)rounds;
+ rc = kv_mismatch == 0 && raw_mismatch == 0;
+ fprintf(stderr,
+ "ds4: kv-rope-store canary direct=%.3f ms/round fused=%.3f ms/round speedup=%.2fx "
+ "kv_max_abs=%.3e kv_mismatch=%llu/%llu raw_max_abs=%.3e raw_mismatch=%llu/%llu %s\n",
+ direct_per, fused_per, fused_per > 0.0 ? direct_per / fused_per : 0.0,
+ (double)kv_max_abs,
+ (unsigned long long)kv_mismatch,
+ (unsigned long long)kv_count,
+ (double)raw_max_abs,
+ (unsigned long long)raw_mismatch,
+ (unsigned long long)raw_count,
+ rc ? "PASS" : "FAIL");
+ }
+ ds4_gpu_tensor_free(direct_kv);
+ ds4_gpu_tensor_free(fused_kv);
+ ds4_gpu_tensor_free(direct_raw);
+ ds4_gpu_tensor_free(fused_raw);
+ }
+
+ free(input_host);
+ free(direct_kv_host);
+ free(fused_kv_host);
+ free(direct_raw_host);
+ free(fused_raw_host);
+ return rc;
 }
 
 int ds4_gpu_store_raw_kv_batch_tensor(
