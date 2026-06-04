@@ -219,6 +219,32 @@ def summarize(rows: list[dict[str, Any]], margin_budget: float) -> dict[str, Any
     }
 
 
+def summarize_perturbation(reference: np.ndarray, candidate: np.ndarray, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    mask = np.isfinite(reference) & np.isfinite(candidate)
+    if not bool(np.any(mask)):
+        return {
+            "finite_logits": 0,
+            "logit_delta_l2": float("nan"),
+            "logit_delta_rms": float("nan"),
+            "logit_delta_max_abs": float("nan"),
+            "theta_max_flipped_margin_logits": None,
+            "theta_min_unflipped_margin_logits": None,
+            "flipped_reference_margin_logits": [],
+        }
+    delta = candidate[mask].astype(np.float64) - reference[mask].astype(np.float64)
+    flipped = [float(row["reference_margin_logits"]) for row in rows if not row["argmax_agree"]]
+    unflipped = [float(row["reference_margin_logits"]) for row in rows if row["argmax_agree"]]
+    return {
+        "finite_logits": int(delta.size),
+        "logit_delta_l2": float(np.linalg.norm(delta)),
+        "logit_delta_rms": float(np.sqrt(np.mean(delta * delta))),
+        "logit_delta_max_abs": float(np.max(np.abs(delta))),
+        "theta_max_flipped_margin_logits": max(flipped) if flipped else None,
+        "theta_min_unflipped_margin_logits": min(unflipped) if unflipped else None,
+        "flipped_reference_margin_logits": flipped,
+    }
+
+
 def emit_text(rows: list[dict[str, Any]], summary: dict[str, Any], limit: int) -> None:
     print(
         "pos target ref_arg cand_arg ref_margin cand_margin erosion budget status "
@@ -283,12 +309,14 @@ def main() -> int:
             )
         )
     summary = summarize(rows, args.margin_budget)
+    perturbation = summarize_perturbation(reference[args.skip_positions :], candidate[args.skip_positions :], rows)
     payload = {
         "reference": str(args.reference),
         "candidate": str(args.candidate),
         "top_k": args.top_k,
         "skip_positions": args.skip_positions,
         "summary": summary,
+        "perturbation": perturbation,
         "positions": rows,
     }
     emit_text(rows, summary, args.print_limit)

@@ -158,9 +158,22 @@ def is_latin_margin_token(item: dict[str, Any]) -> bool:
     return saw_letter or any(char in "\n\r\t" or unicodedata.category(char)[0] in {"N", "P", "S", "Z"} for char in text)
 
 
+def is_ascii_margin_token(item: dict[str, Any]) -> bool:
+    text = token_text(item)
+    if not text:
+        return False
+    try:
+        text.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return any(not char.isspace() for char in text) or any(char in "\n\r\t" for char in text)
+
+
 def margin_token_allowed(item: dict[str, Any], token_filter: str) -> bool:
     if token_filter == "none":
         return True
+    if token_filter == "ascii":
+        return is_ascii_margin_token(item)
     if token_filter == "latin":
         return is_latin_margin_token(item)
     raise ValueError(f"bad margin token filter {token_filter}")
@@ -274,6 +287,68 @@ def load_trace_margin_directions(
     else:
         raise ValueError(f"bad margin threshold mode {threshold_mode}")
     return pool, pairs, trace_indices, p5_margin, raw_summary, filtered_summary
+
+
+def load_many_trace_margin_directions(
+    paths: list[Path],
+    top_k: int,
+    token_filter: str,
+    threshold_mode: str,
+    fragile_margin_max: float | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, dict[str, Any], dict[str, Any]]:
+    if not paths:
+        raise ValueError("at least one --logprobs-json path is required")
+    if len(paths) == 1:
+        return load_trace_margin_directions(paths[0], top_k, token_filter, threshold_mode, fragile_margin_max)
+
+    token_pool: set[int] = set()
+    token_pairs: list[tuple[int, int]] = []
+    trace_indices: list[int] = []
+    raw_summaries: list[dict[str, Any]] = []
+    filtered_summaries: list[dict[str, Any]] = []
+    p5_values: list[float] = []
+    step_offset = 0
+    for path in paths:
+        local_pool, local_pairs, local_trace_indices, p5_margin, raw_summary, filtered_summary = load_trace_margin_directions(
+            path, top_k, token_filter, threshold_mode, fragile_margin_max
+        )
+        local_tokens = local_pool.tolist()
+        for pair in local_pairs.tolist():
+            first = int(local_tokens[int(pair[0])])
+            second = int(local_tokens[int(pair[1])])
+            token_pairs.append((first, second))
+            token_pool.add(first)
+            token_pool.add(second)
+        trace_indices.extend((local_trace_indices + step_offset).astype(np.int64).tolist())
+        raw_summaries.append({"source": str(path), **raw_summary})
+        filtered_summaries.append({"source": str(path), **filtered_summary})
+        p5_values.append(float(p5_margin))
+        step_offset += len(load_steps(path))
+
+    pool = np.asarray(sorted(token_pool), dtype=np.int64)
+    row_to_local = {int(token): i for i, token in enumerate(pool.tolist())}
+    pairs = np.asarray([[row_to_local[a], row_to_local[b]] for a, b in token_pairs], dtype=np.int64)
+    trace_index_array = np.asarray(trace_indices, dtype=np.int64)
+    raw_p5s = [float(item["reasoning_p5_margin_logits"]) for item in raw_summaries]
+    filtered_p5s = [float(item["reasoning_p5_margin_logits"]) for item in filtered_summaries]
+    raw_summary = {
+        "trace_count": len(paths),
+        "sources": raw_summaries,
+        "reasoning_p5_margin_logits": float(np.min(raw_p5s)),
+        "reasoning_min_margin_logits": float(np.min([float(item["reasoning_min_margin_logits"]) for item in raw_summaries])),
+        "reasoning_mean_margin_logits": float(np.mean([float(item["reasoning_mean_margin_logits"]) for item in raw_summaries])),
+        "aggregation": "min_p5_across_traces",
+    }
+    filtered_summary = {
+        "trace_count": len(paths),
+        "sources": filtered_summaries,
+        "reasoning_p5_margin_logits": float(np.min(filtered_p5s)),
+        "reasoning_min_margin_logits": float(np.min([float(item["reasoning_min_margin_logits"]) for item in filtered_summaries])),
+        "reasoning_mean_margin_logits": float(np.mean([float(item["reasoning_mean_margin_logits"]) for item in filtered_summaries])),
+        "used_fragile_direction_count": int(pairs.shape[0]),
+        "aggregation": "min_p5_across_traces",
+    }
+    return pool, pairs, trace_index_array, float(np.min(p5_values)), raw_summary, filtered_summary
 
 
 def read_hc_dump(path: Path) -> np.ndarray:
@@ -559,7 +634,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--d8f", required=True, type=Path)
     parser.add_argument("--layer", required=True, type=int)
-    parser.add_argument("--logprobs-json", required=True, type=Path)
+    parser.add_argument("--logprobs-json", required=True, type=Path, nargs="+")
     parser.add_argument("--acts", type=Path, default=DEFAULT_ACTS)
     parser.add_argument("--ffn-in-bin", type=Path)
     parser.add_argument("--hc-dump", type=Path)
@@ -567,7 +642,7 @@ def main() -> int:
     parser.add_argument("--experts", default="selected")
     parser.add_argument("--projection", choices=("gate", "up", "down", "all"), default="all")
     parser.add_argument("--logprobs-top-k", type=int, default=20)
-    parser.add_argument("--margin-token-filter", choices=("none", "latin"), default="latin")
+    parser.add_argument("--margin-token-filter", choices=("none", "ascii", "latin"), default="ascii")
     parser.add_argument("--margin-threshold", choices=("raw", "filtered", "min"), default="min")
     parser.add_argument(
         "--fragile-margin-max",
@@ -600,7 +675,7 @@ def main() -> int:
     if args.max_experts is not None:
         experts = experts[: args.max_experts]
 
-    token_pool, pair_local, trace_indices, p5_margin, raw_margin_summary, filtered_margin_summary_payload = load_trace_margin_directions(
+    token_pool, pair_local, trace_indices, p5_margin, raw_margin_summary, filtered_margin_summary_payload = load_many_trace_margin_directions(
         args.logprobs_json,
         args.logprobs_top_k,
         args.margin_token_filter,
@@ -654,7 +729,7 @@ def main() -> int:
         "tokens": int(acts.shape[0]),
         "experts_requested": args.experts,
         "experts_scored": len(scored),
-        "margin_trace": str(args.logprobs_json),
+        "margin_trace": [str(path) for path in args.logprobs_json],
         "reasoning_p5_margin_logits": p5_margin,
         "margin_token_filter": args.margin_token_filter,
         "margin_threshold": args.margin_threshold,
