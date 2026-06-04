@@ -56702,10 +56702,14 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
         const MTLSize down_grid = MTLSizeMake(down_tile32_recbuf ? ((ds4_down_out_dim + 31u) >> 5) : (down_tile16 ? ((ds4_down_out_dim + 15u) >> 4) : (down_tile8 ? ((ds4_down_out_dim + 7u) >> 3) : ds4_down_out_dim)),
                                               n_tokens, 1);
         const MTLSize packet_tg = MTLSizeMake(256, 1, 1);
+        const int rank1_split_packet_icb_policy =
+            ds4_gpu_env_bool("DS4_D8F_RANK1_SPLIT_PACKET_ICB");
         const int rank1_split_packet_icb = rank1_split_sidecar &&
             !down_native_i8_cbsram &&
-            ds4_gpu_env_bool("DS4_D8F_RANK1_SPLIT_PACKET_ICB") > 0 &&
-            ds4_gpu_env_bool("DS4_D8F_RANK1_SPLIT_PACKET_ICB_DISABLE") <= 0;
+            ds4_gpu_env_bool("DS4_D8F_RANK1_SPLIT_PACKET_ICB_DISABLE") <= 0 &&
+            (rank1_split_packet_icb_policy >= 0 ?
+             rank1_split_packet_icb_policy > 0 :
+             ds4_gpu_max_fusion_enabled());
         const NSUInteger packet_base_cmd = rank1_split_packet_icb ?
             (NSUInteger)86u + (NSUInteger)layer * 4u :
             (NSUInteger)layer * 2u;
@@ -56795,23 +56799,25 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                 uint64_t dot_extra[8] = { layer, n_tokens, n_experts, rank1_split_sidecar, ds4_mid_dim, ds4_down_out_dim, 0, 0 };
                 uint64_t axpy_extra[8] = { layer, n_tokens, n_experts, rank1_split_sidecar, ds4_mid_dim, ds4_down_out_dim, 0, 0 };
                 packet_icb_ready =
-	                    ds4_icb_slot_record_command(&g_d8f_packet_icb_slot, packet_rank1_dot_cmd,
-	                                                g_d8f_down_rank1_dot_batch_classic_pipeline,
-	                                                dot_bufs, dot_offs, dot_n,
-	                                                MTLSizeMake(n_experts, n_tokens, 1),
-	                                                packet_tg, 8u * (uint32_t)sizeof(float),
-	                                                dot_extra, 8) &&
+	                    ds4_icb_slot_record_command_barrier(&g_d8f_packet_icb_slot, packet_rank1_dot_cmd,
+	                                                        g_d8f_down_rank1_dot_batch_classic_pipeline,
+	                                                        dot_bufs, dot_offs, dot_n,
+	                                                        MTLSizeMake(n_experts, n_tokens, 1),
+	                                                        packet_tg, 8u * (uint32_t)sizeof(float),
+	                                                        1,
+	                                                        dot_extra, 8) &&
 	                    ds4_icb_slot_record_command_barrier(&g_d8f_packet_icb_slot, packet_down_cmd, down_pso,
 	                                                        down_bufs, down_offs, down_n,
 	                                                        down_grid, packet_tg, down_tg_mem,
-	                                                        0,
+	                                                        1,
 	                                                        down_extra, 8) &&
-                    ds4_icb_slot_record_command(&g_d8f_packet_icb_slot, packet_rank1_axpy_cmd,
-                                                g_d8f_down_rank1_axpy_batch_classic_pipeline,
-                                                axpy_bufs, axpy_offs, axpy_n,
-                                                MTLSizeMake((ds4_down_out_dim + 255u) >> 8, n_tokens, 1),
-                                                packet_tg, 0u,
-                                                axpy_extra, 8);
+                    ds4_icb_slot_record_command_barrier(&g_d8f_packet_icb_slot, packet_rank1_axpy_cmd,
+                                                        g_d8f_down_rank1_axpy_batch_classic_pipeline,
+                                                        axpy_bufs, axpy_offs, axpy_n,
+                                                        MTLSizeMake((ds4_down_out_dim + 255u) >> 8, n_tokens, 1),
+                                                        packet_tg, 0u,
+                                                        1,
+                                                        axpy_extra, 8);
             } else if (packet_icb_ready && packet_icb_gate_only_requested) {
                 packet_icb_gate_only = 1;
             } else if (packet_icb_ready) {
@@ -56849,7 +56855,8 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
 	        if (packet_icb_ready) {
 	            atomic_fetch_add_explicit(&g_ds4_d8f_packet_icb_hit_count, 1, memory_order_relaxed);
 	            const int packet_icb_range_replay =
-	                packet_icb_range_possible && !packet_icb_gate_only;
+	                (packet_icb_range_possible && !packet_icb_gate_only) ||
+	                rank1_split_packet_icb;
 	            static int s_d8f_classic_packet_icb_notice = 0;
 	            if (!s_d8f_classic_packet_icb_notice) {
 	                s_d8f_classic_packet_icb_notice = 1;
@@ -56861,7 +56868,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
 	                        packet_icb_gate_only, packet_icb_range_replay);
 	            }
 	            if (packet_icb_range_replay) {
-	                const NSUInteger packet_cmd_count = 2u;
+	                const NSUInteger packet_cmd_count = rank1_split_packet_icb ? 4u : 2u;
 	                atomic_fetch_add_explicit(&g_ds4_d8f_packet_icb_range_count, 1, memory_order_relaxed);
 	                ds4_icb_slot_use_resources(&g_d8f_packet_icb_slot, enc,
 	                                           packet_gate_cmd, packet_cmd_count,
@@ -57209,10 +57216,11 @@ int ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(const char *d8f_path,
                                             gate_bufs, gate_offs, gate_n,
                                             gate_grid, packet_tg, gate_tg_mem,
                                             gate_extra, 8) &&
-                ds4_icb_slot_record_command(&g_d8f_packet_icb_slot, packet_down_cmd, down_pso,
-                                            down_bufs, down_offs, down_n,
-                                            down_grid, packet_tg, down_tg_mem,
-                                            down_extra, 8) &&
+                ds4_icb_slot_record_command_barrier(&g_d8f_packet_icb_slot, packet_down_cmd, down_pso,
+                                                    down_bufs, down_offs, down_n,
+                                                    down_grid, packet_tg, down_tg_mem,
+                                                    1,
+                                                    down_extra, 8) &&
                 ds4_d8f_packet_icb_residency_prepare();
             if (!packet_icb_ready && !mtl4_batch_active) ds4_d8f_packet_icb_reset();
         }
@@ -57232,14 +57240,11 @@ int ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(const char *d8f_path,
                 d8f_packet_icb_notice_printed = 1;
                 fprintf(stderr,
                         "ds4_d8f: MTL4 packet ICB enabled for routed organ path "
-                        "(gateup_recbuf=%d down16=%d down32=%d)\n",
+                        "(gateup_recbuf=%d down16=%d down32=%d range=1)\n",
                         gateup_recbuf, down_tile16_recbuf, down_tile32_recbuf);
             }
-            [enc executeCommandsInBuffer:g_d8f_packet_icb_slot.icb withRange:NSMakeRange(packet_gate_cmd, 1)];
-            [enc barrierAfterEncoderStages:MTLStageDispatch
-                         beforeEncoderStages:MTLStageDispatch
-                           visibilityOptions:MTL4VisibilityOptionDevice];
-            [enc executeCommandsInBuffer:g_d8f_packet_icb_slot.icb withRange:NSMakeRange(packet_down_cmd, 1)];
+            atomic_fetch_add_explicit(&g_ds4_d8f_packet_icb_range_count, 1, memory_order_relaxed);
+            [enc executeCommandsInBuffer:g_d8f_packet_icb_slot.icb withRange:NSMakeRange(packet_gate_cmd, 2)];
         } else {
             gateAt = ds4_mtl4_pool_acquire(gate_arg_count);
             [gateAt setAddress:g_d8f_runtime_buf.gpuAddress atIndex:0];
