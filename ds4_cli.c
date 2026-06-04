@@ -88,6 +88,33 @@ static void cli_interrupt_clear(void) {
     cli_interrupted = 0;
 }
 
+enum { DS4_CLI_SELECTED_EXPERT_CAP = 6, DS4_CLI_EXPERT_COUNT = 256 };
+
+static int cli_parse_selected_experts(int argc,
+                                      char **argv,
+                                      int arg_index,
+                                      uint32_t *experts,
+                                      uint32_t *n_experts,
+                                      const char *flag) {
+    if (argc <= arg_index || !argv[arg_index] || !argv[arg_index][0] ||
+        !strcmp(argv[arg_index], "-")) {
+        return 1;
+    }
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", argv[arg_index]);
+    *n_experts = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(tmp, ",", &save);
+         tok && *n_experts < DS4_CLI_SELECTED_EXPERT_CAP;
+         tok = strtok_r(NULL, ",", &save)) {
+        long v = strtol(tok, NULL, 10);
+        if (v >= 0 && v < DS4_CLI_EXPERT_COUNT) experts[(*n_experts)++] = (uint32_t)v;
+    }
+    if (*n_experts != 0) return 1;
+    fprintf(stderr, "ds4: empty EXPERTS_CSV for %s\n", flag);
+    return 0;
+}
+
 static void usage(FILE *fp) {
     fprintf(fp,
         "Usage: ds4 [(-p PROMPT | --prompt-file FILE)] [options]\n"
@@ -3172,25 +3199,9 @@ int main(int argc, char **argv) {
     if (argc >= 3 && !strcmp(argv[1], "--d8f-mpsgraph-lut-down-canary")) {
 #if defined(__APPLE__)
         const char *path = argv[2];
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
-        uint32_t experts[ds4_cli_selected_expert_cap] = {165u, 0u, 1u, 2u, 3u, 4u};
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {165u, 0u, 1u, 2u, 3u, 4u};
         uint32_t n_experts = 1u;
-        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
-            n_experts = 0u;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0u) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-mpsgraph-lut-down-canary\n");
-                return 1;
-            }
-        }
+        if (!cli_parse_selected_experts(argc, argv, 3, experts, &n_experts, "--d8f-mpsgraph-lut-down-canary")) return 1;
         const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
         const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
         const uint32_t mode = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1u;
@@ -3205,25 +3216,9 @@ int main(int argc, char **argv) {
     if (argc >= 3 && !strcmp(argv[1], "--d8f-mpsgraph-lut-gateup-canary")) {
 #if defined(__APPLE__)
         const char *path = argv[2];
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
-        uint32_t experts[ds4_cli_selected_expert_cap] = {165u, 0u, 1u, 2u, 3u, 4u};
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {165u, 0u, 1u, 2u, 3u, 4u};
         uint32_t n_experts = 1u;
-        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
-            n_experts = 0u;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0u) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-mpsgraph-lut-gateup-canary\n");
-                return 1;
-            }
-        }
+        if (!cli_parse_selected_experts(argc, argv, 3, experts, &n_experts, "--d8f-mpsgraph-lut-gateup-canary")) return 1;
         const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
         const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
         const uint32_t mode = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1u;
@@ -3239,25 +3234,9 @@ int main(int argc, char **argv) {
     if (argc >= 3 && !strcmp(argv[1], "--d8f-mpsgraph-lut-hybrid-organ-canary")) {
 #if defined(__APPLE__)
         const char *path = argv[2];
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
-        uint32_t experts[ds4_cli_selected_expert_cap] = {165u, 0u, 1u, 2u, 3u, 4u};
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {165u, 0u, 1u, 2u, 3u, 4u};
         uint32_t n_experts = 1u;
-        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
-            n_experts = 0u;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0u) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-mpsgraph-lut-hybrid-organ-canary\n");
-                return 1;
-            }
-        }
+        if (!cli_parse_selected_experts(argc, argv, 3, experts, &n_experts, "--d8f-mpsgraph-lut-hybrid-organ-canary")) return 1;
         const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 4096u;
         const uint32_t tokens = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 1u;
         const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20u;
@@ -3587,52 +3566,20 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc >= 3 && !strcmp(argv[1], "--d8m-down-selected-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *d8m_path = argv[2];
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 26, 27, 1, 2, 3};
         uint32_t n_experts = 3;
-        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8m-down-selected-canary\n");
-                return 1;
-            }
-        }
+        if (!cli_parse_selected_experts(argc, argv, 3, experts, &n_experts, "--d8m-down-selected-canary")) return 1;
         const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
         const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
         return ds4_gpu_mtl4_d8m_down_selected_canary(
             d8m_path, experts, n_experts, rows, rounds) ? 0 : 1;
     }
     if (argc >= 3 && !strcmp(argv[1], "--d8m-down-selected-batch-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *d8m_path = argv[2];
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 26, 27, 1, 2, 3};
         uint32_t n_experts = 3;
-        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8m-down-selected-batch-canary\n");
-                return 1;
-            }
-        }
+        if (!cli_parse_selected_experts(argc, argv, 3, experts, &n_experts, "--d8m-down-selected-batch-canary")) return 1;
         const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
         const uint32_t tokens = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 8u;
         const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20u;
@@ -3640,26 +3587,10 @@ int main(int argc, char **argv) {
             d8m_path, experts, n_experts, rows, tokens, rounds) ? 0 : 1;
     }
     if (argc >= 3 && !strcmp(argv[1], "--d8f-gateup-selected-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *d8f_path = argv[2];
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 26, 27, 1, 2, 3};
         uint32_t n_experts = 3;
-        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-gateup-selected-canary\n");
-                return 1;
-            }
-        }
+        if (!cli_parse_selected_experts(argc, argv, 3, experts, &n_experts, "--d8f-gateup-selected-canary")) return 1;
         const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
         const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
         const float clamp = (argc >= 7) ? strtof(argv[6], NULL) : 10.0f;
@@ -3667,52 +3598,20 @@ int main(int argc, char **argv) {
             d8f_path, experts, n_experts, rows, rounds, clamp) ? 0 : 1;
     }
     if (argc >= 3 && !strcmp(argv[1], "--d8f-down-selected-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *d8f_path = argv[2];
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 26, 27, 1, 2, 3};
         uint32_t n_experts = 3;
-        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-down-selected-canary\n");
-                return 1;
-            }
-        }
+        if (!cli_parse_selected_experts(argc, argv, 3, experts, &n_experts, "--d8f-down-selected-canary")) return 1;
         const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
         const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
         return ds4_gpu_mtl4_d8f_down_selected_canary(
             d8f_path, experts, n_experts, rows, rounds) ? 0 : 1;
     }
     if (argc >= 3 && !strcmp(argv[1], "--d8f-metal-lut-down-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *d8f_path = argv[2];
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 26, 27, 1, 2, 3};
         uint32_t n_experts = 3;
-        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-metal-lut-down-canary\n");
-                return 1;
-            }
-        }
+        if (!cli_parse_selected_experts(argc, argv, 3, experts, &n_experts, "--d8f-metal-lut-down-canary")) return 1;
         const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 4096u;
         const uint32_t tokens = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 1u;
         const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20u;
@@ -3720,26 +3619,10 @@ int main(int argc, char **argv) {
             d8f_path, experts, n_experts, rows, tokens, rounds) ? 0 : 1;
     }
     if (argc >= 3 && !strcmp(argv[1], "--d8f-organ-selected-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *d8f_path = argv[2];
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 26, 27, 1, 2, 3};
         uint32_t n_experts = 3;
-        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-organ-selected-canary\n");
-                return 1;
-            }
-        }
+        if (!cli_parse_selected_experts(argc, argv, 3, experts, &n_experts, "--d8f-organ-selected-canary")) return 1;
         const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
         const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
         const float clamp = (argc >= 7) ? strtof(argv[6], NULL) : 10.0f;
@@ -3747,26 +3630,10 @@ int main(int argc, char **argv) {
             d8f_path, experts, n_experts, rows, rounds, clamp) ? 0 : 1;
     }
     if (argc >= 3 && !strcmp(argv[1], "--d8f-organ-selected-batch-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *d8f_path = argv[2];
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 26, 27, 1, 2, 3};
         uint32_t n_experts = 3;
-        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-organ-selected-batch-canary\n");
-                return 1;
-            }
-        }
+        if (!cli_parse_selected_experts(argc, argv, 3, experts, &n_experts, "--d8f-organ-selected-batch-canary")) return 1;
         const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8u;
         const uint32_t tokens = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2u;
         const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1u;
@@ -3775,26 +3642,10 @@ int main(int argc, char **argv) {
             d8f_path, experts, n_experts, rows, tokens, rounds, clamp) ? 0 : 1;
     }
     if (argc >= 3 && !strcmp(argv[1], "--d8f-rowblock-interleave-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *d8f_path = argv[2];
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 26, 27, 1, 2, 3};
         uint32_t n_experts = 3;
-        if (argc >= 4 && argv[3] && argv[3][0] && strcmp(argv[3], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[3]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-rowblock-interleave-canary\n");
-                return 1;
-            }
-        }
+        if (!cli_parse_selected_experts(argc, argv, 3, experts, &n_experts, "--d8f-rowblock-interleave-canary")) return 1;
         const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
         const uint32_t tokens = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 1u;
         const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1u;
@@ -3803,28 +3654,12 @@ int main(int argc, char **argv) {
             d8f_path, experts, n_experts, rows, tokens, rounds, clamp) ? 0 : 1;
     }
     if (argc >= 3 && !strcmp(argv[1], "--d8f-prefix-graph-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *d8f_dir = argv[2];
         const uint32_t first_layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 0u;
         const uint32_t n_layers = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 10u;
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 26, 27, 1, 2, 3};
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 26, 27, 1, 2, 3};
         uint32_t n_experts = 3;
-        if (argc >= 6 && argv[5] && argv[5][0] && strcmp(argv[5], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[5]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --d8f-prefix-graph-canary\n");
-                return 1;
-            }
-        }
+        if (!cli_parse_selected_experts(argc, argv, 5, experts, &n_experts, "--d8f-prefix-graph-canary")) return 1;
         const uint32_t tokens = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 1u;
         const uint32_t rounds = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 4u;
         const float clamp = (argc >= 9) ? strtof(argv[8], NULL) : 10.0f;
@@ -3834,28 +3669,12 @@ int main(int argc, char **argv) {
     /* --m1r-d8m-routed-organ-canary M1R_PACK D8M_PACK [LAYER [EXPERTS_CSV [ROWS [ROUNDS [CLAMP]]]]]
      * Runs hybrid routed organ: M1R gate/up -> D8M down in one MTL4 command buffer. */
     if (argc >= 4 && !strcmp(argv[1], "--m1r-d8m-routed-organ-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *m1r_path = argv[2];
         const char *d8m_path = argv[3];
         const uint32_t layer = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 42u;
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 1, 2, 3, 4, 5};
-        uint32_t n_experts = ds4_cli_selected_expert_cap;
-        if (argc >= 6 && argv[5] && argv[5][0] && strcmp(argv[5], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[5]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --m1r-d8m-routed-organ-canary\n");
-                return 1;
-            }
-        }
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 1, 2, 3, 4, 5};
+        uint32_t n_experts = DS4_CLI_SELECTED_EXPERT_CAP;
+        if (!cli_parse_selected_experts(argc, argv, 5, experts, &n_experts, "--m1r-d8m-routed-organ-canary")) return 1;
         const uint32_t rows = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 128u;
         const uint32_t rounds = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 20u;
         const float clamp = (argc >= 9) ? strtof(argv[8], NULL) : 10.0f;
@@ -3865,28 +3684,12 @@ int main(int argc, char **argv) {
     /* --m1r-d8m-routed-organ-batch-canary M1R_PACK D8M_PACK [LAYER [EXPERTS_CSV [ROWS [TOKENS [ROUNDS [CLAMP]]]]]]
      * Runs token-batched hybrid routed organ: M1R gate/up -> D8M down in one MTL4 command buffer. */
     if (argc >= 4 && !strcmp(argv[1], "--m1r-d8m-routed-organ-batch-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *m1r_path = argv[2];
         const char *d8m_path = argv[3];
         const uint32_t layer = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 42u;
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 1, 2, 3, 4, 5};
-        uint32_t n_experts = ds4_cli_selected_expert_cap;
-        if (argc >= 6 && argv[5] && argv[5][0] && strcmp(argv[5], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[5]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --m1r-d8m-routed-organ-batch-canary\n");
-                return 1;
-            }
-        }
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 1, 2, 3, 4, 5};
+        uint32_t n_experts = DS4_CLI_SELECTED_EXPERT_CAP;
+        if (!cli_parse_selected_experts(argc, argv, 5, experts, &n_experts, "--m1r-d8m-routed-organ-batch-canary")) return 1;
         const uint32_t rows = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 4096u;
         const uint32_t n_tokens = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 8u;
         const uint32_t rounds = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 5u;
@@ -3897,27 +3700,11 @@ int main(int argc, char **argv) {
     /* --m1r-gateup-swiglu-selected-canary PACK [LAYER [EXPERTS_CSV [ROWS [ROUNDS [CLAMP]]]]]
      * Runs selected experts directly from an M1R fixed-plane pack. */
     if (argc >= 3 && !strcmp(argv[1], "--m1r-gateup-swiglu-selected-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *m1r_path = argv[2];
         const uint32_t layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 25u;
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 1, 2, 3, 4, 5};
-        uint32_t n_experts = ds4_cli_selected_expert_cap;
-        if (argc >= 5 && argv[4] && argv[4][0] && strcmp(argv[4], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[4]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --m1r-gateup-swiglu-selected-canary\n");
-                return 1;
-            }
-        }
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 1, 2, 3, 4, 5};
+        uint32_t n_experts = DS4_CLI_SELECTED_EXPERT_CAP;
+        if (!cli_parse_selected_experts(argc, argv, 4, experts, &n_experts, "--m1r-gateup-swiglu-selected-canary")) return 1;
         const uint32_t rows = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128u;
         const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20u;
         const float clamp = (argc >= 8) ? strtof(argv[7], NULL) : 10.0f;
@@ -3927,27 +3714,11 @@ int main(int argc, char **argv) {
     /* --m1r-down-selected-canary PACK [LAYER [EXPERTS_CSV [ROWS [ROUNDS]]]]
      * Runs selected experts through direct M1R down-projection sum. */
     if (argc >= 3 && !strcmp(argv[1], "--m1r-down-selected-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *m1r_path = argv[2];
         const uint32_t layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 25u;
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 1, 2, 3, 4, 5};
-        uint32_t n_experts = ds4_cli_selected_expert_cap;
-        if (argc >= 5 && argv[4] && argv[4][0] && strcmp(argv[4], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[4]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --m1r-down-selected-canary\n");
-                return 1;
-            }
-        }
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 1, 2, 3, 4, 5};
+        uint32_t n_experts = DS4_CLI_SELECTED_EXPERT_CAP;
+        if (!cli_parse_selected_experts(argc, argv, 4, experts, &n_experts, "--m1r-down-selected-canary")) return 1;
         const uint32_t rows = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128u;
         const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20u;
         return ds4_gpu_mtl4_m1r_down_selected_canary(
@@ -3956,27 +3727,11 @@ int main(int argc, char **argv) {
     /* --m1r-routed-organ-canary PACK [LAYER [EXPERTS_CSV [ROUNDS [CLAMP]]]]
      * Runs direct M1R gate+up+SwiGLU then down-sum in one command buffer. */
     if (argc >= 3 && !strcmp(argv[1], "--m1r-routed-organ-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *m1r_path = argv[2];
         const uint32_t layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 25u;
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 1, 2, 3, 4, 5};
-        uint32_t n_experts = ds4_cli_selected_expert_cap;
-        if (argc >= 5 && argv[4] && argv[4][0] && strcmp(argv[4], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[4]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --m1r-routed-organ-canary\n");
-                return 1;
-            }
-        }
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 1, 2, 3, 4, 5};
+        uint32_t n_experts = DS4_CLI_SELECTED_EXPERT_CAP;
+        if (!cli_parse_selected_experts(argc, argv, 4, experts, &n_experts, "--m1r-routed-organ-canary")) return 1;
         const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
         const float clamp = (argc >= 7) ? strtof(argv[6], NULL) : 10.0f;
         return ds4_gpu_mtl4_m1r_routed_organ_canary(
@@ -3985,27 +3740,11 @@ int main(int argc, char **argv) {
     /* --m1r-routed-organ-batch-canary PACK [LAYER [EXPERTS_CSV [TOKENS [ROUNDS [CLAMP]]]]]
      * Compares true token-batch dispatch against per-token tensor dispatch. */
     if (argc >= 3 && !strcmp(argv[1], "--m1r-routed-organ-batch-canary")) {
-        enum { ds4_cli_selected_expert_cap = 6, ds4_cli_expert_count = 256 };
         const char *m1r_path = argv[2];
         const uint32_t layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 25u;
-        uint32_t experts[ds4_cli_selected_expert_cap] = {0, 1, 2, 3, 4, 5};
-        uint32_t n_experts = ds4_cli_selected_expert_cap;
-        if (argc >= 5 && argv[4] && argv[4][0] && strcmp(argv[4], "-")) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", argv[4]);
-            n_experts = 0;
-            char *save = NULL;
-            for (char *tok = strtok_r(tmp, ",", &save);
-                 tok && n_experts < ds4_cli_selected_expert_cap;
-                 tok = strtok_r(NULL, ",", &save)) {
-                long v = strtol(tok, NULL, 10);
-                if (v >= 0 && v < ds4_cli_expert_count) experts[n_experts++] = (uint32_t)v;
-            }
-            if (n_experts == 0) {
-                fprintf(stderr, "ds4: empty EXPERTS_CSV for --m1r-routed-organ-batch-canary\n");
-                return 1;
-            }
-        }
+        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 1, 2, 3, 4, 5};
+        uint32_t n_experts = DS4_CLI_SELECTED_EXPERT_CAP;
+        if (!cli_parse_selected_experts(argc, argv, 4, experts, &n_experts, "--m1r-routed-organ-batch-canary")) return 1;
         const uint32_t n_tokens = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 8u;
         const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 5u;
         const float clamp = (argc >= 8) ? strtof(argv[7], NULL) : 10.0f;
