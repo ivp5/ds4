@@ -136,6 +136,11 @@ static void usage(FILE *fp) {
         "      residency set. Lets very large GGUFs (e.g. q4 on 128 GB) run by leaving routed\n"
         "      expert pages to the OS page cache. Metal backend only.\n"
         "      Equivalent to --n-cpu-moe with all layers on CPU.\n"
+        "  --ssd-stream-iq2xxs\n"
+        "      Experimental 80GB IQ2_XXS path for 64GB M1: route all routed MoE pages through\n"
+        "      file-backed SSD/page-cache streaming, map only non-routed GGUF segments into\n"
+        "      Metal, disable full-file Metal residency/warmup, and allow the >52 GiB tripwire\n"
+        "      only for this explicit mode. Metal backend only; slow but bounded.\n"
         "  --n-cpu-moe N\n"
         "      Compute the routed MoE on the CPU only for the first N layers; the\n"
         "      remaining layers stay on the GPU. Matches llama.cpp's --n-cpu-moe\n"
@@ -2174,6 +2179,16 @@ static cli_config parse_options(int argc, char **argv) {
             if (!prefill_metal_phases_explicit) c.engine.prefill_metal_phases = 0;
         } else if (!strcmp(arg, "--cpu-moe")) {
             c.engine.cpu_moe = true;
+        } else if (!strcmp(arg, "--ssd-stream-iq2xxs")) {
+            c.engine.ssd_stream_iq2xxs = true;
+            c.engine.cpu_moe = true;
+            c.engine.prefill_metal_phases = 0;
+            prefill_metal_phases_explicit = true;
+            setenv("DS4_METAL_NO_RESIDENCY", "1", 0);
+            setenv("DS4_METAL_NO_MODEL_WARMUP", "1", 0);
+            fprintf(stderr,
+                    "ds4: --ssd-stream-iq2xxs enabled: routed expert pages stay file-backed; "
+                    "Metal maps only non-routed segments and skips full-file residency/warmup\n");
         } else if (!strcmp(arg, "--n-cpu-moe")) {
             c.engine.n_cpu_moe_layers = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--prefill-metal-phases")) {

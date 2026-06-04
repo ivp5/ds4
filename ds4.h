@@ -111,6 +111,7 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool cpu_moe;
+    bool ssd_stream_iq2xxs;
     int  n_cpu_moe_layers;
     /* Prefill the model in N phases, each Metal-resident.  Mutually
      * exclusive with --cpu-moe / --n-cpu-moe.  When != 0 the prefill path

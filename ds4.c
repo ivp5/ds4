@@ -20266,6 +20266,7 @@ struct ds4_engine {
  bool mtp_ready;
  bool mtp_model_aliased;   /* #674: mtp_model aliases model (embedded head) — skip close */
  bool cpu_moe;
+ bool ssd_stream_iq2xxs;
  bool cpu_model_ready;
  bool cpu_moe_layer[DS4_N_LAYER];
  /* Prefill-only Metal phase split. 0 = disabled. When >0, prefill
@@ -23755,13 +23756,18 @@ static uint64_t ds4_current_wired_bytes(void) {
 #endif
 }
 
+static bool ds4_env_mib_to_bytes(const char *env_name, uint64_t *out);
+
 /* silv 2026-05-30 (MEASURED root cause of the M1 panics): returns 1 if wiring
  * `add_bytes` of GPU memory NOW would over-commit physical RAM (the kernel-panic
  * axis — wired pages cannot be evicted), else 0. Live system-wide wired via
  * host_statistics64 also catches concurrent consumers. reserve from
- * DS4_WIRE_RESERVE_MIB (default 6 GiB). Used by the Metal residency commit to
- * DEGRADE to demand-paging instead of wiring a >RAM model: the 2026-05-30 trace
- * showed the cpu-moe view set covers the full 82.7 GB IQ2_XXS and requestResidency
+ * DS4_WIRE_RESERVE_MIB (default 6 GiB). Also enforces a hard wired-memory
+ * ceiling (default 56 decimal GB; override DS4_WIRE_HARD_LIMIT_MIB) because
+ * the local M1 Max has repeatedly shown that "phys - reserve" is too lax once
+ * other Metal consumers exist. Used by the Metal residency commit to DEGRADE
+ * to demand-paging instead of wiring a >RAM model: the 2026-05-30 trace showed
+ * the cpu-moe view set covers the full 82.7 GB IQ2_XXS and requestResidency
  * wired all of it on a 68.7 GB box (sys-wired 3->45 GB by prefill layer 1). */
 int ds4_mem_would_overcommit(uint64_t add_bytes) {
  const uint64_t phys = ds4_physical_ram_bytes();
@@ -23769,7 +23775,23 @@ int ds4_mem_would_overcommit(uint64_t add_bytes) {
  const uint64_t wired = ds4_current_wired_bytes();
  static uint64_t s_initial_wired = 0;
  static int s_auto_reserve_logged = 0;
+ static int s_hard_limit_logged = 0;
  if (s_initial_wired == 0) s_initial_wired = wired;
+ uint64_t hard_limit = 56ull * 1000ull * 1000ull * 1000ull;
+ (void)ds4_env_mib_to_bytes("DS4_WIRE_HARD_LIMIT_MIB", &hard_limit);
+ if (hard_limit > 0 && add_bytes > 0 && wired + add_bytes > hard_limit) {
+  if (!s_hard_limit_logged || getenv("DS4_RESIDENCY_VERBOSE")) {
+   s_hard_limit_logged = 1;
+   fprintf(stderr,
+           "ds4: residency hard-limit guard: wired %.2f GB + request %.2f GB "
+           "would exceed %.2f GB (DS4_WIRE_HARD_LIMIT_MIB overrides). "
+           "Skipping residency request.\n",
+           (double)wired / 1e9,
+           (double)add_bytes / 1e9,
+           (double)hard_limit / 1e9);
+  }
+  return 1;
+ }
  uint64_t reserve = (uint64_t)6 << 30;
  const char *r = getenv("DS4_WIRE_RESERVE_MIB");
  if (r && r[0]) {
@@ -24059,9 +24081,10 @@ static size_t engine_collect_cpu_moe_routed_ranges(const ds4_engine *e,
  * residency-side savings become load-bearing on a larger model, the right
  * mechanism is MTLResidencySet membership trimming — orthogonal to views.
  *
- * Diagnostic: `engine_collect_cpu_moe_routed_ranges` still computes the
- * routed-range list (used elsewhere); we just don't use it to restrict
- * views. Print the byte count for observability. */
+ * SSD-stream IQ2_XXS is the explicit exception: prefill phases are disabled,
+ * all routed dispatch stays on the file-backed CPU mmap, and Metal maps only
+ * non-routed GGUF segments. That is residency/page-cache optimization, not a
+ * CPU-vs-GPU claim. */
 static bool engine_map_metal_views_with_routed_holes(ds4_engine *e) {
  if (e->model.no_tensor_data) {
   return true;
@@ -24070,15 +24093,58 @@ static bool engine_map_metal_views_with_routed_holes(ds4_engine *e) {
  size_t nm = engine_collect_cpu_moe_routed_ranges(e, routed);
  uint64_t routed_bytes = 0;
  for (size_t i = 0; i < nm; i++) routed_bytes += routed[i].end - routed[i].start;
- free(routed);
 
- const bool ok = (ds4_gpu_set_model_map_range(
-                      e->model.map, e->model.size,
-                      e->model.tensor_data_pos,
-                      e->model.size - e->model.tensor_data_pos,
-                      e->model.size) != 0);
+ bool ok = false;
+ if (e->ssd_stream_iq2xxs && nm > 0) {
+  uint64_t *seg_off = xmalloc((nm + 1) * sizeof(*seg_off));
+  uint64_t *seg_size = xmalloc((nm + 1) * sizeof(*seg_size));
+  uint32_t nseg = 0;
+  uint64_t cursor = e->model.tensor_data_pos;
+  const uint64_t model_end = e->model.size;
+  for (size_t i = 0; i < nm; i++) {
+   uint64_t rs = routed[i].start;
+   uint64_t re = routed[i].end;
+   if (re <= cursor) continue;
+   if (rs < cursor) rs = cursor;
+   if (rs > model_end) break;
+   if (re > model_end) re = model_end;
+   if (rs > cursor) {
+    seg_off[nseg] = cursor;
+    seg_size[nseg] = rs - cursor;
+    nseg++;
+   }
+   if (re > cursor) cursor = re;
+  }
+  if (cursor < model_end) {
+   seg_off[nseg] = cursor;
+   seg_size[nseg] = model_end - cursor;
+   nseg++;
+  }
+  ok = nseg > 0 &&
+       ds4_gpu_set_model_map_segments(e->model.map, e->model.size,
+                                       seg_off, seg_size, nseg) != 0;
+  if (ok) {
+   uint64_t mapped_bytes = 0;
+   for (uint32_t i = 0; i < nseg; i++) mapped_bytes += seg_size[i];
+   fprintf(stderr,
+    "ds4: --ssd-stream-iq2xxs: Metal maps %u non-routed GGUF segments "
+    "(%.2f GiB) and excludes %.2f GiB routed expert pages from Metal "
+    "residency/view wrapping; routed pages stream through file-backed mmap\n",
+    nseg,
+    (double)mapped_bytes / (1024.0 * 1024.0 * 1024.0),
+    (double)routed_bytes / (1024.0 * 1024.0 * 1024.0));
+  }
+  free(seg_off);
+  free(seg_size);
+ } else {
+  ok = (ds4_gpu_set_model_map_range(
+                       e->model.map, e->model.size,
+                       e->model.tensor_data_pos,
+                       e->model.size - e->model.tensor_data_pos,
+                       e->model.size) != 0);
+ }
 
- if (nm > 0) {
+ if (nm > 0 && !e->ssd_stream_iq2xxs) {
   fprintf(stderr,
    "ds4: --cpu-moe: %zu routed-expert ranges (%.2f GiB) overlap with the "
    "full Metal view set — residency exclusion DISABLED (engineer-roster "
@@ -24086,6 +24152,7 @@ static bool engine_map_metal_views_with_routed_holes(ds4_engine *e) {
    "layer not residency layer)\n",
    nm, (double)routed_bytes / (1024.0 * 1024.0 * 1024.0));
  }
+ free(routed);
  return ok;
 }
 
@@ -24204,10 +24271,19 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  *out = NULL;
  return 1;
  }
+ if (opt->ssd_stream_iq2xxs && opt->backend != DS4_BACKEND_METAL) {
+ fprintf(stderr, "ds4: --ssd-stream-iq2xxs requires the Metal backend\n");
+ *out = NULL;
+ return 1;
+ }
  if ((opt->cpu_moe || opt->n_cpu_moe_layers > 0) && opt->backend != DS4_BACKEND_METAL) {
  fprintf(stderr, "ds4: CPU MoE is only supported on the Metal backend\n");
  *out = NULL;
  return 1;
+ }
+ if (opt->ssd_stream_iq2xxs) {
+ setenv("DS4_METAL_NO_RESIDENCY", "1", 0);
+ setenv("DS4_METAL_NO_MODEL_WARMUP", "1", 0);
  }
  if (opt->prefill_metal_phases < -1 || opt->prefill_metal_phases > DS4_N_LAYER) {
  fprintf(stderr,
@@ -24218,6 +24294,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  }
  if (opt->prefill_metal_phases != 0 && opt->backend != DS4_BACKEND_METAL) {
  fprintf(stderr, "ds4: --prefill-metal-phases requires the Metal backend\n");
+ *out = NULL;
+ return 1;
+ }
+ if (opt->ssd_stream_iq2xxs && opt->prefill_metal_phases != 0) {
+ fprintf(stderr,
+ "ds4: --ssd-stream-iq2xxs is a residency/page-cache streaming mode and "
+ "requires --prefill-metal-phases 0\n");
  *out = NULL;
  return 1;
  }
@@ -24261,23 +24344,36 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
    const uint64_t _DS4_SAFETY_BYTES = 52ULL * 1024ULL * 1024ULL * 1024ULL;
    const uint64_t fsz = (uint64_t)_ds4_tripwire_st.st_size;
    if (fsz > _DS4_SAFETY_BYTES) {
-    fprintf(stderr,
-     "\nds4: MEMORY-CEILING BALK — refusing to load %s (%.1f GiB > 52 GiB ceiling)\n"
-     "    A model larger than 52 GiB does not run usably on this 64 GB M1 Max by\n"
-     "    ANY residency strategy: wiring it -> kernel panic (2026-05-19/23/28);\n"
-     "    skipping the wire -> demand-pages the >RAM working set -> THRASH/unusable\n"
-     "    (2026-05-30, even WITH --prefill-metal-phases auto). 'No panic' != 'usable'.\n\n"
-     "    Use a <=52 GiB model/pack (the deployable target), or run this model on\n"
-     "    AMD/nvidia. To bypass at your own risk (panic/thrash):\n"
-     "      DS4_DISABLE_SIZE_TRIPWIRE=1 ds4 ...\n\n",
-     opt->model_path, (double)fsz / (1024.0 * 1024.0 * 1024.0));
-    if (!getenv("DS4_DISABLE_SIZE_TRIPWIRE")) {
+    const bool stream_ok = opt->ssd_stream_iq2xxs &&
+                           opt->backend == DS4_BACKEND_METAL &&
+                           opt->prefill_metal_phases == 0;
+    if (stream_ok) {
+     fprintf(stderr,
+      "\nds4: MEMORY-CEILING STREAM — loading %s (%.1f GiB > 52 GiB) via "
+      "--ssd-stream-iq2xxs\n"
+      "    This maps only non-routed Metal segments, skips full-file "
+      "residency/warmup, and keeps routed experts file-backed/page-cache "
+      "streamed. This is not full-model residency.\n\n",
+      opt->model_path, (double)fsz / (1024.0 * 1024.0 * 1024.0));
+    } else if (!getenv("DS4_DISABLE_SIZE_TRIPWIRE")) {
+     fprintf(stderr,
+      "\nds4: MEMORY-CEILING BALK — refusing to load %s (%.1f GiB > 52 GiB ceiling)\n"
+      "    A model larger than 52 GiB does not run usably on this 64 GB M1 Max by\n"
+      "    ANY full-residency strategy: wiring it -> kernel panic (2026-05-19/23/28);\n"
+      "    skipping the wire -> demand-pages the >RAM working set -> THRASH/unusable\n"
+      "    (2026-05-30, even WITH --prefill-metal-phases auto). 'No panic' != 'usable'.\n\n"
+      "    Use a <=52 GiB model/pack, run this model on AMD/nvidia, or use the explicit\n"
+      "    residency-bounded --ssd-stream-iq2xxs path. To bypass at your own risk:\n"
+      "      DS4_DISABLE_SIZE_TRIPWIRE=1 ds4 ...\n\n",
+      opt->model_path, (double)fsz / (1024.0 * 1024.0 * 1024.0));
      /* engine struct not yet allocated; nothing to free. Abort early. */
      *out = NULL;
      return 2;
     }
-    fprintf(stderr,
-     "ds4: DS4_DISABLE_SIZE_TRIPWIRE=1 set — proceeding at silv's own risk (panic/thrash).\n");
+    if (!stream_ok && getenv("DS4_DISABLE_SIZE_TRIPWIRE")) {
+     fprintf(stderr,
+      "ds4: DS4_DISABLE_SIZE_TRIPWIRE=1 set — proceeding at silv's own risk (panic/thrash).\n");
+    }
    }
   } else {
    /* stat failure is non-fatal here; the GGUF loader downstream will
@@ -24290,6 +24386,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  e->mtp_model.fd = -1;
  e->backend = opt->backend;
  e->quality = opt->quality;
+ e->ssd_stream_iq2xxs = opt->ssd_stream_iq2xxs;
  e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
  if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
  e->mtp_draft_tree_width = opt->mtp_draft_tree_width > 0 ? opt->mtp_draft_tree_width : 1;
@@ -24396,6 +24493,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  * different artifact: no GGUF routed residency is being swapped, and H2766
  * shows phase-free GPU runtime is the faster path. */
  int n_cpu = opt->n_cpu_moe_layers;
+ if (opt->ssd_stream_iq2xxs) n_cpu = DS4_N_LAYER;
  if (opt->cpu_moe && n_cpu == 0) n_cpu = DS4_N_LAYER;
  const bool d8f_external_single_phase =
  engine_has_external_d8f_routed_pack() &&
@@ -24450,7 +24548,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  * that chain. Removing it severs the trace -> manifest -> runtime
  * connection: the manifests become CSV files no code consumes. */
  const char *pin_path = getenv("DS4_LAYER_PIN_FILE");
- if (pin_path && pin_path[0] && e->backend == DS4_BACKEND_METAL) {
+ if (pin_path && pin_path[0] && e->ssd_stream_iq2xxs) {
+ fprintf(stderr,
+ "ds4: DS4_LAYER_PIN_FILE ignored under --ssd-stream-iq2xxs; all routed "
+ "expert pages must stay outside Metal residency\n");
+ } else if (pin_path && pin_path[0] && e->backend == DS4_BACKEND_METAL) {
  FILE *pf = fopen(pin_path, "r");
  if (!pf) {
  fprintf(stderr,
@@ -24546,7 +24648,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  * separate MAP_PRIVATE cpu_model mmap; pulling them into the Metal-shared
  * page cache here would push warmed bytes past RAM and cause the kernel
  * to evict pages mid-warm, re-reading the file several times over. */
- if (opt->warm_weights) {
+ if (opt->warm_weights && e->ssd_stream_iq2xxs) {
+ fprintf(stderr,
+ "ds4: --warm-weights ignored under --ssd-stream-iq2xxs; dense prefetching "
+ "the 80GB GGUF defeats SSD/page-cache streaming\n");
+ } else if (opt->warm_weights) {
  ds4_byte_range *skip = NULL;
  size_t n_skip = 0;
  if (e->cpu_moe) {

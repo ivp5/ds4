@@ -895,6 +895,7 @@ typedef struct {
 
 static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
 static uint32_t g_model_view_count;
+static int g_model_map_batch_depth;
 
 /* silv 2026-05-28 #771 B+D — forward declared so the early callers in
  * ds4_gpu_map_model_views can call this before the definition lower down.
@@ -1075,6 +1076,7 @@ static uint64_t round_up_u64(uint64_t v, uint64_t align) {
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
 static void ds4_d8f_packet_icb_reset(void);
 static int ds4_gpu_warm_model_views(void);
+static int ds4_gpu_finalize_model_views(void);
 
 /* task #560: ICB record→replay for kernel_dsv4_router_weights_one. Defined
  * far below alongside the route_remap helpers; declared here for use by the
@@ -1315,6 +1317,14 @@ static int ds4_gpu_map_model_views(
  }
 
  const double t_mapped = ds4_gpu_now_ms();
+ if (g_model_map_batch_depth > 0) {
+ fprintf(stderr,
+ "ds4: Metal model view segment created in %.3f ms (mapped %.2f MiB from offset %.2f MiB)\n",
+ t_mapped - t0,
+ mapped_model_size / 1024.0 / 1024.0,
+ page_model_offset / 1024.0 / 1024.0);
+ return 1;
+ }
  const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
  if (request_residency) ds4_gpu_progress_begin("requesting Metal residency (may take tens of seconds)");
  if (!ds4_gpu_model_residency_request_views()) {
@@ -1344,8 +1354,9 @@ static int ds4_gpu_map_model_views(
  }
  const double t_warm = ds4_gpu_now_ms();
  fprintf(stderr,
- "ds4: Metal model views created in %.3f ms, residency requested in %.3f ms, warmup %.3f ms (mapped %.2f MiB from offset %.2f MiB)\n",
+ "ds4: Metal model views created in %.3f ms, residency %s in %.3f ms, warmup %.3f ms (mapped %.2f MiB from offset %.2f MiB)\n",
  t_mapped - t0,
+ request_residency ? "requested" : "disabled",
  t_resident - t_mapped,
  t_warm - t_warm0,
  mapped_model_size / 1024.0 / 1024.0,
@@ -6293,6 +6304,7 @@ fprintf(stderr,
  g_model_map_size = 0;
  g_model_mapped_offset = 0;
  g_model_mapped_size = 0;
+ g_model_map_batch_depth = 0;
  g_tensor_alloc_live_bytes = 0;
  g_tensor_alloc_peak_bytes = 0;
  g_flash_attn_mask_bytes = 0;
@@ -6639,6 +6651,57 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
  return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, model_size);
+}
+
+int ds4_gpu_set_model_map_segments(const void *model_map, uint64_t model_size,
+ const uint64_t *map_offsets, const uint64_t *map_sizes, uint32_t count) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (!model_map || model_size == 0 || !map_offsets || !map_sizes || count == 0) return 0;
+
+ @autoreleasepool {
+ ds4_gpu_model_residency_clear();
+ ds4_gpu_model_views_clear();
+ g_model_map_ptr = model_map;
+ g_model_map_size = model_size;
+ g_model_mapped_offset = map_offsets[0];
+ g_model_mapped_size = 0;
+
+ uint64_t total = 0;
+ int ok = 1;
+ g_model_map_batch_depth++;
+ for (uint32_t i = 0; i < count; i++) {
+  const uint64_t off = map_offsets[i];
+  const uint64_t size = map_sizes[i];
+  if (size == 0 || off > model_size || size > model_size - off) {
+   ok = 0;
+   break;
+  }
+  if (!ds4_gpu_map_model_views(model_map, model_size, off, size)) {
+   ok = 0;
+   break;
+  }
+  total += size;
+ }
+ g_model_map_batch_depth--;
+
+ if (!ok) {
+  ds4_gpu_model_residency_clear();
+  ds4_gpu_model_views_clear();
+  return 0;
+ }
+
+ g_model_mapped_size = total;
+ if (!ds4_gpu_finalize_model_views()) {
+  ds4_gpu_model_residency_clear();
+  ds4_gpu_model_views_clear();
+  return 0;
+ }
+ fprintf(stderr,
+ "ds4: Metal mapped segmented mmaped model as %u overlapping shared buffers "
+ "across %u source segments (%.2f MiB total)\n",
+ g_model_view_count, count, total / 1024.0 / 1024.0);
+ return 1;
+ }
 }
 
 int ds4_gpu_set_model_fd(int fd) {
@@ -51324,7 +51387,8 @@ static int ds4_gpu_finalize_model_views(void) {
  }
  const double t_warm = ds4_gpu_now_ms();
  fprintf(stderr,
- "ds4: Metal residency requested in %.3f ms, warmup %.3f ms\n",
+ "ds4: Metal residency %s in %.3f ms, warmup %.3f ms\n",
+ request_residency ? "requested" : "disabled",
  t_resident - t0,
  t_warm - t_resident);
  return warmed;

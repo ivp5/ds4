@@ -207,12 +207,12 @@ unless the caller explicitly provides concatenated trace-row activations.
 observed θ=max flipped reference margin; `tools/ds4_margin_perturbation_correlation.py`
 reproduced the current norm→θ canary (`corr_l2_theta=0.9640`, θ 0.0586→0.8591
 over four flipped candidates), so the trace set must be norm-stratified as well
-as domain-diverse. Treat top-pool per-token logit error under ~1 logit as a
-reasoning-token safety budget, not a standalone proof: existing artifacts show
-large errors can avoid argmax flips when the reference margin is wide, while
-small errors can still flip razor-thin margins. The promotion gate therefore
-tracks both `P95(head-projected fragile-token codec error) < P5(reasoning margin)`
-and `top_pool_abs_logit_error <= 1.0` on materialized reasoning traces.
+as domain-diverse. The current codec promotion metric is per-token logit-space
+error on reasoning tokens: require `top_pool_abs_logit_error <= 1.0` on
+materialized reasoning traces and use `P95(head-projected fragile-token codec
+error) < P5(reasoning margin)` as the explanatory prefilter. This supersedes
+weight rel-L2 and act-aware rel-L2 as the SOTA selector; AIME is post-hoc
+confirmation, not the tuned objective.
 
 Gate/up residual triage: global rank-1/rank-8 and row-block rank-1/rank-8
 residual probes on H3371 L40/E104 are too weak for the byte cost; gate act-rel
@@ -466,12 +466,14 @@ decimal, so local launch tooling must preflight wired memory and refuse projecte
 usage above 56 GB. `tools/ds4_run_margin_trace_suite.py` now does that by
 default (`--wired-limit-gb 56`, H3384 estimate 47 GB).
 
-IQ2_XXS full GGUF is not an SSD-streaming candidate in the current primary path:
-the local file is 80.8 GiB and the live no-bypass probe exits at the engine
-`MEMORY-CEILING BALK` before mmap. Existing code comments state that phasing and
-CPU-MoE can avoid a kernel panic but still demand-page a >RAM working set into
-thrash; proper SSD streaming would require a sidecar slot-bank/pread runtime
-like the Anemll fork, not just bypassing `DS4_DISABLE_SIZE_TRIPWIRE`.
+IQ2_XXS full GGUF now has an explicit experimental streaming path:
+`--ssd-stream-iq2xxs`. This is a residency/page-cache mode, not a CPU-vs-GPU
+claim: all routed expert pages stay outside Metal view/residency wrapping and
+stream through the file-backed mmap, while Metal maps only non-routed GGUF
+segments and skips full-file residency/warmup. The 80.8 GiB size tripwire is
+overridden only for this explicit mode; the 56 GB wired hard cap still governs
+all residency requests. Use it to measure IQ2_XXS logit-space fidelity and
+token-margin tails, not as a performance claim until throughput is measured.
 
 ## Files
 
