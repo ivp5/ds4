@@ -197,13 +197,17 @@ calibration cross-product probe.
 The single 18-step echo trace is only a bifurcation canary. Promotion traces
 must be diversified across AIME/math, code, tool/schema text, complex prose,
 systems explanations, and ordinary chat; `tools/ds4_margin_trace_suite.py`
-builds an 18-prompt JSONL manifest from existing repo samples. The predictor
-now accepts multiple `--logprobs-json` paths, unions their fragile ASCII margin
-directions, and uses the weakest per-trace P5 margin. `tools/ds4_logit_margin_eval.py`
-also reports logit perturbation magnitude and observed θ=max flipped reference
-margin; `tools/ds4_margin_perturbation_correlation.py` reproduced the current
-norm→θ canary (`corr_l2_theta=0.9640`, θ 0.0586→0.8591 over four flipped
-candidates), so the trace set must be norm-stratified as well as domain-diverse.
+builds an 18-prompt JSONL manifest from existing repo samples, and
+`tools/ds4_run_margin_trace_suite.py` materializes those prompts and captures
+one `--dump-logprobs` JSON per row. The predictor now accepts multiple
+`--logprobs-json` paths, unions their fragile ASCII margin directions, and uses
+the weakest per-trace P5 margin; auto-alignment stays off for multi-trace inputs
+unless the caller explicitly provides concatenated trace-row activations.
+`tools/ds4_logit_margin_eval.py` also reports logit perturbation magnitude and
+observed θ=max flipped reference margin; `tools/ds4_margin_perturbation_correlation.py`
+reproduced the current norm→θ canary (`corr_l2_theta=0.9640`, θ 0.0586→0.8591
+over four flipped candidates), so the trace set must be norm-stratified as well
+as domain-diverse.
 
 Gate/up residual triage: global rank-1/rank-8 and row-block rank-1/rank-8
 residual probes on H3371 L40/E104 are too weak for the byte cost; gate act-rel

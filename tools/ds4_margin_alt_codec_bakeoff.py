@@ -457,7 +457,12 @@ def main() -> int:
     elif args.trace_row_mode == "cross":
         trace_row_mode = "cross"
     else:
-        can_align = bool(args.ffn_in_bin or args.hc_dump) and bool(trace_indices.size) and int(np.max(trace_indices)) < acts.shape[0]
+        can_align = (
+            len(args.logprobs_json) == 1
+            and bool(args.ffn_in_bin or args.hc_dump)
+            and bool(trace_indices.size)
+            and int(np.max(trace_indices)) < acts.shape[0]
+        )
         trace_row_mode = "aligned" if can_align else "cross"
     head_rows = load_head_rows(MODEL_DIR, index, token_pool)
     margin_dirs = head_rows[pair_local[:, 0]] - head_rows[pair_local[:, 1]]
