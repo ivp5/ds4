@@ -169,7 +169,7 @@ they pass real selected-layer D8F, overlap, and fidelity gates.
 | `ds4flash.gguf` (IQ2_XXS w2 imatrix) | 86.7 GB | Production | Full AIME P01-P10 reachable |
 | `DeepSeek-V4-Flash_H3384_H3382_all43_route_hotblock_sidecar_top6_down_native_codes_D8F_800kctx_probe_20260604` | 41 GB file / ~17.6 GB process RSS during current smoke / ~46 GB peak system wired during prefill | Default speed candidate, **not fidelity SOTA** | H3384 hot-block D8F + top6 native down-code sidecars; no-flag CLI can discover it, but normal generation is blocked before model load because agent2 A194-A203 and local `--coherence-gate` show dynamic AIME echo collapse; temp=0.6 seed=1 fails malformed-burst at token 13, and `DS4_D8F_RUNTIME_NATIVE_DOWN_DISABLE=1` still fails greedy at token 26, so recurrence is in the base D8F codec/allocation, not only native-down sidecar runtime or greedy sampling |
 | `DeepSeek-V4-Flash_H3385_H3384_sparse_groupcode_sidecars_D8F_800kctx_probe_20260604` | 487 MB hardlink overlay on H3384 | Experimental sparse sidecar overlay, **not a self-contained flat-pack** | D8F payloads are hardlinks to H3384 and the directory lacks the metadata GGUF + non-routed pack required by `--flat-pack`; sparse+rank1 Metal selected-layer canaries are exact but slower than native-code sidecars and inherit H3384 coherence risk |
-| `DeepSeek-V4-Flash_H3373_H3216_source_down_late_route_hot_gateup_repair_D8F_800kctx_20260604` | Rebuild target; allocator predicts ~51.77 GB with current metadata + non-routed pack extras | Current general-fidelity rebuild target, **not locally fully encoded yet** | Agent2 identified the echo-causing loss as gate/up; H3372 then exposed that late down was over-demoted. `tools/ds4_h3371_allocator.py --base-policy source --late-hot-gateup-threshold 0.02` keeps H3216 down allocation and promotes 40 L40-L42 route-hot gate/up records to K2048/K4096, leaving ~226 MB decimal margin under 52 GB. L40 top-8 hot canary beats H3384 on all projections: mean rel-L2 gate `0.4522` vs `0.4596`, up `0.4156` vs `0.4215`, down `0.5473` vs `0.5544`. |
+| `DeepSeek-V4-Flash_H3373_H3216_source_down_late_route_hot_gateup_repair_D8F_800kctx_20260604` | Rebuild target; allocator predicts ~51.77 GB with current metadata + non-routed pack extras | Current general-fidelity rebuild target, **not locally fully encoded yet** | Agent2 identified the echo-causing loss as gate/up; H3372 then exposed that late down was over-demoted. `tools/ds4_h3371_allocator.py --base-policy source --late-hot-gateup-threshold 0.02` keeps H3216 down allocation and promotes 40 L40-L42 route-hot gate/up records to K2048/K4096, leaving ~226 MB decimal margin under 52 GB. L40 rel-L2 canaries beat H3384, but promotion now requires `tools/ds4_head_margin_sensitivity.py`: `P95(|head_Latin(selected-worst) · J_norm · (W-Wq) · X|) < P5(reasoning margin)`. |
 | `DeepSeek-V4-Flash_H3372_H3371_late_route_hot_gateup_repair_D8F_800kctx_20260604` | Rebuild target; allocator predicts ~51.64 GB with current metadata + non-routed pack extras | Superseded by H3373 source-down repair | H3372 keeps H3371's late-down budget repair and promotes route-hot gate/up, leaving ~357 MB margin. L40/E104 gate/up improves to `0.450/0.414`, but top-8 hot down worsens vs H3384 by mean rel-L2 `+0.113`; H3373 restores H3216 down while still fitting. |
 | `DeepSeek-V4-Flash_H3371_H3216_budget_repair_no_overlay_D8F_800kctx_20260603` | Rebuild target; allocator predicts ~51.60 GB with current metadata + non-routed pack extras | Superseded by H3372/H3373 | `tools/ds4_h3371_allocator.py` regenerates the non-AIME policy from H3216: demote L40-L42 down records to K512 and demote the 186 weakest L40 down rows to K256. Audit found it left the L40-L42 route-hot gate/up records at K256/K256, matching Agent2's gate/up-loss diagnosis. |
 | `DS4-trim50-asym-with-metadata.gguf` | 26 GB | Path A trim | **4× gen speedup BUT arithmetic carry breaks** (shifts cite v_P+5 vs v_P+9 collapse) |
@@ -182,6 +182,17 @@ expert. The first L40 canaries refute the easy "missing codebook scalar" bug:
 optimal decoded→source scalars are ~0.91-0.99 for E0/E192/E236 gate/up/down,
 while rel-L2 remains ~0.46-0.60. So the sampled echo is not fixed by a global
 scale multiplier; the current evidence points at allocation/codec fidelity.
+
+Margin-sensitivity triage is now the fidelity selector. `tools/ds4_logprob_margin_gate.py`
+extracts the reasoning margin tail from `--dump-logprobs`; the agent2 H3384
+echo trace has `reasoning_p5_margin_logits=0.0768974` and six fragile
+selected-vs-nearest-Latin-competitor directions under 0.5 logits.
+`tools/ds4_head_margin_sensitivity.py` projects codec error through the output
+head rows for those directions, applies the RMSNorm JVP, and scores the
+linearized influence on fragile rows. Its default backend is MLX/GPU when
+available; exact trace runs should supply `--ffn-in-bin` and `--hc-dump` so
+`--trace-row-mode auto` uses aligned per-token influence instead of the
+calibration cross-product probe.
 
 Gate/up residual triage: global rank-1/rank-8 and row-block rank-1/rank-8
 residual probes on H3371 L40/E104 are too weak for the byte cost; gate act-rel
@@ -399,7 +410,9 @@ Deferred:
    DS4_BENCH_QUIET=1 to disable for piped CSV-only output)
 6. **MTP is retired** — don't enable speculative decoding on M1
 7. **trim50 file**: use for non-math; arithmetic carry breaks
-8. **Pillars env-gated** — none auto-active; enable when you have a
+8. **Codec promotion is margin-gated** — rel-L2/act-aware are triage only;
+   require `P95(head-projected fragile-token codec error) < P5(reasoning margin)`
+9. **Pillars env-gated** — none auto-active; enable when you have a
    measurement target
 
 ## Anemll ds4-ssd fork notes — measured borrowing only
@@ -416,8 +429,8 @@ selected-layer/end-to-end win and coherence gate pass.
 
 Borrowed now: make the measured speed-only recipe explicit — H3384 + Metal +
 PRIME + `prefill-metal-phases auto`, with dynamic coherence refuted by greedy
-and sampled gates. The primary fidelity direction is the H3371 general-fit
-rebuild, not another sampler setting on H3384.
+and sampled gates. The primary fidelity direction is the H3373 margin-gated
+general-fit rebuild, not another sampler setting on H3384.
 Fork lesson kept for future sidecar work:
 M1-class profiles keep ANE routed prefill off unless measured; 16K prefill
 chunks require raw-cap headroom (`128 + chunk`, aligned), and SSD/I/O knobs
