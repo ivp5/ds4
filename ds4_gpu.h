@@ -33,6 +33,7 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_mtl_buffer(const ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_mtl_offset(const ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
+int ds4_gpu_logits_mask_reserved_specials(ds4_gpu_tensor *logits, uint32_t n_vocab, uint32_t n_rows);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,

@@ -231,9 +231,7 @@ def aqlm_m2_k32_quantizer(group: int, sample_blocks: int, iters: int) -> Quantiz
             design = np.zeros((sample.shape[0], 2 * k), dtype=np.float32)
             design[row_ids, i1] = 1.0
             design[row_ids, k + i2] = 1.0
-            lhs = design.T @ design + np.eye(2 * k, dtype=np.float32) * 1.0e-5
-            rhs = design.T @ sample
-            solved = np.linalg.solve(lhs, rhs).astype(np.float32)
+            solved = np.linalg.lstsq(design, sample, rcond=1e-4)[0].astype(np.float32)
             c1 = solved[:k]
             c2 = solved[k:]
         combos = (c1[:, None, :] + c2[None, :, :]).reshape(k * k, 8)

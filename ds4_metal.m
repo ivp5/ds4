@@ -690,6 +690,7 @@ static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
 static uint64_t g_model_mapped_size;
+static int g_model_map_requires_view_coverage;
 static uint64_t g_tensor_alloc_live_bytes;
 static uint64_t g_tensor_alloc_peak_bytes;
 static uint64_t g_model_wrap_count;
@@ -1125,6 +1126,7 @@ static void ds4_gpu_model_views_clear(void) {
  g_model_views[i].bytes = 0;
  }
  g_model_view_count = 0;
+ g_model_map_requires_view_coverage = 0;
 }
 
 /* silv 2026-05-30: gate EVERY requestResidency on live availability (not only the
@@ -5895,6 +5897,46 @@ int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count)
  return 1;
 }
 
+int ds4_gpu_logits_mask_reserved_specials(ds4_gpu_tensor *logits, uint32_t n_vocab, uint32_t n_rows) {
+ enum {
+  ds4_reserved_special_first = 128847u,
+  ds4_reserved_special_count = 416u
+ };
+ if (!logits || n_rows == 0) return 0;
+ if (getenv("DS4_DISABLE_NATIVE_SPECIAL_TOKEN_MASK") != NULL) return 1;
+ if (n_vocab < ds4_reserved_special_first + ds4_reserved_special_count) return 1;
+ const uint64_t row_bytes = (uint64_t)n_vocab * sizeof(float);
+ const uint64_t required_bytes = row_bytes * (uint64_t)n_rows;
+ if (n_rows != 0 && row_bytes != 0 && required_bytes / row_bytes != (uint64_t)n_rows) return 0;
+ if (ds4_gpu_tensor_bytes(logits) < required_bytes) return 0;
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+
+ @autoreleasepool {
+  DS4MetalTensor *obj = ds4_gpu_tensor_obj(logits);
+  if (!obj || !obj.buffer) return 0;
+  int owned = 0;
+  id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+  if (!cb) return 0;
+  int ok = 1;
+  const float neg_inf = -1.0e30f;
+  const uint64_t first_byte = (uint64_t)ds4_reserved_special_first * sizeof(float);
+  for (uint32_t row = 0; row < n_rows; row++) {
+   const NSUInteger offset = (NSUInteger)(obj.offset + (uint64_t)row * row_bytes + first_byte);
+   if (!ds4_gpu_encode_fill_f32_rows(cb,
+                                     obj.buffer,
+                                     offset,
+                                     ds4_reserved_special_count,
+                                     1,
+                                     neg_inf)) {
+    ok = 0;
+    break;
+   }
+  }
+  if (owned && !ds4_gpu_finish_command_buffer(cb, owned, "mask reserved special logits")) ok = 0;
+  return ok;
+ }
+}
+
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
  if (!tensor || (!data && bytes != 0)) return 0;
  DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
@@ -6638,6 +6680,7 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
  g_model_map_size = model_size;
  g_model_mapped_offset = map_offset;
  g_model_mapped_size = map_size;
+ g_model_map_requires_view_coverage = 0;
  if (!ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size)) {
  ds4_gpu_model_residency_clear();
  return 0;
@@ -6665,6 +6708,7 @@ int ds4_gpu_set_model_map_segments(const void *model_map, uint64_t model_size,
  g_model_map_size = model_size;
  g_model_mapped_offset = map_offsets[0];
  g_model_mapped_size = 0;
+ g_model_map_requires_view_coverage = 0;
 
  uint64_t total = 0;
  int ok = 1;
@@ -6687,6 +6731,7 @@ int ds4_gpu_set_model_map_segments(const void *model_map, uint64_t model_size,
  if (!ok) {
   ds4_gpu_model_residency_clear();
   ds4_gpu_model_views_clear();
+  g_model_map_requires_view_coverage = 0;
   return 0;
  }
 
@@ -6694,8 +6739,10 @@ int ds4_gpu_set_model_map_segments(const void *model_map, uint64_t model_size,
  if (!ds4_gpu_finalize_model_views()) {
   ds4_gpu_model_residency_clear();
   ds4_gpu_model_views_clear();
+  g_model_map_requires_view_coverage = 0;
   return 0;
  }
+ g_model_map_requires_view_coverage = 1;
  fprintf(stderr,
  "ds4: Metal mapped segmented mmaped model as %u overlapping shared buffers "
  "across %u source segments (%.2f MiB total)\n",
@@ -6707,6 +6754,38 @@ int ds4_gpu_set_model_map_segments(const void *model_map, uint64_t model_size,
 int ds4_gpu_set_model_fd(int fd) {
  (void)fd;
  return 1;
+}
+
+static int32_t ds4_gpu_find_model_view(
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t offset,
+ uint64_t len,
+ uint32_t *match_count) {
+ if (match_count) *match_count = 0;
+ if (len > UINT64_MAX - offset) return -1;
+ const uint64_t end = offset + len;
+ int32_t best_i = -1;
+ uint64_t best_bytes = UINT64_MAX;
+ uint32_t n_matches = 0;
+ for (uint32_t i = 0; i < g_model_view_count; i++) {
+  if (g_model_views[i].model_map != model_map ||
+      g_model_views[i].model_size != model_size) {
+   continue;
+  }
+  const uint64_t view_start = g_model_views[i].model_offset;
+  if (g_model_views[i].bytes > UINT64_MAX - view_start) continue;
+  const uint64_t view_end = view_start + g_model_views[i].bytes;
+  if (offset >= view_start && end <= view_end) {
+   n_matches++;
+   if (g_model_views[i].bytes < best_bytes) {
+    best_bytes = g_model_views[i].bytes;
+    best_i = (int32_t)i;
+   }
+  }
+ }
+ if (match_count) *match_count = n_matches;
+ return best_i;
 }
 
 static id<MTLBuffer> ds4_gpu_wrap_model_range(
@@ -6733,25 +6812,8 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
   * [offset, offset+len). The per-tensor view (smallest) wins over the
   * huge embed/head view. Still O(n) but n ≤ DS4_METAL_MAX_MODEL_VIEWS so
   * the walk cost is negligible vs the lookup correctness payoff. */
- const uint64_t end = offset + len;
- int32_t best_i = -1;
- uint64_t best_bytes = UINT64_MAX;
  uint32_t n_matches = 0;
- for (uint32_t i = 0; i < g_model_view_count; i++) {
-  if (g_model_views[i].model_map != model_map ||
-      g_model_views[i].model_size != model_size) {
-   continue;
-  }
-  const uint64_t view_start = g_model_views[i].model_offset;
-  const uint64_t view_end = view_start + g_model_views[i].bytes;
-  if (offset >= view_start && end <= view_end) {
-   n_matches++;
-   if (g_model_views[i].bytes < best_bytes) {
-    best_bytes = g_model_views[i].bytes;
-    best_i = (int32_t)i;
-   }
-  }
- }
+ int32_t best_i = ds4_gpu_find_model_view(model_map, model_size, offset, len, &n_matches);
  if (best_i >= 0) {
   /* silv 2026-05-29 #816 — counter: how often did most-specific-match
    * actually disambiguate? n_matches>1 means the pre-fix first-match-wins
@@ -6815,7 +6877,7 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
  fprintf(stderr,
   "ds4: Metal model range %.2f..%.2f GiB is not covered by mapped model views\n",
   ds4_gpu_gib(offset),
-  ds4_gpu_gib(end));
+  ds4_gpu_gib(offset + len));
  return nil;
 }
 
@@ -6868,16 +6930,13 @@ static int ds4_gpu_range_resolvable(
  uint64_t model_size,
  uint64_t offset,
  uint64_t bytes) {
- if (offset <= model_size && bytes <= model_size - offset) return 1;
- const uint64_t end = offset + bytes;
- for (uint32_t i = 0; i < g_model_view_count; i++) {
-  if (g_model_views[i].model_map != model_map) continue;
-  if (g_model_views[i].model_size != model_size) continue;
-  const uint64_t view_start = g_model_views[i].model_offset;
-  const uint64_t view_end = view_start + g_model_views[i].bytes;
-  if (offset >= view_start && end <= view_end) return 1;
+ if (ds4_gpu_find_model_view(model_map, model_size, offset, bytes, NULL) >= 0) return 1;
+ if (g_model_map_requires_view_coverage &&
+     model_map == g_model_map_ptr &&
+     model_size == g_model_map_size) {
+  return 0;
  }
- return 0;
+ return offset <= model_size && bytes <= model_size - offset;
 }
 
 int ds4_gpu_indexer_score_one_tensor(
@@ -7764,36 +7823,34 @@ int ds4_gpu_matmul_q8_0_storage(
 }
 
 /* === ICB dense-path (silv 2026-05-29 task #822) ===========================================
- * Route the fixed-shape dense Q8_0 MATVEC (n_tok==1: q_a/q_b/kv/attn_o/shared gate/up/down)
- * through ds4_icb_slot record→replay to kill ~252 per-token re-encodes (0.52 t/s is dispatch-
- * bound, ~600x below the bandwidth ceiling). Mirrors the WORKING g_vqb2_decode_matmul_slot.
- * CRUX: ICB indirect commands cannot use setBytes — so mv_args lives in a per-slot MTLBuffer
- * at binding 0 (the mul_mv kernel reads [[buffer(0)]] identically whether fed by setBytes or a
- * buffer, so NO kernel change). Signature is token-stable (fixed weight buf, reused scratch
- * x/out, fixed grid/tg/smem/args per (layer,role)) ⇒ replay hits every token after the first. */
+ * Opt-in canary for fixed-shape dense Q8_0 MATVEC (n_tok==1:
+ * q_a/q_b/kv/attn_o/shared gate/up/down). The isolated kernel canary is not
+ * a runtime proof: the 2026-06-04 full-logit decode matrix showed enabling
+ * this path alone produces huge corrupted logits on IQ2_XXS. Keep it
+ * explicit until a same-prompt direct-vs-ICB decode oracle proves agreement. */
 static int ds4_gpu_dense_matvec_icb_enabled(void) {
  if (!g_dense_matvec_icb_env_checked) {
   const int disabled = ds4_gpu_env_bool("DS4_DENSE_MATVEC_ICB_DISABLE") > 0 ||
                        ds4_gpu_env_bool("DS4_ICB_DENSE_MATVEC_DISABLE") > 0;
   const int explicit_dense = ds4_gpu_env_bool("DS4_DENSE_MATVEC_ICB");
   const int explicit_legacy = ds4_gpu_env_bool("DS4_ICB_DENSE_MATVEC");
+  const int explicit_max = ds4_gpu_env_bool("DS4_MAX_FUSION_DENSE_MATVEC_ICB");
   if (disabled) {
    g_dense_matvec_icb_env_active = 0;
   } else if (explicit_dense >= 0) {
    g_dense_matvec_icb_env_active = explicit_dense > 0;
   } else if (explicit_legacy >= 0) {
    g_dense_matvec_icb_env_active = explicit_legacy > 0;
+  } else if (explicit_max >= 0) {
+   g_dense_matvec_icb_env_active = explicit_max > 0;
   } else {
-   g_dense_matvec_icb_env_active =
-    ds4_gpu_prime_path_enabled() ||
-    ds4_gpu_max_fusion_enabled() ||
-    ds4_gpu_env_bool("DS4_MAX_FUSION_DENSE_MATVEC_ICB") > 0;
+   g_dense_matvec_icb_env_active = 0;
   }
   g_dense_matvec_icb_env_checked = 1;
   if (g_dense_matvec_icb_env_active) {
    fprintf(stderr,
            "ds4: dense Q8_0 matvec ICB replay active "
-           "(PRIME/default; set DS4_DENSE_MATVEC_ICB_DISABLE=1 to disable)\n");
+           "(explicit canary path; disable with DS4_DENSE_MATVEC_ICB_DISABLE=1)\n");
   }
  }
  return g_dense_matvec_icb_env_active;

@@ -15005,6 +15005,12 @@ static bool metal_graph_encode_decode_layer(
  return ok;
 }
 
+static bool metal_graph_finalize_logits_device(ds4_gpu_tensor *logits, uint64_t vocab_dim, uint32_t n_rows) {
+ if (!logits || n_rows == 0) return false;
+ if (vocab_dim > UINT32_MAX) return false;
+ return ds4_gpu_logits_mask_reserved_specials(logits, (uint32_t)vocab_dim, n_rows) != 0;
+}
+
 /* Encode the final HC collapse, output norm, and vocab projection on Metal. */
 static bool metal_graph_encode_output_head(
  ds4_gpu_graph *g,
@@ -15121,9 +15127,10 @@ static bool metal_graph_encode_output_head(
  metal_graph_debug_dump_tensor("result_norm", g->output_norm, DS4_N_EMBD, DS4_N_LAYER, 0);
  }
  if (ok) ok = ds4_matmul_q8_0_via_tensor(g->logits, model,
-  weights->output,
-  DS4_N_EMBD, vocab_dim,
-  g->output_norm, 1) != 0;
+ weights->output,
+ DS4_N_EMBD, vocab_dim,
+ g->output_norm, 1) != 0;
+ if (ok) ok = metal_graph_finalize_logits_device(g->logits, vocab_dim, 1);
  DS4_METAL_PROFILE_OUTPUT_STAGE("lm_head");
  if (ok) {
  metal_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, DS4_N_LAYER, 0);
@@ -15224,9 +15231,10 @@ static bool metal_graph_encode_output_head_batch(
  DS4_RMS_EPS) != 0;
  }
  if (ok) ok = ds4_matmul_q8_0_via_tensor(logits, model,
-  weights->output,
-  DS4_N_EMBD, vocab_dim,
-  output_norm, n_tokens) != 0;
+ weights->output,
+ DS4_N_EMBD, vocab_dim,
+ output_norm, n_tokens) != 0;
+ if (ok) ok = metal_graph_finalize_logits_device(logits, vocab_dim, n_tokens);
 
  ds4_gpu_tensor_free(logits);
  ds4_gpu_tensor_free(output_norm);
@@ -15308,9 +15316,10 @@ static bool metal_graph_encode_output_head_mtp(
  DS4_RMS_EPS) != 0;
  }
  if (ok) ok = ds4_matmul_q8_0_via_tensor(g->logits, base_model,
-  base_weights->output,
-  DS4_N_EMBD, vocab_dim,
-  g->output_norm, 1) != 0;
+ base_weights->output,
+ DS4_N_EMBD, vocab_dim,
+ g->output_norm, 1) != 0;
+ if (ok) ok = metal_graph_finalize_logits_device(g->logits, vocab_dim, 1);
  return ok;
 }
 
@@ -21468,7 +21477,7 @@ static void print_top_logits(
  }
 }
 
-static void ds4_apply_head_demote(float *logits);
+static void ds4_finalize_host_logits(float *logits);
 static int ds4_head_demote_active(void);
 
 /* CPU generation entry point. It runs layer-major prefill once, then decodes
@@ -21527,7 +21536,7 @@ static int generate_raw_swa_cpu(
  }
  fprintf(stderr, "ds4: wrote CPU prefill logits to %s\n", dump_prefill_logits);
  }
- ds4_apply_head_demote(logits);
+ ds4_finalize_host_logits(logits);
 
  int n_generated = 0;
  int n_decode_eval = 0;
@@ -21603,7 +21612,7 @@ static int generate_raw_swa_cpu(
  directional_steering_attn,
  directional_steering_ffn,
  &decode_scratch);
- ds4_apply_head_demote(logits);
+ ds4_finalize_host_logits(logits);
  ds4_alloc_guard_end();
  if (token_timing) {
  const double t_eval1 = now_sec();
@@ -21724,7 +21733,7 @@ static int generate_metal_graph_raw_swa(
  }
  fprintf(stderr, "ds4: wrote GPU prefill logits to %s\n", dump_prefill_logits);
  }
- ds4_apply_head_demote(logits);
+ ds4_finalize_host_logits(logits);
 
  int pos = prompt->len;
  int n_generated = 0;
@@ -21851,7 +21860,7 @@ static int generate_metal_graph_raw_swa(
  }
  ds4_skip_clear_decode_confidence();
  if (!ok) break;
- if (!top_only_argmax) ds4_apply_head_demote(logits);
+ if (!top_only_argmax) ds4_finalize_host_logits(logits);
  if (token_timing) {
  const double t_eval1 = now_sec();
  fprintf(stderr, "ds4: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
@@ -22407,6 +22416,18 @@ static int ds4_head_demote_active(void) {
  return s_head_demote_ids && s_head_demote_n > 0;
 }
 
+static void ds4_apply_native_special_token_mask(float *logits, uint32_t n_vocab) {
+ enum {
+  ds4_reserved_special_first = 128847u,
+  ds4_reserved_special_count = 416u
+ };
+ if (!logits || getenv("DS4_DISABLE_NATIVE_SPECIAL_TOKEN_MASK") != NULL) return;
+ if (n_vocab < ds4_reserved_special_first + ds4_reserved_special_count) return;
+ for (uint32_t i = 0; i < ds4_reserved_special_count; i++) {
+  logits[ds4_reserved_special_first + i] = DS4_NEG_INF;
+ }
+}
+
 static void ds4_apply_head_demote(float *logits) {
  ds4_head_demote_load_once();
  if (!logits) return;
@@ -22417,9 +22438,14 @@ static void ds4_apply_head_demote(float *logits) {
  }
 }
 
+static void ds4_finalize_host_logits(float *logits) {
+ ds4_apply_native_special_token_mask(logits, DS4_N_VOCAB);
+ ds4_apply_head_demote(logits);
+}
+
 static bool ds4_session_ensure_host_logits(ds4_session *s) {
  if (!s || !s->logits) return false;
- if (s->logits_host_valid) { ds4_apply_head_demote(s->logits); return true; }
+ if (s->logits_host_valid) { ds4_finalize_host_logits(s->logits); return true; }
 #ifndef DS4_NO_GPU
  if (!ds4_session_is_cpu(s) && s->graph.logits) {
  if (ds4_gpu_tensor_read(s->graph.logits,
@@ -22427,7 +22453,7 @@ static bool ds4_session_ensure_host_logits(ds4_session *s) {
  s->logits,
  (uint64_t)DS4_N_VOCAB * sizeof(s->logits[0])) != 0) {
  s->logits_host_valid = true;
- ds4_apply_head_demote(s->logits);
+ ds4_finalize_host_logits(s->logits);
  return true;
  }
  }

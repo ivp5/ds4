@@ -254,7 +254,7 @@ Current PRIME/default policy is measured-path-first, not dispatch-count-first:
 | route_remap (43 layers × per-token) | `DS4_ICB_ACTIVE` | default-on; disable with `DS4_ICB_ACTIVE=0` or `DS4_ICB_ACTIVE_DISABLE=1` |
 | softplus_sqrt | `DS4_ICB_SOFTPLUS` | default-on in decode router-select fallback; fused router-select usually bypasses it |
 | topk_mask (2-kernel) | `DS4_ICB_TOPK_MASK` | default-on when that mask path is selected |
-| dense Q8_0 single-token matvec | `DS4_DENSE_MATVEC_ICB` | PRIME/default; disable with `DS4_DENSE_MATVEC_ICB_DISABLE=1` |
+| dense Q8_0 single-token matvec | `DS4_DENSE_MATVEC_ICB` | opt-in only; 2026-06-04 full-logit canary reproduced decode collapse with huge logits |
 | D8F classic packet ICB replay | `DS4_D8F_CLASSIC_PACKET_ICB` | PRIME/default; native texture down is gate-only ICB plus direct textured down |
 | D8F texture-free packet range replay | `DS4_D8F_PACKET_ICB_RANGE` | PRIME/default where eligible; disable with `DS4_D8F_PACKET_ICB_RANGE_DISABLE=1` |
 | route_weights_one | `DS4_ICB_WEIGHTS_ONE` | opt-in only; measured loser on the 6-thread decode kernel |
@@ -294,7 +294,7 @@ takes up build time + 8244 lines of declarations).
 **Operating recipe** for the ACTUAL ICB pipelines:
 ```bash
 # Speed-only H3384 canary: GPU-resident pack, split-2 overlap, measured
-# decode fusions, D8F native-down texture/cache gates, dense Q8_0 matvec ICB,
+# decode fusions, D8F native-down texture/cache gates,
 # D8F packet ICB replay/range where eligible, and top-only argmax.
 # Do not treat this as the primary fidelity path: greedy and temp=0.6 sampled
 # gates both collapse, so the failure is not a greedy-only attractor.
@@ -303,6 +303,10 @@ takes up build time + 8244 lines of declarations).
 # Comparison baseline for speed-only canaries: turn PRIME-only replay off explicitly.
 DS4_PRIME_PATH=0 DS4_DENSE_MATVEC_ICB_DISABLE=1 DS4_METAL_DISABLE_TOP_ONLY_ARGMAX=1 \
   ./ds4 --metal --flat-pack /path/to/H3384 ...
+
+# Broken canary retained opt-in for diagnosis only. Do not make primary until
+# full-logit decode agrees with direct dispatch on the same prompt/margins.
+DS4_DENSE_MATVEC_ICB=1 ./ds4 --metal ...
 
 # Known loser on decode remains opt-in: caller pays useResource cost on a
 # 6-thread one-shot kernel, so do not include it in PRIME without new A/B data.

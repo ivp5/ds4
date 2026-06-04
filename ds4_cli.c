@@ -309,6 +309,16 @@ static int parse_int(const char *s, const char *opt) {
     return (int)v;
 }
 
+static int parse_nonnegative_int(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT32_MAX) {
+        fprintf(stderr, "ds4: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
 static uint64_t parse_u64(const char *s, const char *opt) {
     char *end = NULL;
     unsigned long long v = strtoull(s, &end, 10);
@@ -2197,7 +2207,7 @@ static cli_config parse_options(int argc, char **argv) {
             if (!strcmp(s, "auto")) {
                 c.engine.prefill_metal_phases = -1;
             } else {
-                c.engine.prefill_metal_phases = parse_int(s, arg);
+                c.engine.prefill_metal_phases = parse_nonnegative_int(s, arg);
             }
         } else if (!strcmp(arg, "--mtl4-moe")) {
             /* MTL4 ML packed-MoE path (group=6, n_tokens≤16). Sets the env
