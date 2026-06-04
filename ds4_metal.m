@@ -55730,11 +55730,14 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
         const NSUInteger packet_rank1_axpy_cmd = packet_base_cmd + 3u;
         const NSUInteger packet_last_cmd = rank1_split_packet_icb ? packet_rank1_axpy_cmd : packet_down_cmd;
         int packet_icb_ready = 0;
+        int packet_icb_gate_only = 0;
         const int rank1_packet_icb_policy = ds4_gpu_env_bool("DS4_D8F_RANK1_PACKET_ICB");
         const int rank1_packet_icb_requested =
             rank1_sidecar_active && rank1_packet_icb_policy != 0;
+        const int packet_icb_gate_only_requested =
+            down_native_recbuf && !rank1_split_sidecar;
         if (n_tokens == 1u &&
-            !down_native_recbuf &&
+            (packet_icb_gate_only_requested || !down_native_recbuf) &&
             (rank1_split_packet_icb ||
              (!rank1_split_sidecar && (!rank1_sidecar_active || rank1_packet_icb_requested))) &&
             (rank1_packet_icb_requested || ds4_gpu_d8f_classic_packet_icb_enabled()) && gate_pso && down_pso &&
@@ -55815,6 +55818,8 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                                                 MTLSizeMake((ds4_down_out_dim + 255u) >> 8, n_tokens, 1),
                                                 packet_tg, 0u,
                                                 axpy_extra, 8);
+            } else if (packet_icb_ready && packet_icb_gate_only_requested) {
+                packet_icb_gate_only = 1;
             } else if (packet_icb_ready) {
                 packet_icb_ready =
                     ds4_icb_slot_record_command(&g_d8f_packet_icb_slot, packet_down_cmd, down_pso,
@@ -55838,9 +55843,10 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                 s_d8f_classic_packet_icb_notice = 1;
                 fprintf(stderr,
                         "ds4: D8F classic in-graph packet ICB enabled "
-                        "(gateup_recbuf=%d down_recbuf=%d down_cbsram=%u half_mid=%d down_tile32=%d down_native=%d rank1_split=%d)\n",
+                        "(gateup_recbuf=%d down_recbuf=%d down_cbsram=%u half_mid=%d down_tile32=%d down_native=%d rank1_split=%d gate_only=%d)\n",
                         gateup_recbuf, down_tile16_recbuf || down_native_recbuf, down_cbsram_k_cap,
-                        half_mid, down_tile32_recbuf, down_native_recbuf, rank1_split_sidecar);
+                        half_mid, down_tile32_recbuf, down_native_recbuf, rank1_split_sidecar,
+                        packet_icb_gate_only);
             }
             ds4_icb_slot_use_resources(&g_d8f_packet_icb_slot, enc,
                                        packet_gate_cmd, 1,
@@ -55857,7 +55863,7 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                                            packet_rank1_axpy_cmd, 1,
                                            MTLResourceUsageRead | MTLResourceUsageWrite);
                 ds4_icb_slot_execute(&g_d8f_packet_icb_slot, enc, packet_rank1_axpy_cmd, 1);
-            } else {
+            } else if (!packet_icb_gate_only) {
                 ds4_icb_slot_use_resources(&g_d8f_packet_icb_slot, enc,
                                            packet_down_cmd, 1,
                                            MTLResourceUsageRead | MTLResourceUsageWrite);
@@ -55890,7 +55896,8 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                 [enc setThreadgroupMemoryLength:8u * (uint32_t)sizeof(float) atIndex:0];
                 [enc dispatchThreadgroups:MTLSizeMake(n_experts, n_tokens, 1) threadsPerThreadgroup:packet_tg];
             }
-
+        }
+        if (!packet_icb_ready || packet_icb_gate_only) {
             if (down_native_pack2d_warm) {
                 [enc setComputePipelineState:g_d8f_down_native_pack2d_warm_classic_pipeline];
                 [enc setTexture:g_d8f_runtime_pack2d_tex atIndex:0];
