@@ -252,7 +252,7 @@ Current PRIME/default policy is measured-path-first, not dispatch-count-first:
 | ICB / replay path | Env var | Status |
 |-------------------|---------|--------|
 | route_remap (43 layers × per-token) | `DS4_ICB_ACTIVE` | default-on; disable with `DS4_ICB_ACTIVE=0` or `DS4_ICB_ACTIVE_DISABLE=1` |
-| softplus_sqrt | `DS4_ICB_SOFTPLUS` | default-on in decode router-select fallback; fused router-select usually bypasses it |
+| softplus_sqrt | `DS4_ICB_SOFTPLUS` | default-on in decode router-select fallback |
 | topk_mask (2-kernel) | `DS4_ICB_TOPK_MASK` | default-on when that mask path is selected |
 | dense Q8_0 single-token matvec | `DS4_DENSE_MATVEC_ICB` | opt-in only; 2026-06-04 full-logit canary reproduced decode collapse with huge logits |
 | D8F classic packet ICB replay | `DS4_D8F_CLASSIC_PACKET_ICB` | PRIME/default; native texture down is gate-only ICB plus direct textured down |
@@ -261,14 +261,16 @@ Current PRIME/default policy is measured-path-first, not dispatch-count-first:
 
 **Fusion kernels (not ICB but related)**:
 
-| Fusion | Disable env var (default-ON) |
-|--------|------------------------------|
-| router_select_fusion | `DS4_METAL_DISABLE_ROUTER_SELECT_FUSION` |
-| routed_pair_swiglu_fusion | `DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION` |
-| KV RoPE+store | `DS4_METAL_DISABLE_KV_ROPE_STORE_FUSION` |
-| indexed/decode attention inverse-RoPE | `DS4_METAL_DISABLE_INDEXED_ATTN_ROPE_FUSION`, `DS4_METAL_DISABLE_DECODE_ATTN_ROPE_FUSION` |
-| FP8 shared-down HC | `DS4_METAL_DISABLE_SHARED_DOWN_FP8_HC_FUSION` |
-| top-only greedy argmax | `DS4_METAL_DISABLE_TOP_ONLY_ARGMAX` |
+| Fusion | Default policy |
+|--------|----------------|
+| KV RoPE+store | default-on; disable with `DS4_METAL_DISABLE_KV_ROPE_STORE_FUSION=1`; 2026-06-04 full-logit canary kept `We need to` |
+| FP8 shared-down HC | default-on; disable with `DS4_METAL_DISABLE_SHARED_DOWN_FP8_HC_FUSION=1` |
+| top-only greedy argmax | default-on; disable with `DS4_METAL_DISABLE_TOP_ONLY_ARGMAX=1` |
+| router_select_fusion | opt-in canary: `DS4_METAL_ENABLE_ROUTER_SELECT_FUSION=1`; default demoted after AIME prompt-logit drift |
+| decode attention inverse-RoPE | opt-in canary: `DS4_METAL_ENABLE_DECODE_ATTN_ROPE_FUSION=1`; default demoted after `We We start` regression |
+| indexed attention inverse-RoPE | opt-in canary: `DS4_METAL_ENABLE_INDEXED_ATTN_ROPE_FUSION=1`; grouped with decode inverse-RoPE until long-context parity is proven |
+| decode HC norm fusion | opt-in canary: `DS4_METAL_ENABLE_HC_NORM_FUSION=1`; default demoted after `We are given` drift |
+| routed_pair_swiglu_fusion | disable with `DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION=1` |
 
 **D8F native-down texture/cache defaults**:
 - Native down readers default on for layers `0,20,25,26,37` at `n_tokens<=4`.

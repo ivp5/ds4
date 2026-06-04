@@ -12045,13 +12045,17 @@ static bool metal_graph_use_indexer_q_rope_fusion(void) {
 }
 
 static bool metal_graph_use_indexed_attn_rope_fusion(void) {
+ static int enable_cache = -1;
  static int disable_cache = -1;
- return !metal_graph_env_flag("DS4_METAL_DISABLE_INDEXED_ATTN_ROPE_FUSION", &disable_cache);
+ return metal_graph_env_flag("DS4_METAL_ENABLE_INDEXED_ATTN_ROPE_FUSION", &enable_cache) &&
+        !metal_graph_env_flag("DS4_METAL_DISABLE_INDEXED_ATTN_ROPE_FUSION", &disable_cache);
 }
 
 static bool metal_graph_use_decode_attn_rope_fusion(void) {
+ static int enable_cache = -1;
  static int disable_cache = -1;
- return !metal_graph_env_flag("DS4_METAL_DISABLE_DECODE_ATTN_ROPE_FUSION", &disable_cache);
+ return metal_graph_env_flag("DS4_METAL_ENABLE_DECODE_ATTN_ROPE_FUSION", &enable_cache) &&
+        !metal_graph_env_flag("DS4_METAL_DISABLE_DECODE_ATTN_ROPE_FUSION", &disable_cache);
 }
 
 static bool metal_graph_use_router_matmul_select_fusion(void) {
@@ -12068,8 +12072,10 @@ static bool metal_graph_use_reference_compressor_pair_proj(void) {
 }
 
 static bool metal_graph_use_reference_hc_norm_decode(void) {
- static int cache = -1;
- return metal_graph_env_flag("DS4_METAL_DISABLE_HC_NORM_FUSION", &cache);
+ static int enable_cache = -1;
+ static int disable_cache = -1;
+ return !metal_graph_env_flag("DS4_METAL_ENABLE_HC_NORM_FUSION", &enable_cache) ||
+        metal_graph_env_flag("DS4_METAL_DISABLE_HC_NORM_FUSION", &disable_cache);
 }
 
 static bool metal_graph_use_reference_shared_down_hc(void) {

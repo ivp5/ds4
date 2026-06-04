@@ -18943,6 +18943,7 @@ static int ds4_gpu_encode_router_select(
 
  int ok = 0;
  if (!g_quality_mode && n_tokens == 1 &&
+ getenv("DS4_METAL_ENABLE_ROUTER_SELECT_FUSION") != NULL &&
  getenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSION") == NULL) {
  const bool use_token_buffer = single_token == NULL;
  ds4_gpu_dsv4_router_select_one_args args = {
