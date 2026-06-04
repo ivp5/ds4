@@ -2198,7 +2198,8 @@ int main(int argc, char **argv) {
     }
     /* --fp8-attn-out-icb-canary [group_dim [rank [n_groups [out_dim [n_tokens [rounds [mode]]]]]]]
      * Mode 0 preserves direct A-then-B command-buffer boundaries through ICB replay.
-     * Mode 1 executes A and B in one command buffer with an in-encoder barrier. */
+     * Mode 1 executes A and B in one command buffer with an in-encoder barrier.
+     * Mode 2 executes A+B as one ICB range with a barrier on the dependent B command. */
     if (argc >= 2 && !strcmp(argv[1], "--fp8-attn-out-icb-canary")) {
         const uint32_t group_dim = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 128;
         const uint32_t rank      = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16;
