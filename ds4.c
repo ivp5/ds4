@@ -10928,28 +10928,30 @@ static bool ds4_prime_path_enabled(void) {
  return true;
 }
 
+static int g_metal_graph_max_fusion_enabled_cache = -1;
+static int g_d8f_mtl4_packet_warning_printed;
+
 static bool ds4_metal_graph_max_fusion_enabled(void) {
- static int cache = -1;
- if (cache < 0) {
-  cache = (!ds4_env_enabled("DS4_METAL_GRAPH_MAX_FUSION_DISABLE") &&
-           !ds4_env_enabled("DS4_MAX_FUSION_DISABLE") &&
-           (ds4_env_enabled("DS4_METAL_GRAPH_MAX_FUSION") ||
-            ds4_env_enabled("DS4_MAX_FUSION"))) ? 1 : 0;
-  if (cache) {
+ if (g_metal_graph_max_fusion_enabled_cache < 0) {
+  g_metal_graph_max_fusion_enabled_cache =
+  (!ds4_env_enabled("DS4_METAL_GRAPH_MAX_FUSION_DISABLE") &&
+   !ds4_env_enabled("DS4_MAX_FUSION_DISABLE") &&
+   (ds4_env_enabled("DS4_METAL_GRAPH_MAX_FUSION") ||
+    ds4_env_enabled("DS4_MAX_FUSION"))) ? 1 : 0;
+  if (g_metal_graph_max_fusion_enabled_cache) {
    fprintf(stderr,
     "ds4: Metal graph max-fusion policy active — single decode submit requested; "
     "router/indexer dispatch fusions eligible\n");
   }
  }
- return cache != 0;
+ return g_metal_graph_max_fusion_enabled_cache != 0;
 }
 
 static bool ds4_d8f_mtl4_packet_requested(uint32_t n_tokens) {
   (void)n_tokens;
   const bool requested = ds4_env_enabled("DS4_D8F_FORCE_MTL4_PACKET");
-  static int warned = 0;
-  if (requested && !warned) {
-   warned = 1;
+  if (requested && !g_d8f_mtl4_packet_warning_printed) {
+   g_d8f_mtl4_packet_warning_printed = 1;
    fprintf(stderr,
     "ds4: DS4_D8F_FORCE_MTL4_PACKET selects the diagnostic graph-exit MTL4 path; "
     "measured fast MTL4 requires an owned command stream, not per-layer bridging\n");
@@ -11973,23 +11975,6 @@ static bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t i
  g->layer_index_state_score[il], 0, bytes) != 0;
 }
 
-static uint32_t metal_graph_decode_indexer_top_k(const ds4_gpu_graph *g) {
- (void)g;
- /* Env-var override DS4_INDEXER_TOP_K=N caps the indexer's top-k at N
- * (must be 1..DS4_N_INDEXER_TOP_K). Smaller K cuts attention compute on
- * even (ratio-4 indexer) layers linearly with K. Quality may degrade. */
- static int cached = -1;
- if (cached < 0) {
- const char *e = getenv("DS4_INDEXER_TOP_K");
- if (e && e[0]) {
- int v = atoi(e);
- cached = (v > 0 && v <= (int)DS4_N_INDEXER_TOP_K) ? v : (int)DS4_N_INDEXER_TOP_K;
- } else {
- cached = (int)DS4_N_INDEXER_TOP_K;
- }
- }
- return (uint32_t)cached;
-}
 
 /* =========================================================================
  * Metal Decode Release Helpers and Reference Fallbacks.
@@ -12016,11 +12001,14 @@ static struct {
  bool uses_router_matmul_select_fusion;
  bool uses_fp8_attn_out_onecb_hc;
  bool uses_fp8_shared_down_hc;
+ bool disables_fp8_attn_out;
+ bool disables_fp8_attn_out_hc_fuse;
  bool uses_top_only_argmax;
  bool uses_hc_rms_mix_fusion;
  bool uses_hc_full_prelude_fusion;
  bool uses_output_hc_sum_norm_fusion;
  bool uses_output_hc_full_fusion;
+ uint32_t indexer_top_k;
 } g_decode_policy;
 
 static bool g_decode_policy_has_been_read_from_environment;
@@ -12057,6 +12045,14 @@ static void metal_graph_read_decode_policy_from_environment_once(void) {
  ds4_env_enabled("DS4_ENABLE_FP8_ATTN_OUT_ONECB_HC") &&
  !ds4_env_enabled("DS4_DISABLE_FP8_ATTN_OUT_ONECB_HC");
  g_decode_policy.uses_fp8_shared_down_hc = !ds4_env_enabled("DS4_METAL_DISABLE_SHARED_DOWN_FP8_HC_FUSION");
+ g_decode_policy.disables_fp8_attn_out = ds4_env_enabled("DS4_DISABLE_FP8_ATTN_OUT");
+ g_decode_policy.disables_fp8_attn_out_hc_fuse = ds4_env_enabled("DS4_DISABLE_FP8_ATTN_OUT_HC_FUSE");
+ if (g_decode_policy.disables_fp8_attn_out) {
+  fprintf(stderr, "ds4: DS4_DISABLE_FP8_ATTN_OUT=1 — FP8 attn output path disabled (bisect probe)\n");
+ }
+ if (g_decode_policy.disables_fp8_attn_out_hc_fuse) {
+  fprintf(stderr, "ds4: DS4_DISABLE_FP8_ATTN_OUT_HC_FUSE=1 — FP8 attn output HC fusion disabled\n");
+ }
  g_decode_policy.uses_top_only_argmax =
  (ds4_prime_path_enabled() || max_fusion || ds4_env_enabled("DS4_METAL_ENABLE_TOP_ONLY_ARGMAX")) &&
  !ds4_env_enabled("DS4_METAL_DISABLE_TOP_ONLY_ARGMAX");
@@ -12064,8 +12060,21 @@ static void metal_graph_read_decode_policy_from_environment_once(void) {
  g_decode_policy.uses_hc_full_prelude_fusion = !ds4_env_enabled("DS4_METAL_DISABLE_HC_FULL_PRELUDE_FUSION");
  g_decode_policy.uses_output_hc_sum_norm_fusion = !ds4_env_enabled("DS4_METAL_DISABLE_OUTPUT_HC_SUM_NORM_FUSION");
  g_decode_policy.uses_output_hc_full_fusion = !ds4_env_enabled("DS4_METAL_DISABLE_OUTPUT_HC_FULL_FUSION");
+ g_decode_policy.indexer_top_k = DS4_N_INDEXER_TOP_K;
+ const char *indexer_top_k_env = getenv("DS4_INDEXER_TOP_K");
+ if (indexer_top_k_env && indexer_top_k_env[0]) {
+  int v = atoi(indexer_top_k_env);
+  if (v > 0 && v <= (int)DS4_N_INDEXER_TOP_K) g_decode_policy.indexer_top_k = (uint32_t)v;
+ }
  g_decode_policy_has_been_read_from_environment = true;
 }
+
+static uint32_t metal_graph_decode_indexer_top_k(const ds4_gpu_graph *g) {
+ (void)g;
+ metal_graph_read_decode_policy_from_environment_once();
+ return g_decode_policy.indexer_top_k;
+}
+
 
 static bool metal_graph_decode_hc_pre(
  ds4_gpu_tensor *out,
@@ -12461,6 +12470,9 @@ static uint64_t s_n_storage_dispatch_fp8_direct = 0;
  * doing real work. If identical → Increment 5 is dormant (kernel-level
  * canary fires but no observable model-level effect). */
 static uint64_t s_n_storage_dispatch_bf16_suppressed = 0;
+static int g_storage_dispatch_site_profile_checked;
+static int g_storage_dispatch_site_profile_enabled;
+static int g_bf16_storage_disabled = -1;
 
 typedef enum {
  DS4_DISPATCH_DTYPE_F16 = 0,
@@ -12561,16 +12573,14 @@ static ds4_storage_dispatch_site ds4_storage_dispatch_site_for_tensor(const ds4_
 }
 
 static bool ds4_storage_dispatch_site_profile_enabled(void) {
- static int checked = 0;
- static int enabled = 0;
- if (!checked) {
-  enabled = ds4_env_enabled("DS4_STORAGE_DISPATCH_SITE_PROFILE") ? 1 : 0;
-  checked = 1;
-  if (enabled) {
+ if (!g_storage_dispatch_site_profile_checked) {
+  g_storage_dispatch_site_profile_enabled = ds4_env_enabled("DS4_STORAGE_DISPATCH_SITE_PROFILE") ? 1 : 0;
+  g_storage_dispatch_site_profile_checked = 1;
+  if (g_storage_dispatch_site_profile_enabled) {
    fprintf(stderr, "ds4: DS4_STORAGE_DISPATCH_SITE_PROFILE=1 — storage-dispatch site attribution enabled\n");
   }
  }
- return enabled != 0;
+ return g_storage_dispatch_site_profile_enabled != 0;
 }
 
 static void ds4_storage_dispatch_note(ds4_storage_dispatch_dtype dtype,
@@ -12606,16 +12616,15 @@ static void ds4_storage_dispatch_print_sites(void) {
  * (force mmap fallback even when BF16 storage is set). Default 0 (use
  * BF16 storage when available — Increment 5a behavior). */
 static int ds4_bf16_storage_disabled(void) {
- static int cached = -1;
- if (cached < 0) {
+ if (g_bf16_storage_disabled < 0) {
   const char *env = getenv("DS4_BF16_STORAGE_DISABLE");
-  cached = (env && env[0] == '1') ? 1 : 0;
-  if (cached) {
+  g_bf16_storage_disabled = (env && env[0] == '1') ? 1 : 0;
+  if (g_bf16_storage_disabled) {
    fprintf(stderr, "ds4: DS4_BF16_STORAGE_DISABLE=1 — BF16 storage path "
            "FORCED OFF, F16 dispatcher will use mmap for BF16-stored tensors\n");
   }
  }
- return cached;
+ return g_bf16_storage_disabled;
 }
 
 /* silv 2026-05-28 #796 Increment 4 — BF16 dispatch wrapper.
@@ -14373,17 +14382,8 @@ static bool metal_graph_encode_decode_layer(
   * to be skipped, falling through to the Q8_0 / legacy path. If the
   * prompt-invariant 1.84e+37 logit disappears with this disabled,
   * the bug lives inside the FP8 attention chain. */
- static int s_disable_fp8_attn_out_checked = 0;
- static int s_disable_fp8_attn_out = 0;
- if (!s_disable_fp8_attn_out_checked) {
-  s_disable_fp8_attn_out = getenv("DS4_DISABLE_FP8_ATTN_OUT") != NULL ? 1 : 0;
-  s_disable_fp8_attn_out_checked = 1;
-  if (s_disable_fp8_attn_out) {
-   fprintf(stderr, "ds4: DS4_DISABLE_FP8_ATTN_OUT=1 — FP8 attn output path disabled (bisect probe)\n");
-  }
- }
  const bool attn_output_fp8_storage =
- !s_disable_fp8_attn_out &&
+ !g_decode_policy.disables_fp8_attn_out &&
  layer->attn_output_a->storage.dtype == DS4_TENSOR_FP8_E4M3 &&
  layer->attn_output_b->storage.dtype == DS4_TENSOR_FP8_E4M3 &&
  layer->attn_output_a->storage.metal_buffer != NULL &&
@@ -14396,17 +14396,8 @@ static bool metal_graph_encode_decode_layer(
   !metal_graph_directional_steering_attn_enabled(g) &&
   !g_decode_policy.uses_reference_attn_out_hc &&
   attn_output_q8_native;
-  static int s_disable_fp8_attn_out_hc_fuse_checked = 0;
-  static int s_disable_fp8_attn_out_hc_fuse = 0;
-  if (!s_disable_fp8_attn_out_hc_fuse_checked) {
-  s_disable_fp8_attn_out_hc_fuse = getenv("DS4_DISABLE_FP8_ATTN_OUT_HC_FUSE") != NULL ? 1 : 0;
-  s_disable_fp8_attn_out_hc_fuse_checked = 1;
-  if (s_disable_fp8_attn_out_hc_fuse) {
-  fprintf(stderr, "ds4: DS4_DISABLE_FP8_ATTN_OUT_HC_FUSE=1 — FP8 attn output HC fusion disabled\n");
-  }
-  }
   const bool fuse_fp8_attn_out_hc =
-  !s_disable_fp8_attn_out_hc_fuse &&
+  !g_decode_policy.disables_fp8_attn_out_hc_fuse &&
   !metal_graph_directional_steering_attn_enabled(g) &&
   !g_decode_policy.uses_reference_attn_out_hc &&
   attn_output_fp8_storage;
