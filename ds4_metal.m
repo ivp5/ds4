@@ -7634,13 +7634,14 @@ static int ds4_gpu_dense_matvec_icb_enabled(void) {
    g_dense_matvec_icb_env_active = explicit_legacy > 0;
   } else {
    g_dense_matvec_icb_env_active =
+    ds4_gpu_max_fusion_enabled() ||
     ds4_gpu_env_bool("DS4_MAX_FUSION_DENSE_MATVEC_ICB") > 0;
   }
   g_dense_matvec_icb_env_checked = 1;
   if (g_dense_matvec_icb_env_active) {
    fprintf(stderr,
            "ds4: dense Q8_0 matvec ICB replay active "
-           "(explicit experiment; set DS4_DENSE_MATVEC_ICB_DISABLE=1 to disable)\n");
+           "(max-fusion default; set DS4_DENSE_MATVEC_ICB_DISABLE=1 to disable)\n");
   }
  }
  return g_dense_matvec_icb_env_active;
