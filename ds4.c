@@ -6657,31 +6657,36 @@ static void layer_kv_projection_normed_one(
  free(raw);
 }
 
-static void layer_q_projection_with_lora_one_decode_scratch(
- const ds4_model * model,
- const ds4_layer_weights * layer,
- const float * norm,
- float * q,
- float * qr_norm,
- ds4_cpu_decode_scratch * scratch) {
- const float *q_a_norm = tensor_data(model, layer->attn_q_a_norm);
-
- matvec_q8_0_decode_scratch(scratch->qr, model, layer->attn_q_a, norm, scratch);
- rms_norm_weight(qr_norm, scratch->qr, q_a_norm, 1024, DS4_RMS_EPS);
- matvec_q8_0_decode_scratch(q, model, layer->attn_q_b, qr_norm, scratch);
- head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
-}
-
-static void layer_kv_projection_normed_one_decode_scratch(
+static void layer_qkv_projection_normed_one_decode_scratch(
  const ds4_model * model,
  const ds4_layer_weights * layer,
  const float * normed,
+ float * q,
+ float * qr_norm,
  float * kv,
  ds4_cpu_decode_scratch * scratch) {
+ const float *q_a_norm = tensor_data(model, layer->attn_q_a_norm);
  const float *kv_norm = tensor_data(model, layer->attn_kv_a_norm);
 
- matvec_q8_0_decode_scratch(scratch->kv_raw, model, layer->attn_kv, normed, scratch);
+ if (layer->attn_q_a->type == 8 &&
+     layer->attn_kv->type == 8 &&
+     layer->attn_q_a->ndim == 2 &&
+     layer->attn_kv->ndim == 2 &&
+     layer->attn_q_a->dim[0] == layer->attn_kv->dim[0]) {
+  cpu_decode_quantize_q8_0(scratch, normed, layer->attn_q_a->dim[0]);
+  matvec_q8_0_prequant(scratch->qr, model, layer->attn_q_a,
+                       scratch->q8_xq, scratch->q8_xscale);
+  matvec_q8_0_prequant(scratch->kv_raw, model, layer->attn_kv,
+                       scratch->q8_xq, scratch->q8_xscale);
+ } else {
+  matvec_any_decode_scratch(scratch->qr, model, layer->attn_q_a, normed, scratch);
+  matvec_any_decode_scratch(scratch->kv_raw, model, layer->attn_kv, normed, scratch);
+ }
+
+ rms_norm_weight(qr_norm, scratch->qr, q_a_norm, 1024, DS4_RMS_EPS);
  rms_norm_weight(kv, scratch->kv_raw, kv_norm, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+ matvec_q8_0_decode_scratch(q, model, layer->attn_q_b, qr_norm, scratch);
+ head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
 }
 
 static float rope_yarn_ramp(float low, float high, int i0) {
@@ -9810,18 +9815,14 @@ static void layer_forward_raw_swa_one(
  t0 = profile ? now_sec() : 0.0;
  layer_attn_norm_one(scratch->attn_norm, model, layer, scratch->attn_cur);
  const uint32_t ratio = cache->compress_ratio;
- layer_q_projection_with_lora_one_decode_scratch(model, layer,
+ layer_qkv_projection_normed_one_decode_scratch(model, layer,
  scratch->attn_norm,
  scratch->q,
  scratch->qr_norm,
- scratch);
- if (profile) t_q = now_sec() - t0;
- t0 = profile ? now_sec() : 0.0;
- layer_kv_projection_normed_one_decode_scratch(model, layer,
- scratch->attn_norm,
  scratch->kv,
  scratch);
- if (profile) t_kv = now_sec() - t0;
+ if (profile) t_q = now_sec() - t0;
+ if (profile) t_kv = 0.0;
 
  t0 = profile ? now_sec() : 0.0;
  rope_tail_layer_inplace(scratch->q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
