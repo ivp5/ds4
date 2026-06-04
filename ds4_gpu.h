@@ -1474,24 +1474,6 @@ int ds4_gpu_mtl4_hadamard16_apply(_Float16 *host_buf, uint32_t n_rows, uint32_t 
  * otherwise. */
 int ds4_gpu_mtl4_hadamard16_canary(uint32_t n_rows, uint32_t n_in);
 
-/* Phase B-2.3c stub: polar hot-path dispatcher entry. Validates pool
- * has gate/up/down PLR2 files for the layer; emits diagnostic; always
- * returns 0 (fallback to FP4 path). Body implementation pending silv
- * decision on row-coverage sub-strategy (A.1 full-row corpus / A.2
- * VQ / A.3 hybrid). See BRANCH_A_PREFLIGHT.md.
- *
- * Hot-path integration: called from metal_graph_encode_layer_ffn_batch
- * when g->polar_pool_ref != NULL && g->polar_layer_enabled_ref[il].
- * Returns 1 if polar substitution claimed the FFN output; 0 to
- * fall through to existing FP4 path.
- */
-/* Forward declaration via void* — caller (ds4.c) passes g->polar_pool_ref
- * which is const ds4_polar_pool*. Stub casts back internally. This avoids
- * pulling ds4_polar_reader.h into ds4_gpu.h's already-deep dependency tree. */
-int ds4_gpu_mtl4_polar_routed_moe_batch_stub(const void *pool,
-                                              uint32_t layer,
-                                              uint32_t n_tokens);
-
 /* silv 2026-05-27 task #643 — Hadamard-16 batched FP16 transform.
  *
  * Applies the 16-point Walsh-Hadamard transform (scaled by 1/sqrt(16) for

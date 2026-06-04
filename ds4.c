@@ -51,7 +51,6 @@
 #include "ds4_quant_blocks.h"
 #include "ds4_neon_i8mm.h"
 #include "ds4_moe_route_log.h"
-#include "ds4_polar_reader.h"
 #include "ds4_prefix_cache.h"
 #include "ds4_d8f_reader.h"
 #include "ds4_vqb2_pack.h"  /* legacy hot-store coverage masks; not a runtime pack selector */
@@ -179,7 +178,6 @@ static int g_top_only_session_logged;
 static bool g_decode_policy_has_been_read_from_environment;
 static FILE *g_dump_expert_mid_fp;
 static int g_dump_expert_mid_env_checked;
-static int g_polar_layer_notice_printed[DS4_POLAR_MAX_LAYERS];
 static int g_hash_router_probe_printed[DS4_N_LAYER];
 static int g_d8f_prefill_notice_printed;
 static int g_m1r_prefill_batch_notice_printed;
@@ -10752,13 +10750,6 @@ typedef struct {
  uint32_t power_percent;
  double prefill_layer_avg_sec[DS4_N_LAYER];
  double decode_token_avg_sec;
- /* #563 Phase B-2: pointers into engine state (engine owns the lifecycle).
-  * NULL when polar dispatch is disabled. When non-NULL, ffn-batch entry
-  * checks polar_layer_enabled[il] AND polar_pool has GUD for il before
-  * deciding whether to dispatch the H1735 kernel (Phase B-2 dispatch
-  * substitution lives downstream of this gate). */
- const ds4_polar_pool *polar_pool_ref;
- const uint8_t *polar_layer_enabled_ref;
  bool cpu_moe;
  bool cpu_moe_layer[DS4_N_LAYER];
  const ds4_model *cpu_model;
@@ -17679,32 +17670,6 @@ static bool metal_graph_encode_layer_ffn_batch(
  uint32_t n_tokens) {
  if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
 
- /* #563 Phase B-2.1 instrumentation: report when this layer would have been
-  * polar-dispatched. Counts as a structural gate but does not yet substitute
-  * the FP4 path. The Phase B-2.2 dispatch substitution lands as a separate
-  * commit that uses the same gate condition. */
- if (g->polar_pool_ref && g->polar_layer_enabled_ref &&
-     il < DS4_POLAR_MAX_LAYERS && g->polar_layer_enabled_ref[il]) {
-     const ds4_polar_file *gate = ds4_polar_pool_get(g->polar_pool_ref, il, DS4_POLAR_KIND_GATE);
-     const ds4_polar_file *up   = ds4_polar_pool_get(g->polar_pool_ref, il, DS4_POLAR_KIND_UP);
-     const ds4_polar_file *down = ds4_polar_pool_get(g->polar_pool_ref, il, DS4_POLAR_KIND_DOWN);
-     if (!g_polar_layer_notice_printed[il]) {
-         g_polar_layer_notice_printed[il] = 1;
-         if (gate && up && down) {
-             fprintf(stderr,
-                     "ds4: polar layer %u armed (gate=%u×%u up=%u×%u down=%u×%u) — Phase B-2.2 dispatch pending\n",
-                     il, gate->n_experts, gate->n_rows,
-                     up->n_experts, up->n_rows, down->n_experts, down->n_rows);
-         } else {
-             fprintf(stderr,
-                     "ds4: polar layer %u NOT armed — missing %s%s%s in pool\n",
-                     il, gate ? "" : "[gate]",
-                     up ? "" : "[up]",
-                     down ? "" : "[down]");
-         }
-     }
- }
-
  const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
  const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
  const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
@@ -17995,23 +17960,6 @@ static bool metal_graph_encode_layer_ffn_batch(
 	 }
  if (ok) ok = (ds4_gpu_begin_commands() != 0);
 	 } else if (ok) {
- /* Phase B-2.3c stub: polar hot-path gate. If polar pool + per-layer
-  * enable both engaged, give polar dispatcher first chance at this
-  * FFN. Stub returns 0 → falls through to FP4 path (body pending
-  * silv decision on row-coverage strategy per BRANCH_A_PREFLIGHT.md). */
- bool polar_taken = false;
- if (g->polar_pool_ref &&
-     g->polar_layer_enabled_ref &&
-     il < DS4_POLAR_MAX_LAYERS &&
-     g->polar_layer_enabled_ref[il]) {
-  polar_taken = ds4_gpu_mtl4_polar_routed_moe_batch_stub(
-   g->polar_pool_ref, (uint32_t)il, (uint32_t)n_tokens) != 0;
- }
- if (polar_taken) {
-  /* Polar dispatcher claimed the FFN — output is in batch_routed_out.
-   * Skip FP4 path entirely. (Stub currently never returns 1, so this
-   * branch is dead until body lands.) */
- } else {
  /* MTL4 entry: env-gated, falls back to legacy when disabled or
  * preflight fails (n_expert != 6 or n_tokens > 16). The two
  * functions share signature except for the extra mtl4_path_taken
@@ -18047,7 +17995,6 @@ static bool metal_graph_encode_layer_ffn_batch(
  &g->batch_routed_mid_is_f16,
  &mtl4_taken) != 0;
  (void)mtl4_taken; /* hook for future telemetry */
- }  /* end polar_taken else (FP4 fallback) */
  }
  if (ok) {
  metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
@@ -20173,11 +20120,9 @@ struct ds4_engine {
  float directional_steering_attn_scale;
  float directional_steering_ffn_scale;
  uint32_t power_percent;     /* 1..100; 0 means uninitialized → treated as 100 */
- ds4_polar_pool polar_pool;  /* #563 Phase B: per-(layer, kind) PLR2 mmap pool */
  /* prefix_cache: now a file-scope singleton in ds4_prefix_cache.c (silv
   * 2026-06-04 "all caches global") — one engine per process => one cache,
   * no struct member, no pointer threading. */
- uint8_t polar_layer_enabled[DS4_POLAR_MAX_LAYERS]; /* #563 Phase B-2: DS4_POLAR_LAYERS mask */
  bool quality;
  bool metal_ready;
  bool mtp_ready;
@@ -20220,9 +20165,6 @@ static void metal_graph_apply_engine_runtime(ds4_gpu_graph *g, const ds4_engine 
  g->cpu_model = e->cpu_moe ? &e->cpu_model : NULL;
  g->prefill_metal_phases = e->prefill_metal_phases;
  g->power_percent = e->power_percent;   /* propagate throttle to graph */
- /* #563 Phase B-2: thread polar pool + layer mask refs into graph. */
- g->polar_pool_ref = (e->polar_pool.opened_count > 0) ? &e->polar_pool : NULL;
- g->polar_layer_enabled_ref = e->polar_layer_enabled;
  for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
  g->cpu_moe_layer[il] = e->cpu_moe_layer[il];
  }
@@ -24541,47 +24483,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
   * Phase 1 ships only hash + LRU bookkeeping. Phase 3+ adds disk-backed
   * GPU state save/restore. */
  ds4_prefix_cache_init();
- /* #563 Phase B-1.5: load PLR2 polar files if DS4_POLAR_DIR is set.
-  * Held alongside FP4 weights; no dispatch substitution yet (Phase B-2). */
- ds4_polar_pool_init(&e->polar_pool);
- const char *polar_dir = getenv("DS4_POLAR_DIR");
- if (polar_dir && polar_dir[0]) {
- uint32_t opened = ds4_polar_pool_load_dir(&e->polar_pool, polar_dir);
- if (opened > 0) {
- ds4_polar_pool_print_summary(&e->polar_pool, polar_dir);
- } else {
- fprintf(stderr, "ds4: DS4_POLAR_DIR=%s opened 0 files (Phase B-1 disabled)\n",
- polar_dir);
- }
- }
- /* #563 Phase B-2: DS4_POLAR_LAYERS="l1,l2,..." selects which layers get
-  * polar dispatch (H1735 kernel) instead of FP4. Comma-separated layer
-  * indices; empty / unset = no polar dispatch (Phase B-1 only). Layer must
-  * also be present in the polar pool (GUD all loaded). Phase B-2 dispatch
-  * itself lives in metal_graph_encode_layer_batch; this just records the
-  * intent. */
- memset(e->polar_layer_enabled, 0, sizeof(e->polar_layer_enabled));
- const char *polar_layers = getenv("DS4_POLAR_LAYERS");
- if (polar_layers && polar_layers[0]) {
- const char *p = polar_layers;
- uint32_t n_marked = 0;
- while (*p) {
- char *end = NULL;
- long v = strtol(p, &end, 10);
- if (end == p) break;
- if (v >= 0 && v < (long)DS4_POLAR_MAX_LAYERS) {
- e->polar_layer_enabled[v] = 1;
- n_marked++;
- }
- p = end;
- while (*p == ',' || *p == ' ') p++;
- }
- fprintf(stderr, "ds4: DS4_POLAR_LAYERS marked %u layers for polar dispatch (Phase B-2)\n",
- n_marked);
- if (n_marked > 0 && e->polar_pool.opened_count == 0) {
- fprintf(stderr, "ds4: WARN — DS4_POLAR_LAYERS set but DS4_POLAR_DIR unset / empty; dispatch will fall back to FP4\n");
- }
- }
+ if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
  if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
  ds4_acquire_instance_lock();
 
@@ -25883,7 +25785,6 @@ void ds4_engine_close(ds4_engine *e) {
    }
  }
  ds4_prefix_cache_free();
- ds4_polar_pool_close(&e->polar_pool);  /* #563 Phase B-1: release mmap'd PLR2 */
  weights_free(&e->weights);
  vocab_free(&e->vocab);
  ds4_threads_shutdown();
