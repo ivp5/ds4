@@ -21,7 +21,6 @@ import json
 import math
 import mmap
 from pathlib import Path
-import struct
 import sys
 import time
 from typing import Any
@@ -45,69 +44,11 @@ if str(REPO_ROOT / "tools") not in sys.path:
 from ds4_d8f_weight_compare import decode_d8f, load_source, read_record  # noqa: E402
 from ds4_logprob_margin_gate import analyze as analyze_logprobs  # noqa: E402
 from ds4_logprob_margin_gate import load_steps  # noqa: E402
+from ds4_safetensors import SafetensorStore  # noqa: E402
 
 
 ROUTE_SCALE = 1.5
 TOPK_EXPERTS = 6
-
-
-def bf16_to_f32(raw: bytes, shape: list[int] | tuple[int, ...]) -> np.ndarray:
-    return (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(shape)
-
-
-def load_index(model_dir: Path) -> dict[str, str]:
-    with (model_dir / "model.safetensors.index.json").open("r", encoding="utf-8") as handle:
-        return json.load(handle)["weight_map"]
-
-
-def tensor_meta(model_dir: Path, index: dict[str, str], name: str) -> tuple[Path, int, dict[str, Any]]:
-    shard = model_dir / index[name]
-    with shard.open("rb") as handle:
-        header_bytes = struct.unpack("<Q", handle.read(8))[0]
-        header = json.loads(handle.read(header_bytes))
-    return shard, 8 + header_bytes, header[name]
-
-
-def load_tensor(model_dir: Path, index: dict[str, str], name: str) -> tuple[bytes, list[int], str]:
-    shard, base, meta = tensor_meta(model_dir, index, name)
-    start, end = meta["data_offsets"]
-    with shard.open("rb") as handle:
-        handle.seek(base + start)
-        return handle.read(end - start), meta["shape"], meta["dtype"]
-
-
-def load_numeric(model_dir: Path, index: dict[str, str], name: str) -> np.ndarray:
-    raw, shape, dtype = load_tensor(model_dir, index, name)
-    if dtype == "BF16":
-        return bf16_to_f32(raw, shape)
-    if dtype == "F16":
-        return np.frombuffer(raw, dtype=np.float16).astype(np.float32).reshape(shape)
-    if dtype == "F32":
-        return np.frombuffer(raw, dtype=np.float32).reshape(shape)
-    raise ValueError(f"{name}: unsupported dtype {dtype}")
-
-
-def load_head_rows(model_dir: Path, index: dict[str, str], rows: np.ndarray) -> np.ndarray:
-    shard, base, meta = tensor_meta(model_dir, index, "head.weight")
-    shape = meta["shape"]
-    dtype = meta["dtype"]
-    if dtype not in {"BF16", "F16", "F32"}:
-        raise ValueError(f"head.weight row loader supports BF16/F16/F32, got {dtype}")
-    item_bytes = {"BF16": 2, "F16": 2, "F32": 4}[dtype]
-    start, _ = meta["data_offsets"]
-    row_bytes = shape[1] * item_bytes
-    out: list[np.ndarray] = []
-    with shard.open("rb") as handle:
-        for row in rows.tolist():
-            handle.seek(base + start + int(row) * row_bytes)
-            raw = handle.read(row_bytes)
-            if dtype == "BF16":
-                out.append(bf16_to_f32(raw, (shape[1],)))
-            elif dtype == "F16":
-                out.append(np.frombuffer(raw, dtype=np.float16).astype(np.float32))
-            else:
-                out.append(np.frombuffer(raw, dtype=np.float32).copy())
-    return np.stack(out, axis=0)
 
 
 def parse_csv_ints(text: str | None) -> list[int]:
@@ -409,13 +350,13 @@ def resolve_backend(args: argparse.Namespace) -> str:
     return backend
 
 
-def router_select(model_dir: Path, index: dict[str, str], layer: int, acts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    gate = load_numeric(model_dir, index, f"layers.{layer}.ffn.gate.weight")
+def router_select(store: SafetensorStore, layer: int, acts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    gate = store.numeric(f"layers.{layer}.ffn.gate.weight")
     scores = acts @ gate.T
     probs = np.sqrt(np.log1p(np.exp(-np.abs(scores))) + np.maximum(scores, 0.0))
     bias_name = f"layers.{layer}.ffn.gate.bias"
-    if bias_name in index:
-        probs += load_numeric(model_dir, index, bias_name).reshape(1, -1)
+    if bias_name in store.weight_map:
+        probs += store.numeric(bias_name).reshape(1, -1)
     selected = np.argpartition(-probs, TOPK_EXPERTS, axis=1)[:, :TOPK_EXPERTS]
     selected_probs = np.take_along_axis(probs, selected, axis=1)
     weights = selected_probs / np.maximum(np.sum(selected_probs, axis=1, keepdims=True), 1.0e-9) * ROUTE_SCALE
@@ -664,10 +605,10 @@ def main() -> int:
     args = parser.parse_args()
     args.backend = resolve_backend(args)
 
-    index = load_index(MODEL_DIR)
+    store = SafetensorStore(MODEL_DIR)
     acts = load_acts(args)
     residual_exact = load_residual(args, acts.shape[0])
-    selected, weights = router_select(MODEL_DIR, index, args.layer, acts)
+    selected, weights = router_select(store, args.layer, acts)
     if args.experts == "selected":
         experts = sorted(int(value) for value in np.unique(selected))
     else:
@@ -694,9 +635,9 @@ def main() -> int:
             and int(np.max(trace_indices)) < acts.shape[0]
         )
         trace_row_mode = "aligned" if can_align else "cross"
-    head_rows = load_head_rows(MODEL_DIR, index, token_pool)
+    head_rows = store.rows("head.weight", token_pool)
     margin_dirs = head_rows[pair_local[:, 0]] - head_rows[pair_local[:, 1]]
-    norm_weight = load_numeric(MODEL_DIR, index, "norm.weight").reshape(-1)
+    norm_weight = store.numeric("norm.weight").reshape(-1)
 
     with args.d8f.open("rb") as handle:
         mapped = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)

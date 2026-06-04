@@ -27,11 +27,11 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-LIB_ROOT = REPO_ROOT / "tmp" / "20260531_codec_coherence"
-if str(LIB_ROOT) not in sys.path:
-    sys.path.insert(0, str(LIB_ROOT))
+TOOLS_ROOT = REPO_ROOT / "tools"
+if str(TOOLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(TOOLS_ROOT))
 
-import ds4_mlx_lib as mlx_lib  # noqa: E402
+from ds4_safetensors import DEFAULT_MODEL_DIR, SafetensorStore  # noqa: E402
 
 
 HEADER_BYTES = 4096
@@ -108,9 +108,10 @@ def decode_d8f(mapped: mmap.mmap, record: dict[str, int], projection: str) -> np
     return decoded
 
 
-def load_source(layer: int, projection: str, expert: int) -> np.ndarray:
+def load_source(layer: int, projection: str, expert: int, store: SafetensorStore | None = None) -> np.ndarray:
+    store = store or SafetensorStore(DEFAULT_MODEL_DIR)
     stem = f"layers.{layer}.ffn.experts.{expert}.{SOURCE_STEMS[projection]}"
-    source = np.asarray(mlx_lib.deq_fp4(stem), dtype=np.float32)
+    source = np.asarray(store.packed_fp4(stem), dtype=np.float32)
     if projection in ("gate", "up"):
         return source if source.shape == SHAPES[projection] else source.T
     return source if source.shape == SHAPES[projection] else source.T
@@ -145,6 +146,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer", required=True, type=int)
     parser.add_argument("--projection", required=True, choices=sorted(PROJECTIONS))
     parser.add_argument("--expert", required=True, type=int)
+    parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     return parser.parse_args()
 
 
@@ -155,8 +157,9 @@ def main() -> int:
         try:
             if mapped[:8] != b"DS4D8F1\0":
                 raise ValueError(f"{args.d8f}: not DS4D8F1")
+            store = SafetensorStore(args.model_dir)
             record = read_record(mapped, args.projection, args.expert)
-            source = load_source(args.layer, args.projection, args.expert)
+            source = load_source(args.layer, args.projection, args.expert, store)
             decoded = decode_d8f(mapped, record, args.projection)
             result = {
                 "d8f": os.fspath(args.d8f),
