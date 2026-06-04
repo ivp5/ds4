@@ -12000,113 +12000,73 @@ static uint32_t metal_graph_decode_indexer_top_k(const ds4_gpu_graph *g) {
  * DS4_METAL_DISABLE_*_FUSION environment switches.
  */
 
-static bool metal_graph_env_flag(const char *name, int *cache) {
- if (*cache == -1) {
+static bool metal_graph_env_switch_is_on(const char *name) {
  const char *env = getenv(name);
- *cache = env && env[0] && strcmp(env, "0") != 0;
- }
- return *cache != 0;
+ return env && env[0] && strcmp(env, "0") != 0;
 }
 
-static bool metal_graph_use_reference_hc_decode(void) {
- static int cache = -1;
- return metal_graph_env_flag("DS4_METAL_DISABLE_HC_FUSION", &cache);
-}
+static int g_decode_policy_loaded = 0;
+static bool g_decode_uses_reference_hc;
+static bool g_decode_uses_reference_kv;
+static bool g_decode_uses_reference_qkv_norm;
+static bool g_decode_uses_reference_compressor_pair_proj;
+static bool g_decode_uses_reference_hc_norm;
+static bool g_decode_uses_reference_shared_down_hc;
+static bool g_decode_uses_reference_attn_out_hc;
+static bool g_decode_uses_kv_rope_store_fusion;
+static bool g_decode_uses_q_head_norm_rope_fusion;
+static bool g_decode_uses_indexer_q_rope_fusion;
+static bool g_decode_uses_indexed_attn_rope_fusion;
+static bool g_decode_uses_decode_attn_rope_fusion;
+static bool g_decode_uses_router_matmul_select_fusion;
+static bool g_decode_uses_fp8_attn_out_onecb_hc;
+static bool g_decode_uses_fp8_shared_down_hc;
+static bool g_decode_uses_top_only_argmax;
+static bool g_decode_uses_hc_rms_mix_fusion;
+static bool g_decode_uses_hc_full_prelude_fusion;
+static bool g_decode_uses_output_hc_sum_norm_fusion;
+static bool g_decode_uses_output_hc_full_fusion;
 
-static bool metal_graph_use_reference_kv_decode(void) {
- static int cache = -1;
- return metal_graph_env_flag("DS4_METAL_DISABLE_KV_FUSION", &cache);
-}
-
-static bool metal_graph_use_kv_rope_store_fusion(void) {
- static int disable_cache = -1;
- return !metal_graph_env_flag("DS4_METAL_DISABLE_KV_ROPE_STORE_FUSION", &disable_cache);
-}
-
-static bool metal_graph_use_reference_qkv_norm(void) {
- static int cache = -1;
- return metal_graph_env_flag("DS4_METAL_DISABLE_QKV_NORM_FUSION", &cache);
-}
-
-static bool metal_graph_use_q_head_norm_rope(void) {
- static int enable_cache = -1;
- static int disable_cache = -1;
- return (ds4_metal_graph_max_fusion_enabled() ||
-         metal_graph_env_flag("DS4_METAL_ENABLE_Q_HEAD_NORM_ROPE_FUSION", &enable_cache)) &&
-        !metal_graph_env_flag("DS4_METAL_DISABLE_Q_HEAD_NORM_ROPE_FUSION", &disable_cache);
-}
-
-static bool metal_graph_use_indexer_q_rope_fusion(void) {
- static int enable_cache = -1;
- static int disable_cache = -1;
- return (ds4_metal_graph_max_fusion_enabled() ||
-         metal_graph_env_flag("DS4_METAL_ENABLE_INDEXER_Q_ROPE_FUSION", &enable_cache)) &&
-        !metal_graph_env_flag("DS4_METAL_DISABLE_INDEXER_Q_ROPE_FUSION", &disable_cache);
-}
-
-static bool metal_graph_use_indexed_attn_rope_fusion(void) {
- static int enable_cache = -1;
- static int disable_cache = -1;
- return metal_graph_env_flag("DS4_METAL_ENABLE_INDEXED_ATTN_ROPE_FUSION", &enable_cache) &&
-        !metal_graph_env_flag("DS4_METAL_DISABLE_INDEXED_ATTN_ROPE_FUSION", &disable_cache);
-}
-
-static bool metal_graph_use_decode_attn_rope_fusion(void) {
- static int enable_cache = -1;
- static int disable_cache = -1;
- return metal_graph_env_flag("DS4_METAL_ENABLE_DECODE_ATTN_ROPE_FUSION", &enable_cache) &&
-        !metal_graph_env_flag("DS4_METAL_DISABLE_DECODE_ATTN_ROPE_FUSION", &disable_cache);
-}
-
-static bool metal_graph_use_router_matmul_select_fusion(void) {
- static int enable_cache = -1;
- static int disable_cache = -1;
- return (ds4_metal_graph_max_fusion_enabled() ||
-         metal_graph_env_flag("DS4_METAL_ENABLE_ROUTER_MATMUL_SELECT_FUSION", &enable_cache)) &&
-        !metal_graph_env_flag("DS4_METAL_DISABLE_ROUTER_MATMUL_SELECT_FUSION", &disable_cache);
-}
-
-static bool metal_graph_use_reference_compressor_pair_proj(void) {
- static int cache = -1;
- return metal_graph_env_flag("DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
-}
-
-static bool metal_graph_use_reference_hc_norm_decode(void) {
- static int enable_cache = -1;
- static int disable_cache = -1;
- return !metal_graph_env_flag("DS4_METAL_ENABLE_HC_NORM_FUSION", &enable_cache) ||
-        metal_graph_env_flag("DS4_METAL_DISABLE_HC_NORM_FUSION", &disable_cache);
-}
-
-static bool metal_graph_use_reference_shared_down_hc(void) {
- static int cache = -1;
- return metal_graph_env_flag("DS4_METAL_DISABLE_SHARED_DOWN_HC_FUSION", &cache);
-}
-
-static bool metal_graph_use_reference_attn_out_hc(void) {
- static int cache = -1;
- return metal_graph_env_flag("DS4_METAL_DISABLE_ATTN_OUT_HC_FUSION", &cache);
-}
-
-static bool metal_graph_use_fp8_attn_out_onecb_hc(void) {
- static int enable_cache = -1;
- static int disable_cache = -1;
- return metal_graph_env_flag("DS4_ENABLE_FP8_ATTN_OUT_ONECB_HC", &enable_cache) &&
-        !metal_graph_env_flag("DS4_DISABLE_FP8_ATTN_OUT_ONECB_HC", &disable_cache);
-}
-
-static bool metal_graph_use_fp8_shared_down_hc(void) {
- static int disable_cache = -1;
- return !metal_graph_env_flag("DS4_METAL_DISABLE_SHARED_DOWN_FP8_HC_FUSION", &disable_cache);
-}
-
-static bool metal_graph_use_top_only_argmax_decode(void) {
- static int enable_cache = -1;
- static int disable_cache = -1;
- return (ds4_prime_path_enabled() ||
-         ds4_metal_graph_max_fusion_enabled() ||
-         metal_graph_env_flag("DS4_METAL_ENABLE_TOP_ONLY_ARGMAX", &enable_cache)) &&
-        !metal_graph_env_flag("DS4_METAL_DISABLE_TOP_ONLY_ARGMAX", &disable_cache);
+static void metal_graph_decode_policy_load_once(void) {
+ if (g_decode_policy_loaded) return;
+ const bool max_fusion = ds4_metal_graph_max_fusion_enabled();
+ g_decode_uses_reference_hc = metal_graph_env_switch_is_on("DS4_METAL_DISABLE_HC_FUSION");
+ g_decode_uses_reference_kv = metal_graph_env_switch_is_on("DS4_METAL_DISABLE_KV_FUSION");
+ g_decode_uses_reference_qkv_norm = metal_graph_env_switch_is_on("DS4_METAL_DISABLE_QKV_NORM_FUSION");
+ g_decode_uses_reference_compressor_pair_proj = metal_graph_env_switch_is_on("DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ");
+ g_decode_uses_reference_hc_norm =
+ !metal_graph_env_switch_is_on("DS4_METAL_ENABLE_HC_NORM_FUSION") ||
+ metal_graph_env_switch_is_on("DS4_METAL_DISABLE_HC_NORM_FUSION");
+ g_decode_uses_reference_shared_down_hc = metal_graph_env_switch_is_on("DS4_METAL_DISABLE_SHARED_DOWN_HC_FUSION");
+ g_decode_uses_reference_attn_out_hc = metal_graph_env_switch_is_on("DS4_METAL_DISABLE_ATTN_OUT_HC_FUSION");
+ g_decode_uses_kv_rope_store_fusion = !metal_graph_env_switch_is_on("DS4_METAL_DISABLE_KV_ROPE_STORE_FUSION");
+ g_decode_uses_q_head_norm_rope_fusion =
+ (max_fusion || metal_graph_env_switch_is_on("DS4_METAL_ENABLE_Q_HEAD_NORM_ROPE_FUSION")) &&
+ !metal_graph_env_switch_is_on("DS4_METAL_DISABLE_Q_HEAD_NORM_ROPE_FUSION");
+ g_decode_uses_indexer_q_rope_fusion =
+ (max_fusion || metal_graph_env_switch_is_on("DS4_METAL_ENABLE_INDEXER_Q_ROPE_FUSION")) &&
+ !metal_graph_env_switch_is_on("DS4_METAL_DISABLE_INDEXER_Q_ROPE_FUSION");
+ g_decode_uses_indexed_attn_rope_fusion =
+ metal_graph_env_switch_is_on("DS4_METAL_ENABLE_INDEXED_ATTN_ROPE_FUSION") &&
+ !metal_graph_env_switch_is_on("DS4_METAL_DISABLE_INDEXED_ATTN_ROPE_FUSION");
+ g_decode_uses_decode_attn_rope_fusion =
+ metal_graph_env_switch_is_on("DS4_METAL_ENABLE_DECODE_ATTN_ROPE_FUSION") &&
+ !metal_graph_env_switch_is_on("DS4_METAL_DISABLE_DECODE_ATTN_ROPE_FUSION");
+ g_decode_uses_router_matmul_select_fusion =
+ (max_fusion || metal_graph_env_switch_is_on("DS4_METAL_ENABLE_ROUTER_MATMUL_SELECT_FUSION")) &&
+ !metal_graph_env_switch_is_on("DS4_METAL_DISABLE_ROUTER_MATMUL_SELECT_FUSION");
+ g_decode_uses_fp8_attn_out_onecb_hc =
+ metal_graph_env_switch_is_on("DS4_ENABLE_FP8_ATTN_OUT_ONECB_HC") &&
+ !metal_graph_env_switch_is_on("DS4_DISABLE_FP8_ATTN_OUT_ONECB_HC");
+ g_decode_uses_fp8_shared_down_hc = !metal_graph_env_switch_is_on("DS4_METAL_DISABLE_SHARED_DOWN_FP8_HC_FUSION");
+ g_decode_uses_top_only_argmax =
+ (ds4_prime_path_enabled() || max_fusion || metal_graph_env_switch_is_on("DS4_METAL_ENABLE_TOP_ONLY_ARGMAX")) &&
+ !metal_graph_env_switch_is_on("DS4_METAL_DISABLE_TOP_ONLY_ARGMAX");
+ g_decode_uses_hc_rms_mix_fusion = !metal_graph_env_switch_is_on("DS4_METAL_DISABLE_HC_RMS_MIX_FUSION");
+ g_decode_uses_hc_full_prelude_fusion = !metal_graph_env_switch_is_on("DS4_METAL_DISABLE_HC_FULL_PRELUDE_FUSION");
+ g_decode_uses_output_hc_sum_norm_fusion = !metal_graph_env_switch_is_on("DS4_METAL_DISABLE_OUTPUT_HC_SUM_NORM_FUSION");
+ g_decode_uses_output_hc_full_fusion = !metal_graph_env_switch_is_on("DS4_METAL_DISABLE_OUTPUT_HC_FULL_FUSION");
+ g_decode_policy_loaded = 1;
 }
 
 static bool metal_graph_decode_hc_pre(
@@ -12117,7 +12077,8 @@ static bool metal_graph_decode_hc_pre(
  const ds4_model *model,
  uint64_t scale_offset,
  uint64_t base_offset) {
- if (metal_graph_use_reference_hc_decode()) {
+ metal_graph_decode_policy_load_once();
+ if (g_decode_uses_reference_hc) {
  return ds4_gpu_hc_split_sinkhorn_tensor(split,
  mix,
  model->map,
@@ -12153,7 +12114,8 @@ static bool metal_graph_decode_kv_store(
  ds4_gpu_tensor *raw_cache,
  uint32_t raw_cap,
  uint32_t raw_row) {
- if (metal_graph_use_reference_kv_decode()) {
+ metal_graph_decode_policy_load_once();
+ if (g_decode_uses_reference_kv) {
  return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0 &&
  ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, DS4_N_HEAD_DIM) != 0;
  }
@@ -12971,46 +12933,6 @@ static int ds4_matmul_f16_rope_via_tensor(ds4_gpu_tensor *dst,
                                        beta_slow);
 }
 
-static bool metal_graph_use_hc_rms_mix_fusion(void) {
- static int initialized = 0;
- static int enabled = 0;
- if (!initialized) {
-  enabled = getenv("DS4_METAL_DISABLE_HC_RMS_MIX_FUSION") == NULL;
-  initialized = 1;
- }
- return enabled != 0;
-}
-
-static bool metal_graph_use_hc_full_prelude_fusion(void) {
- static int initialized = 0;
- static int enabled = 0;
- if (!initialized) {
-  enabled = getenv("DS4_METAL_DISABLE_HC_FULL_PRELUDE_FUSION") == NULL;
-  initialized = 1;
- }
- return enabled != 0;
-}
-
-static bool metal_graph_use_output_hc_sum_norm_fusion(void) {
- static int initialized = 0;
- static int enabled = 0;
- if (!initialized) {
-  enabled = getenv("DS4_METAL_DISABLE_OUTPUT_HC_SUM_NORM_FUSION") == NULL;
-  initialized = 1;
- }
- return enabled != 0;
-}
-
-static bool metal_graph_use_output_hc_full_fusion(void) {
- static int initialized = 0;
- static int enabled = 0;
- if (!initialized) {
-  enabled = getenv("DS4_METAL_DISABLE_OUTPUT_HC_FULL_FUSION") == NULL;
-  initialized = 1;
- }
- return enabled != 0;
-}
-
 static int ds4_hc_rms_f16_mix_via_tensor(ds4_gpu_tensor *dst,
                                           const ds4_model *model,
                                           const ds4_tensor *t,
@@ -13018,7 +12940,8 @@ static int ds4_hc_rms_f16_mix_via_tensor(ds4_gpu_tensor *dst,
                                           uint64_t out_dim,
                                           const ds4_gpu_tensor *src,
                                           float eps) {
- if (!metal_graph_use_hc_rms_mix_fusion() ||
+ metal_graph_decode_policy_load_once();
+ if (!g_decode_uses_hc_rms_mix_fusion ||
      !dst || !model || !t || !src ||
      t->type != DS4_TENSOR_F16 ||
      in_dim > UINT32_MAX || out_dim > UINT32_MAX || out_dim > 24u) {
@@ -13062,8 +12985,9 @@ static int ds4_hc_full_prelude_f16_via_tensor(ds4_gpu_tensor *out,
                                               float rms_eps,
                                               float eps,
                                               float norm_eps) {
- if (!metal_graph_use_hc_full_prelude_fusion() ||
-     !metal_graph_use_hc_rms_mix_fusion() ||
+ metal_graph_decode_policy_load_once();
+ if (!g_decode_uses_hc_full_prelude_fusion ||
+     !g_decode_uses_hc_rms_mix_fusion ||
      !out || !norm_out || !split || !mix_out || !model || !t || !residual_hc ||
      t->type != DS4_TENSOR_F16 ||
      n_embd != DS4_N_EMBD || n_hc != DS4_N_HC) {
@@ -13122,13 +13046,14 @@ static int ds4_output_hc_full_f16_via_tensor(ds4_gpu_tensor *pre_out,
                                              uint64_t base_offset,
                                              uint64_t norm_weight_offset,
                                              uint32_t n_embd,
-                                             uint32_t n_hc,
-                                             float rms_eps,
-                                             float eps,
-                                             float norm_eps) {
- if (!metal_graph_use_output_hc_full_fusion() ||
-     !metal_graph_use_hc_rms_mix_fusion() ||
-     !metal_graph_use_output_hc_sum_norm_fusion() ||
+                                              uint32_t n_hc,
+                                              float rms_eps,
+                                              float eps,
+                                              float norm_eps) {
+ metal_graph_decode_policy_load_once();
+ if (!g_decode_uses_output_hc_full_fusion ||
+     !g_decode_uses_hc_rms_mix_fusion ||
+     !g_decode_uses_output_hc_sum_norm_fusion ||
      !pre_out || !weights_out || !embd_out || !norm_out ||
      !model || !t || !residual_hc ||
      t->type != DS4_TENSOR_F16 ||
@@ -13779,7 +13704,8 @@ static bool metal_graph_encode_decode_layer(
  if (ext_factor != 0.0f && freq_scale > 0.0f) {
  attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
  }
- const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
+ metal_graph_decode_policy_load_once();
+ const bool qkv_rms_fused = !g_decode_uses_reference_qkv_norm;
 
  bool ok = true;
  const bool decode_stage_profile = getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
@@ -13798,8 +13724,8 @@ static bool metal_graph_encode_decode_layer(
  } \
  } while (0)
  const bool fuse_hc_norm =
- !metal_graph_use_reference_hc_decode() &&
- !metal_graph_use_reference_hc_norm_decode();
+ !g_decode_uses_reference_hc &&
+ !g_decode_uses_reference_hc_norm;
  int attn_hc_prelude_fused = 0;
  if (ok && fuse_hc_norm) {
  attn_hc_prelude_fused = ds4_hc_full_prelude_f16_via_tensor(g->attn_cur,
@@ -13937,7 +13863,7 @@ static bool metal_graph_encode_decode_layer(
  if (ok) {
  metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
  }
- if (ok && metal_graph_use_q_head_norm_rope()) {
+ if (ok && g_decode_uses_q_head_norm_rope_fusion) {
  ok = ds4_gpu_head_rms_norm_rope_tail_tensor(g->q,
  1,
  DS4_N_HEAD,
@@ -13985,8 +13911,8 @@ static bool metal_graph_encode_decode_layer(
  }
  int kv_rope_store_fused = 0;
  if (ok &&
- metal_graph_use_kv_rope_store_fusion() &&
- !metal_graph_use_reference_kv_decode() &&
+ g_decode_uses_kv_rope_store_fusion &&
+ !g_decode_uses_reference_kv &&
  !metal_graph_debug_wants("KVrope", il, pos)) {
  kv_rope_store_fused = ds4_gpu_kv_rope_fp8_store_raw_tensor(g->kv,
  raw_cache,
@@ -14050,7 +13976,7 @@ static bool metal_graph_encode_decode_layer(
  fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
  ok = false;
  }
- if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
+ if (ok && !g_decode_uses_reference_compressor_pair_proj) {
  ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
  g->comp_sc_cur,
  model->map,
@@ -14131,7 +14057,7 @@ static bool metal_graph_encode_decode_layer(
  fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
  ok = false;
  }
- if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
+ if (ok && !g_decode_uses_reference_compressor_pair_proj) {
  ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
  g->comp_sc_cur,
  model->map,
@@ -14196,7 +14122,7 @@ static bool metal_graph_encode_decode_layer(
  ok = false;
  }
  int indexer_q_rope_fused = 0;
- if (ok && metal_graph_use_indexer_q_rope_fusion()) {
+ if (ok && g_decode_uses_indexer_q_rope_fusion) {
  indexer_q_rope_fused = ds4_matmul_f16_rope_via_tensor(g->indexer_q,
  model,
  layer->indexer_attn_q_b,
@@ -14309,7 +14235,7 @@ static bool metal_graph_encode_decode_layer(
  if (ok) {
  const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
  if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
- if (metal_graph_use_indexed_attn_rope_fusion() &&
+ if (g_decode_uses_indexed_attn_rope_fusion &&
  !metal_graph_debug_wants("kqv_out", il, pos)) {
  indexed_attn_rope_fused = ds4_gpu_attention_indexed_mixed_batch_heads_rope_tensor(
  g->heads,
@@ -14378,7 +14304,7 @@ static bool metal_graph_encode_decode_layer(
  &decode_index_stage_t0);
  }
  } else {
- if (metal_graph_use_decode_attn_rope_fusion() &&
+ if (g_decode_uses_decode_attn_rope_fusion &&
  !metal_graph_debug_wants("kqv_out", il, pos)) {
  decode_attn_rope_fused = ds4_gpu_attention_decode_heads_rope_tensor(g->heads,
  model->map, model->size,
@@ -14470,7 +14396,7 @@ static bool metal_graph_encode_decode_layer(
   layer->attn_output_b->storage.scale_dtype == DS4_TENSOR_FP8_E8M0;
   const bool fuse_attn_out_hc =
   !metal_graph_directional_steering_attn_enabled(g) &&
-  !metal_graph_use_reference_attn_out_hc() &&
+  !g_decode_uses_reference_attn_out_hc &&
   attn_output_q8_native;
   static int s_disable_fp8_attn_out_hc_fuse_checked = 0;
   static int s_disable_fp8_attn_out_hc_fuse = 0;
@@ -14484,7 +14410,7 @@ static bool metal_graph_encode_decode_layer(
   const bool fuse_fp8_attn_out_hc =
   !s_disable_fp8_attn_out_hc_fuse &&
   !metal_graph_directional_steering_attn_enabled(g) &&
-  !metal_graph_use_reference_attn_out_hc() &&
+  !g_decode_uses_reference_attn_out_hc &&
   attn_output_fp8_storage;
   if (ok && attn_output_fp8_storage) {
   s_n_storage_dispatch_fp8_direct++;
@@ -14492,7 +14418,7 @@ static bool metal_graph_encode_decode_layer(
   s_n_storage_dispatch_fp8_direct++;
   ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8_DIRECT, layer->attn_output_b);
   bool fp8_attn_out_onecb_hc_done = false;
-  if (fuse_fp8_attn_out_hc && metal_graph_use_fp8_attn_out_onecb_hc()) {
+  if (fuse_fp8_attn_out_hc && g_decode_uses_fp8_attn_out_onecb_hc) {
   const bool store_fp8_attn_out =
   getenv("DS4_FP8_ATTN_OUT_HC_STORE_BLOCK") != NULL ||
   metal_graph_debug_wants("attn_out", il, pos);
@@ -14726,7 +14652,7 @@ static bool metal_graph_encode_decode_layer(
   *       straight to router_select. */
  int router_matmul_select_fused = 0;
  if (ok && !g->quality &&
-     metal_graph_use_router_matmul_select_fusion() &&
+     g_decode_uses_router_matmul_select_fusion &&
      layer->ffn_gate_inp &&
      layer->ffn_gate_inp->type == DS4_TENSOR_F16 &&
      layer->ffn_gate_inp->storage.metal_buffer == NULL &&
@@ -14921,13 +14847,13 @@ static bool metal_graph_encode_decode_layer(
  layer->ffn_down_shexp->storage.metal_buffer &&
  layer->ffn_down_shexp->storage.scale_metal_buffer;
  const bool fuse_shared_down_hc =
- !keep_ffn_out && shared_down_q8_native && !metal_graph_use_reference_shared_down_hc();
+ !keep_ffn_out && shared_down_q8_native && !g_decode_uses_reference_shared_down_hc;
  const bool fuse_shared_down_fp8_hc =
  !keep_ffn_out &&
- metal_graph_use_fp8_shared_down_hc() &&
+ g_decode_uses_fp8_shared_down_hc &&
  shared_down_fp8_storage &&
  !metal_graph_directional_steering_ffn_enabled(g) &&
- !metal_graph_use_reference_shared_down_hc();
+ !g_decode_uses_reference_shared_down_hc;
  bool fp8_shared_down_hc_fused = false;
  if (ok && fuse_shared_down_fp8_hc) {
  const bool store_fp8_shared_down =
@@ -15130,7 +15056,8 @@ static bool metal_graph_encode_output_head(
  metal_graph_debug_dump_tensor("result_hc_pre", g->output_pre, DS4_N_HC, DS4_N_LAYER, 0);
  }
  int output_hc_sum_norm_fused = output_hc_full_fused;
- if (ok && !output_hc_full_fused && metal_graph_use_output_hc_sum_norm_fusion()) {
+ metal_graph_decode_policy_load_once();
+ if (ok && !output_hc_full_fused && g_decode_uses_output_hc_sum_norm_fusion) {
  output_hc_sum_norm_fused = ds4_gpu_output_hc_sum_norm_tensor(g->output_weights,
  g->output_embd,
  g->output_norm,
@@ -16415,7 +16342,8 @@ static bool metal_graph_encode_layer_attention_batch(
 	 uint32_t *index_counts = ratio == 4 ? g->batch_index_counts : NULL;
 	 if (comp_counts) memset(comp_counts, 0, (size_t)n_tokens * sizeof(comp_counts[0]));
 	 if (index_counts) memset(index_counts, 0, (size_t)n_tokens * sizeof(index_counts[0]));
-	 const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
+	 metal_graph_decode_policy_load_once();
+	 const bool qkv_rms_fused = !g_decode_uses_reference_qkv_norm;
 	 ds4_gpu_tensor *hc_mix_view = g->batch_hc_mix;
 	 ds4_gpu_tensor *hc_split_view = g->batch_hc_split;
 	 ds4_gpu_tensor *attn_cur_view = g->batch_attn_cur;
@@ -16430,7 +16358,7 @@ static bool metal_graph_encode_layer_attention_batch(
   layer->hc_attn_fn,
   hc_dim, mix_hc,
   g->batch_flat_hc, n_tokens) != 0;
- if (metal_graph_use_reference_hc_decode()) {
+ if (g_decode_uses_reference_hc) {
  if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
  hc_mix_view,
  model->map,
@@ -16585,7 +16513,7 @@ static bool metal_graph_encode_layer_attention_batch(
  (uint64_t)n_tokens * q_dim, il, pos0);
  }
  DS4_METAL_PROFILE_Q_STAGE("q_b");
- if (ok && metal_graph_use_q_head_norm_rope()) {
+ if (ok && g_decode_uses_q_head_norm_rope_fusion) {
  ok = ds4_gpu_head_rms_norm_rope_tail_tensor(g->batch_q,
  n_tokens,
  DS4_N_HEAD,
@@ -17835,7 +17763,8 @@ static bool metal_graph_encode_layer_ffn_batch(
   layer->hc_ffn_fn,
   hc_dim, mix_hc,
   g->batch_flat_hc, n_tokens) != 0;
- if (metal_graph_use_reference_hc_decode()) {
+ metal_graph_decode_policy_load_once();
+ if (g_decode_uses_reference_hc) {
  if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
  hc_mix_view,
  model->map,
@@ -21700,8 +21629,9 @@ static int generate_metal_graph_raw_swa(
  float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
  const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
  const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
+ metal_graph_decode_policy_load_once();
  const bool top_only_argmax =
- metal_graph_use_top_only_argmax_decode() &&
+ g_decode_uses_top_only_argmax &&
  !trace_top &&
  !ds4_skip_confidence_gate_enabled() &&
  !ds4_head_demote_active();
@@ -26521,8 +26451,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
  } else {
  ds4_skip_clear_decode_confidence();
  }
+ metal_graph_decode_policy_load_once();
  const bool top_only_argmax =
- metal_graph_use_top_only_argmax_decode() &&
+ g_decode_uses_top_only_argmax &&
  !ds4_skip_confidence_gate_enabled() &&
  !ds4_head_demote_active();
  int top_only_token = -1;
