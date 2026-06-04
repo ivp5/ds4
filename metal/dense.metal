@@ -554,6 +554,162 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 template [[host_name("kernel_mul_mv_f32_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
 
+struct ds4_metal_args_mul_mv_rope {
+    ds4_metal_args_mul_mv mv;
+    int head_dim;
+    int n_head;
+    int n_rot;
+    int pos;
+    int n_ctx_orig;
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+};
+
+static float dense_rope_yarn_ramp(const float low, const float high, const int i0) {
+    const float y = (i0 / 2 - low) / max(0.001f, high - low);
+    return 1.0f - min(1.0f, max(0.0f, y));
+}
+
+static float dense_rope_yarn_corr_factor(int n_dims, int n_ctx_orig, float n_rot, float base) {
+    return n_dims * log(n_ctx_orig / (n_rot * 2 * M_PI_F)) / (2 * log(base));
+}
+
+static void dense_rope_yarn_corr_dims(int n_dims, int n_ctx_orig, float freq_base,
+                                      float beta_fast, float beta_slow, thread float dims[2]) {
+    dims[0] = max(0.0f, floor(dense_rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_fast, freq_base)));
+    dims[1] = min(n_dims - 1.0f, ceil(dense_rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_slow, freq_base)));
+}
+
+static void dense_rope_yarn(float theta_extrap, float freq_scale, float corr_dims[2],
+                            int i0, float ext_factor, float mscale,
+                            thread float *cos_theta, thread float *sin_theta) {
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        float ramp_mix = dense_rope_yarn_ramp(corr_dims[0], corr_dims[1], i0) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * log(1.0f / freq_scale);
+    }
+    *cos_theta = cos(theta) * mscale;
+    *sin_theta = sin(theta) * mscale;
+}
+
+kernel void kernel_mul_mv_f16_f32_4_rope_tail(
+        constant ds4_metal_args_mul_mv_rope & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB = 32;
+    constexpr short NF = 16;
+    constexpr short NF4 = NF / 4;
+    constexpr short NR0 = 2;
+
+    const int nb = args.mv.ne00 / NB;
+    const int r0 = tgpig.x * NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+    const uint i12 = im % args.mv.ne12;
+    const uint i13 = im / args.mv.ne12;
+    const uint64_t offset1 = r1 * args.mv.nb11 + i12 * args.mv.nb12 + i13 * args.mv.nb13;
+    device const float *y = (device const float *)(src1 + offset1);
+    device const float4 *y4 = (device const float4 *)(src1 + offset1);
+
+    device const half *ax[NR0];
+    device const half4 *ax4[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row) * args.mv.nb01 +
+                                 (i12 / args.mv.r2) * args.mv.nb02 +
+                                 (i13 / args.mv.r3) * args.mv.nb03;
+        ax[row] = (device const half *)(src0 + offset0);
+        ax4[row] = (device const half4 *)(src0 + offset0);
+    }
+
+    float sumf[NR0] = {0.0f, 0.0f};
+    const short ix = tiisg / (NW / NF);
+    const short il = tiisg % (NW / NF);
+    const int ib0 = sgitg * NF + ix;
+    float4 yl4[NF4];
+    device const float4 *yb4 = y4 + (ib0 * NB + il * NF) / 4;
+
+    for (int ib = ib0; ib < nb; ib += NSG * NF) {
+        for (short i = 0; i < NF4; ++i) yl4[i] = yb4[i];
+        for (short row = 0; row < NR0; row++) {
+            device const half4 *xb4 = ax4[row] + (ib * NB + il * NF) / 4;
+            float sumq = 0.0f;
+            for (short i = 0; i < NF4; ++i) sumq += dot(float4(xb4[i]), yl4[i]);
+            sumf[row] += sumq;
+        }
+        yb4 += NSG * NF * NW / 4;
+    }
+
+    for (int i = nb * NB + sgitg * NW + tiisg; i < args.mv.ne00; i += NW * NSG) {
+        for (short row = 0; row < NR0; row++) sumf[row] += float(ax[row][i]) * y[i];
+    }
+
+    threadgroup float *shmem0 = (threadgroup float *)shmem;
+    threadgroup float *shmem1 = shmem0 + NW;
+    if (sgitg == 0) {
+        shmem0[tiisg] = 0.0f;
+        shmem1[tiisg] = 0.0f;
+    }
+    sumf[0] = simd_sum(sumf[0]);
+    sumf[1] = simd_sum(sumf[1]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shmem0[sgitg] = sumf[0];
+        shmem1[sgitg] = sumf[1];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total0 = simd_sum(shmem0[tiisg]);
+    const float total1 = simd_sum(shmem1[tiisg]);
+    if (tiisg != 0 || sgitg != 0 || r0 >= args.mv.ne01) return;
+
+    device float *dst_f32 = (device float *)dst + (uint64_t)im * args.mv.ne0 * args.mv.ne1 +
+                            (uint64_t)r1 * args.mv.ne0;
+    if (r0 + 1 >= args.mv.ne01 ||
+        args.n_rot <= 0 || args.n_rot > args.head_dim || (args.n_rot & 1) != 0 ||
+        args.head_dim <= 0 || args.head_dim > args.mv.ne01) {
+        dst_f32[r0] = total0;
+        if (r0 + 1 < args.mv.ne01) dst_f32[r0 + 1] = total1;
+        return;
+    }
+
+    const int local = r0 - (r0 / args.head_dim) * args.head_dim;
+    const int n_nope = args.head_dim - args.n_rot;
+    if (local < n_nope || ((local - n_nope) & 1) != 0 || local + 1 >= args.head_dim) {
+        dst_f32[r0] = total0;
+        dst_f32[r0 + 1] = total1;
+        return;
+    }
+
+    float corr_dims[2];
+    dense_rope_yarn_corr_dims(args.n_rot, args.n_ctx_orig, args.freq_base,
+                              args.beta_fast, args.beta_slow, corr_dims);
+    const int rel_i0 = local - n_nope;
+    const float inv_ndims = -1.0f / (float)args.n_rot;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+    const float theta = (float)args.pos * exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
+#else
+    const float theta = (float)args.pos * pow(args.freq_base, inv_ndims * (float)rel_i0);
+#endif
+    float cos_theta;
+    float sin_theta;
+    dense_rope_yarn(theta, args.freq_scale, corr_dims, rel_i0,
+                    args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
+    dst_f32[r0] = total0 * cos_theta - total1 * sin_theta;
+    dst_f32[r0 + 1] = total0 * sin_theta + total1 * cos_theta;
+}
+
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling
 // scores.  This paired variant keeps the exact dense F16 row-reduction shape

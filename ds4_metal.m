@@ -3078,6 +3078,21 @@ typedef struct {
 
 typedef ds4_gpu_q8_0_matvec_args ds4_gpu_f16_matvec_args;
 
+typedef struct {
+ ds4_gpu_f16_matvec_args mv;
+ int32_t head_dim;
+ int32_t n_head;
+ int32_t n_rot;
+ int32_t pos;
+ int32_t n_ctx_orig;
+ float freq_base;
+ float freq_scale;
+ float ext_factor;
+ float attn_factor;
+ float beta_fast;
+ float beta_slow;
+} ds4_gpu_f16_matvec_rope_args;
+
 static ds4_gpu_q8_0_matvec_args ds4_gpu_make_q8_0_mv_args(uint64_t in_dim, uint64_t out_dim) {
  const uint64_t row_bytes = (in_dim / 32u) * 34u;
  return (ds4_gpu_q8_0_matvec_args) {
@@ -7868,6 +7883,74 @@ static int ds4_gpu_matmul_f16_kernel_dispatch(
  return 1;
 }
 
+static int ds4_gpu_matmul_f16_rope_kernel_dispatch(
+ ds4_gpu_tensor *out,
+ id<MTLBuffer> wbuf,
+ uint64_t inner_offset,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok,
+ uint32_t n_head,
+ uint32_t head_dim,
+ uint32_t n_rot,
+ uint32_t pos,
+ uint32_t n_ctx_orig,
+ float freq_base,
+ float freq_scale,
+ float ext_factor,
+ float attn_factor,
+ float beta_fast,
+ float beta_slow,
+ const char *label) {
+ if (n_tok != 1u ||
+     n_head == 0u || head_dim == 0u ||
+     out_dim != (uint64_t)n_head * (uint64_t)head_dim ||
+     out_dim > UINT32_MAX || in_dim > UINT32_MAX ||
+     (in_dim % 4u) != 0u || (out_dim & 1u) != 0u ||
+     n_rot == 0u || n_rot > head_dim || (n_rot & 1u) != 0u) return 0;
+ id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+ id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+ if (!xbuf || !outbuf || !wbuf) return 0;
+
+ int owned = 0;
+ id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+ if (!cb) return 0;
+
+ ds4_gpu_f16_matvec_rope_args args = {
+  .mv = ds4_gpu_make_f16_mv_args(in_dim, out_dim),
+  .head_dim = (int32_t)head_dim,
+  .n_head = (int32_t)n_head,
+  .n_rot = (int32_t)n_rot,
+  .pos = (int32_t)pos,
+  .n_ctx_orig = (int32_t)n_ctx_orig,
+  .freq_base = freq_base,
+  .freq_scale = freq_scale,
+  .ext_factor = ext_factor,
+  .attn_factor = attn_factor,
+  .beta_fast = beta_fast,
+  .beta_slow = beta_slow,
+ };
+ ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 0);
+ args.mv.nr0 = 2;
+ id<MTLComputePipelineState> pipeline =
+  ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_f16_f32_4_rope_tail", mv_dispatch.nsg);
+ if (!pipeline) return 0;
+
+ id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+ [enc setComputePipelineState:pipeline];
+ [enc setBytes:&args length:sizeof(args) atIndex:0];
+ [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+ [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+ [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+ [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
+ [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + 1u) / 2u, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+ ds4_gpu_end_compute_encoder(cb, enc);
+
+ return ds4_gpu_finish_command_buffer(cb, owned, label ? label : "F16 matvec+RoPE") ? 1 : 0;
+}
+
 int ds4_gpu_matmul_f16_tensor(
  ds4_gpu_tensor *out,
  const void *model_map,
@@ -7904,6 +7987,52 @@ int ds4_gpu_matmul_f16_tensor(
  if (!wbuf) return 0;
 
  return ds4_gpu_matmul_f16_kernel_dispatch(out, wbuf, inner_offset, in_dim, out_dim, x, n_tok, "F16 tensor matmul");
+ }
+}
+
+int ds4_gpu_matmul_f16_rope_tensor(
+ ds4_gpu_tensor *out,
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t weight_offset,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok,
+ uint32_t n_head,
+ uint32_t head_dim,
+ uint32_t n_rot,
+ uint32_t pos,
+ uint32_t n_ctx_orig,
+ float freq_base,
+ float freq_scale,
+ float ext_factor,
+ float attn_factor,
+ float beta_fast,
+ float beta_slow) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
+
+ @autoreleasepool {
+ id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+ id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+ const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+ const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+ if (!xbuf || !outbuf ||
+     ds4_gpu_tensor_bytes(x) < x_bytes ||
+     ds4_gpu_tensor_bytes(out) < out_bytes) return 0;
+
+ const uint64_t row_bytes = in_dim * sizeof(uint16_t);
+ const uint64_t weight_bytes = row_bytes * out_dim;
+ if (!ds4_gpu_range_resolvable(model_map, model_size, weight_offset, weight_bytes)) return 0;
+
+ uint64_t inner_offset = 0;
+ id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+ if (!wbuf) return 0;
+ return ds4_gpu_matmul_f16_rope_kernel_dispatch(out, wbuf, inner_offset, in_dim, out_dim, x, n_tok,
+                                                n_head, head_dim, n_rot, pos, n_ctx_orig,
+                                                freq_base, freq_scale, ext_factor, attn_factor,
+                                                beta_fast, beta_slow, "F16 tensor matvec+RoPE");
  }
 }
 
@@ -8140,6 +8269,39 @@ int ds4_gpu_matmul_f16_storage(
          * mmap-style multi-tensor view). All other dispatch logic is
          * identical to matmul_f16_tensor and lives in kernel_dispatch. */
         return ds4_gpu_matmul_f16_kernel_dispatch(out, wbuf, 0, in_dim, out_dim, x, n_tok, "F16 storage matmul");
+    }
+}
+
+int ds4_gpu_matmul_f16_rope_storage(
+    ds4_gpu_tensor *out,
+    void *weight_buf,
+    uint64_t in_dim,
+    uint64_t out_dim,
+    const ds4_gpu_tensor *x,
+    uint64_t n_tok,
+    uint32_t n_head,
+    uint32_t head_dim,
+    uint32_t n_rot,
+    uint32_t pos,
+    uint32_t n_ctx_orig,
+    float freq_base,
+    float freq_scale,
+    float ext_factor,
+    float attn_factor,
+    float beta_fast,
+    float beta_slow) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!weight_buf || !out || !x) return 0;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> wbuf = (__bridge id<MTLBuffer>)weight_buf;
+        const uint64_t weight_bytes = in_dim * out_dim * sizeof(uint16_t);
+        if ((uint64_t)wbuf.length < weight_bytes) return 0;
+        return ds4_gpu_matmul_f16_rope_kernel_dispatch(out, wbuf, 0, in_dim, out_dim, x, n_tok,
+                                                       n_head, head_dim, n_rot, pos, n_ctx_orig,
+                                                       freq_base, freq_scale, ext_factor, attn_factor,
+                                                       beta_fast, beta_slow, "F16 storage matvec+RoPE");
     }
 }
 
@@ -9200,6 +9362,141 @@ int ds4_gpu_head_norm_rope_canary(uint32_t n_tok,
         ds4_gpu_tensor_free(fused);
     }
     free(input_host);
+    free(direct_host);
+    free(fused_host);
+    return rc;
+}
+
+static uint16_t ds4_indexer_q_canary_f32_to_f16(float f) {
+    __fp16 h = (__fp16)f;
+    uint16_t u = 0;
+    memcpy(&u, &h, sizeof(u));
+    return u;
+}
+
+int ds4_gpu_indexer_q_rope_canary(uint32_t in_dim,
+                                  uint32_t n_head,
+                                  uint32_t head_dim,
+                                  uint32_t n_rot,
+                                  uint32_t rounds) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!in_dim || !n_head || !head_dim || n_rot == 0u || n_rot > head_dim ||
+        (in_dim % 4u) != 0u || (n_rot & 1u) != 0u) return 0;
+    if (rounds == 0) rounds = 1;
+    const uint32_t out_dim = n_head * head_dim;
+    if (out_dim == 0u || (out_dim & 1u) != 0u) return 0;
+    const uint64_t weight_count = (uint64_t)in_dim * out_dim;
+    const uint64_t out_count = out_dim;
+    if (weight_count > (1ull << 28)) return 0;
+
+    const size_t page = (size_t)getpagesize();
+    const uint64_t weight_bytes = weight_count * sizeof(uint16_t);
+    const size_t weight_padded = (size_t)((weight_bytes + (uint64_t)page - 1ull) & ~((uint64_t)page - 1ull));
+    void *weight_mem = NULL;
+    if (posix_memalign(&weight_mem, page, weight_padded) != 0 || !weight_mem) return 0;
+    memset(weight_mem, 0, weight_padded);
+    uint16_t *weights = (uint16_t *)weight_mem;
+    float *x_host = (float *)calloc((size_t)in_dim, sizeof(float));
+    float *direct_host = (float *)calloc((size_t)out_count, sizeof(float));
+    float *fused_host = (float *)calloc((size_t)out_count, sizeof(float));
+    if (!x_host || !direct_host || !fused_host) {
+        free(weight_mem); free(x_host); free(direct_host); free(fused_host);
+        return 0;
+    }
+    for (uint32_t i = 0; i < in_dim; i++) {
+        x_host[i] = ((float)((int)(i % 53u) - 26)) * 0.015625f;
+    }
+    for (uint64_t i = 0; i < weight_count; i++) {
+        const float v = ((float)((int)(i % 41u) - 20)) * 0.00390625f;
+        weights[i] = ds4_indexer_q_canary_f32_to_f16(v);
+    }
+
+    int rc = 0;
+    @autoreleasepool {
+        void *weight_buf = ds4_gpu_wrap_heap_bytes(weight_mem, (uint64_t)weight_padded);
+        ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
+        ds4_gpu_tensor *direct = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+        ds4_gpu_tensor *fused = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+        int setup_ok = weight_buf && x && direct && fused &&
+            ds4_gpu_tensor_write(x, 0, x_host, (uint64_t)in_dim * sizeof(float)) > 0;
+        fprintf(stderr,
+                "ds4: indexer-q-rope canary START in=%u heads=%u head_dim=%u n_rot=%u rounds=%u\n",
+                in_dim, n_head, head_dim, n_rot, rounds);
+
+        int direct_ok = setup_ok;
+        const double direct_start_ms = ds4_gpu_now_ms();
+        for (uint32_t iter = 0; direct_ok && iter < rounds; iter++) {
+            direct_ok = ds4_gpu_matmul_f16_storage(direct,
+                                                   weight_buf,
+                                                   in_dim,
+                                                   out_dim,
+                                                   x,
+                                                   1) != 0;
+            if (direct_ok) {
+                direct_ok = ds4_gpu_rope_tail_tensor(direct, 1, n_head, head_dim, n_rot,
+                                                     17u, 4096u, false,
+                                                     10000.0f, 1.0f, 0.0f, 1.0f,
+                                                     32.0f, 1.0f) != 0;
+            }
+        }
+        const double direct_ms = ds4_gpu_now_ms() - direct_start_ms;
+
+        int fused_ok = setup_ok;
+        const double fused_start_ms = ds4_gpu_now_ms();
+        for (uint32_t iter = 0; fused_ok && iter < rounds; iter++) {
+            fused_ok = ds4_gpu_matmul_f16_rope_storage(fused,
+                                                       weight_buf,
+                                                       in_dim,
+                                                       out_dim,
+                                                       x,
+                                                       1,
+                                                       n_head,
+                                                       head_dim,
+                                                       n_rot,
+                                                       17u,
+                                                       4096u,
+                                                       10000.0f,
+                                                       1.0f,
+                                                       0.0f,
+                                                       1.0f,
+                                                       32.0f,
+                                                       1.0f) != 0;
+        }
+        const double fused_ms = ds4_gpu_now_ms() - fused_start_ms;
+
+        if (direct_ok && fused_ok &&
+            ds4_gpu_tensor_read(direct, 0, direct_host, out_count * sizeof(float)) > 0 &&
+            ds4_gpu_tensor_read(fused, 0, fused_host, out_count * sizeof(float)) > 0) {
+            uint64_t mismatches = 0;
+            float max_abs = 0.0f;
+            float max_rel = 0.0f;
+            for (uint64_t i = 0; i < out_count; i++) {
+                const float delta = fabsf(direct_host[i] - fused_host[i]);
+                const float denom = fabsf(direct_host[i]) + 1.0e-6f;
+                const float rel = delta / denom;
+                if (delta > max_abs) max_abs = delta;
+                if (rel > max_rel) max_rel = rel;
+                if (delta > 2.0e-5f && rel > 2.0e-5f) mismatches++;
+            }
+            const double direct_per = direct_ms / (double)rounds;
+            const double fused_per = fused_ms / (double)rounds;
+            rc = mismatches == 0;
+            fprintf(stderr,
+                    "ds4: indexer-q-rope canary direct=%.3f ms/round fused=%.3f ms/round speedup=%.2fx "
+                    "max_abs=%.3e max_rel=%.3e mismatches=%llu/%llu %s\n",
+                    direct_per, fused_per, fused_per > 0.0 ? direct_per / fused_per : 0.0,
+                    (double)max_abs, (double)max_rel,
+                    (unsigned long long)mismatches,
+                    (unsigned long long)out_count,
+                    rc ? "PASS" : "FAIL");
+        }
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(direct);
+        ds4_gpu_tensor_free(fused);
+        if (weight_buf) ds4_gpu_release_heap_buffer(weight_buf);
+    }
+    free(weight_mem);
+    free(x_host);
     free(direct_host);
     free(fused_host);
     return rc;

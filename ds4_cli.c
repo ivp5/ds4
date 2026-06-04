@@ -2230,6 +2230,16 @@ int main(int argc, char **argv) {
         const uint32_t rounds   = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 8u;
         return ds4_gpu_head_norm_rope_canary(n_tok, n_head, head_dim, n_rot, rounds) ? 0 : 1;
     }
+    /* --indexer-q-rope-canary [in_dim [heads [head_dim [n_rot [rounds]]]]]
+     * Validates fused F16 indexer-Q matvec + RoPE against matvec then RoPE. */
+    if (argc >= 2 && !strcmp(argv[1], "--indexer-q-rope-canary")) {
+        const uint32_t in_dim   = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 1536u;
+        const uint32_t n_head   = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 64u;
+        const uint32_t head_dim = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
+        const uint32_t n_rot    = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 64u;
+        const uint32_t rounds   = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 8u;
+        return ds4_gpu_indexer_q_rope_canary(in_dim, n_head, head_dim, n_rot, rounds) ? 0 : 1;
+    }
     /* --indexed-attn-rope-canary [rounds]
      * Validates fused indexed decode attention + inverse RoPE against the
      * attention-then-RoPE two-dispatch reference. */

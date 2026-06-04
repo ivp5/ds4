@@ -299,6 +299,26 @@ int ds4_gpu_matmul_f16_tensor(
  uint64_t out_dim,
  const ds4_gpu_tensor *x,
  uint64_t n_tok);
+int ds4_gpu_matmul_f16_rope_tensor(
+ ds4_gpu_tensor *out,
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t weight_offset,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok,
+ uint32_t n_head,
+ uint32_t head_dim,
+ uint32_t n_rot,
+ uint32_t pos,
+ uint32_t n_ctx_orig,
+ float freq_base,
+ float freq_scale,
+ float ext_factor,
+ float attn_factor,
+ float beta_fast,
+ float beta_slow);
 
 /* silv 2026-05-28 #796 Increment 2b — heap-storage-aware F16 matvec.
  * Same as matmul_f16_tensor but consumes a pre-wrapped MTLBuffer (from
@@ -313,6 +333,24 @@ int ds4_gpu_matmul_f16_storage(
  uint64_t out_dim,
  const ds4_gpu_tensor *x,
  uint64_t n_tok);
+int ds4_gpu_matmul_f16_rope_storage(
+ ds4_gpu_tensor *out,
+ void *weight_buf,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok,
+ uint32_t n_head,
+ uint32_t head_dim,
+ uint32_t n_rot,
+ uint32_t pos,
+ uint32_t n_ctx_orig,
+ float freq_base,
+ float freq_scale,
+ float ext_factor,
+ float attn_factor,
+ float beta_fast,
+ float beta_slow);
 /* #796 Increment 2b canary — cross-validates wrap_heap_bytes + matmul_f16_storage. */
 int ds4_gpu_mtl4_matmul_f16_storage_canary(uint32_t M, uint32_t N);
 
@@ -1359,6 +1397,11 @@ int ds4_gpu_fp8_hc_fuse_canary(uint32_t in_dim,
                                uint32_t n_tokens,
                                uint32_t rounds);
 int ds4_gpu_head_norm_rope_canary(uint32_t n_tok,
+                                  uint32_t n_head,
+                                  uint32_t head_dim,
+                                  uint32_t n_rot,
+                                  uint32_t rounds);
+int ds4_gpu_indexer_q_rope_canary(uint32_t in_dim,
                                   uint32_t n_head,
                                   uint32_t head_dim,
                                   uint32_t n_rot,

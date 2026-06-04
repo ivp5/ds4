@@ -11990,6 +11990,11 @@ static bool metal_graph_use_q_head_norm_rope(void) {
  return !metal_graph_env_flag("DS4_METAL_DISABLE_Q_HEAD_NORM_ROPE_FUSION", &disable_cache);
 }
 
+static bool metal_graph_use_indexer_q_rope_fusion(void) {
+ static int enable_cache = -1;
+ return metal_graph_env_flag("DS4_METAL_ENABLE_INDEXER_Q_ROPE_FUSION", &enable_cache);
+}
+
 static bool metal_graph_use_indexed_attn_rope_fusion(void) {
  static int disable_cache = -1;
  return !metal_graph_env_flag("DS4_METAL_DISABLE_INDEXED_ATTN_ROPE_FUSION", &disable_cache);
@@ -12825,8 +12830,71 @@ static int ds4_matmul_f16_via_tensor(ds4_gpu_tensor *dst,
     (int)t->name.len, t->name.ptr, (unsigned long long)n_tok);
  }
  return ds4_gpu_matmul_f16_tensor(dst, model->map, model->size,
-                                   t->abs_offset, in_dim, out_dim,
-                                   src, n_tok);
+                                  t->abs_offset, in_dim, out_dim,
+                                  src, n_tok);
+}
+
+static int ds4_matmul_f16_rope_via_tensor(ds4_gpu_tensor *dst,
+                                          const ds4_model *model,
+                                          const ds4_tensor *t,
+                                          uint64_t in_dim,
+                                          uint64_t out_dim,
+                                          const ds4_gpu_tensor *src,
+                                          uint64_t n_tok,
+                                          uint32_t n_head,
+                                          uint32_t head_dim,
+                                          uint32_t n_rot,
+                                          uint32_t pos,
+                                          uint32_t n_ctx_orig,
+                                          float freq_base,
+                                          float freq_scale,
+                                          float ext_factor,
+                                          float attn_factor,
+                                          float beta_fast,
+                                          float beta_slow) {
+ if (!dst || !model || !t || !src || n_tok != 1u) return 0;
+ if (t->storage.metal_buffer != NULL) {
+  const uint32_t eff = t->storage.dtype;
+  if (eff == DS4_TENSOR_F16) {
+   return ds4_gpu_matmul_f16_rope_storage(dst,
+                                          t->storage.metal_buffer,
+                                          in_dim,
+                                          out_dim,
+                                          src,
+                                          n_tok,
+                                          n_head,
+                                          head_dim,
+                                          n_rot,
+                                          pos,
+                                          n_ctx_orig,
+                                          freq_base,
+                                          freq_scale,
+                                          ext_factor,
+                                          attn_factor,
+                                          beta_fast,
+                                          beta_slow);
+  }
+  return 0;
+ }
+ return ds4_gpu_matmul_f16_rope_tensor(dst,
+                                       model->map,
+                                       model->size,
+                                       t->abs_offset,
+                                       in_dim,
+                                       out_dim,
+                                       src,
+                                       n_tok,
+                                       n_head,
+                                       head_dim,
+                                       n_rot,
+                                       pos,
+                                       n_ctx_orig,
+                                       freq_base,
+                                       freq_scale,
+                                       ext_factor,
+                                       attn_factor,
+                                       beta_fast,
+                                       beta_slow);
 }
 
 static bool metal_graph_use_hc_rms_mix_fusion(void) {
@@ -14053,7 +14121,34 @@ static bool metal_graph_encode_decode_layer(
  fprintf(stderr, "ds4: Metal graph indexer weight projection expects F16 weights\n");
  ok = false;
  }
- if (ok) ok = ds4_matmul_f16_via_tensor(g->indexer_q, model,
+ int indexer_q_rope_fused = 0;
+ if (ok && metal_graph_use_indexer_q_rope_fusion()) {
+ indexer_q_rope_fused = ds4_matmul_f16_rope_via_tensor(g->indexer_q,
+ model,
+ layer->indexer_attn_q_b,
+ q_rank,
+ indexer_q_dim,
+ g->qr_norm,
+ 1,
+ DS4_N_INDEXER_HEAD,
+ DS4_N_INDEXER_HEAD_DIM,
+ DS4_N_ROT,
+ pos,
+ compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+ freq_base,
+ freq_scale,
+ ext_factor,
+ attn_factor,
+ DS4_ROPE_YARN_BETA_FAST,
+ DS4_ROPE_YARN_BETA_SLOW);
+ static int indexer_q_rope_logged = 0;
+ if (indexer_q_rope_fused && !indexer_q_rope_logged) {
+ indexer_q_rope_logged = 1;
+ fprintf(stderr, "ds4: indexer Q F16 matvec + RoPE fused path active\n");
+ }
+ }
+ if (ok && !indexer_q_rope_fused) {
+ ok = ds4_matmul_f16_via_tensor(g->indexer_q, model,
  layer->indexer_attn_q_b,
  q_rank, indexer_q_dim,
  g->qr_norm, 1) != 0;
@@ -14070,6 +14165,7 @@ static bool metal_graph_encode_decode_layer(
  attn_factor,
  DS4_ROPE_YARN_BETA_FAST,
  DS4_ROPE_YARN_BETA_SLOW) != 0;
+ }
  if (ok) ok = ds4_matmul_f16_via_tensor(g->indexer_weights, model,
  layer->indexer_proj,
  DS4_N_EMBD, DS4_N_INDEXER_HEAD,
