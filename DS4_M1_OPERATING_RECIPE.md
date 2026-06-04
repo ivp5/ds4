@@ -173,6 +173,12 @@ they pass real selected-layer D8F, overlap, and fidelity gates.
 | Q4_K_M-XL 153 GB | 153 GB | doesn't fit | — |
 | `MLX-Qwen3.5-9B-DS-V4-Flash-4bit` | 5 GB | distill, MLX | side-by-side proposer |
 
+Int8 codebook-cache remains opt-in. On H3384 L26 selected-six,
+`DS4_D8F_RUNTIME_NATIVE_DOWN_I8_CBSRAM=1` kept 52,911/219,136 entries at
+`max_rel=0.02` and preserved selected mismatch=0, but slowed selected organ
+time 16.911 → 25.015 ms/20 rounds and raised selected max_rel to 0.2818.
+Tighter gates (`0.005`, `0.001`) were still slower, so this is not primary.
+
 The trim50 file fits comfortably in 64GB but the dropped 10 layers
 {1-6, 26, 27, 30, 35} are arithmetic-load-bearing under multi-equation
 problems (shifts #292-294 bisect work). Use for non-math chat; not for
