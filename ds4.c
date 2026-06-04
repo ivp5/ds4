@@ -10686,15 +10686,17 @@ typedef struct {
  ds4_gpu_tensor *batch_router_probs;
  ds4_gpu_tensor *batch_router_selected;
  ds4_gpu_tensor *batch_router_weights;
- ds4_gpu_tensor *batch_routed_gate;
- ds4_gpu_tensor *batch_routed_up;
- ds4_gpu_tensor *batch_routed_mid;
- ds4_gpu_tensor *batch_routed_down;
- ds4_gpu_tensor *batch_routed_out;
- bool batch_routed_mid_is_f16;
- ds4_gpu_tensor *batch_ffn_out;
- bool materialize_ffn_out;
- ds4_gpu_tensor *directional_steering_dirs;
+	 ds4_gpu_tensor *batch_routed_gate;
+	 ds4_gpu_tensor *batch_routed_up;
+	 ds4_gpu_tensor *batch_routed_mid;
+	 ds4_gpu_tensor *batch_routed_down;
+	 ds4_gpu_tensor *batch_routed_out;
+	 bool batch_routed_mid_is_f16;
+	 ds4_gpu_tensor *batch_ffn_out;
+	 uint32_t *batch_comp_counts;
+	 uint32_t *batch_index_counts;
+	 bool materialize_ffn_out;
+	 ds4_gpu_tensor *directional_steering_dirs;
  float directional_steering_attn_scale;
  float directional_steering_ffn_scale;
  bool quality;
@@ -11104,10 +11106,12 @@ static void metal_graph_free(ds4_gpu_graph *g) {
  ds4_gpu_tensor_free(g->batch_hc_split);
  ds4_gpu_tensor_free(g->batch_hc_mix);
  ds4_gpu_tensor_free(g->batch_flat_hc);
- ds4_gpu_tensor_free(g->batch_next_hc);
- ds4_gpu_tensor_free(g->batch_cur_hc);
- ds4_gpu_tensor_free(g->prefill_tokens);
- ds4_gpu_tensor_free(g->logits);
+	 ds4_gpu_tensor_free(g->batch_next_hc);
+	 ds4_gpu_tensor_free(g->batch_cur_hc);
+	 ds4_gpu_tensor_free(g->prefill_tokens);
+	 free(g->batch_index_counts);
+	 free(g->batch_comp_counts);
+	 ds4_gpu_tensor_free(g->logits);
  ds4_gpu_tensor_free(g->logits_select);
  ds4_gpu_tensor_free(g->mtp_raw_cache);
  ds4_gpu_tensor_free(g->mtp_next_hc);
@@ -11824,9 +11828,11 @@ static bool metal_graph_alloc_raw_cap(
  g->batch_router_weights = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(float));
  g->batch_routed_gate = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
  g->batch_routed_up = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
- g->batch_routed_mid = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
- g->batch_routed_down = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
- g->batch_routed_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
+	 g->batch_routed_mid = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+	 g->batch_routed_down = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+	 g->batch_routed_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
+	 g->batch_comp_counts = xcalloc((size_t)pc, sizeof(g->batch_comp_counts[0]));
+	 g->batch_index_counts = xcalloc((size_t)pc, sizeof(g->batch_index_counts[0]));
 
  bool layer_cache_ok = true;
  for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
@@ -11892,9 +11898,9 @@ static bool metal_graph_alloc_raw_cap(
  g->batch_shared_mid && g->batch_shared_out &&
  g->batch_router_logits && g->batch_router_probs &&
  g->batch_router_selected && g->batch_router_weights &&
- g->batch_routed_gate && g->batch_routed_up &&
- g->batch_routed_mid && g->batch_routed_down &&
- g->batch_routed_out;
+	 g->batch_routed_gate && g->batch_routed_up &&
+	 g->batch_routed_mid && g->batch_routed_down &&
+	 g->batch_routed_out && g->batch_comp_counts && g->batch_index_counts;
  if (!ok) metal_graph_free(g);
  return ok;
 }
@@ -16093,15 +16099,16 @@ static bool metal_graph_refresh_ratio4_compressor_state(
  ds4_gpu_tensor *state_score,
  const ds4_tensor *kv_weight,
  const ds4_tensor *score_weight,
- const ds4_tensor *ape,
- uint32_t head_dim,
- uint32_t width,
- uint32_t pos0,
- uint32_t n_tokens) {
- if (!g || !model || !state_kv || !state_score || !kv_weight || !score_weight || !ape ||
- head_dim == 0 || width == 0 || n_tokens < 4) {
- return false;
- }
+	 const ds4_tensor *ape,
+	 uint32_t head_dim,
+	 uint32_t width,
+	 uint32_t pos0,
+	 uint32_t n_tokens) {
+	 if (!g || !model || !state_kv || !state_score || !kv_weight || !score_weight || !ape ||
+	 head_dim == 0 || width == 0) {
+	 return false;
+	 }
+	 if (n_tokens < 4) return true;
 
  /*
  * The recurrent ratio-4 state is intentionally rebuilt from the last
@@ -16376,11 +16383,21 @@ static bool metal_graph_encode_layer_attention_batch(
  ok = metal_graph_layer_stage_profile_boundary("attn", (name), il, pos0, n_tokens, &layer_stage_t0); \
  } \
  } while (0)
-#define DS4_METAL_PROFILE_Q_STAGE(name) do { \
- if (ok && q_stage_profile) { \
- ok = metal_graph_q_stage_profile_boundary((name), il, pos0, n_tokens, &q_stage_t0); \
- } \
- } while (0)
+	#define DS4_METAL_PROFILE_Q_STAGE(name) do { \
+	 if (ok && q_stage_profile) { \
+	 ok = metal_graph_q_stage_profile_boundary((name), il, pos0, n_tokens, &q_stage_t0); \
+	 } \
+	 } while (0)
+	#define DS4_METAL_ATTN_OP(name, expr) do { \
+	 if (ok && !(expr)) { \
+	 if (layer_stage_profile) { \
+	 fprintf(stderr, "ds4: metal layer stage FAIL part=attn stage=%s layer=%u pos=%u tokens=%u\n", \
+	 (name), il, pos0, n_tokens); \
+	 } \
+	 ok = false; \
+	 } \
+	 DS4_METAL_PROFILE_ATTN_STAGE(name); \
+	 } while (0)
  const float freq_base = layer_rope_freq_base(il);
  const float freq_scale = layer_rope_freq_scale(il);
  const float ext_factor = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
@@ -16388,18 +16405,16 @@ static bool metal_graph_encode_layer_attention_batch(
  if (ext_factor != 0.0f && freq_scale > 0.0f) {
  attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
  }
- uint32_t *comp_counts = compressed ? xcalloc(n_tokens, sizeof(comp_counts[0])) : NULL;
- uint32_t *index_counts = ratio == 4 ? xcalloc(n_tokens, sizeof(index_counts[0])) : NULL;
- const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
- ds4_gpu_tensor *hc_mix_view = ds4_gpu_tensor_view(
- g->batch_hc_mix, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
- ds4_gpu_tensor *hc_split_view = ds4_gpu_tensor_view(
- g->batch_hc_split, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
- ds4_gpu_tensor *attn_cur_view = ds4_gpu_tensor_view(
- g->batch_attn_cur, 0, (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float));
- ds4_gpu_tensor *after_attn_hc_view = ds4_gpu_tensor_view(
- g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
- bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
+	 uint32_t *comp_counts = compressed ? g->batch_comp_counts : NULL;
+	 uint32_t *index_counts = ratio == 4 ? g->batch_index_counts : NULL;
+	 if (comp_counts) memset(comp_counts, 0, (size_t)n_tokens * sizeof(comp_counts[0]));
+	 if (index_counts) memset(index_counts, 0, (size_t)n_tokens * sizeof(index_counts[0]));
+	 const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
+	 ds4_gpu_tensor *hc_mix_view = g->batch_hc_mix;
+	 ds4_gpu_tensor *hc_split_view = g->batch_hc_split;
+	 ds4_gpu_tensor *attn_cur_view = g->batch_attn_cur;
+	 ds4_gpu_tensor *after_attn_hc_view = g->batch_after_attn_hc;
+	 bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
  if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
  g->batch_cur_hc,
  (uint32_t)hc_dim,
@@ -16747,19 +16762,19 @@ static bool metal_graph_encode_layer_attention_batch(
  fprintf(stderr, "ds4: Metal layer-major prefill needs attention compressor weights\n");
  ok = false;
  }
- if (ok) ok = ds4_matmul_f16_via_tensor(g->batch_comp_kv, model,
-  layer->attn_compressor_kv,
-  DS4_N_EMBD, comp_width,
-  g->batch_attn_norm, n_tokens) != 0;
+	 DS4_METAL_ATTN_OP("compressor_kv_matmul", ds4_matmul_f16_via_tensor(g->batch_comp_kv, model,
+	  layer->attn_compressor_kv,
+	  DS4_N_EMBD, comp_width,
+	  g->batch_attn_norm, n_tokens) != 0);
  if (ok) metal_graph_debug_dump_tensor("attn_comp_kv_raw",
  g->batch_comp_kv,
  (uint64_t)comp_width * n_tokens,
  il,
  pos0);
- if (ok) ok = ds4_matmul_f16_via_tensor(g->batch_comp_sc, model,
-  layer->attn_compressor_gate,
-  DS4_N_EMBD, comp_width,
-  g->batch_attn_norm, n_tokens) != 0;
+	 DS4_METAL_ATTN_OP("compressor_gate_matmul", ds4_matmul_f16_via_tensor(g->batch_comp_sc, model,
+	  layer->attn_compressor_gate,
+	  DS4_N_EMBD, comp_width,
+	  g->batch_attn_norm, n_tokens) != 0);
  if (ok) metal_graph_debug_dump_tensor("attn_comp_score_raw",
  g->batch_comp_sc,
  (uint64_t)comp_width * n_tokens,
@@ -16776,11 +16791,10 @@ static bool metal_graph_encode_layer_attention_batch(
  fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
  ok = false;
  }
- if (ok) {
- ok = ds4_gpu_compressor_prefill_tensor(g->attn_comp_stage,
- g->layer_attn_state_kv[il],
- g->layer_attn_state_score[il],
- g->batch_comp_kv,
+	 DS4_METAL_ATTN_OP("compressor_prefill", ds4_gpu_compressor_prefill_tensor(g->attn_comp_stage,
+	 g->layer_attn_state_kv[il],
+	 g->layer_attn_state_score[il],
+	 g->batch_comp_kv,
  g->batch_comp_sc,
  model->map,
  model->size,
@@ -16799,26 +16813,25 @@ static bool metal_graph_encode_layer_attention_batch(
  freq_scale,
  ext_factor,
  attn_factor,
- DS4_ROPE_YARN_BETA_FAST,
- DS4_ROPE_YARN_BETA_SLOW,
- DS4_RMS_EPS) != 0;
- if (ok && n_comp != 0) {
- ok = metal_graph_store_attn_comp_stage(g, il, 0, n_comp);
- }
- if (ok && ratio == 4) {
- ok = metal_graph_refresh_ratio4_compressor_state(g,
- model,
- g->layer_attn_state_kv[il],
- g->layer_attn_state_score[il],
+	 DS4_ROPE_YARN_BETA_FAST,
+	 DS4_ROPE_YARN_BETA_SLOW,
+	 DS4_RMS_EPS) != 0);
+	 if (n_comp != 0) {
+	 DS4_METAL_ATTN_OP("compressor_store", metal_graph_store_attn_comp_stage(g, il, 0, n_comp));
+	 }
+	 if (ok && ratio == 4) {
+	 DS4_METAL_ATTN_OP("compressor_ratio4_refresh", metal_graph_refresh_ratio4_compressor_state(g,
+	 model,
+	 g->layer_attn_state_kv[il],
+	 g->layer_attn_state_score[il],
  layer->attn_compressor_kv,
  layer->attn_compressor_gate,
  layer->attn_compressor_ape,
- DS4_N_HEAD_DIM,
- comp_width,
- pos0,
- n_tokens);
- }
- }
+	 DS4_N_HEAD_DIM,
+	 comp_width,
+	 pos0,
+	 n_tokens));
+	 }
  if (ok) {
  g->layer_n_comp[il] = n_comp;
  for (uint32_t t = 0; t < n_tokens; t++) {
@@ -17734,15 +17747,10 @@ static bool metal_graph_encode_layer_attention_batch(
  }
  DS4_L1_PROBE("hc_attn_post(after expand+resid)", g->batch_after_attn_hc, hc_dim);
  DS4_METAL_PROFILE_ATTN_STAGE("hc_post");
- ds4_gpu_tensor_free(after_attn_hc_view);
- ds4_gpu_tensor_free(attn_cur_view);
- ds4_gpu_tensor_free(hc_split_view);
- ds4_gpu_tensor_free(hc_mix_view);
- free(index_counts);
- free(comp_counts);
-#undef DS4_METAL_PROFILE_ATTN_STAGE
-#undef DS4_METAL_PROFILE_Q_STAGE
- return ok;
+	#undef DS4_METAL_PROFILE_ATTN_STAGE
+	#undef DS4_METAL_PROFILE_Q_STAGE
+	#undef DS4_METAL_ATTN_OP
+	 return ok;
 }
 
 /* Encode the batched prefill FFN half: HC pre/norm, shared expert, routed
@@ -17807,15 +17815,11 @@ static bool metal_graph_encode_layer_ffn_batch(
  } \
  } while (0)
 
- ds4_gpu_tensor *hc_mix_view = ds4_gpu_tensor_view(
- g->batch_hc_mix, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
- ds4_gpu_tensor *hc_split_view = ds4_gpu_tensor_view(
- g->batch_hc_split, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
- ds4_gpu_tensor *ffn_cur_view = ds4_gpu_tensor_view(
- g->batch_ffn_cur, 0, (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float));
- ds4_gpu_tensor *next_hc_view = ds4_gpu_tensor_view(
- g->batch_next_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
- bool ok = hc_mix_view && hc_split_view && ffn_cur_view && next_hc_view;
+	 ds4_gpu_tensor *hc_mix_view = g->batch_hc_mix;
+	 ds4_gpu_tensor *hc_split_view = g->batch_hc_split;
+	 ds4_gpu_tensor *ffn_cur_view = g->batch_ffn_cur;
+	 ds4_gpu_tensor *next_hc_view = g->batch_next_hc;
+	 bool ok = hc_mix_view && hc_split_view && ffn_cur_view && next_hc_view;
  if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
  g->batch_after_attn_hc,
  (uint32_t)hc_dim,
@@ -18230,12 +18234,8 @@ static bool metal_graph_encode_layer_ffn_batch(
  DS4_L1_PROBE("hc_ffn_post(end of L1)", g->batch_next_hc, hc_dim);
  DS4_METAL_PROFILE_FFN_STAGE("hc_post");
 #undef DS4_L1_PROBE
- ds4_gpu_tensor_free(next_hc_view);
- ds4_gpu_tensor_free(ffn_cur_view);
- ds4_gpu_tensor_free(hc_split_view);
- ds4_gpu_tensor_free(hc_mix_view);
-#undef DS4_METAL_PROFILE_FFN_STAGE
- return ok;
+	#undef DS4_METAL_PROFILE_FFN_STAGE
+	 return ok;
 }
 
 /* Encode one complete layer for prefill by chaining attention and FFN batches. */
