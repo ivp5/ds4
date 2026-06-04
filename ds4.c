@@ -13413,8 +13413,16 @@ static bool metal_graph_encode_decode_layer(
  bool ok = true;
  const bool decode_stage_profile = getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
  double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
+ extern uint64_t ds4_dispcount_now(void);
+ uint64_t decode_stage_d0 = decode_stage_profile ? ds4_dispcount_now() : 0u;
 #define DS4_METAL_PROFILE_DECODE_STAGE(name) do { \
  if (ok && decode_stage_profile) { \
+ uint64_t _decode_stage_d1 = ds4_dispcount_now(); \
+ fprintf(stderr, "ds4: DS4_STAGE_DISP layer=%u pos=%u stage=%s dispatches=%llu total=%llu\n", \
+ (unsigned)il, (unsigned)pos, (name), \
+ (unsigned long long)(_decode_stage_d1 - decode_stage_d0), \
+ (unsigned long long)_decode_stage_d1); \
+ decode_stage_d0 = _decode_stage_d1; \
  ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
  } \
  } while (0)

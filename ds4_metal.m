@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <objc/runtime.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -338,7 +339,8 @@ static void ds4_icb_slot_use_resources(ds4_icb_slot_t *slot,
 /* ICB record→replay for kernel_dsv4_router_weights_with_remap. One ICB with
  * 43 slots (one per layer). Per-slot signature tracks the buffer pointers +
  * offsets + n_tokens that were recorded; if signature matches at execute
- * time, replay; else re-record that slot. Env-gated by DS4_ICB_ACTIVE.
+ * time, replay; else re-record that slot. Default-on; set
+ * DS4_ICB_ACTIVE=0 or DS4_ICB_ACTIVE_DISABLE=1 to disable.
  *
  * Per H1716 (codex tinygrad route capture): graph capture removes per-dispatch
  * host-encoding overhead. 6.43× at 1 layer, 16.33× at 16 in tinygrad. For
@@ -369,7 +371,8 @@ static ds4_icb_slot_t g_route_weights_one_slot;
  * The args struct (ds4_gpu_dsv4_topk_mask_args, 8 fields × 8 bytes = 64 bytes) is
  * passed via setBytes in the direct path; for ICB we allocate a small MTLBuffer per
  * slot and memcpy the args before replay. Dispatch grid varies with
- * (top_k, n_tokens, n_comp) so we key slots by those three. Opt-in via DS4_ICB_TOPK_MASK=1.
+ * (top_k, n_tokens, n_comp) so we key slots by those three. Default-on; set
+ * DS4_ICB_TOPK_MASK=0 or DS4_ICB_TOPK_MASK_DISABLE=1 to disable.
  *
  * Per Phase 6 (#560) measurement: ICB on simpler 3-buffer kernel regressed
  * 19.1 → 17.1 t/s on trim50 decode. topk_mask has 2 kernels per call + an args
@@ -384,7 +387,7 @@ static id<MTLBuffer> g_topk_mask_icb_args_buffers[DS4_TOPK_MASK_ICB_SLOTS];
  * Called at line ~13676 + ~13762 with FIXED shape (width=256, rows=1, c4=1, min=0,
  * max=0) — ideal for ICB record/replay since args + dispatch grid never change.
  * 2 slots for the 2 call sites; args buffer pre-populated once at first record.
- * Opt-in via DS4_ICB_SOFTPLUS=1. */
+ * Default-on; set DS4_ICB_SOFTPLUS=0 or DS4_ICB_SOFTPLUS_DISABLE=1 to disable. */
 /* Cycle 9c: Phase 4 ICB slot lives at the helper function (g_softplus_sqrt_slot)
  * inside ds4_softplus_sqrt_dispatch_icb. The 2-element bespoke slot array is
  * subsumed by 2 commands inside the generic ds4_icb_slot_t. */
@@ -440,6 +443,72 @@ static _Atomic uint64_t g_ds4_d8f_packet_icb_hit_count = 0;
 static _Atomic uint64_t g_ds4_d8f_packet_icb_miss_count = 0;
 static _Atomic uint64_t g_ds4_d8f_mtl4_batch_append_count = 0;
 static _Atomic uint64_t g_ds4_d8f_mtl4_batch_commit_count = 0;
+static _Atomic uint64_t g_ds4_dispatch_count = 0;
+
+typedef void (*ds4_dispatch_imp_t)(id, SEL, MTLSize, MTLSize);
+static ds4_dispatch_imp_t g_ds4_orig_dispatch_threadgroups = 0;
+static ds4_dispatch_imp_t g_ds4_orig_dispatch_threads = 0;
+
+static int ds4_dispatch_count_enabled(void) {
+ static int s_checked = 0;
+ static int s_enabled = 0;
+ if (!s_checked) {
+ s_enabled =
+ (getenv("DS4_DISPATCH_COUNT") != NULL ||
+ getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL) ? 1 : 0;
+ s_checked = 1;
+ }
+ return s_enabled;
+}
+
+static void ds4_counting_dispatch_threadgroups(id self, SEL selector,
+                                               MTLSize grid,
+                                               MTLSize threads_per_group) {
+ atomic_fetch_add_explicit(&g_ds4_dispatch_count, 1, memory_order_relaxed);
+ if (g_ds4_orig_dispatch_threadgroups) {
+ g_ds4_orig_dispatch_threadgroups(self, selector, grid, threads_per_group);
+ }
+}
+
+static void ds4_counting_dispatch_threads(id self, SEL selector,
+                                          MTLSize threads,
+                                          MTLSize threads_per_group) {
+ atomic_fetch_add_explicit(&g_ds4_dispatch_count, 1, memory_order_relaxed);
+ if (g_ds4_orig_dispatch_threads) {
+ g_ds4_orig_dispatch_threads(self, selector, threads, threads_per_group);
+ }
+}
+
+static void ds4_swizzle_dispatch_count_once(id enc) {
+ static int s_threadgroups_done = 0;
+ static int s_threads_done = 0;
+ if (!enc || (s_threadgroups_done && s_threads_done)) return;
+ Class cls = object_getClass(enc);
+ if (!cls) return;
+
+ if (!s_threadgroups_done) {
+ Method method = class_getInstanceMethod(cls, @selector(dispatchThreadgroups:threadsPerThreadgroup:));
+ if (method) {
+ g_ds4_orig_dispatch_threadgroups = (ds4_dispatch_imp_t)method_getImplementation(method);
+ method_setImplementation(method, (IMP)ds4_counting_dispatch_threadgroups);
+ s_threadgroups_done = 1;
+ }
+ }
+
+ if (!s_threads_done) {
+ Method method = class_getInstanceMethod(cls, @selector(dispatchThreads:threadsPerThreadgroup:));
+ if (method) {
+ g_ds4_orig_dispatch_threads = (ds4_dispatch_imp_t)method_getImplementation(method);
+ method_setImplementation(method, (IMP)ds4_counting_dispatch_threads);
+ s_threads_done = 1;
+ }
+ }
+}
+
+uint64_t ds4_dispcount_now(void) {
+ return atomic_load_explicit(&g_ds4_dispatch_count, memory_order_relaxed);
+}
+
 static inline id<MTLCommandBuffer> ds4_gpu_create_cb_counted(void) {
  atomic_fetch_add_explicit(&g_ds4_cb_create_count, 1, memory_order_relaxed);
  return [g_queue commandBuffer];
@@ -743,10 +812,15 @@ static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
 
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
  if (g_batch_cb && cb == g_batch_cb) {
- if (!g_batch_enc) g_batch_enc = [cb computeCommandEncoder];
+ if (!g_batch_enc) {
+ g_batch_enc = [cb computeCommandEncoder];
+ if (ds4_dispatch_count_enabled()) ds4_swizzle_dispatch_count_once(g_batch_enc);
+ }
  return g_batch_enc;
  }
- return [cb computeCommandEncoder];
+ id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+ if (ds4_dispatch_count_enabled()) ds4_swizzle_dispatch_count_once(enc);
+ return enc;
 }
 
 static void ds4_gpu_end_compute_encoder(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc) {
@@ -1354,7 +1428,12 @@ static int ds4_gpu_env_bool(const char *name) {
  return 1;
 }
 
-
+static int ds4_gpu_env_default_on(const char *name, const char *disable_name) {
+ if (disable_name && ds4_gpu_env_bool(disable_name) > 0) return 0;
+ const int value = ds4_gpu_env_bool(name);
+ if (value >= 0) return value > 0;
+ return 1;
+}
 
 static int ds4_gpu_d8f_down_tile8_enabled(void) {
  const int forced_off = ds4_gpu_env_bool("DS4_D8F_DOWN_ROW_TILE8_DISABLE") > 0;
@@ -5527,6 +5606,14 @@ void ds4_gpu_cleanup(void) {
  }
  }
 
+ if (getenv("DS4_DISPATCH_COUNT")) {
+ const uint64_t dispatches = atomic_load_explicit(&g_ds4_dispatch_count,
+ memory_order_relaxed);
+ fprintf(stderr,
+ "ds4: dispatch_count: encoded %llu Metal compute dispatches\n",
+ (unsigned long long)dispatches);
+ }
+
  if (getenv("DS4_D8F_COUNT")) {
  const uint64_t inline_count = atomic_load_explicit(&g_ds4_d8f_inline_count,
  memory_order_relaxed);
@@ -6651,10 +6738,10 @@ static int ds4_topk_mask_dispatch_icb(id<MTLCommandBuffer> cb,
     static int s_env_checked = 0;
     static int s_env_active = 0;
     if (!s_env_checked) {
-        s_env_active = getenv("DS4_ICB_TOPK_MASK") != NULL ? 1 : 0;
+        s_env_active = ds4_gpu_env_default_on("DS4_ICB_TOPK_MASK", "DS4_ICB_TOPK_MASK_DISABLE");
         s_env_checked = 1;
         if (s_env_active) {
-            fprintf(stderr, "ds4: DS4_ICB_TOPK_MASK=1 — topk_mask 2-kernel ICB engaged (opt-in; measurement pending)\n");
+            fprintf(stderr, "ds4: DS4_ICB_TOPK_MASK default-on — topk_mask 2-kernel ICB engaged (set DS4_ICB_TOPK_MASK=0 or DS4_ICB_TOPK_MASK_DISABLE=1 to disable)\n");
         }
     }
     if (!s_env_active) return 0;
@@ -6750,7 +6837,8 @@ int ds4_gpu_dsv4_topk_mask_tensor(
  id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
  if (!cb) return 0;
 
- /* #557 ICB Phase 3: try ICB path first (opt-in via DS4_ICB_TOPK_MASK=1).
+ /* #557 ICB Phase 3: try ICB path first (default-on; disable via
+  * DS4_ICB_TOPK_MASK=0 or DS4_ICB_TOPK_MASK_DISABLE=1).
   * Slot 0 = this single call-site path (indexer top-k mask).
   * On miss / opt-out, fall through to direct encoding below. */
  const int icb_ran = ds4_topk_mask_dispatch_icb(cb, 0, &args,
@@ -14580,11 +14668,12 @@ static int ds4_softplus_sqrt_dispatch_icb(id<MTLCommandBuffer> cb,
     static int s_env_checked = 0;
     static int s_env_active = 0;
     if (!s_env_checked) {
-        s_env_active = getenv("DS4_ICB_SOFTPLUS") != NULL ? 1 : 0;
+        s_env_active = ds4_gpu_env_default_on("DS4_ICB_SOFTPLUS", "DS4_ICB_SOFTPLUS_DISABLE");
         s_env_checked = 1;
         if (s_env_active) {
-            fprintf(stderr, "ds4: DS4_ICB_SOFTPLUS=1 — softplus_sqrt ICB engaged via "
-                            "unified ds4_icb_slot API (Cycle 9c)\n");
+            fprintf(stderr, "ds4: DS4_ICB_SOFTPLUS default-on — softplus_sqrt ICB engaged via "
+                            "unified ds4_icb_slot API (set DS4_ICB_SOFTPLUS=0 or "
+                            "DS4_ICB_SOFTPLUS_DISABLE=1 to disable)\n");
         }
     }
     if (!s_env_active) return 0;
@@ -16247,7 +16336,7 @@ static int ds4_gpu_encode_router_select(
  ds4_gpu_end_compute_encoder(cb, enc);
 
  /* ICB record→replay path (slot 0 — decode-select-one), task #560.
-  * Falls through to direct encoding when DS4_ICB_ACTIVE is off. */
+  * Falls through to direct encoding when DS4_ICB_ACTIVE is disabled. */
  if (!ds4_route_weights_one_dispatch(cb, router_weights_pipeline, 0,
                                       probsbuf, probs_off,
                                       selectedbuf, selected_off,
@@ -17158,7 +17247,8 @@ int ds4_gpu_remap_routed_for_trim(
  g_dsv4_route_remap_args_n_tokens = n_tokens;
  }
 
- /* ICB record→replay path: gated by DS4_ICB_ACTIVE. Each layer slot caches
+ /* ICB record→replay path: default-on; DS4_ICB_ACTIVE=0 or
+  * DS4_ICB_ACTIVE_DISABLE=1 disables it. Each layer slot caches
   * the recorded command with (selectedbuf, weightsbuf, n_tokens) signature.
   * Signature match → just execute. Mismatch → re-record at that slot. The
   * args buffer offset is part of the recorded command (per-layer), so layer
@@ -17170,11 +17260,12 @@ int ds4_gpu_remap_routed_for_trim(
   * pipeline, grid, tg, tg_mem) — captured uniformly. The slot lives at
   * file scope so the device-reset hook can clear it. */
  if (!g_route_remap_icb_env_checked) {
- g_route_remap_icb_env_active = getenv("DS4_ICB_ACTIVE") != NULL ? 1 : 0;
+ g_route_remap_icb_env_active = ds4_gpu_env_default_on("DS4_ICB_ACTIVE", "DS4_ICB_ACTIVE_DISABLE");
  g_route_remap_icb_env_checked = 1;
  if (g_route_remap_icb_env_active) {
- fprintf(stderr, "ds4: DS4_ICB_ACTIVE=1 — route_remap ICB engaged via "
-                 "unified ds4_icb_slot API (Cycle 9b)\n");
+ fprintf(stderr, "ds4: DS4_ICB_ACTIVE default-on — route_remap ICB engaged via "
+                 "unified ds4_icb_slot API (set DS4_ICB_ACTIVE=0 or "
+                 "DS4_ICB_ACTIVE_DISABLE=1 to disable)\n");
  }
  }
 
