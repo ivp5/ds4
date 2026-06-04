@@ -1029,6 +1029,47 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
  float eps,
  float norm_eps);
 
+int ds4_gpu_hc_rms_f16_mix_split_weighted_sum_norm_tensor(
+ ds4_gpu_tensor *out,
+ ds4_gpu_tensor *norm_out,
+ ds4_gpu_tensor *split,
+ ds4_gpu_tensor *mix_out,
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t weight_offset,
+ const ds4_gpu_tensor *residual_hc,
+ uint64_t scale_offset,
+ uint64_t base_offset,
+ uint64_t norm_weight_offset,
+ uint32_t n_embd,
+ uint32_t n_hc,
+ uint32_t sinkhorn_iters,
+ float rms_eps,
+ float eps,
+ float norm_eps);
+
+int ds4_gpu_hc_rms_f16_mix_split_weighted_sum_norm_storage(
+ ds4_gpu_tensor *out,
+ ds4_gpu_tensor *norm_out,
+ ds4_gpu_tensor *split,
+ ds4_gpu_tensor *mix_out,
+ void *weight_buf,
+ uint64_t weight_offset,
+ const ds4_gpu_tensor *residual_hc,
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t scale_offset,
+ uint64_t base_offset,
+ uint64_t norm_weight_offset,
+ uint32_t n_embd,
+ uint32_t n_hc,
+ uint32_t sinkhorn_iters,
+ float rms_eps,
+ float eps,
+ float norm_eps);
+
+int ds4_gpu_hc_full_prelude_canary(void);
+
 int ds4_gpu_output_hc_weights_tensor(
  ds4_gpu_tensor *out,
  const ds4_gpu_tensor *pre,

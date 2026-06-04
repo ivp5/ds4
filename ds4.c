@@ -12814,6 +12814,16 @@ static bool metal_graph_use_hc_rms_mix_fusion(void) {
  return enabled != 0;
 }
 
+static bool metal_graph_use_hc_full_prelude_fusion(void) {
+ static int initialized = 0;
+ static int enabled = 0;
+ if (!initialized) {
+  enabled = getenv("DS4_METAL_DISABLE_HC_FULL_PRELUDE_FUSION") == NULL;
+  initialized = 1;
+ }
+ return enabled != 0;
+}
+
 static bool metal_graph_use_output_hc_sum_norm_fusion(void) {
  static int initialized = 0;
  static int enabled = 0;
@@ -12857,6 +12867,71 @@ static int ds4_hc_rms_f16_mix_via_tensor(ds4_gpu_tensor *dst,
                                            (uint32_t)out_dim,
                                            src,
                                            eps);
+}
+
+static int ds4_hc_full_prelude_f16_via_tensor(ds4_gpu_tensor *out,
+                                              ds4_gpu_tensor *norm_out,
+                                              ds4_gpu_tensor *split,
+                                              ds4_gpu_tensor *mix_out,
+                                              const ds4_model *model,
+                                              const ds4_tensor *t,
+                                              const ds4_gpu_tensor *residual_hc,
+                                              uint64_t scale_offset,
+                                              uint64_t base_offset,
+                                              uint64_t norm_weight_offset,
+                                              uint32_t n_embd,
+                                              uint32_t n_hc,
+                                              uint32_t sinkhorn_iters,
+                                              float rms_eps,
+                                              float eps,
+                                              float norm_eps) {
+ if (!metal_graph_use_hc_full_prelude_fusion() ||
+     !metal_graph_use_hc_rms_mix_fusion() ||
+     !out || !norm_out || !split || !mix_out || !model || !t || !residual_hc ||
+     t->type != DS4_TENSOR_F16 ||
+     n_embd != DS4_N_EMBD || n_hc != DS4_N_HC) {
+  return 0;
+ }
+ if (t->storage.metal_buffer != NULL) {
+  if (t->storage.dtype != DS4_TENSOR_F16) return 0;
+  s_n_storage_dispatch_f16++;
+  ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_F16, t);
+  return ds4_gpu_hc_rms_f16_mix_split_weighted_sum_norm_storage(out,
+                                                                norm_out,
+                                                                split,
+                                                                mix_out,
+                                                                t->storage.metal_buffer,
+                                                                0,
+                                                                residual_hc,
+                                                                model->map,
+                                                                model->size,
+                                                                scale_offset,
+                                                                base_offset,
+                                                                norm_weight_offset,
+                                                                n_embd,
+                                                                n_hc,
+                                                                sinkhorn_iters,
+                                                                rms_eps,
+                                                                eps,
+                                                                norm_eps);
+ }
+ return ds4_gpu_hc_rms_f16_mix_split_weighted_sum_norm_tensor(out,
+                                                              norm_out,
+                                                              split,
+                                                              mix_out,
+                                                              model->map,
+                                                              model->size,
+                                                              t->abs_offset,
+                                                              residual_hc,
+                                                              scale_offset,
+                                                              base_offset,
+                                                              norm_weight_offset,
+                                                              n_embd,
+                                                              n_hc,
+                                                              sinkhorn_iters,
+                                                              rms_eps,
+                                                              eps,
+                                                              norm_eps);
 }
 
 /* silv 2026-05-28 #796 Increment 2c/2d — dispatcher canary.
@@ -13481,8 +13556,30 @@ static bool metal_graph_encode_decode_layer(
  ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
  } \
  } while (0)
+ const bool fuse_hc_norm =
+ !metal_graph_use_reference_hc_decode() &&
+ !metal_graph_use_reference_hc_norm_decode();
+ int attn_hc_prelude_fused = 0;
+ if (ok && fuse_hc_norm) {
+ attn_hc_prelude_fused = ds4_hc_full_prelude_f16_via_tensor(g->attn_cur,
+ g->attn_norm,
+ g->hc_split,
+ g->hc_mix,
+ model,
+ layer->hc_attn_fn,
+ g->cur_hc,
+ layer->hc_attn_scale->abs_offset,
+ layer->hc_attn_base->abs_offset,
+ layer->attn_norm->abs_offset,
+ DS4_N_EMBD,
+ DS4_N_HC,
+ DS4_N_HC_SINKHORN_ITER,
+ DS4_RMS_EPS,
+ DS4_HC_EPS,
+ DS4_RMS_EPS);
+ }
  int attn_hc_mix_fused = 0;
- if (ok) {
+ if (ok && !attn_hc_prelude_fused) {
   attn_hc_mix_fused = ds4_hc_rms_f16_mix_via_tensor(g->hc_mix,
   model,
   layer->hc_attn_fn,
@@ -13496,10 +13593,7 @@ static bool metal_graph_encode_decode_layer(
   if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
   hc_dim, mix_hc, g->flat_hc, 1);
  }
- const bool fuse_hc_norm =
- !metal_graph_use_reference_hc_decode() &&
- !metal_graph_use_reference_hc_norm_decode();
- if (ok && fuse_hc_norm) {
+ if (ok && fuse_hc_norm && !attn_hc_prelude_fused) {
  ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->attn_cur,
  g->attn_norm,
  g->hc_split,
@@ -14170,8 +14264,27 @@ static bool metal_graph_encode_decode_layer(
  if (ok) {
  metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
  }
+ int ffn_hc_prelude_fused = 0;
+ if (ok && fuse_hc_norm) {
+ ffn_hc_prelude_fused = ds4_hc_full_prelude_f16_via_tensor(g->ffn_cur,
+ g->ffn_norm,
+ g->hc_split,
+ g->hc_mix,
+ model,
+ layer->hc_ffn_fn,
+ g->after_attn_hc,
+ layer->hc_ffn_scale->abs_offset,
+ layer->hc_ffn_base->abs_offset,
+ layer->ffn_norm->abs_offset,
+ DS4_N_EMBD,
+ DS4_N_HC,
+ DS4_N_HC_SINKHORN_ITER,
+ DS4_RMS_EPS,
+ DS4_HC_EPS,
+ DS4_RMS_EPS);
+ }
  int ffn_hc_mix_fused = 0;
- if (ok) {
+ if (ok && !ffn_hc_prelude_fused) {
   ffn_hc_mix_fused = ds4_hc_rms_f16_mix_via_tensor(g->hc_mix,
   model,
   layer->hc_ffn_fn,
@@ -14185,7 +14298,7 @@ static bool metal_graph_encode_decode_layer(
   if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
   hc_dim, mix_hc, g->flat_hc, 1);
  }
- if (ok && fuse_hc_norm) {
+ if (ok && fuse_hc_norm && !ffn_hc_prelude_fused) {
  ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->ffn_cur,
  g->ffn_norm,
  g->hc_split,
