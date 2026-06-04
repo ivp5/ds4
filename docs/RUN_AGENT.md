@@ -36,10 +36,10 @@ ds4-agent does NOT take `--mtl4-moe` (that's a `ds4` flag only). Without
 `--prefill-metal-phases auto` or `--cpu-moe`, the engine goes full-Metal
 directly. Verified: `mapped 45475.62 MiB` for trim50.
 
-Minimal interactive (full-Metal MoE, ICB on, MTP off):
+Minimal interactive (full-Metal MoE, default ICB/native-down gates, MTP off):
 
 ```bash
-DS4_EXPERT_REMAP_ACTIVE=1 DS4_ICB_ACTIVE=1 \
+DS4_EXPERT_REMAP_ACTIVE=1 \
     ./ds4-agent \
     -m ./gguf/DS4-trim50-asym-with-metadata.gguf
 ```
@@ -47,7 +47,7 @@ DS4_EXPERT_REMAP_ACTIVE=1 DS4_ICB_ACTIVE=1 \
 With MTP draft model (faster on structured prompts, see [perf table](#perf-table)):
 
 ```bash
-DS4_EXPERT_REMAP_ACTIVE=1 DS4_ICB_ACTIVE=1 \
+DS4_EXPERT_REMAP_ACTIVE=1 \
     ./ds4-agent \
     -m ./gguf/DS4-trim50-asym-with-metadata.gguf \
     --mtp ./gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
@@ -57,7 +57,7 @@ DS4_EXPERT_REMAP_ACTIVE=1 DS4_ICB_ACTIVE=1 \
 Non-interactive one-shot with a prompt:
 
 ```bash
-DS4_EXPERT_REMAP_ACTIVE=1 DS4_ICB_ACTIVE=1 \
+DS4_EXPERT_REMAP_ACTIVE=1 \
     ./ds4-agent \
     -m ./gguf/DS4-trim50-asym-with-metadata.gguf \
     --non-interactive \
@@ -68,7 +68,7 @@ DS4_EXPERT_REMAP_ACTIVE=1 DS4_ICB_ACTIVE=1 \
 For raw `ds4` (non-agent, no DSML tool system prompt) use `--mtl4-moe` per [§4](#4-env-flags-reference):
 
 ```bash
-DS4_EXPERT_REMAP_ACTIVE=1 DS4_ICB_ACTIVE=1 \
+DS4_EXPERT_REMAP_ACTIVE=1 \
     ./ds4 -m ./gguf/DS4-trim50-asym-with-metadata.gguf --mtl4-moe \
     --temp 0 -p "Hello, my name is" -n 16
 ```
@@ -88,7 +88,9 @@ IQ2_XXS file directly (requires either `--cpu-moe` or wired_limit_mb >= 90 GiB).
 | flag | purpose |
 |---|---|
 | `DS4_EXPERT_REMAP_ACTIVE=1` | engages the trim50 inference plumbing (fused `router_weights_with_remap` kernel + inverse expert table) |
-| `DS4_ICB_ACTIVE=1` | enables MTLIndirectCommandBuffer record→replay for the route remap (+10% prefill, +4% gen, 6-30× lower variance) |
+| `DS4_ICB_ACTIVE=0` / `DS4_ICB_ACTIVE_DISABLE=1` | disables the default-on route-remap ICB replay path |
+| `DS4_ICB_TOPK_MASK=0`, `DS4_ICB_SOFTPLUS=0` | disable default-on buffer-only ICB replay for top-k mask/scatter or softplus/sqrt |
+| `DS4_D8F_RUNTIME_NATIVE_DOWN_DISABLE=1` | disables the default native-down texture gates (`L0,L20,L25,L26,L37` for decode/small-batch; compact atlas on `L20,L37`, pack2D on `L26`) |
 | `--mtl4-moe` | takes the Metal-MoE path. On M1 Max falls back to legacy SIMD MoE (Metal 4 tensor API is M5+ only); needed to avoid the `--cpu-moe` fallback in `--prefill-metal-phases auto` |
 | `--mtp <path>` | optional MTP draft model for speculative decode |
 | `--mtp-draft N` | max draft tokens per speculative step (1-16, default 1) |

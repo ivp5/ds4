@@ -1435,6 +1435,14 @@ static int ds4_gpu_env_default_on(const char *name, const char *disable_name) {
  return 1;
 }
 
+static inline uint64_t ds4_gpu_layer_bit(uint32_t layer) {
+ return layer < 64u ? (1ull << layer) : 0ull;
+}
+
+static inline int ds4_gpu_layer_mask_has(uint64_t mask, uint32_t layer) {
+ return layer < 64u && ((mask >> layer) & 1ull) != 0ull;
+}
+
 static int ds4_gpu_d8f_down_tile8_enabled(void) {
  const int forced_off = ds4_gpu_env_bool("DS4_D8F_DOWN_ROW_TILE8_DISABLE") > 0;
  if (forced_off) return 0;
@@ -1666,6 +1674,13 @@ static uint32_t ds4_gpu_env_u32(const char *name, uint32_t default_val) {
 static int ds4_gpu_d8f_runtime_native_down_enabled_for_layer(uint32_t layer,
                                                              uint32_t token_count) {
     if (ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_DISABLE") > 0) return 0;
+    const uint64_t default_mask =
+        ds4_gpu_layer_bit(0u)  |
+        ds4_gpu_layer_bit(20u) |
+        ds4_gpu_layer_bit(25u) |
+        ds4_gpu_layer_bit(26u) |
+        ds4_gpu_layer_bit(37u);
+    const uint32_t default_max_tokens = 4u;
     static int parsed = 0;
     static int has_allow = 0;
     static int has_disable = 0;
@@ -1691,11 +1706,14 @@ static int ds4_gpu_d8f_runtime_native_down_enabled_for_layer(uint32_t layer,
     const int explicit_native = ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN");
     if (explicit_native == 0) return 0;
     if (explicit_native > 0) return 1;
-    return has_allow;
+    if (has_allow) return 1;
+    if (token_count > default_max_tokens) return 0;
+    return ds4_gpu_layer_mask_has(default_mask, layer);
 }
 
 static int ds4_gpu_d8f_runtime_native_down_pack2d_enabled_for_layer(uint32_t layer) {
     if (ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_PACK2D_DISABLE") > 0) return 0;
+    const uint64_t default_mask = ds4_gpu_layer_bit(26u);
     static int parsed = 0;
     static int has_allow = 0;
     static int has_disable = 0;
@@ -1716,11 +1734,15 @@ static int ds4_gpu_d8f_runtime_native_down_pack2d_enabled_for_layer(uint32_t lay
     const int explicit_pack2d = ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_PACK2D");
     if (explicit_pack2d == 0) return 0;
     if (explicit_pack2d > 0) return 1;
-    return has_allow;
+    if (has_allow) return 1;
+    return ds4_gpu_layer_mask_has(default_mask, layer);
 }
 
 static int ds4_gpu_d8f_runtime_native_down_compact_tex_enabled_for_layer(uint32_t layer) {
     if (ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_COMPACT_TEX_DISABLE") > 0) return 0;
+    const uint64_t default_mask =
+        ds4_gpu_layer_bit(20u) |
+        ds4_gpu_layer_bit(37u);
     static int parsed = 0;
     static int has_allow = 0;
     static int has_disable = 0;
@@ -1741,7 +1763,8 @@ static int ds4_gpu_d8f_runtime_native_down_compact_tex_enabled_for_layer(uint32_
     const int explicit_compact = ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_COMPACT_TEX");
     if (explicit_compact == 0) return 0;
     if (explicit_compact > 0) return 1;
-    return has_allow;
+    if (has_allow) return 1;
+    return ds4_gpu_layer_mask_has(default_mask, layer);
 }
 
 static int ds4_gpu_d8f_runtime_native_down_pack2d_warm_enabled_for_layer(uint32_t layer) {
