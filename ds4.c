@@ -10577,6 +10577,7 @@ typedef struct {
  ds4_gpu_tensor *spec_prefix1_index_state_kv[DS4_N_LAYER];
  ds4_gpu_tensor *spec_prefix1_index_state_score[DS4_N_LAYER];
  ds4_gpu_tensor *spec_logits;
+ ds4_gpu_tensor *spec_logits_select;
  uint32_t layer_n_comp[DS4_N_LAYER];
  uint32_t layer_n_index_comp[DS4_N_LAYER];
  uint32_t spec_prefix1_n_comp[DS4_N_LAYER];
@@ -10603,6 +10604,7 @@ typedef struct {
  ds4_gpu_tensor *indexer_scores;
  ds4_gpu_tensor *comp_mask;
  ds4_gpu_tensor *comp_selected;
+ ds4_gpu_tensor *logits_select;
  ds4_gpu_tensor *heads;
  ds4_gpu_tensor *attn_low;
  ds4_gpu_tensor *attn_out;
@@ -11106,6 +11108,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
  ds4_gpu_tensor_free(g->batch_cur_hc);
  ds4_gpu_tensor_free(g->prefill_tokens);
  ds4_gpu_tensor_free(g->logits);
+ ds4_gpu_tensor_free(g->logits_select);
  ds4_gpu_tensor_free(g->mtp_raw_cache);
  ds4_gpu_tensor_free(g->mtp_next_hc);
  ds4_gpu_tensor_free(g->mtp_state_hc);
@@ -11117,6 +11120,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
  ds4_gpu_tensor_free(g->mtp_enorm);
  ds4_gpu_tensor_free(g->mtp_embed);
  ds4_gpu_tensor_free(g->spec_logits);
+ ds4_gpu_tensor_free(g->spec_logits_select);
  ds4_gpu_tensor_free(g->output_norm);
  ds4_gpu_tensor_free(g->output_embd);
  ds4_gpu_tensor_free(g->output_weights);
@@ -11737,6 +11741,7 @@ static bool metal_graph_alloc_raw_cap(
  g->comp_mask = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * pc * sizeof(float));
  g->comp_selected = ds4_gpu_tensor_alloc((uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) *
  pc * sizeof(uint32_t));
+ g->logits_select = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
  g->heads = ds4_gpu_tensor_alloc(q_dim * sizeof(float));
  g->attn_low = ds4_gpu_tensor_alloc(low_dim * sizeof(float));
  g->attn_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
@@ -11780,6 +11785,7 @@ static bool metal_graph_alloc_raw_cap(
  g->mtp_next_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
  g->mtp_raw_cache = ds4_gpu_tensor_alloc((uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
  g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
+ g->spec_logits_select = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
  g->mtp_n_raw = 0;
  }
 
@@ -11855,7 +11861,7 @@ static bool metal_graph_alloc_raw_cap(
  g->q && g->kv_raw && g->kv &&
  g->comp_kv_cur && g->comp_sc_cur && g->attn_comp_stage &&
  g->indexer_q && g->indexer_weights && g->indexer_scores &&
- g->comp_mask && g->comp_selected &&
+ g->comp_mask && g->comp_selected && g->logits_select &&
  g->heads && g->attn_low && g->attn_out &&
  g->after_attn_hc && g->ffn_cur && g->ffn_norm &&
  g->shared_gate && g->shared_up && g->shared_mid &&
@@ -11870,7 +11876,7 @@ static bool metal_graph_alloc_raw_cap(
  (g->mtp_embed && g->mtp_enorm && g->mtp_eproj &&
  g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
  g->mtp_input_hc && g->mtp_state_hc && g->mtp_next_hc &&
- g->mtp_raw_cache && g->spec_logits)) &&
+ g->mtp_raw_cache && g->spec_logits && g->spec_logits_select)) &&
  g->prefill_tokens &&
  g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
  g->batch_hc_mix && g->batch_hc_split &&
@@ -15011,6 +15017,40 @@ static bool metal_graph_finalize_logits_device(ds4_gpu_tensor *logits, uint64_t 
  return ds4_gpu_logits_mask_reserved_specials(logits, (uint32_t)vocab_dim, n_rows) != 0;
 }
 
+/* Preserve output-head raw logits as the model-compute artifact. Greedy GPU
+ * selection uses a copied/finalized view so fast top-k has the same sampling
+ * semantics as host-finalized logits without mutating the raw logits buffer. */
+static bool metal_graph_prepare_logits_selection(
+ ds4_gpu_tensor *dst,
+ ds4_gpu_tensor *src,
+ uint64_t vocab_dim,
+ uint32_t n_rows) {
+ if (!dst || !src || n_rows == 0 || vocab_dim > UINT32_MAX) return false;
+ const uint64_t row_bytes = vocab_dim * sizeof(float);
+ const uint64_t bytes = row_bytes * (uint64_t)n_rows;
+ if (row_bytes != 0 && bytes / row_bytes != (uint64_t)n_rows) return false;
+ if (ds4_gpu_tensor_bytes(dst) < bytes || ds4_gpu_tensor_bytes(src) < bytes) return false;
+ if (ds4_gpu_tensor_copy(dst, 0, src, 0, bytes) == 0) return false;
+ return metal_graph_finalize_logits_device(dst, vocab_dim, n_rows);
+}
+
+static bool metal_graph_topk_finalized_logits(
+ ds4_gpu_graph *g,
+ ds4_gpu_tensor *raw_logits,
+ ds4_gpu_tensor *selected,
+ uint32_t k,
+ uint32_t n_rows) {
+ if (!g || !raw_logits || !selected || k == 0 || n_rows == 0) return false;
+ ds4_gpu_tensor *select_logits = (n_rows == 1) ? g->logits_select : g->spec_logits_select;
+ if (!select_logits) return false;
+ return metal_graph_prepare_logits_selection(select_logits, raw_logits, DS4_N_VOCAB, n_rows) &&
+ ds4_gpu_indexer_topk_tensor(selected,
+ select_logits,
+ DS4_N_VOCAB,
+ k,
+ n_rows) != 0;
+}
+
 /* Encode the final HC collapse, output norm, and vocab projection on Metal. */
 static bool metal_graph_encode_output_head(
  ds4_gpu_graph *g,
@@ -15130,7 +15170,6 @@ static bool metal_graph_encode_output_head(
  weights->output,
  DS4_N_EMBD, vocab_dim,
  g->output_norm, 1) != 0;
- if (ok) ok = metal_graph_finalize_logits_device(g->logits, vocab_dim, 1);
  DS4_METAL_PROFILE_OUTPUT_STAGE("lm_head");
  if (ok) {
  metal_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, DS4_N_LAYER, 0);
@@ -15234,7 +15273,6 @@ static bool metal_graph_encode_output_head_batch(
  weights->output,
  DS4_N_EMBD, vocab_dim,
  output_norm, n_tokens) != 0;
- if (ok) ok = metal_graph_finalize_logits_device(logits, vocab_dim, n_tokens);
 
  ds4_gpu_tensor_free(logits);
  ds4_gpu_tensor_free(output_norm);
@@ -15319,7 +15357,6 @@ static bool metal_graph_encode_output_head_mtp(
  base_weights->output,
  DS4_N_EMBD, vocab_dim,
  g->output_norm, 1) != 0;
- if (ok) ok = metal_graph_finalize_logits_device(g->logits, vocab_dim, 1);
  return ok;
 }
 
@@ -18278,13 +18315,7 @@ static bool metal_graph_eval_token_raw_swa_top(
  bool ok = ds4_gpu_begin_commands() != 0;
  if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
  token, pos, true, true);
- if (ok) {
- ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
- g->logits,
- DS4_N_VOCAB,
- 1,
- 1) != 0;
- }
+ if (ok) ok = metal_graph_topk_finalized_logits(g, g->logits, g->comp_selected, 1, 1);
  if (ok) ok = ds4_gpu_end_commands() != 0;
  if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
  if (ok && logits) {
@@ -18382,13 +18413,7 @@ static bool metal_graph_eval_mtp_draft_from_hc(
  mtp_model,
  mtp,
  base_weights->output->dim[1]);
- if (ok && top_id) {
- ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
- g->logits,
- DS4_N_VOCAB,
- 1,
- 1) != 0;
- }
+ if (ok && top_id) ok = metal_graph_topk_finalized_logits(g, g->logits, g->comp_selected, 1, 1);
  if (ok) ok = ds4_gpu_end_commands() != 0;
  g->cur_hc = saved_cur;
  g->after_ffn_hc = saved_after;
@@ -19679,11 +19704,7 @@ static bool metal_graph_verify_suffix_tops(
  weights->output->dim[1]);
  if (ok) {
  if (top_rows) {
- ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
- g->spec_logits,
- DS4_N_VOCAB,
- 1,
- top_rows) != 0;
+ ok = metal_graph_topk_finalized_logits(g, g->spec_logits, g->comp_selected, 1, top_rows);
  }
  }
  if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -19830,11 +19851,7 @@ static bool metal_graph_verify_decode2_exact(
 	 ok = metal_graph_encode_output_head_batch(g, model, weights, 2u, weights->output->dim[1]);
 	 g->batch_cur_hc = saved_batch_cur;
 	 }
-	 if (ok) ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
-	 g->spec_logits,
-	 DS4_N_VOCAB,
-	 1,
-	 2) != 0;
+	 if (ok) ok = metal_graph_topk_finalized_logits(g, g->spec_logits, g->comp_selected, 1, 2);
 	 if (ok) ok = ds4_gpu_end_commands() != 0;
 	 else (void)ds4_gpu_synchronize();
 	 g->batch_cur_hc = saved_batch_cur;
@@ -19872,11 +19889,7 @@ static bool metal_graph_verify_decode2_exact(
 	 g->cur_hc = cur0;
 	 ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
 	 }
-	 if (ok) ok = ds4_gpu_indexer_topk_tensor(top0_view,
-	 g->logits,
-	 DS4_N_VOCAB,
-	 1,
-	 1) != 0;
+	 if (ok) ok = metal_graph_topk_finalized_logits(g, g->logits, top0_view, 1, 1);
 	 if (ok && (cache_logits0_on_device || logits0)) {
 	 ok = ds4_gpu_tensor_copy(g->spec_logits,
 	 0,
@@ -19888,13 +19901,7 @@ static bool metal_graph_verify_decode2_exact(
 	 g->cur_hc = cur1;
 	 ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
 	 }
-	 if (ok && top1) {
-	 ok = ds4_gpu_indexer_topk_tensor(top1_view,
-	 g->logits,
-	 DS4_N_VOCAB,
-	 1,
-	 1) != 0;
-	 }
+	 if (ok && top1) ok = metal_graph_topk_finalized_logits(g, g->logits, top1_view, 1, 1);
 	 if (ok) ok = ds4_gpu_end_commands() != 0;
 	 else (void)ds4_gpu_synchronize();
 	 g->cur_hc = saved_cur;
@@ -19920,11 +19927,7 @@ static bool metal_graph_verify_decode2_exact(
  g->cur_hc = cur0;
  ok = ds4_gpu_begin_commands() != 0;
  if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
- if (ok) ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
- g->logits,
- DS4_N_VOCAB,
- 1,
- 1) != 0;
+ if (ok) ok = metal_graph_topk_finalized_logits(g, g->logits, g->comp_selected, 1, 1);
  if (ok && cache_logits0_on_device) {
  ok = ds4_gpu_tensor_copy(g->spec_logits,
  0,
@@ -19948,13 +19951,7 @@ static bool metal_graph_verify_decode2_exact(
  g->cur_hc = cur1;
  ok = ds4_gpu_begin_commands() != 0;
  if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
- if (ok && top1) {
- ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
- g->logits,
- DS4_N_VOCAB,
- 1,
- 1) != 0;
- }
+ if (ok && top1) ok = metal_graph_topk_finalized_logits(g, g->logits, g->comp_selected, 1, 1);
  if (ok) ok = ds4_gpu_end_commands() != 0;
  else (void)ds4_gpu_synchronize();
  g->cur_hc = saved_cur;
@@ -22372,6 +22369,7 @@ bool ds4_session_uses_gpu(const ds4_session *s) {
 
 static void ds4_session_note_host_logits(ds4_session *s) {
  if (!s) return;
+ ds4_finalize_host_logits(s->logits);
  s->logits_host_valid = true;
  s->logits_argmax_valid = false;
 }
