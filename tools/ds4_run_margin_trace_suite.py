@@ -82,6 +82,53 @@ def base_command(args: argparse.Namespace, prompt_path: Path, trace_path: Path) 
     return cmd
 
 
+def current_wired_gb() -> float | None:
+    if sys.platform != "darwin":
+        return None
+    proc = subprocess.run(["vm_stat"], text=True, capture_output=True, check=False)
+    if proc.returncode != 0:
+        return None
+    page_size = 16384
+    wired_pages: int | None = None
+    for line in proc.stdout.splitlines():
+        if "page size of" in line:
+            parts = line.replace(")", "").split()
+            for index, part in enumerate(parts):
+                if part == "of" and index + 1 < len(parts):
+                    try:
+                        page_size = int(parts[index + 1])
+                    except ValueError:
+                        pass
+        if line.startswith("Pages wired down:"):
+            value = line.split(":", 1)[1].strip().rstrip(".").replace(".", "")
+            wired_pages = int(value)
+    if wired_pages is None:
+        return None
+    return float(wired_pages * page_size) / 1.0e9
+
+
+def enforce_wired_budget(args: argparse.Namespace) -> None:
+    if args.backend != "metal" or args.dry_run:
+        return
+    wired = current_wired_gb()
+    if wired is None:
+        print("[trace-suite] wired preflight unavailable; continuing", file=sys.stderr, flush=True)
+        return
+    projected = wired + max(args.wired_estimate_gb, 0.0)
+    print(
+        f"[trace-suite] wired preflight current={wired:.2f}GB "
+        f"estimate={args.wired_estimate_gb:.2f}GB projected={projected:.2f}GB "
+        f"limit={args.wired_limit_gb:.2f}GB",
+        flush=True,
+    )
+    if projected > args.wired_limit_gb:
+        raise SystemExit(
+            f"refusing DS4 launch: projected wired {projected:.2f}GB exceeds "
+            f"--wired-limit-gb {args.wired_limit_gb:.2f}. Wait for other GPU jobs, "
+            "lower --wired-estimate-gb only with evidence, or run elsewhere."
+        )
+
+
 def run_command(cmd: list[str], cwd: Path, env: dict[str, str], dry_run: bool) -> tuple[int, float]:
     started = time.perf_counter()
     print("+", shell_join(cmd), flush=True)
@@ -108,6 +155,13 @@ def main() -> int:
     parser.add_argument("--reuse", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--raw-prompt", action="store_true")
+    parser.add_argument("--wired-limit-gb", type=float, default=56.0)
+    parser.add_argument(
+        "--wired-estimate-gb",
+        type=float,
+        default=47.0,
+        help="expected additional wired-memory footprint for this DS4 trace run; H3384 AIME prefill measured ~47GB",
+    )
     parser.add_argument(
         "--allow-uncertified-h3384",
         action="store_true",
@@ -141,6 +195,7 @@ def main() -> int:
             elapsed = 0.0
             print(f"[trace-suite] reuse {trace_path}", flush=True)
         else:
+            enforce_wired_budget(args)
             code, elapsed = run_command(cmd, REPO_ROOT, env, args.dry_run)
         if code != 0:
             failures += 1

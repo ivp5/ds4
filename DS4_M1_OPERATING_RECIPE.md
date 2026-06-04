@@ -207,7 +207,12 @@ unless the caller explicitly provides concatenated trace-row activations.
 observed θ=max flipped reference margin; `tools/ds4_margin_perturbation_correlation.py`
 reproduced the current norm→θ canary (`corr_l2_theta=0.9640`, θ 0.0586→0.8591
 over four flipped candidates), so the trace set must be norm-stratified as well
-as domain-diverse.
+as domain-diverse. Treat top-pool per-token logit error under ~1 logit as a
+reasoning-token safety budget, not a standalone proof: existing artifacts show
+large errors can avoid argmax flips when the reference margin is wide, while
+small errors can still flip razor-thin margins. The promotion gate therefore
+tracks both `P95(head-projected fragile-token codec error) < P5(reasoning margin)`
+and `top_pool_abs_logit_error <= 1.0` on materialized reasoning traces.
 
 Gate/up residual triage: global rank-1/rank-8 and row-block rank-1/rank-8
 residual probes on H3371 L40/E104 are too weak for the byte cost; gate act-rel
@@ -452,6 +457,21 @@ Fork lesson kept for future sidecar work:
 M1-class profiles keep ANE routed prefill off unless measured; 16K prefill
 chunks require raw-cap headroom (`128 + chunk`, aligned), and SSD/I/O knobs
 should be profile defaults with user env winning, not hidden cargo-cult flags.
+
+Current DS4 is only partly GPU-resident: GGUF/non-routed/pack files are mmaped
+file-backed storage, while Metal wraps or copies the tensors it needs and wired
+memory grows layer-by-layer during prefill. Measured H3384 AIME P01 prefill
+reached ~47 GB system wired; another live DS4 job left current wired at ~53.9 GB
+decimal, so local launch tooling must preflight wired memory and refuse projected
+usage above 56 GB. `tools/ds4_run_margin_trace_suite.py` now does that by
+default (`--wired-limit-gb 56`, H3384 estimate 47 GB).
+
+IQ2_XXS full GGUF is not an SSD-streaming candidate in the current primary path:
+the local file is 80.8 GiB and the live no-bypass probe exits at the engine
+`MEMORY-CEILING BALK` before mmap. Existing code comments state that phasing and
+CPU-MoE can avoid a kernel panic but still demand-page a >RAM working set into
+thrash; proper SSD streaming would require a sidecar slot-bank/pread runtime
+like the Anemll fork, not just bypassing `DS4_DISABLE_SIZE_TRIPWIRE`.
 
 ## Files
 

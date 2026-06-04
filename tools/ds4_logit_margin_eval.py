@@ -199,23 +199,28 @@ def position_metrics(
     }
 
 
-def summarize(rows: list[dict[str, Any]], margin_budget: float) -> dict[str, Any]:
+def summarize(rows: list[dict[str, Any]], margin_budget: float, logit_error_budget: float) -> dict[str, Any]:
     erosions = np.asarray([row["worst_gap_erosion_logits"] for row in rows], dtype=np.float64)
     abs_errors = np.asarray([row["top_pool_abs_logit_error"] for row in rows], dtype=np.float64)
     margins = np.asarray([row["reference_margin_logits"] for row in rows], dtype=np.float64)
     flips = sum(1 for row in rows if not row["argmax_agree"])
-    failed = sum(1 for row in rows if row["status"] != "PASS")
+    margin_failed = sum(1 for row in rows if row["status"] != "PASS")
+    logit_over = sum(1 for row in rows if row["top_pool_abs_logit_error"] > logit_error_budget)
     return {
         "positions": len(rows),
         "margin_budget_logits": margin_budget,
-        "failures": failed,
+        "logit_error_budget": logit_error_budget,
+        "failures": margin_failed,
+        "margin_failures": margin_failed,
+        "logit_error_over_budget": logit_over,
         "argmax_flips": flips,
         "max_gap_erosion_logits": float(np.max(erosions)) if rows else float("nan"),
         "mean_gap_erosion_logits": float(np.mean(erosions)) if rows else float("nan"),
         "p95_gap_erosion_logits": float(np.percentile(erosions, 95)) if rows else float("nan"),
         "max_top_pool_abs_logit_error": float(np.max(abs_errors)) if rows else float("nan"),
+        "p95_top_pool_abs_logit_error": float(np.percentile(abs_errors, 95)) if rows else float("nan"),
         "min_reference_margin_logits": float(np.min(margins)) if rows else float("nan"),
-        "status": "PASS" if failed == 0 else "FAIL",
+        "status": "PASS" if margin_failed == 0 and logit_over == 0 else "FAIL",
     }
 
 
@@ -278,6 +283,7 @@ def main() -> int:
     parser.add_argument("--reference", required=True, type=Path)
     parser.add_argument("--candidate", required=True, type=Path)
     parser.add_argument("--margin-budget", type=float, default=0.5)
+    parser.add_argument("--logit-error-budget", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=64)
     parser.add_argument("--skip-positions", type=int, default=0)
     parser.add_argument("--target-token", help="single token id or comma list, one per position")
@@ -308,7 +314,7 @@ def main() -> int:
                 competitors,
             )
         )
-    summary = summarize(rows, args.margin_budget)
+    summary = summarize(rows, args.margin_budget, args.logit_error_budget)
     perturbation = summarize_perturbation(reference[args.skip_positions :], candidate[args.skip_positions :], rows)
     payload = {
         "reference": str(args.reference),
