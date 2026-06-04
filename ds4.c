@@ -23791,8 +23791,8 @@ static bool ds4_env_mib_to_bytes(const char *env_name, uint64_t *out);
  * the local M1 Max has repeatedly shown that "phys - reserve" is too lax once
  * other Metal consumers exist. Used by the Metal residency commit to DEGRADE
  * to demand-paging instead of wiring a >RAM model: the 2026-05-30 trace showed
- * the cpu-moe view set covers the full 82.7 GB IQ2_XXS and requestResidency
- * wired all of it on a 68.7 GB box (sys-wired 3->45 GB by prefill layer 1). */
+ * a full-view IQ2_XXS mapping could ask Metal to wire far more than a 64 GiB
+ * M1 Max can safely hold. */
 int ds4_mem_would_overcommit(uint64_t add_bytes) {
  const uint64_t phys = ds4_physical_ram_bytes();
  if (phys == 0) return 0;
@@ -24156,37 +24156,17 @@ static bool engine_audit_metal_model_views(const ds4_engine *e,
  return true;
 }
 
-/* Register Metal model views over the full tensor-data range.
+/* Register Metal model views for the runtime that will actually dereference
+ * them. Plain --cpu-moe / --n-cpu-moe compute their selected routed experts
+ * through the CPU mmap, so those pages must stay out of the Metal view set.
+ * That restores the May-24 IQ2_XXS organ boundary: non-routed tensors are
+ * GPU-visible; CPU-routed experts are file-backed host pages only.
  *
- * silv 2026-05-28 engineer-roster simplification (Knuth/Carmack/Linus/Pearl):
- * collapsed the cpu-moe "punch holes in the view set" path into a single
- * full-range mapping. The previous design had three subsystems each
- * modifying g_model_views[]:
- *   1. set_model_map_range — initial whole-file views (overlapping)
- *   2. set_model_map_ranges — REPLACES view set with non-contiguous segments
- *      (cpu-moe excluding routed-expert ranges)
- *   3. prefill-metal-phases — activates a layer subset for Metal
- *
- * Subsystems (2) and (3) disagreed: cpu-moe assumed "all routed → CPU",
- * but prefill-phases kept some routed on Metal. When a phase-activated
- * routed-FFN kernel asked for a tensor in the cpu-moe-excluded range,
- * wrap_model_range linear-searched the truncated view set, found no view,
- * and emitted "Metal model range 8.37..8.89 GiB is not covered by mapped
- * model views" → "prompt processing failed: metal prefill failed".
- *
- * The conflation of VIEW (what addresses Metal can resolve — must be total)
- * with RESIDENCY (subset GPU-resident at the moment — may be partial) is
- * the bug. After this rewrite: views always cover the full tensor-data
- * range. cpu-moe still routes routed-FFN to CPU at the dispatch layer
- * (ds4_routed_moe_apply_full); the residency optimization (~0.66 GiB
- * skipped on this corpus) is forfeited but the bug surface is gone. If
- * residency-side savings become load-bearing on a larger model, the right
- * mechanism is MTLResidencySet membership trimming — orthogonal to views.
- *
- * SSD-stream IQ2_XXS is the explicit exception: prefill phases are disabled,
- * all routed dispatch stays on the file-backed CPU mmap, and Metal maps only
- * non-routed GGUF segments. That is residency/page-cache optimization, not a
- * CPU-vs-GPU claim. */
+ * Prefill-metal-phases is different: it dynamically flips layer routing so a
+ * previously CPU-routed layer may become GPU-routed during a phase. That mode
+ * needs full tensor-data views and manages residency at phase activation time.
+ * The CLI now rejects combining explicit cpu-moe with prefill phases; keeping
+ * the branch here makes the invariant local and fail-fast. */
 static bool engine_map_metal_views_with_routed_holes(ds4_engine *e) {
  if (e->model.no_tensor_data) {
   return true;
@@ -24197,7 +24177,10 @@ static bool engine_map_metal_views_with_routed_holes(ds4_engine *e) {
  for (size_t i = 0; i < nm; i++) routed_bytes += routed[i].end - routed[i].start;
 
  bool ok = false;
- if (e->ssd_stream_iq2xxs && nm > 0) {
+ const bool segmented_cpu_moe =
+  (e->ssd_stream_iq2xxs || (e->cpu_moe && e->prefill_metal_phases == 0)) &&
+  nm > 0;
+ if (segmented_cpu_moe) {
   uint64_t *seg_off = xmalloc((nm + 1) * sizeof(*seg_off));
   uint64_t *seg_size = xmalloc((nm + 1) * sizeof(*seg_size));
   uint32_t nseg = 0;
@@ -24228,13 +24211,23 @@ static bool engine_map_metal_views_with_routed_holes(ds4_engine *e) {
   if (ok) {
    uint64_t mapped_bytes = 0;
    for (uint32_t i = 0; i < nseg; i++) mapped_bytes += seg_size[i];
-   fprintf(stderr,
-    "ds4: --ssd-stream-iq2xxs: Metal maps %u non-routed GGUF segments "
-    "(%.2f GiB) and excludes %.2f GiB routed expert pages from Metal "
-    "residency/view wrapping; routed pages stream through file-backed mmap\n",
-    nseg,
-    (double)mapped_bytes / (1024.0 * 1024.0 * 1024.0),
-    (double)routed_bytes / (1024.0 * 1024.0 * 1024.0));
+   if (e->ssd_stream_iq2xxs) {
+    fprintf(stderr,
+     "ds4: --ssd-stream-iq2xxs: Metal maps %u non-routed GGUF segments "
+     "(%.2f GiB) and excludes %.2f GiB routed expert pages from Metal "
+     "residency/view wrapping; routed pages stream through file-backed mmap\n",
+     nseg,
+     (double)mapped_bytes / (1024.0 * 1024.0 * 1024.0),
+     (double)routed_bytes / (1024.0 * 1024.0 * 1024.0));
+   } else {
+    fprintf(stderr,
+     "ds4: --cpu-moe: Metal maps %u non-routed GGUF segments "
+     "(%.2f GiB) and excludes %.2f GiB routed expert pages from Metal "
+     "views/residency; routed experts use the CPU mmap\n",
+     nseg,
+     (double)mapped_bytes / (1024.0 * 1024.0 * 1024.0),
+     (double)routed_bytes / (1024.0 * 1024.0 * 1024.0));
+   }
   }
   free(seg_off);
   free(seg_size);
@@ -24246,7 +24239,7 @@ static bool engine_map_metal_views_with_routed_holes(ds4_engine *e) {
                        e->model.size) != 0);
  }
 
- if (nm > 0 && !e->ssd_stream_iq2xxs) {
+ if (nm > 0 && !segmented_cpu_moe) {
   fprintf(stderr,
    "ds4: --cpu-moe: %zu routed-expert ranges (%.2f GiB) overlap with the "
    "full Metal view set — residency exclusion DISABLED (engineer-roster "

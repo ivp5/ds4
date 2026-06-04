@@ -1178,13 +1178,12 @@ static void ds4_gpu_model_residency_clear(void) {
 static int ds4_gpu_model_residency_request_views(void) {
  if (g_model_view_count == 0 || getenv("DS4_METAL_NO_RESIDENCY") != NULL) return 1;
 
- /* silv 2026-05-30 (MEASURED root cause of the M1 panics): the cpu-moe view set
-  * covers the FULL tensor-data range (82.7 GB for IQ2_XXS). requestResidency on
-  * all of it wires 82.7 GB on a 68.7 GB machine -> over-commit -> kernel panic
-  * (trace: sys-wired 3->45 GB by prefill L1, climbing). Residency is a HINT, not
-  * required for correctness; if wiring the full view set would over-commit, SKIP
-  * it and let Metal demand-page (slower first-touch, safe). Phase prefill still
-  * manages its own per-phase residency. DS4_FORCE_FULL_RESIDENCY=1 forces old behavior. */
+ /* silv 2026-05-30 (MEASURED root cause of the M1 panics): requestResidency on
+  * an oversized full-view model can wire more shared pages than a 64 GiB M1 Max
+  * can safely hold. Residency is a HINT, not required for correctness; if wiring
+  * the current view set would over-commit, SKIP it and let Metal demand-page
+  * (slower first-touch, safe). Phase prefill still manages its own per-phase
+  * residency. DS4_FORCE_FULL_RESIDENCY=1 forces old behavior. */
  {
   uint64_t resident_bytes = 0;
   for (uint32_t i = 0; i < g_model_view_count; i++) resident_bytes += g_model_views[i].bytes;
