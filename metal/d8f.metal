@@ -1009,6 +1009,99 @@ kernel void d8f_down_sparse_score_selected_batch(
   const float m7 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 7u);
   score[(ulong(token_slot) * ulong(groups) + ulong(group)) *
         ulong(args.max_group_unique) + ulong(local)] =
+	      d8f_dot8_codebook_buffer(pack, rec.codebook_offset, code, m0, m1, m2, m3, m4, m5, m6, m7);
+}
+
+kernel void d8f_down_sparse_score_indirect_prepare(
+  device const D8FSparseDownRecordLite *sparse  [[buffer(0)]],
+  device const uint *selected                   [[buffer(1)]],
+  device uint *slot_prefix                      [[buffer(2)]],
+  device uint *indirect_args                    [[buffer(3)]],
+  constant D8FSparseDownArgs &args              [[buffer(4)]],
+  uint tid [[thread_position_in_grid]]) {
+  if (tid != 0u) return;
+  const uint total_slots = args.n_tokens * args.n_selected;
+  uint total_unique = 0u;
+  slot_prefix[0] = 0u;
+  for (uint token_slot = 0u; token_slot < total_slots; token_slot++) {
+    const uint selected_denom = args.n_selected == 0u ? 1u : args.n_selected;
+    const uint token = token_slot / selected_denom;
+    const uint slot = token_slot - token * args.n_selected;
+    uint add = 0u;
+    if (token < args.n_tokens && slot < args.n_selected) {
+      const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];
+      const D8FSparseDownRecordLite srec = sparse[expert];
+      if ((srec.flags & 1u) != 0u) add = srec.unique_count;
+    }
+    total_unique += add;
+    slot_prefix[token_slot + 1u] = total_unique;
+  }
+  indirect_args[0] = (total_unique + 255u) >> 8;
+  indirect_args[1] = 1u;
+  indirect_args[2] = 1u;
+}
+
+kernel void d8f_down_sparse_score_selected_compact_indirect(
+  device const uchar *sparse_pack               [[buffer(0)]],
+  device const uchar *pack                      [[buffer(1)]],
+  device const D8FSparseDownRecordLite *sparse  [[buffer(2)]],
+  device const D8FRecordLite *recs              [[buffer(3)]],
+  device const float *mid                       [[buffer(4)]],
+  device const uint *selected                   [[buffer(5)]],
+  device float *score                           [[buffer(6)]],
+  constant D8FSparseDownArgs &args              [[buffer(7)]],
+  device const uint *slot_prefix                [[buffer(8)]],
+  device const ushort *unique_group             [[buffer(9)]],
+  uint tid [[thread_index_in_threadgroup]],
+  uint3 tgp [[threadgroup_position_in_grid]]) {
+  const uint linear = tgp.x * 256u + tid;
+  const uint total_slots = args.n_tokens * args.n_selected;
+  const uint total_unique = slot_prefix[total_slots];
+  if (linear >= total_unique) return;
+  uint lo_slot = 0u;
+  uint hi_slot = total_slots;
+  while (lo_slot + 1u < hi_slot) {
+    const uint mid_slot_idx = (lo_slot + hi_slot) >> 1;
+    if (slot_prefix[mid_slot_idx] <= linear) {
+      lo_slot = mid_slot_idx;
+    } else {
+      hi_slot = mid_slot_idx;
+    }
+  }
+  const uint token_slot = lo_slot;
+  const uint unique_index = linear - slot_prefix[token_slot];
+  const uint selected_denom = args.n_selected == 0u ? 1u : args.n_selected;
+  const uint token = token_slot / selected_denom;
+  const uint slot = token_slot - token * args.n_selected;
+  if (token >= args.n_tokens || slot >= args.n_selected) return;
+  const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];
+  const D8FSparseDownRecordLite srec = sparse[expert];
+  if ((srec.flags & 1u) == 0u || unique_index >= srec.unique_count) return;
+  device const uint *prefix = (device const uint *)(sparse_pack + srec.group_prefix_offset);
+  const uint group = uint(unique_group[ulong(srec.reserved0) + ulong(unique_index)]);
+  const uint start = prefix[group];
+  const uint end = prefix[group + 1u];
+  if (end <= start || end > srec.unique_count || unique_index < start || group >= (args.in_dim >> 3)) return;
+  const uint local = unique_index - start;
+  if (local >= args.max_group_unique) return;
+  device const ushort *unique_codes = (device const ushort *)(sparse_pack + srec.unique_code_offset);
+  const uint code = uint(unique_codes[unique_index]);
+  const D8FRecordLite rec = recs[8192u + expert];
+  if (code >= rec.k) return;
+  device const float *slot_mid =
+      mid + ulong(token) * ulong(args.mid_token_stride) +
+      ulong(slot) * ulong(args.mid_slot_stride);
+  const uint x_base = group << 3;
+  const float m0 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 0u);
+  const float m1 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 1u);
+  const float m2 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 2u);
+  const float m3 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 3u);
+  const float m4 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 4u);
+  const float m5 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 5u);
+  const float m6 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 6u);
+  const float m7 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 7u);
+  score[(ulong(token_slot) * ulong(args.in_dim >> 3) + ulong(group)) *
+        ulong(args.max_group_unique) + ulong(local)] =
       d8f_dot8_codebook_buffer(pack, rec.codebook_offset, code, m0, m1, m2, m3, m4, m5, m6, m7);
 }
 

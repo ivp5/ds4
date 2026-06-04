@@ -1917,6 +1917,22 @@ static int ds4_gpu_d8f_runtime_sparse_down_enabled_for_layer(uint32_t layer,
     return has_allow;
 }
 
+static int ds4_gpu_d8f_runtime_sparse_unpack_inverse_enabled(void) {
+    if (ds4_gpu_env_bool("DS4_D8F_RUNTIME_SPARSE_DOWN_UNPACK_INVERSE_DISABLE") > 0) return 0;
+    const int explicit_unpack = ds4_gpu_env_bool("DS4_D8F_RUNTIME_SPARSE_DOWN_UNPACK_INVERSE");
+    if (explicit_unpack >= 0) return explicit_unpack > 0;
+    const int explicit_bitpack = ds4_gpu_env_bool("DS4_D8F_RUNTIME_SPARSE_DOWN_BITPACK_INVERSE");
+    if (explicit_bitpack > 0) return 0;
+    return 1;
+}
+
+static int ds4_gpu_d8f_runtime_sparse_indirect_score_enabled(void) {
+    if (ds4_gpu_env_bool("DS4_D8F_RUNTIME_SPARSE_DOWN_INDIRECT_SCORE_DISABLE") > 0) return 0;
+    const int explicit_indirect = ds4_gpu_env_bool("DS4_D8F_RUNTIME_SPARSE_DOWN_INDIRECT_SCORE");
+    if (explicit_indirect == 0) return 0;
+    return 1;
+}
+
 static int ds4_gpu_d8f_runtime_native_down_pack2d_enabled_for_layer(uint32_t layer) {
     if (ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_PACK2D_DISABLE") > 0) return 0;
     const uint64_t default_mask = ds4_gpu_layer_bit(26u);
@@ -8063,8 +8079,8 @@ int ds4_gpu_indirect_dispatch_canary(uint32_t n_groups, uint32_t work, uint32_t 
  if (!g_initialized && !ds4_gpu_init()) return 0;
  if (n_groups == 0) n_groups = 1024;
  if (rounds == 0) rounds = 20;
- if (n_groups > 65536u) {
-  fprintf(stderr, "ds4: indirect-dispatch canary rejects n_groups=%u; cap is 65536 for this no-model probe\n",
+ if (n_groups > 262144u) {
+  fprintf(stderr, "ds4: indirect-dispatch canary rejects n_groups=%u; cap is 262144 for this no-model probe\n",
           n_groups);
   return 0;
  }
@@ -8105,13 +8121,20 @@ int ds4_gpu_indirect_dispatch_canary(uint32_t n_groups, uint32_t work, uint32_t 
   id<MTLBuffer> out_a = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
   id<MTLBuffer> out_b = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
   id<MTLBuffer> out_c = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-  id<MTLBuffer> indirect = [g_device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
-  if (!out_a || !out_b || !out_c || !indirect) return 0;
+  id<MTLBuffer> out_d = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+  id<MTLBuffer> indirect = [g_device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+  if (!out_a || !out_b || !out_c || !out_d || !indirect) return 0;
   memset(out_a.contents, 0, bytes);
   memset(out_b.contents, 0, bytes);
   memset(out_c.contents, 0, bytes);
+  memset(out_d.contents, 0, bytes);
+  uint32_t *indirect_args = (uint32_t *)indirect.contents;
+  indirect_args[0] = 1u;
+  indirect_args[1] = 1u;
+  indirect_args[2] = 1u;
   double tiny_min_ms = DBL_MAX;
   double direct_min_ms = DBL_MAX;
+  double indirect_prefilled_min_ms = DBL_MAX;
   double indirect_min_ms = DBL_MAX;
   for (uint32_t r = 0; r < rounds; r++) {
    const double t0 = ds4_gpu_now_ms();
@@ -8152,6 +8175,26 @@ int ds4_gpu_indirect_dispatch_canary(uint32_t n_groups, uint32_t work, uint32_t 
    const double t0 = ds4_gpu_now_ms();
    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+   indirect_args[0] = n_groups;
+   indirect_args[1] = 1u;
+   indirect_args[2] = 1u;
+   [enc setComputePipelineState:grid_pso];
+   [enc setBuffer:out_d offset:0 atIndex:0];
+   [enc setBytes:&work length:sizeof(work) atIndex:2];
+   [enc dispatchThreadgroupsWithIndirectBuffer:indirect
+                          indirectBufferOffset:0
+                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+   [enc endEncoding];
+   [cb commit];
+   [cb waitUntilCompleted];
+   if (cb.status != MTLCommandBufferStatusCompleted) return 0;
+   const double dt = ds4_gpu_now_ms() - t0;
+   if (dt < indirect_prefilled_min_ms) indirect_prefilled_min_ms = dt;
+  }
+  for (uint32_t r = 0; r < rounds; r++) {
+   const double t0 = ds4_gpu_now_ms();
+   id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
    uint32_t n = n_groups;
    [enc setComputePipelineState:count_pso];
    [enc setBuffer:indirect offset:0 atIndex:0];
@@ -8175,29 +8218,37 @@ int ds4_gpu_indirect_dispatch_canary(uint32_t n_groups, uint32_t work, uint32_t 
   const float *a = (const float *)out_a.contents;
   const float *b = (const float *)out_b.contents;
   const float *c = (const float *)out_c.contents;
+  const float *d = (const float *)out_d.contents;
   uint32_t mism_ab = 0;
   uint32_t mism_ac = 0;
+  uint32_t mism_ad = 0;
   float max_ab = 0.0f;
   float max_ac = 0.0f;
+  float max_ad = 0.0f;
   for (uint32_t i = 0; i < n_groups; i++) {
    const float dab = fabsf(a[i] - b[i]);
    const float dac = fabsf(a[i] - c[i]);
+   const float dad = fabsf(a[i] - d[i]);
    if (dab > max_ab) max_ab = dab;
    if (dac > max_ac) max_ac = dac;
+   if (dad > max_ad) max_ad = dad;
    if (dab > 1e-5f) mism_ab++;
    if (dac > 1e-5f) mism_ac++;
+   if (dad > 1e-5f) mism_ad++;
   }
   fprintf(stderr,
-          "ds4: indirect-dispatch canary groups=%u work=%u rounds=%u tiny=%.3f ms direct=%.3f ms indirect=%.3f ms tiny/direct=%.1fx tiny/indirect=%.1fx indirect/direct=%.2f mism_ab=%u mism_ac=%u max_ab=%.3e max_ac=%.3e last={%.2f,%.2f,%.2f} %s\n",
+          "ds4: indirect-dispatch canary groups=%u work=%u rounds=%u tiny=%.3f ms direct=%.3f ms indirect_prefilled=%.3f ms indirect_gpu_count=%.3f ms tiny/direct=%.1fx tiny/indirect_prefilled=%.1fx tiny/indirect_gpu_count=%.1fx indirect_prefilled/direct=%.2f indirect_gpu_count/direct=%.2f mism_ab=%u mism_ac=%u mism_ad=%u max_ab=%.3e max_ac=%.3e max_ad=%.3e last={%.2f,%.2f,%.2f,%.2f} %s\n",
           n_groups, work, rounds,
-          tiny_min_ms, direct_min_ms, indirect_min_ms,
+          tiny_min_ms, direct_min_ms, indirect_prefilled_min_ms, indirect_min_ms,
           direct_min_ms > 0.0 ? tiny_min_ms / direct_min_ms : 0.0,
+          indirect_prefilled_min_ms > 0.0 ? tiny_min_ms / indirect_prefilled_min_ms : 0.0,
           indirect_min_ms > 0.0 ? tiny_min_ms / indirect_min_ms : 0.0,
+          direct_min_ms > 0.0 ? indirect_prefilled_min_ms / direct_min_ms : 0.0,
           direct_min_ms > 0.0 ? indirect_min_ms / direct_min_ms : 0.0,
-          mism_ab, mism_ac, (double)max_ab, (double)max_ac,
-          a[n_groups - 1u], b[n_groups - 1u], c[n_groups - 1u],
-          (mism_ab == 0 && mism_ac == 0) ? "PASS" : "FAIL");
-  return mism_ab == 0 && mism_ac == 0;
+          mism_ab, mism_ac, mism_ad, (double)max_ab, (double)max_ac, (double)max_ad,
+          a[n_groups - 1u], b[n_groups - 1u], c[n_groups - 1u], d[n_groups - 1u],
+          (mism_ab == 0 && mism_ac == 0 && mism_ad == 0) ? "PASS" : "FAIL");
+  return mism_ab == 0 && mism_ac == 0 && mism_ad == 0;
  }
 }
 
@@ -52641,6 +52692,8 @@ static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_compact_tex_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_i8_cbsram_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sparse_score_selected_batch_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sparse_score_indirect_prepare_classic_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_sparse_score_selected_compact_indirect_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sparse_gather_selected_batch_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_native_pack2d_warm_classic_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_sum_selected_weighted_batch_tile16_recbuf_cbsram_classic_pipeline;
@@ -52739,6 +52792,10 @@ static int ds4_d8f_classic_pipeline_init(void) {
             ds4_d8f_classic_direct_pipeline_from_library(g_library, @"d8f_down_sum_selected_weighted_batch_tile16_recbuf_native_codes_i8_cbsram");
         g_d8f_down_sparse_score_selected_batch_classic_pipeline =
             ds4_d8f_classic_direct_pipeline_from_library(g_library, @"d8f_down_sparse_score_selected_batch");
+        g_d8f_down_sparse_score_indirect_prepare_classic_pipeline =
+            ds4_d8f_classic_direct_pipeline_from_library(g_library, @"d8f_down_sparse_score_indirect_prepare");
+        g_d8f_down_sparse_score_selected_compact_indirect_classic_pipeline =
+            ds4_d8f_classic_direct_pipeline_from_library(g_library, @"d8f_down_sparse_score_selected_compact_indirect");
         g_d8f_down_sparse_gather_selected_batch_classic_pipeline =
             ds4_d8f_classic_direct_pipeline_from_library(g_library, @"d8f_down_sparse_gather_selected_batch");
         g_d8f_down_native_pack2d_warm_classic_pipeline =
@@ -55646,6 +55703,7 @@ static id<MTLBuffer> g_d8f_runtime_layer_buf[ds4_d8f_runtime_layer_cap];
 static id<MTLBuffer> g_d8f_runtime_layer_sparse_buf[ds4_d8f_runtime_layer_cap];
 static id<MTLBuffer> g_d8f_runtime_layer_sparse_rec_buf[ds4_d8f_runtime_layer_cap];
 static id<MTLBuffer> g_d8f_runtime_layer_sparse_inverse_buf[ds4_d8f_runtime_layer_cap];
+static id<MTLBuffer> g_d8f_runtime_layer_sparse_group_buf[ds4_d8f_runtime_layer_cap];
 static uint32_t g_d8f_runtime_layer_sparse_max_group_unique[ds4_d8f_runtime_layer_cap];
 static uint32_t g_d8f_runtime_layer_sparse_live_records[ds4_d8f_runtime_layer_cap];
 static id<MTLTexture> g_d8f_runtime_layer_texbuf[ds4_d8f_runtime_layer_cap];
@@ -55668,8 +55726,12 @@ static id<MTLBuffer> g_d8f_runtime_rec_buf;
 static id<MTLBuffer> g_d8f_runtime_sparse_buf;
 static id<MTLBuffer> g_d8f_runtime_sparse_rec_buf;
 static id<MTLBuffer> g_d8f_runtime_sparse_inverse_buf;
+static id<MTLBuffer> g_d8f_runtime_sparse_group_buf;
 static id<MTLBuffer> g_d8f_runtime_sparse_score_buf;
 static NSUInteger g_d8f_runtime_sparse_score_bytes;
+static id<MTLBuffer> g_d8f_runtime_sparse_prefix_buf;
+static NSUInteger g_d8f_runtime_sparse_prefix_bytes;
+static id<MTLBuffer> g_d8f_runtime_sparse_indirect_buf;
 static uint32_t g_d8f_runtime_sparse_max_group_unique;
 static uint32_t g_d8f_runtime_sparse_live_records;
 static id<MTLBuffer> g_d8f_runtime_i8_rec_buf;
@@ -55826,8 +55888,12 @@ static void ds4_d8f_runtime_active_clear(void) {
     g_d8f_runtime_sparse_buf = nil;
     g_d8f_runtime_sparse_rec_buf = nil;
     g_d8f_runtime_sparse_inverse_buf = nil;
+    g_d8f_runtime_sparse_group_buf = nil;
     g_d8f_runtime_sparse_score_buf = nil;
     g_d8f_runtime_sparse_score_bytes = 0;
+    g_d8f_runtime_sparse_prefix_buf = nil;
+    g_d8f_runtime_sparse_prefix_bytes = 0;
+    g_d8f_runtime_sparse_indirect_buf = nil;
     g_d8f_runtime_sparse_max_group_unique = 0;
     g_d8f_runtime_sparse_live_records = 0;
     g_d8f_runtime_gate_args_buf = nil;
@@ -55847,17 +55913,19 @@ static void ds4_d8f_runtime_layer_reset(uint32_t layer) {
                                   g_d8f_runtime_layer_sparse_buf[layer] ||
                                   g_d8f_runtime_layer_sparse_rec_buf[layer] ||
                                   g_d8f_runtime_layer_sparse_inverse_buf[layer] ||
+                                  g_d8f_runtime_layer_sparse_group_buf[layer] ||
                                   g_d8f_runtime_layer_gate_args_buf[layer] ||
                                   g_d8f_runtime_layer_down_args_buf[layer] ||
                                   g_d8f_runtime_layer_down_base_args_buf[layer] ||
                                   g_d8f_runtime_layer_sparse_args_buf[layer])) {
-        id<MTLAllocation> allocs[9];
+        id<MTLAllocation> allocs[10];
         NSUInteger count = 0;
         if (g_d8f_runtime_layer_buf[layer]) allocs[count++] = g_d8f_runtime_layer_buf[layer];
         if (g_d8f_runtime_layer_rec_buf[layer]) allocs[count++] = g_d8f_runtime_layer_rec_buf[layer];
         if (g_d8f_runtime_layer_sparse_buf[layer]) allocs[count++] = g_d8f_runtime_layer_sparse_buf[layer];
         if (g_d8f_runtime_layer_sparse_rec_buf[layer]) allocs[count++] = g_d8f_runtime_layer_sparse_rec_buf[layer];
         if (g_d8f_runtime_layer_sparse_inverse_buf[layer]) allocs[count++] = g_d8f_runtime_layer_sparse_inverse_buf[layer];
+        if (g_d8f_runtime_layer_sparse_group_buf[layer]) allocs[count++] = g_d8f_runtime_layer_sparse_group_buf[layer];
         if (g_d8f_runtime_layer_gate_args_buf[layer]) allocs[count++] = g_d8f_runtime_layer_gate_args_buf[layer];
         if (g_d8f_runtime_layer_down_args_buf[layer]) allocs[count++] = g_d8f_runtime_layer_down_args_buf[layer];
         if (g_d8f_runtime_layer_down_base_args_buf[layer]) allocs[count++] = g_d8f_runtime_layer_down_base_args_buf[layer];
@@ -55875,6 +55943,7 @@ static void ds4_d8f_runtime_layer_reset(uint32_t layer) {
     g_d8f_runtime_layer_sparse_buf[layer] = nil;
     g_d8f_runtime_layer_sparse_rec_buf[layer] = nil;
     g_d8f_runtime_layer_sparse_inverse_buf[layer] = nil;
+    g_d8f_runtime_layer_sparse_group_buf[layer] = nil;
     g_d8f_runtime_layer_sparse_max_group_unique[layer] = 0;
     g_d8f_runtime_layer_sparse_live_records[layer] = 0;
     g_d8f_runtime_layer_texbuf[layer] = nil;
@@ -55927,6 +55996,7 @@ static void ds4_d8f_runtime_activate_layer(uint32_t layer) {
     g_d8f_runtime_sparse_buf = g_d8f_runtime_layer_sparse_buf[layer];
     g_d8f_runtime_sparse_rec_buf = g_d8f_runtime_layer_sparse_rec_buf[layer];
     g_d8f_runtime_sparse_inverse_buf = g_d8f_runtime_layer_sparse_inverse_buf[layer];
+    g_d8f_runtime_sparse_group_buf = g_d8f_runtime_layer_sparse_group_buf[layer];
     g_d8f_runtime_sparse_max_group_unique = g_d8f_runtime_layer_sparse_max_group_unique[layer];
     g_d8f_runtime_sparse_live_records = g_d8f_runtime_layer_sparse_live_records[layer];
     g_d8f_runtime_texbuf = g_d8f_runtime_layer_texbuf[layer];
@@ -55966,7 +56036,7 @@ static void ds4_d8f_runtime_layer_queue_detach(uint32_t layer) {
 static int ds4_d8f_runtime_pack_residency_prepare(uint32_t layer) {
     if (!g_d8f_runtime_pack_rs) {
         MTLResidencySetDescriptor *rsDesc = [MTLResidencySetDescriptor new];
-        rsDesc.initialCapacity = ds4_d8f_runtime_layer_cap * 9;
+        rsDesc.initialCapacity = ds4_d8f_runtime_layer_cap * 10;
         NSError *err = nil;
         g_d8f_runtime_pack_rs = [g_device newResidencySetWithDescriptor:rsDesc error:&err];
         if (!g_d8f_runtime_pack_rs) {
@@ -55975,13 +56045,14 @@ static int ds4_d8f_runtime_pack_residency_prepare(uint32_t layer) {
             return 0;
         }
     }
-    id<MTLAllocation> allocs[9];
+    id<MTLAllocation> allocs[10];
     NSUInteger alloc_count = 0;
     if (g_d8f_runtime_layer_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_buf[layer];
     if (g_d8f_runtime_layer_rec_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_rec_buf[layer];
     if (g_d8f_runtime_layer_sparse_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_sparse_buf[layer];
     if (g_d8f_runtime_layer_sparse_rec_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_sparse_rec_buf[layer];
     if (g_d8f_runtime_layer_sparse_inverse_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_sparse_inverse_buf[layer];
+    if (g_d8f_runtime_layer_sparse_group_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_sparse_group_buf[layer];
     if (g_d8f_runtime_layer_gate_args_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_gate_args_buf[layer];
     if (g_d8f_runtime_layer_down_args_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_down_args_buf[layer];
     if (g_d8f_runtime_layer_down_base_args_buf[layer]) allocs[alloc_count++] = g_d8f_runtime_layer_down_base_args_buf[layer];
@@ -56236,11 +56307,13 @@ static int ds4_d8f_runtime_sparse_down_load(uint32_t layer,
                                             id<MTLBuffer> *out_sparse_buf,
                                             id<MTLBuffer> *out_rec_buf,
                                             id<MTLBuffer> *out_inverse_buf,
+                                            id<MTLBuffer> *out_group_buf,
                                             uint32_t *out_max_group_unique,
                                             uint32_t *out_live_records) {
     if (out_sparse_buf) *out_sparse_buf = nil;
     if (out_rec_buf) *out_rec_buf = nil;
     if (out_inverse_buf) *out_inverse_buf = nil;
+    if (out_group_buf) *out_group_buf = nil;
     if (out_max_group_unique) *out_max_group_unique = 0;
     if (out_live_records) *out_live_records = 0;
     if (!out_file || layer >= ds4_d8f_runtime_layer_cap) return 0;
@@ -56263,30 +56336,38 @@ static int ds4_d8f_runtime_sparse_down_load(uint32_t layer,
     uint32_t max_group_unique = 0;
     uint32_t live_records = 0;
     uint64_t inverse_entries = 0;
+    const int unpack_inverse = ds4_gpu_d8f_runtime_sparse_unpack_inverse_enabled();
+    const int indirect_score = ds4_gpu_d8f_runtime_sparse_indirect_score_enabled();
+    uint64_t unique_group_entries = 0;
     for (uint32_t expert = 0; expert < 256u; expert++) {
         ds4_d8fs_record rec;
         if (!ds4_d8fs_get_record(&sparse_file, expert, &rec)) continue;
         const uint64_t rec_inverse_entries = (uint64_t)rec.rows * (uint64_t)rec.groups;
+        const uint64_t rec_unique_entries = (uint64_t)rec.unique_count;
         if (rec.rows == 0u || rec.groups == 0u ||
             rec.rows > 65536u ||
             rec.groups > 4096u ||
+            rec.unique_count == 0u ||
             rec_inverse_entries > UINT32_MAX ||
-            inverse_entries + rec_inverse_entries > (uint64_t)UINT32_MAX) {
+            inverse_entries + rec_inverse_entries > (uint64_t)UINT32_MAX ||
+            unique_group_entries + rec_unique_entries > (uint64_t)UINT32_MAX) {
             ds4_d8fs_close(&sparse_file);
             return 0;
         }
-        recs[expert].flags = 1u | 2u;
+        recs[expert].flags = 1u | (unpack_inverse ? 2u : 0u);
         recs[expert].rows = rec.rows;
         recs[expert].groups = rec.groups;
         recs[expert].k = rec.k;
         recs[expert].unique_count = rec.unique_count;
         recs[expert].max_group_unique = rec.max_group_unique;
         recs[expert].inverse_unpacked_offset = (uint32_t)inverse_entries;
+        recs[expert].reserved0 = indirect_score ? (uint32_t)unique_group_entries : 0u;
         recs[expert].group_prefix_offset = rec.group_prefix_offset;
         recs[expert].inverse_offset_table_offset = rec.inverse_offset_table_offset;
         recs[expert].unique_code_offset = rec.unique_code_offset;
         recs[expert].inverse_bits_offset = rec.inverse_bits_offset;
         inverse_entries += rec_inverse_entries;
+        unique_group_entries += rec_unique_entries;
         if (rec.max_group_unique > max_group_unique) max_group_unique = rec.max_group_unique;
         live_records++;
     }
@@ -56298,8 +56379,16 @@ static int ds4_d8f_runtime_sparse_down_load(uint32_t layer,
         ds4_d8fs_close(&sparse_file);
         return 0;
     }
-    uint16_t *inverse_unpacked = (uint16_t *)malloc((size_t)inverse_entries * sizeof(uint16_t));
-    if (!inverse_unpacked) {
+    uint16_t *inverse_unpacked = unpack_inverse ?
+        (uint16_t *)malloc((size_t)inverse_entries * sizeof(uint16_t)) : NULL;
+    if (unpack_inverse && !inverse_unpacked) {
+        ds4_d8fs_close(&sparse_file);
+        return 0;
+    }
+    uint16_t *unique_groups = indirect_score ?
+        (uint16_t *)malloc((size_t)unique_group_entries * sizeof(uint16_t)) : NULL;
+    if (indirect_score && !unique_groups) {
+        free(inverse_unpacked);
         ds4_d8fs_close(&sparse_file);
         return 0;
     }
@@ -56309,6 +56398,7 @@ static int ds4_d8f_runtime_sparse_down_load(uint32_t layer,
         const uint8_t *prefix_base = sparse_file.map + rec.group_prefix_offset;
         const uint8_t *inverse_offset_base = sparse_file.map + rec.inverse_offset_table_offset;
         const uint64_t out_base = recs[expert].inverse_unpacked_offset;
+        const uint64_t group_base = recs[expert].reserved0;
         int rec_ok = 1;
         for (uint32_t group = 0; rec_ok && group < rec.groups; group++) {
             const uint32_t unique_start =
@@ -56339,6 +56429,11 @@ static int ds4_d8f_runtime_sparse_down_load(uint32_t layer,
                 break;
             }
             const uint32_t group_unique = unique_end - unique_start;
+            if (indirect_score) {
+                for (uint32_t local = 0; local < group_unique; local++) {
+                    unique_groups[group_base + unique_start + local] = (uint16_t)group;
+                }
+            }
             const uint32_t bits = ds4_d8f_runtime_ceil_log2_u32(group_unique);
             const uint64_t needed_bits = (uint64_t)rec.rows * (uint64_t)bits;
             const uint64_t available_bits = (uint64_t)(inverse_end - inverse_start) * 8ull;
@@ -56354,10 +56449,13 @@ static int ds4_d8f_runtime_sparse_down_load(uint32_t layer,
                     rec_ok = 0;
                     break;
                 }
-                inverse_unpacked[out_base + (uint64_t)row * rec.groups + group] = (uint16_t)local;
+                if (unpack_inverse) {
+                    inverse_unpacked[out_base + (uint64_t)row * rec.groups + group] = (uint16_t)local;
+                }
             }
         }
         if (!rec_ok) {
+            free(unique_groups);
             free(inverse_unpacked);
             ds4_d8fs_close(&sparse_file);
             return 0;
@@ -56370,11 +56468,19 @@ static int ds4_d8f_runtime_sparse_down_load(uint32_t layer,
     id<MTLBuffer> rec_buf = [g_device newBufferWithBytes:recs
                                                   length:sizeof(recs)
                                                  options:MTLResourceStorageModeShared];
-    id<MTLBuffer> inverse_buf = [g_device newBufferWithBytes:inverse_unpacked
-                                                      length:(NSUInteger)inverse_entries * sizeof(uint16_t)
-                                                     options:MTLResourceStorageModeShared];
+    id<MTLBuffer> inverse_buf = unpack_inverse ?
+        [g_device newBufferWithBytes:inverse_unpacked
+                              length:(NSUInteger)inverse_entries * sizeof(uint16_t)
+                             options:MTLResourceStorageModeShared] : nil;
+    id<MTLBuffer> group_buf = indirect_score ?
+        [g_device newBufferWithBytes:unique_groups
+                              length:(NSUInteger)unique_group_entries * sizeof(uint16_t)
+                             options:MTLResourceStorageModeShared] : nil;
+    free(unique_groups);
     free(inverse_unpacked);
-    if (!sparse_buf || !rec_buf || !inverse_buf) {
+    if (!sparse_buf || !rec_buf ||
+        (unpack_inverse && !inverse_buf) ||
+        (indirect_score && !group_buf)) {
         ds4_d8fs_close(&sparse_file);
         return 0;
     }
@@ -56382,12 +56488,18 @@ static int ds4_d8f_runtime_sparse_down_load(uint32_t layer,
     if (out_sparse_buf) *out_sparse_buf = sparse_buf;
     if (out_rec_buf) *out_rec_buf = rec_buf;
     if (out_inverse_buf) *out_inverse_buf = inverse_buf;
+    if (out_group_buf) *out_group_buf = group_buf;
     if (out_max_group_unique) *out_max_group_unique = max_group_unique;
     if (out_live_records) *out_live_records = live_records;
+    const char *score_mode = indirect_score ? "compact_indirect" : "rectangular";
     fprintf(stderr,
-            "ds4_d8fs: runtime sparse down sidecar L%u live=%u max_group_unique=%u sparse=%.3f MiB path=%s\n",
+            "ds4_d8fs: runtime sparse down sidecar L%u live=%u max_group_unique=%u sparse=%.3f MiB inverse=%s score=%s group_map=%.3f MiB path=%s\n",
             layer, live_records, max_group_unique,
-            (double)sparse_file.size / 1048576.0, sparse_path);
+            (double)sparse_file.size / 1048576.0,
+            unpack_inverse ? "unpacked" : "bitpacked",
+            score_mode,
+            indirect_score ? ((double)unique_group_entries * sizeof(uint16_t) / 1048576.0) : 0.0,
+            sparse_path);
     return 1;
 }
 
@@ -56674,6 +56786,7 @@ static int ds4_d8f_runtime_cache_prepare(uint32_t layer, const char *path) {
         id<MTLBuffer> sparse_buf = nil;
         id<MTLBuffer> sparse_rec_buf = nil;
         id<MTLBuffer> sparse_inverse_buf = nil;
+        id<MTLBuffer> sparse_group_buf = nil;
         uint32_t sparse_max_group_unique = 0;
         uint32_t sparse_live_records = 0;
         if (ds4_d8f_runtime_sparse_down_load(layer,
@@ -56682,11 +56795,13 @@ static int ds4_d8f_runtime_cache_prepare(uint32_t layer, const char *path) {
                                              &sparse_buf,
                                              &sparse_rec_buf,
                                              &sparse_inverse_buf,
+                                             &sparse_group_buf,
                                              &sparse_max_group_unique,
                                              &sparse_live_records)) {
             g_d8f_runtime_layer_sparse_buf[layer] = sparse_buf;
             g_d8f_runtime_layer_sparse_rec_buf[layer] = sparse_rec_buf;
             g_d8f_runtime_layer_sparse_inverse_buf[layer] = sparse_inverse_buf;
+            g_d8f_runtime_layer_sparse_group_buf[layer] = sparse_group_buf;
             g_d8f_runtime_layer_sparse_max_group_unique[layer] = sparse_max_group_unique;
             g_d8f_runtime_layer_sparse_live_records[layer] = sparse_live_records;
             g_d8f_runtime_layer_sparse_open[layer] = 1;
@@ -56834,17 +56949,39 @@ static int ds4_d8f_runtime_sparse_score_buffer_prepare(uint32_t n_tokens,
         (uint64_t)n_tokens * (uint64_t)n_selected * (uint64_t)groups * (uint64_t)max_group_unique;
     const uint64_t bytes = values * sizeof(float);
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return 0;
-    if (g_d8f_runtime_sparse_score_buf && g_d8f_runtime_sparse_score_bytes >= (NSUInteger)bytes) {
-        return 1;
+    if (!g_d8f_runtime_sparse_score_buf ||
+        g_d8f_runtime_sparse_score_bytes < (NSUInteger)bytes) {
+        g_d8f_runtime_sparse_score_buf = [g_device newBufferWithLength:(NSUInteger)bytes
+                                                               options:MTLResourceStorageModeShared];
+        g_d8f_runtime_sparse_score_bytes = g_d8f_runtime_sparse_score_buf ? (NSUInteger)bytes : 0u;
     }
-    g_d8f_runtime_sparse_score_buf = [g_device newBufferWithLength:(NSUInteger)bytes
-                                                           options:MTLResourceStorageModeShared];
-    g_d8f_runtime_sparse_score_bytes = g_d8f_runtime_sparse_score_buf ? (NSUInteger)bytes : 0u;
     if (!g_d8f_runtime_sparse_score_buf) {
         fprintf(stderr,
                 "ds4_d8fs: sparse score scratch allocation failed bytes=%.3f MiB\n",
                 (double)bytes / 1048576.0);
         return 0;
+    }
+    if (ds4_gpu_d8f_runtime_sparse_indirect_score_enabled()) {
+        const uint64_t prefix_bytes64 =
+            ((uint64_t)n_tokens * (uint64_t)n_selected + 1ull) * sizeof(uint32_t);
+        if (prefix_bytes64 == 0 || prefix_bytes64 > (uint64_t)NSUIntegerMax) return 0;
+        const NSUInteger prefix_bytes = (NSUInteger)prefix_bytes64;
+        if (!g_d8f_runtime_sparse_prefix_buf ||
+            g_d8f_runtime_sparse_prefix_bytes < prefix_bytes) {
+            g_d8f_runtime_sparse_prefix_buf =
+                [g_device newBufferWithLength:prefix_bytes
+                                      options:MTLResourceStorageModeShared];
+            g_d8f_runtime_sparse_prefix_bytes = g_d8f_runtime_sparse_prefix_buf ? prefix_bytes : 0u;
+        }
+        if (!g_d8f_runtime_sparse_indirect_buf) {
+            g_d8f_runtime_sparse_indirect_buf =
+                [g_device newBufferWithLength:3u * sizeof(uint32_t)
+                                      options:MTLResourceStorageModeShared];
+        }
+        if (!g_d8f_runtime_sparse_prefix_buf || !g_d8f_runtime_sparse_indirect_buf) {
+            fprintf(stderr, "ds4_d8fs: sparse indirect score scratch allocation failed\n");
+            return 0;
+        }
     }
     return 1;
 }
@@ -56866,7 +57003,6 @@ static int ds4_d8f_runtime_sparse_down_encode(id<MTLComputeCommandEncoder> enc,
                                               uint32_t route_token_stride,
                                               uint32_t selected_token_stride) {
     if (!enc || !g_d8f_runtime_sparse_buf || !g_d8f_runtime_sparse_rec_buf ||
-        !g_d8f_runtime_sparse_inverse_buf ||
         !g_d8f_runtime_rec_buf || !g_d8f_runtime_mid_buf || !g_d8f_runtime_sparse_args_buf ||
         !selBuf || !weightBuf || !outBuf ||
         !g_d8f_down_sparse_score_selected_batch_classic_pipeline ||
@@ -56890,17 +57026,53 @@ static int ds4_d8f_runtime_sparse_down_encode(id<MTLComputeCommandEncoder> enc,
         max_group_unique,
     };
     memcpy(g_d8f_runtime_sparse_args_buf.contents, &args, sizeof(args));
-    [enc setComputePipelineState:g_d8f_down_sparse_score_selected_batch_classic_pipeline];
-    [enc setBuffer:g_d8f_runtime_sparse_buf offset:0 atIndex:0];
-    [enc setBuffer:g_d8f_runtime_buf offset:0 atIndex:1];
-    [enc setBuffer:g_d8f_runtime_sparse_rec_buf offset:0 atIndex:2];
-    [enc setBuffer:g_d8f_runtime_rec_buf offset:0 atIndex:3];
-    [enc setBuffer:g_d8f_runtime_mid_buf offset:0 atIndex:4];
-    [enc setBuffer:selBuf offset:sel_off atIndex:5];
-    [enc setBuffer:g_d8f_runtime_sparse_score_buf offset:0 atIndex:6];
-    [enc setBuffer:g_d8f_runtime_sparse_args_buf offset:0 atIndex:7];
-    [enc dispatchThreads:MTLSizeMake(max_group_unique, groups, n_tokens * n_selected)
-       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    const int indirect_score =
+        ds4_gpu_d8f_runtime_sparse_indirect_score_enabled() &&
+        g_d8f_runtime_sparse_indirect_buf &&
+        g_d8f_runtime_sparse_group_buf;
+    if (indirect_score) {
+        if (g_d8f_down_sparse_score_indirect_prepare_classic_pipeline &&
+            g_d8f_down_sparse_score_selected_compact_indirect_classic_pipeline &&
+            g_d8f_runtime_sparse_prefix_buf) {
+            [enc setComputePipelineState:g_d8f_down_sparse_score_indirect_prepare_classic_pipeline];
+            [enc setBuffer:g_d8f_runtime_sparse_rec_buf offset:0 atIndex:0];
+            [enc setBuffer:selBuf offset:sel_off atIndex:1];
+            [enc setBuffer:g_d8f_runtime_sparse_prefix_buf offset:0 atIndex:2];
+            [enc setBuffer:g_d8f_runtime_sparse_indirect_buf offset:0 atIndex:3];
+            [enc setBuffer:g_d8f_runtime_sparse_args_buf offset:0 atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:g_d8f_down_sparse_score_selected_compact_indirect_classic_pipeline];
+            [enc setBuffer:g_d8f_runtime_sparse_buf offset:0 atIndex:0];
+            [enc setBuffer:g_d8f_runtime_buf offset:0 atIndex:1];
+            [enc setBuffer:g_d8f_runtime_sparse_rec_buf offset:0 atIndex:2];
+            [enc setBuffer:g_d8f_runtime_rec_buf offset:0 atIndex:3];
+            [enc setBuffer:g_d8f_runtime_mid_buf offset:0 atIndex:4];
+            [enc setBuffer:selBuf offset:sel_off atIndex:5];
+            [enc setBuffer:g_d8f_runtime_sparse_score_buf offset:0 atIndex:6];
+            [enc setBuffer:g_d8f_runtime_sparse_args_buf offset:0 atIndex:7];
+            [enc setBuffer:g_d8f_runtime_sparse_prefix_buf offset:0 atIndex:8];
+            [enc setBuffer:g_d8f_runtime_sparse_group_buf offset:0 atIndex:9];
+            [enc dispatchThreadgroupsWithIndirectBuffer:g_d8f_runtime_sparse_indirect_buf
+                                   indirectBufferOffset:0
+                                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            return 0;
+        }
+    } else {
+        [enc setComputePipelineState:g_d8f_down_sparse_score_selected_batch_classic_pipeline];
+        [enc setBuffer:g_d8f_runtime_sparse_buf offset:0 atIndex:0];
+        [enc setBuffer:g_d8f_runtime_buf offset:0 atIndex:1];
+        [enc setBuffer:g_d8f_runtime_sparse_rec_buf offset:0 atIndex:2];
+        [enc setBuffer:g_d8f_runtime_rec_buf offset:0 atIndex:3];
+        [enc setBuffer:g_d8f_runtime_mid_buf offset:0 atIndex:4];
+        [enc setBuffer:selBuf offset:sel_off atIndex:5];
+        [enc setBuffer:g_d8f_runtime_sparse_score_buf offset:0 atIndex:6];
+        [enc setBuffer:g_d8f_runtime_sparse_args_buf offset:0 atIndex:7];
+        [enc dispatchThreads:MTLSizeMake(max_group_unique, groups, n_tokens * n_selected)
+           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     [enc setComputePipelineState:g_d8f_down_sparse_gather_selected_batch_classic_pipeline];
     [enc setBuffer:g_d8f_runtime_sparse_buf offset:0 atIndex:0];
@@ -56913,7 +57085,9 @@ static int ds4_d8f_runtime_sparse_down_encode(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:g_d8f_runtime_sparse_score_buf offset:0 atIndex:7];
     [enc setBuffer:outBuf offset:out_off atIndex:8];
     [enc setBuffer:g_d8f_runtime_sparse_args_buf offset:0 atIndex:9];
-    [enc setBuffer:g_d8f_runtime_sparse_inverse_buf offset:0 atIndex:10];
+    [enc setBuffer:(g_d8f_runtime_sparse_inverse_buf ? g_d8f_runtime_sparse_inverse_buf : g_d8f_runtime_sparse_buf)
+            offset:0
+           atIndex:10];
     [enc setThreadgroupMemoryLength:8u * sizeof(float) atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(rows, n_tokens, 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -57355,10 +57529,15 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             ds4_gpu_d8f_runtime_sparse_down_enabled_for_layer(layer, n_tokens) &&
             g_d8f_runtime_sparse_buf &&
             g_d8f_runtime_sparse_rec_buf &&
-            g_d8f_runtime_sparse_inverse_buf &&
             g_d8f_runtime_sparse_max_group_unique > 0u &&
             g_d8f_down_sparse_score_selected_batch_classic_pipeline &&
             g_d8f_down_sparse_gather_selected_batch_classic_pipeline;
+        const int down_sparse_indirect_score =
+            down_sparse_recbuf &&
+            ds4_gpu_d8f_runtime_sparse_indirect_score_enabled() &&
+            g_d8f_runtime_sparse_group_buf &&
+            g_d8f_down_sparse_score_indirect_prepare_classic_pipeline &&
+            g_d8f_down_sparse_score_selected_compact_indirect_classic_pipeline;
         const int down_native_pack2d =
             down_native_recbuf && !down_native_i8_cbsram && !down_sparse_recbuf &&
             ds4_gpu_d8f_runtime_native_down_pack2d_enabled_for_layer(layer) &&
@@ -57524,11 +57703,13 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
         const int packet_icb_down_ready = down_sparse_recbuf ?
             (g_d8f_down_sparse_score_selected_batch_classic_pipeline &&
              g_d8f_down_sparse_gather_selected_batch_classic_pipeline &&
-             g_d8f_runtime_sparse_inverse_buf &&
              g_d8f_runtime_sparse_args_buf) :
             (down_pso != nil);
 	        if (n_tokens == 1u &&
-            (packet_icb_gate_only_requested || down_sparse_recbuf || down_native_i8_cbsram || !down_native_recbuf) &&
+	            (packet_icb_gate_only_requested ||
+                 (down_sparse_recbuf && !down_sparse_indirect_score) ||
+                 down_native_i8_cbsram ||
+                 (!down_native_recbuf && !down_sparse_indirect_score)) &&
             (rank1_split_packet_icb ||
              (!rank1_split_sidecar && (!rank1_sidecar_active || rank1_packet_icb_requested))) &&
             (rank1_packet_icb_requested || ds4_gpu_d8f_classic_packet_icb_enabled()) &&
@@ -57650,7 +57831,9 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                     gather_bufs[gather_n] = g_d8f_runtime_sparse_score_buf; gather_offs[gather_n++] = 0;
                     gather_bufs[gather_n] = outBuf; gather_offs[gather_n++] = out_off;
                     gather_bufs[gather_n] = g_d8f_runtime_sparse_args_buf; gather_offs[gather_n++] = 0;
-                    gather_bufs[gather_n] = g_d8f_runtime_sparse_inverse_buf; gather_offs[gather_n++] = 0;
+                    gather_bufs[gather_n] = g_d8f_runtime_sparse_inverse_buf ?
+                        g_d8f_runtime_sparse_inverse_buf : g_d8f_runtime_sparse_buf;
+                    gather_offs[gather_n++] = 0;
                     uint64_t score_extra[8] = { layer, n_tokens, n_experts, sparse_groups, sparse_max_group_unique, 1u, 0u, 0u };
                     uint64_t gather_extra[8] = { layer, n_tokens, n_experts, sparse_groups, sparse_max_group_unique, 1u, 0u, 0u };
                     packet_icb_ready =
