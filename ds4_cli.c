@@ -1942,7 +1942,7 @@ static bool flat_pack_dir_usable(const char *dir) {
     return ok;
 }
 
-static void apply_default_sota_flat_pack(cli_config *cfg) {
+static void apply_default_h3384_speed_candidate(cli_config *cfg) {
     if (cfg->model_or_pack_explicit) return;
     static const char default_pack[] =
         "/Users/silv/cl/tlp/montyneg/ds4/"
@@ -1951,8 +1951,8 @@ static void apply_default_sota_flat_pack(cli_config *cfg) {
     apply_flat_pack_dir(cfg, default_pack, "default flat-pack");
     cfg->default_pack_auto_selected = true;
     fprintf(stderr,
-            "ds4: default runnable speed pack selected: H3384 hotblock/native-down D8F "
-            "(codec coherence not certified; run --coherence-gate before promotion)\n");
+            "ds4: default H3384 speed candidate selected: hotblock/native-down D8F "
+            "(not fidelity SOTA; normal generation is blocked until coherence is certified)\n");
 }
 
 static void cli_config_free(cli_config *cfg) {
@@ -2191,7 +2191,7 @@ static cli_config parse_options(int argc, char **argv) {
         exit(2);
     }
 
-    apply_default_sota_flat_pack(&c);
+    apply_default_h3384_speed_candidate(&c);
     return c;
 }
 
