@@ -1958,7 +1958,7 @@ static int ds4_gpu_d8f_runtime_sparse_indirect_score_enabled(void) {
 
 static int ds4_gpu_d8f_runtime_native_down_pack2d_enabled_for_layer(uint32_t layer) {
     if (ds4_gpu_env_bool("DS4_D8F_RUNTIME_NATIVE_DOWN_PACK2D_DISABLE") > 0) return 0;
-    const uint64_t default_mask = ds4_gpu_layer_bit(26u);
+    const uint64_t default_mask = 0ull;
     static int parsed = 0;
     static int has_allow = 0;
     static int has_disable = 0;
