@@ -12814,6 +12814,16 @@ static bool metal_graph_use_hc_rms_mix_fusion(void) {
  return enabled != 0;
 }
 
+static bool metal_graph_use_output_hc_sum_norm_fusion(void) {
+ static int initialized = 0;
+ static int enabled = 0;
+ if (!initialized) {
+  enabled = getenv("DS4_METAL_DISABLE_OUTPUT_HC_SUM_NORM_FUSION") == NULL;
+  initialized = 1;
+ }
+ return enabled != 0;
+}
+
 static int ds4_hc_rms_f16_mix_via_tensor(ds4_gpu_tensor *dst,
                                           const ds4_model *model,
                                           const ds4_tensor *t,
@@ -14547,7 +14557,24 @@ static bool metal_graph_encode_output_head(
  if (ok) {
  metal_graph_debug_dump_tensor("result_hc_pre", g->output_pre, DS4_N_HC, DS4_N_LAYER, 0);
  }
- if (ok) ok = ds4_gpu_output_hc_weights_tensor(g->output_weights,
+ int output_hc_sum_norm_fused = 0;
+ if (ok && metal_graph_use_output_hc_sum_norm_fusion()) {
+ output_hc_sum_norm_fused = ds4_gpu_output_hc_sum_norm_tensor(g->output_weights,
+ g->output_embd,
+ g->output_norm,
+ g->output_pre,
+ g->cur_hc,
+ model->map,
+ model->size,
+ weights->output_hc_scale->abs_offset,
+ weights->output_hc_base->abs_offset,
+ weights->output_norm->abs_offset,
+ DS4_N_EMBD,
+ DS4_N_HC,
+ DS4_HC_EPS,
+ DS4_RMS_EPS);
+ }
+ if (ok && !output_hc_sum_norm_fused) ok = ds4_gpu_output_hc_weights_tensor(g->output_weights,
  g->output_pre,
  model->map,
  model->size,
@@ -14559,7 +14586,7 @@ static bool metal_graph_encode_output_head(
  if (ok) {
  metal_graph_debug_dump_tensor("result_hc_weights", g->output_weights, DS4_N_HC, DS4_N_LAYER, 0);
  }
- if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(g->output_embd,
+ if (ok && !output_hc_sum_norm_fused) ok = ds4_gpu_hc_weighted_sum_tensor(g->output_embd,
  g->cur_hc,
  g->output_weights,
  DS4_N_EMBD,
@@ -14568,7 +14595,7 @@ static bool metal_graph_encode_output_head(
  if (ok) {
  metal_graph_debug_dump_tensor("result_hc", g->output_embd, DS4_N_EMBD, DS4_N_LAYER, 0);
  }
- if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
+ if (ok && !output_hc_sum_norm_fused) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
  g->output_embd,
  model->map,
  model->size,

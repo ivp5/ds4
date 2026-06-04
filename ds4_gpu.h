@@ -1039,6 +1039,24 @@ int ds4_gpu_output_hc_weights_tensor(
  uint32_t n_hc,
  float eps);
 
+int ds4_gpu_output_hc_sum_norm_tensor(
+ ds4_gpu_tensor *weights_out,
+ ds4_gpu_tensor *embd_out,
+ ds4_gpu_tensor *norm_out,
+ const ds4_gpu_tensor *pre,
+ const ds4_gpu_tensor *residual_hc,
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t scale_offset,
+ uint64_t base_offset,
+ uint64_t norm_weight_offset,
+ uint32_t n_embd,
+ uint32_t n_hc,
+ float eps,
+ float norm_eps);
+
+int ds4_gpu_output_hc_sum_norm_canary(void);
+
 int ds4_gpu_hc_expand_tensor(
  ds4_gpu_tensor *out_hc,
  const ds4_gpu_tensor *block_out,

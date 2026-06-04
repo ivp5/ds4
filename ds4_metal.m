@@ -77,6 +77,7 @@ static id<MTLComputePipelineState> g_hc_split_sinkhorn_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_norm_pipeline;
 static id<MTLComputePipelineState> g_hc_weighted_sum_pipeline;
+static id<MTLComputePipelineState> g_output_hc_sum_norm_pipeline;
 static id<MTLComputePipelineState> g_hc_expand_pipeline;
 static id<MTLComputePipelineState> g_unary_sigmoid_pipeline;
 static id<MTLComputePipelineState> g_unary_silu_pipeline;
@@ -3403,6 +3404,22 @@ typedef struct {
 typedef struct {
  int64_t n_embd;
  int32_t n_hc;
+ int64_t n_rows;
+ uint64_t nb_pre1;
+ uint64_t nb_w1;
+ uint64_t nb_x0;
+ uint64_t nb_x1;
+ uint64_t nb_x2;
+ uint64_t nb0;
+ uint64_t nb1;
+ uint64_t nb_norm1;
+ float eps;
+ float norm_eps;
+} ds4_gpu_output_hc_sum_norm_args;
+
+typedef struct {
+ int64_t n_embd;
+ int32_t n_hc;
  int32_t sinkhorn_iters;
  int64_t n_rows;
  int64_t mix_hc;
@@ -5061,6 +5078,22 @@ int ds4_gpu_init(void) {
  return 0;
  }
 
+ fn = [library newFunctionWithName:@"kernel_dsv4_output_hc_sum_norm4"];
+ if (!fn) {
+ fprintf(stderr, "ds4: Metal kernel_dsv4_output_hc_sum_norm4 function not found\n");
+ g_queue = nil;
+ g_device = nil;
+ return 0;
+ }
+ g_output_hc_sum_norm_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+ if (!g_output_hc_sum_norm_pipeline) {
+ fprintf(stderr, "ds4: Metal kernel_dsv4_output_hc_sum_norm4 pipeline failed: %s\n",
+ [[error localizedDescription] UTF8String]);
+ g_queue = nil;
+ g_device = nil;
+ return 0;
+ }
+
  MTLFunctionConstantValues *unary_sigmoid_constants = [[MTLFunctionConstantValues alloc] init];
  int16_t unary_sigmoid_op = 102;
  bool unary_cnt = false;
@@ -5745,6 +5778,7 @@ fprintf(stderr,
  g_hc_split_weighted_sum_pipeline = nil;
  g_hc_split_weighted_sum_norm_pipeline = nil;
  g_hc_weighted_sum_pipeline = nil;
+ g_output_hc_sum_norm_pipeline = nil;
  g_hc_expand_pipeline = nil;
  g_moe_mul_mv_id_iq2_xxs_pipeline = nil;
  g_moe_mul_mv_id_iq2_xxs_pair_pipeline = nil;
@@ -46614,6 +46648,162 @@ int ds4_gpu_hc_weighted_sum_split_tensor(
  "HC weighted sum split");
 }
 
+static int ds4_gpu_output_hc_sum_norm_encode_buffers(
+ ds4_gpu_tensor *weights_out,
+ ds4_gpu_tensor *embd_out,
+ ds4_gpu_tensor *norm_out,
+ const ds4_gpu_tensor *pre,
+ const ds4_gpu_tensor *residual_hc,
+ id<MTLBuffer> scalebuf,
+ NSUInteger scale_inner,
+ id<MTLBuffer> basebuf,
+ NSUInteger base_inner,
+ id<MTLBuffer> normwbuf,
+ NSUInteger norm_inner,
+ uint32_t n_embd,
+ uint32_t n_hc,
+ float eps,
+ float norm_eps) {
+ if (!weights_out || !embd_out || !norm_out || !pre || !residual_hc ||
+ !scalebuf || !basebuf || !normwbuf || n_embd != 4096 || n_hc != 4) {
+ return 0;
+ }
+
+ id<MTLBuffer> prebuf = ds4_gpu_tensor_buffer(pre);
+ id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(residual_hc);
+ id<MTLBuffer> woutbuf = ds4_gpu_tensor_buffer(weights_out);
+ id<MTLBuffer> embdbuf = ds4_gpu_tensor_buffer(embd_out);
+ id<MTLBuffer> normbuf = ds4_gpu_tensor_buffer(norm_out);
+ const uint64_t weight_row_bytes = (uint64_t)n_hc * sizeof(float);
+ const uint64_t embd_row_bytes = (uint64_t)n_embd * sizeof(float);
+ const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+ const uint64_t embd_bytes = ds4_gpu_tensor_bytes(embd_out);
+ if (embd_row_bytes == 0 || embd_bytes < embd_row_bytes ||
+ embd_bytes % embd_row_bytes != 0) {
+ fprintf(stderr, "ds4: Metal output HC sum/norm output size is not a whole row\n");
+ return 0;
+ }
+ const uint64_t n_rows64 = embd_bytes / embd_row_bytes;
+ if (n_rows64 == 0 || n_rows64 > UINT32_MAX ||
+ n_rows64 > UINT64_MAX / residual_row_bytes ||
+ n_rows64 > UINT64_MAX / weight_row_bytes) {
+ fprintf(stderr, "ds4: Metal output HC sum/norm row count is outside supported range\n");
+ return 0;
+ }
+ if (!prebuf || !xbuf || !woutbuf || !embdbuf || !normbuf ||
+ ds4_gpu_tensor_bytes(pre) < n_rows64 * weight_row_bytes ||
+ ds4_gpu_tensor_bytes(weights_out) < n_rows64 * weight_row_bytes ||
+ ds4_gpu_tensor_bytes(residual_hc) < n_rows64 * residual_row_bytes ||
+ ds4_gpu_tensor_bytes(norm_out) < n_rows64 * embd_row_bytes ||
+ scalebuf.length < scale_inner + sizeof(float) ||
+ basebuf.length < base_inner + weight_row_bytes ||
+ normwbuf.length < norm_inner + embd_row_bytes) {
+ fprintf(stderr, "ds4: Metal output HC sum/norm received undersized buffers\n");
+ return 0;
+ }
+
+ id<MTLComputePipelineState> pipeline =
+ ds4_gpu_hot_pipeline(g_output_hc_sum_norm_pipeline,
+ "kernel_dsv4_output_hc_sum_norm4");
+ if (!pipeline) return 0;
+
+ ds4_gpu_output_hc_sum_norm_args args = {
+ .n_embd = (int64_t)n_embd,
+ .n_hc = (int32_t)n_hc,
+ .n_rows = (int64_t)n_rows64,
+ .nb_pre1 = weight_row_bytes,
+ .nb_w1 = weight_row_bytes,
+ .nb_x0 = sizeof(float),
+ .nb_x1 = embd_row_bytes,
+ .nb_x2 = residual_row_bytes,
+ .nb0 = sizeof(float),
+ .nb1 = embd_row_bytes,
+ .nb_norm1 = embd_row_bytes,
+ .eps = eps,
+ .norm_eps = norm_eps,
+ };
+
+ NSUInteger nth = ds4_gpu_rms_norm_threads(n_embd);
+ if (nth > pipeline.maxTotalThreadsPerThreadgroup) {
+ fprintf(stderr, "ds4: Metal output HC sum/norm requires %lu threads but pipeline supports %lu\n",
+ (unsigned long)nth,
+ (unsigned long)pipeline.maxTotalThreadsPerThreadgroup);
+ return 0;
+ }
+
+ int owned = 0;
+ id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+ if (!cb) return 0;
+
+ id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+ [enc setComputePipelineState:pipeline];
+ [enc setBytes:&args length:sizeof(args) atIndex:0];
+ [enc setBuffer:prebuf offset:ds4_gpu_tensor_offset(pre) atIndex:1];
+ [enc setBuffer:scalebuf offset:scale_inner atIndex:2];
+ [enc setBuffer:basebuf offset:base_inner atIndex:3];
+ [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:4];
+ [enc setBuffer:woutbuf offset:ds4_gpu_tensor_offset(weights_out) atIndex:5];
+ [enc setBuffer:embdbuf offset:ds4_gpu_tensor_offset(embd_out) atIndex:6];
+ [enc setBuffer:normwbuf offset:norm_inner atIndex:7];
+ [enc setBuffer:normbuf offset:ds4_gpu_tensor_offset(norm_out) atIndex:8];
+ [enc setThreadgroupMemoryLength:(4096u + 4u + 32u) * sizeof(float) atIndex:0];
+ [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows64, 1, 1)
+ threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+ ds4_gpu_end_compute_encoder(cb, enc);
+
+ if (!ds4_gpu_finish_command_buffer(cb, owned, "output HC sum/norm fused")) return 0;
+ return 1;
+}
+
+int ds4_gpu_output_hc_sum_norm_tensor(
+ ds4_gpu_tensor *weights_out,
+ ds4_gpu_tensor *embd_out,
+ ds4_gpu_tensor *norm_out,
+ const ds4_gpu_tensor *pre,
+ const ds4_gpu_tensor *residual_hc,
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t scale_offset,
+ uint64_t base_offset,
+ uint64_t norm_weight_offset,
+ uint32_t n_embd,
+ uint32_t n_hc,
+ float eps,
+ float norm_eps) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (!model_map || n_embd != 4096 || n_hc != 4) return 0;
+ const uint64_t weight_row_bytes = (uint64_t)n_hc * sizeof(float);
+ const uint64_t embd_row_bytes = (uint64_t)n_embd * sizeof(float);
+ if (!ds4_gpu_range_resolvable(model_map, model_size, scale_offset, sizeof(float)) ||
+     !ds4_gpu_range_resolvable(model_map, model_size, base_offset, weight_row_bytes) ||
+     !ds4_gpu_range_resolvable(model_map, model_size, norm_weight_offset, embd_row_bytes)) {
+ fprintf(stderr, "ds4: Metal output HC sum/norm parameter range is outside the mapped model\n");
+ return 0;
+ }
+ uint64_t scale_inner = 0;
+ uint64_t base_inner = 0;
+ uint64_t norm_inner = 0;
+ id<MTLBuffer> scalebuf = ds4_gpu_wrap_model_range(model_map, model_size, scale_offset, sizeof(float), &scale_inner);
+ id<MTLBuffer> basebuf = ds4_gpu_wrap_model_range(model_map, model_size, base_offset, weight_row_bytes, &base_inner);
+ id<MTLBuffer> normwbuf = ds4_gpu_wrap_model_range(model_map, model_size, norm_weight_offset, embd_row_bytes, &norm_inner);
+ if (!scalebuf || !basebuf || !normwbuf) return 0;
+ return ds4_gpu_output_hc_sum_norm_encode_buffers(weights_out,
+ embd_out,
+ norm_out,
+ pre,
+ residual_hc,
+ scalebuf,
+ (NSUInteger)scale_inner,
+ basebuf,
+ (NSUInteger)base_inner,
+ normwbuf,
+ (NSUInteger)norm_inner,
+ n_embd,
+ n_hc,
+ eps,
+ norm_eps);
+}
+
 /* Release decode fused HC pre-sublayer operation. The graph driver owns the
  * optional reference fallback so this function stays a direct fused dispatch. */
 int ds4_gpu_hc_split_weighted_sum_tensor(
@@ -47004,6 +47194,138 @@ int ds4_gpu_output_hc_weights_tensor(
  }
 
  return 1;
+}
+
+int ds4_gpu_output_hc_sum_norm_canary(void) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ enum { n_embd = 4096, n_hc = 4 };
+ const size_t page = (size_t)getpagesize();
+ void *scale_host = NULL;
+ void *base_host = NULL;
+ void *norm_host = NULL;
+ if (posix_memalign(&scale_host, page, page) != 0 ||
+     posix_memalign(&base_host, page, page) != 0 ||
+     posix_memalign(&norm_host, page, (size_t)n_embd * sizeof(float)) != 0 ||
+     !scale_host || !base_host || !norm_host) {
+ free(scale_host); free(base_host); free(norm_host);
+ return 0;
+ }
+
+ float *scale = (float *)scale_host;
+ float *base = (float *)base_host;
+ float *normw = (float *)norm_host;
+ scale[0] = 0.73f;
+ for (uint32_t h = 0; h < n_hc; h++) base[h] = 0.05f * (float)((int)h - 1);
+ for (uint32_t i = 0; i < n_embd; i++) normw[i] = 0.9f + 0.0001f * (float)(i % 31u);
+
+ float pre_host[n_hc];
+ float weights_ref[n_hc];
+ for (uint32_t h = 0; h < n_hc; h++) pre_host[h] = 0.2f * (float)((int)h - 2);
+ for (uint32_t h = 0; h < n_hc; h++) {
+ const float z = pre_host[h] * scale[0] + base[h];
+ weights_ref[h] = 1.0f / (1.0f + expf(-z)) + 1.0e-6f;
+ }
+
+ float *residual = (float *)calloc((size_t)n_hc * n_embd, sizeof(float));
+ float *embd_ref = (float *)calloc(n_embd, sizeof(float));
+ float *norm_ref = (float *)calloc(n_embd, sizeof(float));
+ float *weights_got = (float *)calloc(n_hc, sizeof(float));
+ float *embd_got = (float *)calloc(n_embd, sizeof(float));
+ float *norm_got = (float *)calloc(n_embd, sizeof(float));
+ if (!residual || !embd_ref || !norm_ref || !weights_got || !embd_got || !norm_got) {
+ free(scale_host); free(base_host); free(norm_host);
+ free(residual); free(embd_ref); free(norm_ref); free(weights_got); free(embd_got); free(norm_got);
+ return 0;
+ }
+ for (uint32_t h = 0; h < n_hc; h++) {
+ for (uint32_t d = 0; d < n_embd; d++) {
+ residual[(uint64_t)h * n_embd + d] =
+ 0.003f * (float)((int)((d * 7u + h * 17u) % 101u) - 50);
+ }
+ }
+ double sumsq = 0.0;
+ for (uint32_t d = 0; d < n_embd; d++) {
+ float v = 0.0f;
+ for (uint32_t h = 0; h < n_hc; h++) v += residual[(uint64_t)h * n_embd + d] * weights_ref[h];
+ embd_ref[d] = v;
+ sumsq += (double)v * (double)v;
+ }
+ const float norm_scale = 1.0f / sqrtf((float)(sumsq / (double)n_embd) + 1.0e-6f);
+ for (uint32_t d = 0; d < n_embd; d++) norm_ref[d] = embd_ref[d] * norm_scale * normw[d];
+
+ void *scale_opaque = ds4_gpu_wrap_heap_bytes(scale_host, (uint64_t)page);
+ void *base_opaque = ds4_gpu_wrap_heap_bytes(base_host, (uint64_t)page);
+ void *norm_opaque = ds4_gpu_wrap_heap_bytes(norm_host, (uint64_t)n_embd * sizeof(float));
+ ds4_gpu_tensor *pre_t = ds4_gpu_tensor_alloc(n_hc * sizeof(float));
+ ds4_gpu_tensor *res_t = ds4_gpu_tensor_alloc((uint64_t)n_hc * n_embd * sizeof(float));
+ ds4_gpu_tensor *weights_t = ds4_gpu_tensor_alloc(n_hc * sizeof(float));
+ ds4_gpu_tensor *embd_t = ds4_gpu_tensor_alloc(n_embd * sizeof(float));
+ ds4_gpu_tensor *norm_t = ds4_gpu_tensor_alloc(n_embd * sizeof(float));
+ int ok = scale_opaque && base_opaque && norm_opaque && pre_t && res_t && weights_t && embd_t && norm_t;
+ if (ok) ok = ds4_gpu_tensor_write(pre_t, 0, pre_host, n_hc * sizeof(float)) != 0;
+ if (ok) ok = ds4_gpu_tensor_write(res_t, 0, residual, (uint64_t)n_hc * n_embd * sizeof(float)) != 0;
+ if (ok) ok = ds4_gpu_output_hc_sum_norm_encode_buffers(weights_t,
+ embd_t,
+ norm_t,
+ pre_t,
+ res_t,
+ (__bridge id<MTLBuffer>)scale_opaque,
+ 0,
+ (__bridge id<MTLBuffer>)base_opaque,
+ 0,
+ (__bridge id<MTLBuffer>)norm_opaque,
+ 0,
+ n_embd,
+ n_hc,
+ 1.0e-6f,
+ 1.0e-6f) != 0;
+ if (ok) ok = ds4_gpu_tensor_read(weights_t, 0, weights_got, n_hc * sizeof(float)) != 0;
+ if (ok) ok = ds4_gpu_tensor_read(embd_t, 0, embd_got, n_embd * sizeof(float)) != 0;
+ if (ok) ok = ds4_gpu_tensor_read(norm_t, 0, norm_got, n_embd * sizeof(float)) != 0;
+
+ double max_w = 0.0;
+ double max_embd = 0.0;
+ double max_norm = 0.0;
+ int mismatch = 0;
+ if (ok) {
+ for (uint32_t h = 0; h < n_hc; h++) {
+ const double diff = fabs((double)weights_got[h] - (double)weights_ref[h]);
+ if (diff > max_w) max_w = diff;
+ if (diff > 2.0e-6) mismatch++;
+ }
+ for (uint32_t d = 0; d < n_embd; d++) {
+ double diff = fabs((double)embd_got[d] - (double)embd_ref[d]);
+ if (diff > max_embd) max_embd = diff;
+ if (diff > 2.0e-5) mismatch++;
+ diff = fabs((double)norm_got[d] - (double)norm_ref[d]);
+ if (diff > max_norm) max_norm = diff;
+ if (diff > 2.0e-5) mismatch++;
+ }
+ fprintf(stderr,
+ "ds4: output HC sum/norm fused canary mismatch=%d max_w=%.6e max_embd=%.6e max_norm=%.6e\n",
+ mismatch, max_w, max_embd, max_norm);
+ } else {
+ fprintf(stderr, "ds4: output HC sum/norm fused canary dispatch FAILED\n");
+ }
+
+ ds4_gpu_tensor_free(pre_t);
+ ds4_gpu_tensor_free(res_t);
+ ds4_gpu_tensor_free(weights_t);
+ ds4_gpu_tensor_free(embd_t);
+ ds4_gpu_tensor_free(norm_t);
+ if (scale_opaque) ds4_gpu_release_heap_buffer(scale_opaque);
+ if (base_opaque) ds4_gpu_release_heap_buffer(base_opaque);
+ if (norm_opaque) ds4_gpu_release_heap_buffer(norm_opaque);
+ free(scale_host);
+ free(base_host);
+ free(norm_host);
+ free(residual);
+ free(embd_ref);
+ free(norm_ref);
+ free(weights_got);
+ free(embd_got);
+ free(norm_got);
+ return ok && mismatch == 0;
 }
 
 int ds4_gpu_hc_expand_tensor(
