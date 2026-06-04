@@ -1581,6 +1581,7 @@ static int ds4_gpu_max_fusion_enabled(void) {
  static int enabled = 0;
  if (!initialized) {
   enabled =
+   ds4_gpu_env_bool("DS4_PRIME_PATH") > 0 ||
    ds4_gpu_env_bool("DS4_METAL_GRAPH_MAX_FUSION") > 0 ||
    ds4_gpu_env_bool("DS4_MAX_FUSION") > 0;
   initialized = 1;

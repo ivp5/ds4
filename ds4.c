@@ -10912,12 +10912,13 @@ static bool ds4_prime_path_enabled(void) {
 static bool ds4_metal_graph_max_fusion_enabled(void) {
  static int cache = -1;
  if (cache < 0) {
-  cache = (ds4_env_enabled("DS4_METAL_GRAPH_MAX_FUSION") ||
+  cache = (ds4_prime_path_enabled() ||
+           ds4_env_enabled("DS4_METAL_GRAPH_MAX_FUSION") ||
            ds4_env_enabled("DS4_MAX_FUSION")) ? 1 : 0;
   if (cache) {
    fprintf(stderr,
     "ds4: Metal graph max-fusion policy active — single decode submit by default; "
-    "router/indexer dispatch fusions eligible\n");
+    "PRIME/D8F stays in-graph; router/indexer dispatch fusions eligible\n");
   }
  }
  return cache != 0;
@@ -15941,10 +15942,10 @@ static bool metal_graph_encode_token_raw_swa(
  * point is layer-based because this executor is a fixed DS4 tape, not a
  * dynamic node graph; four layers is the measured point where the prefix is
  * large enough to hide useful work without starving the second command buffer.
- * D8F/PRIME reuses the same overlap mechanism but defaults to an earlier split;
+ * Legacy D8F/PRIME reused the same overlap mechanism with split=2 because
  * H3355 decode A/B on 2026-06-03 measured split=2 ahead of split=4, split=8,
- * and split=0. DS4_METAL_GRAPH_MAX_FUSION=1 deliberately trades that overlap
- * for minimum submit/ping-pong overhead and a single device-resident tape.
+ * and split=0. The max-fusion policy now treats PRIME as the stronger
+ * objective: minimum submit/ping-pong overhead and one device-resident tape.
  */
  uint32_t split_after_layers = ds4_metal_graph_max_fusion_enabled() ? 0u :
   (ds4_prime_path_enabled() ? 2u : 4u);
