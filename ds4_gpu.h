@@ -1406,16 +1406,6 @@ void *ds4_gpu_wrap_heap_bytes(void *bytes, uint64_t length);
 void  ds4_gpu_release_heap_buffer(void *opaque);
 uint64_t ds4_gpu_heap_buffer_gpu_address(void *opaque);
 
-/* Polar p8_m2 MTL4 dot canary (port of codex H1725). Dispatches a synthetic
- * polar-dot kernel through the M1 Max Metal 4 path: compile MSL via
- * MTL4Compiler, bind buffers via MTL4ArgumentTable .gpuAddress, residency via
- * MTLResidencySet attached to cb/queue, dispatch via MTL4ComputeCommandEncoder,
- * complete via MTL4CommitFeedback. Reports GPU elapsed + max abs error vs the
- * deterministic expected output (pairs × 1.0).
- *
- * Smoke-test surface for task #563 (polar MTL4 inference integration).
- * Returns 1 on success, 0 on failure. */
-int ds4_gpu_mtl4_polar_dot_canary(uint32_t packets, uint32_t pairs);
 /* ICB dense-path canary (task #822) — bit-exact: direct vs ICB-replay of the dense Q8_0 matvec. */
 int ds4_gpu_dense_matvec_icb_canary(uint32_t M, uint32_t N);
 /* ICB dense-path speed bench (task #822) — A/B ms/forward, direct vs ICB cached-replay, no model. */
@@ -1456,16 +1446,6 @@ int ds4_gpu_kv_rope_store_canary(uint32_t head_dim,
 /* MTL4 canary: record a compute command into classic MTLICB, replay it from an MTL4 compute encoder. */
 int ds4_gpu_mtl4_icb_execute_canary(uint32_t n_floats, uint32_t rounds);
 
-/* H1729 tile×row×batch variant of the polar canary. Stores mag/phase/levels
- * ONCE across all (tile, row) packets; streams `batches` hidden vectors
- * through them. Hidden indexing is (batch, tile), so the same token's hidden
- * state fans out to all `rows` weight rows of a tile. Codex measured b8 =
- * 46.70 ns/output (1.45× over per-packet), b32 = 31.81× layout amortization.
- *
- * Returns 1 on success, 0 on failure. */
-int ds4_gpu_mtl4_polar_tile_canary(uint32_t tiles, uint32_t rows,
-                                    uint32_t batches, uint32_t pairs);
-
 /* silv 2026-05-27 task #654 — MTL4 Hadamard-16 widened apply (deployable
  * fast path). Applies one orthogonal H_16 transform (with 1/sqrt(16)
  * normalization) to an n_rows × n_in FP16 buffer using the widened
@@ -1493,94 +1473,6 @@ int ds4_gpu_mtl4_hadamard16_apply(_Float16 *host_buf, uint32_t n_rows, uint32_t 
  * Returns 1 if rel_L2 < 1e-2 (FP16 precision floor for round-trip), 0
  * otherwise. */
 int ds4_gpu_mtl4_hadamard16_canary(uint32_t n_rows, uint32_t n_in);
-
-/* Real-data variant: load mag/phase/levels/hidden/cos_lut/sin_lut from
- * <prefix>.{mag,phase,levels,hidden,cos_lut,sin_lut}.bin files emitted by
- * analyzers/polar_encode_safetensors.py, then dispatch the H1729 tile×row×batch
- * kernel and compare GPU output to <prefix>.expected_polar.bin.
- *
- * Closes the loop on the polar p8_m2 path: real DS4 V4 Flash BF16/FP4 weights
- * → Python polar encoder → MTL4 GPU dot → numerical match against Python ref.
- *
- * Returns 1 on success, 0 on failure. */
-int ds4_gpu_mtl4_polar_tile_real(const char *prefix,
-                                  uint32_t tiles, uint32_t rows,
-                                  uint32_t batches, uint32_t pairs);
-
-/* H1733 fused gate*silu*up*route_weight kernel canary. Computes the full
- * routed-MoE MLP organ in one dispatch over the routed expert subset:
- *   out[batch, route_pair, row] = silu(gate_dot) * up_dot * route_weight[r]
- * where gate_dot/up_dot are polar dots between the (gate_code[r], row) and
- * (up_code[r], row) tiles and the hidden vector for (batch, route_pair).
- *
- * H1731 indexed-code-tile dedup applied: mag/phase/levels are one shared
- * pool of n_codes code tiles; gate_code[r] / up_code[r] select which tile
- * each route_pair uses.
- *
- * Codex measured: b32 = 21.28 ns/equiv row-dot (2.20× vs single row-dots),
- * max_abs vs CPU decoded reference = 7.55e-9.
- *
- * Returns 1 on success, 0 on failure. */
-int ds4_gpu_mtl4_polar_fused_canary(uint32_t n_codes, uint32_t route_pairs,
-                                     uint32_t rows, uint32_t batches,
-                                     uint32_t pairs);
-
-/* H1735 down-projection extension of the H1733 fused gate*silu*up packet.
- *
- * Adds a Q2_K-style down slice multiply on top: for each (batch, route_pair),
- * the threadgroup first computes act[r] = silu(gate)*up*route_weight for
- * r ∈ [0, act_rows), then for tid < down_rows it computes
- *   out[batch, route_pair, tid] = sum_k act[k] * down[route_pair, tid, k]
- * in a single dispatch.
- *
- * H1736/H1738 tile policy: at b8, 16×8 (act × down) hits 22.31 ns/equiv
- * row-dot; at b32, 32×64 hits 21.03 ns. H1737 refuted two-stage
- * materialization; keep this monolithic tiled fusion as-is.
- *
- * Synthetic canary uses mag=0, phase=4 (angle 0), level[0]=1, hidden=1,
- * down=1/act_rows uniform → expected output = pairs² for all out cells.
- * Pass criterion: relative error vs expected < 1e-3.
- *
- * Constraints: act_rows ≤ 64 (MAX_ACT in shared-memory tile), act_rows ≤ rows,
- * down_rows ≤ 256 (must fit in one threadgroup).
- *
- * Returns 1 on success, 0 on failure. */
-int ds4_gpu_mtl4_polar_gate_up_down_canary(uint32_t n_codes, uint32_t route_pairs,
-                                            uint32_t rows, uint32_t batches,
-                                            uint32_t pairs, uint32_t down_rows,
-                                            uint32_t act_rows);
-
-/* #563 Phase B-2.2 real-data canary. Loads PLR2 files from <polar_dir> for
- * (layer) gate+up+down, copies expert <expert> rows into MTL buffers, runs
- * the H1735 kernel with hidden=1, route_weight=1, down=1/act_rows.
- *
- * Validates the PLR2 byte format → MTL4 GPU binding pipeline end-to-end:
- *   - byte alignment of mag/phase/levels arrays
- *   - per-expert stride arithmetic
- *   - cos_lut/sin_lut indexing consistency between encoder and kernel
- *
- * Computes the expected output on CPU via ds4_polar_decode_pair_re/im (the
- * same decode formula the encoder uses) and reports max_abs_err vs GPU.
- *
- * Returns 1 if relative error < 1e-3, 0 on any failure (file open, dispatch,
- * tolerance). */
-int ds4_gpu_mtl4_polar_real_canary(const char *polar_dir,
-                                    uint32_t layer, uint32_t expert,
-                                    uint32_t down_rows, uint32_t act_rows);
-
-/* VQ-2D codec canary: mirror of polar_real_canary but reads VQB1
- * files from <vqb1_dir>/L{LL}_{gate,up,down}.vqb1. Validates the
- * VQ-2D codec + new gate_up_down_vq MTL4 kernel at fp32 noise floor
- * on real DS4 V4 weights.
- *
- * Use:
- *   ./ds4 --vq-real-canary <vqb1_dir> <layer> <expert> [down_rows [act_rows]]
- *
- * Returns 1 on success (rel_err < 1e-3), 0 on any failure.
- */
-int ds4_gpu_mtl4_vq_real_canary(const char *vqb1_dir,
-                                  uint32_t layer, uint32_t expert,
-                                  uint32_t down_rows, uint32_t act_rows);
 
 /* Phase B-2.3c stub: polar hot-path dispatcher entry. Validates pool
  * has gate/up/down PLR2 files for the layer; emits diagnostic; always
@@ -2145,54 +2037,6 @@ int ds4_gpu_mtl4_routed_mm_dispatch_probe(void);
  * the noop-write diagnostic. Output is [n_packets][n_selected][n_rows] fp16
  * computed as out[p][s][r] = sum_pair X[pair*2:(pair+1)*2] · decode(p,e,r,pair).
  * Canary cross-checks each output against a CPU scalar reference. */
-
-/* CDX3-native MTL4 decode-matmul canary. Opens a real DS4-CDX3 pack/index,
- * runs one record's D8 codebook + log-U8 scales + bitpacked indices directly
- * on GPU, and compares against ds4_cdx3_reader scalar decode. */
-int ds4_gpu_mtl4_cdx3_decode_matmul_canary(const char *pack_path,
-                                           const char *index_path,
-                                           uint32_t layer,
-                                           uint32_t expert,
-                                           uint32_t kind,
-                                           uint32_t rows,
-                                           uint32_t rounds);
-
-/* CDX3-native fused gate+up+SwiGLU canary. Opens one real routed expert,
- * decodes gate/up D8 records inside a single MTL4 kernel, applies DS4's clamp
- * and SiLU product, and compares against scalar CDX3 reader output. */
-int ds4_gpu_mtl4_cdx3_gateup_swiglu_canary(const char *pack_path,
-                                           const char *index_path,
-                                           uint32_t layer,
-                                           uint32_t expert,
-                                           uint32_t rows,
-                                           uint32_t rounds,
-                                           float route_weight,
-                                           float swiglu_limit);
-
-/* Same correctness canary as above, but binds the entire CDX3 mmap as one
- * no-copy MTL buffer and passes pack offsets to the kernel. This verifies the
- * production direction: no codebook/scale/index staging copies on the hot path. */
-int ds4_gpu_mtl4_cdx3_gateup_swiglu_pack_canary(const char *pack_path,
-                                                const char *index_path,
-                                                uint32_t layer,
-                                                uint32_t expert,
-                                                uint32_t rows,
-                                                uint32_t rounds,
-                                                float route_weight,
-                                                float swiglu_limit);
-
-/* Selected-expert CDX3 gate+up canary. This is the M1-runtime target shape:
- * one dispatch computes all selected experts after their scale/index payloads
- * are available as fixed-stride planes. Current canary stages from CDX3 records;
- * the production encoding should store those planes directly. */
-int ds4_gpu_mtl4_cdx3_gateup_swiglu_selected_canary(const char *pack_path,
-                                                    const char *index_path,
-                                                    uint32_t layer,
-                                                    const uint32_t *experts,
-                                                    uint32_t n_experts,
-                                                    uint32_t rows,
-                                                    uint32_t rounds,
-                                                    float swiglu_limit);
 
 /* Direct M1R fixed-plane selected-expert canary. This reads the runtime-native
  * pack directly: no CDX3 framed records and no host-side expert staging. */

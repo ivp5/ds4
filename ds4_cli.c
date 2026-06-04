@@ -1,6 +1,5 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
-#include "ds4_polar_reader.h"
 #include "ds4_nonrouted_pack.h"
 #include "ds4_d8m_reader.h"
 #include "ds4_d8f_reader.h"
@@ -2442,116 +2441,6 @@ static void ds4_exec_log_init(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     ds4_exec_log_init(argc, argv);
-    /* --polar-canary [packets [pairs]] : dispatch the MTL4 polar_dot kernel
-     * on synthetic deterministic inputs and report GPU elapsed + max error.
-     * Standalone diagnostic for task #563 (codex H1725 port). Bypasses
-     * engine init since no model is needed. */
-    if (argc >= 2 && !strcmp(argv[1], "--polar-canary")) {
-        uint32_t packets = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 7776;
-        uint32_t pairs   = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 2048;
-        return ds4_gpu_mtl4_polar_dot_canary(packets, pairs) ? 0 : 1;
-    }
-    /* --polar-tile-canary [tiles [rows [batches [pairs]]]] : H1729 tile×row×batch
-     * polar dot, the deployable layout for routed-MoE inference. Defaults
-     * match codex H1727: tiles=2592/32=81 (one expert layer's gate split into
-     * 32-row tiles × 32 batches), rows=32, batches=8, pairs=2048. */
-    if (argc >= 2 && !strcmp(argv[1], "--polar-tile-canary")) {
-        uint32_t tiles   = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 81;
-        uint32_t rows    = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 32;
-        uint32_t batches = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
-        uint32_t pairs   = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2048;
-        return ds4_gpu_mtl4_polar_tile_canary(tiles, rows, batches, pairs) ? 0 : 1;
-    }
-    /* --polar-tile-real <prefix> [tiles [rows [batches [pairs]]]] : load real
-     * polar binaries from <prefix>.{mag,phase,levels,hidden,cos_lut,sin_lut}.bin
-     * and validate GPU output against <prefix>.expected_polar.bin. */
-    if (argc >= 3 && !strcmp(argv[1], "--polar-tile-real")) {
-        const char *prefix = argv[2];
-        uint32_t tiles   = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 2;
-        uint32_t rows    = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 32;
-        uint32_t batches = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2;
-        uint32_t pairs   = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
-        return ds4_gpu_mtl4_polar_tile_real(prefix, tiles, rows, batches, pairs) ? 0 : 1;
-    }
-    /* --polar-fused-canary [n_codes [route_pairs [rows [batches [pairs]]]]] :
-     * H1733 fused gate*silu*up*route_weight in one dispatch. The deployable
-     * shape for routed-MoE inference. */
-    if (argc >= 2 && !strcmp(argv[1], "--polar-fused-canary")) {
-        uint32_t n_codes     = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        uint32_t route_pairs = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 8;
-        uint32_t rows        = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 32;
-        uint32_t batches     = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 1;
-        uint32_t pairs       = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
-        return ds4_gpu_mtl4_polar_fused_canary(n_codes, route_pairs, rows, batches, pairs) ? 0 : 1;
-    }
-    /* --polar-file-info <path> : open a PLR2 combined polar-encoded file
-     * (produced by analyzers/polar_encode_mlx.py --format combined) and
-     * print header + per-expert decode sanity. Phase A of task #563 —
-     * verifies the host-side reader before GPU MTLResidencySet binding. */
-    if (argc >= 3 && !strcmp(argv[1], "--polar-file-info")) {
-        ds4_polar_file pf = { .fd = -1 };
-        if (!ds4_polar_open(argv[2], &pf)) return 1;
-        ds4_polar_print_summary(&pf, argv[2]);
-        ds4_polar_close(&pf);
-        return 0;
-    }
-    /* --polar-dir-info <dir> : scan dir for L{LL}_{kind}.polar files and
-     * report the layer/kind matrix + total mmap bytes resident. Phase
-     * B-1 of #563 — verifies the pool API before engine integration. */
-    if (argc >= 3 && !strcmp(argv[1], "--polar-dir-info")) {
-        ds4_polar_pool pool;
-        ds4_polar_pool_init(&pool);
-        uint32_t opened = ds4_polar_pool_load_dir(&pool, argv[2]);
-        ds4_polar_pool_print_summary(&pool, argv[2]);
-        ds4_polar_pool_close(&pool);
-        return opened > 0 ? 0 : 1;
-    }
-    /* --polar-gud-canary [n_codes [route_pairs [rows [batches [pairs [down_rows [act_rows]]]]]]]:
-     * H1735 fused gate*silu*up*route_weight + down-projection in one
-     * dispatch. Synthetic input where expected output = pairs^2 for all
-     * cells (mag=0, phase=4, levels=1, hidden=1, down=1/act_rows, route_weight=1).
-     * Tile policy hint (H1736/H1738): try down_rows=8 act_rows=16 at small
-     * batches, down_rows=64 act_rows=32 at large batches. */
-    if (argc >= 2 && !strcmp(argv[1], "--polar-gud-canary")) {
-        uint32_t n_codes     = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 16;
-        uint32_t route_pairs = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 8;
-        uint32_t rows        = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 32;
-        uint32_t batches     = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 1;
-        uint32_t pairs       = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 2048;
-        uint32_t down_rows   = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 8;
-        uint32_t act_rows    = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 16;
-        return ds4_gpu_mtl4_polar_gate_up_down_canary(n_codes, route_pairs, rows,
-                                                      batches, pairs,
-                                                      down_rows, act_rows) ? 0 : 1;
-    }
-    /* --polar-real-canary <polar_dir> [layer [expert [down_rows [act_rows]]]]:
-     * #563 Phase B-2.2 real-data validation — load PLR2 files from
-     * <polar_dir> for the given layer, copy expert <expert> rows into MTL
-     * buffers, dispatch H1735 with hidden=1, route_weight=1, down=1/act_rows.
-     * Compares GPU output to a CPU reference derived from polar decode.
-     * Validates the PLR2 byte format → MTL4 GPU pipeline end-to-end. */
-    if (argc >= 3 && !strcmp(argv[1], "--polar-real-canary")) {
-        const char *dir   = argv[2];
-        uint32_t layer    = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 0;
-        uint32_t expert   = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 0;
-        uint32_t down_rows = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 8;
-        uint32_t act_rows  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 16;
-        return ds4_gpu_mtl4_polar_real_canary(dir, layer, expert, down_rows, act_rows) ? 0 : 1;
-    }
-    /* --vq-real-canary <vqb1_dir> [layer [expert [down_rows [act_rows]]]]:
-     * VQ-2D codec validation. Reads VQB1 files from <vqb1_dir>/L{LL}_{kind}.vqb1,
-     * loads expert codes + codebook into MTL buffers, dispatches gate_up_down_vq
-     * kernel. Compares GPU output to a CPU reference computed via the same
-     * codebook lookup. Validates VQB1 format → MTL4 GPU pipeline end-to-end.
-     * Mirror of --polar-real-canary structure for the VQ codec arc. */
-    if (argc >= 3 && !strcmp(argv[1], "--vq-real-canary")) {
-        const char *dir   = argv[2];
-        uint32_t layer    = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 0;
-        uint32_t expert   = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 0;
-        uint32_t down_rows = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 8;
-        uint32_t act_rows  = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 16;
-        return ds4_gpu_mtl4_vq_real_canary(dir, layer, expert, down_rows, act_rows) ? 0 : 1;
-    }
     /* --softplus-sqrt-canary [n_rows [n_cols]] : silv 2026-05-27 task #670
      * MTL4 port of kernel_dsv4_softplus_sqrt_f32_4 (metal/unary.metal:290).
      * Feeds deterministic input through both MTL4 pipeline + CPU reference;
