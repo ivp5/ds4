@@ -1807,7 +1807,7 @@ static int ds4_gpu_d8f_packet_icb_range_enabled(void) {
  if (ds4_gpu_env_bool("DS4_D8F_PACKET_ICB_RANGE_DISABLE") > 0) return 0;
  const int explicit_range = ds4_gpu_env_bool("DS4_D8F_PACKET_ICB_RANGE");
  if (explicit_range >= 0) return explicit_range > 0;
- return 0;
+ return ds4_gpu_max_fusion_enabled();
 }
 
 static int ds4_gpu_d8f_mtl4_packet_icb_enabled(void) {
