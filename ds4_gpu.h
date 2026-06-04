@@ -369,6 +369,27 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
  uint32_t rows,
  float eps);
 
+int ds4_gpu_hc_rms_norm_f16_mix_tensor(
+ ds4_gpu_tensor *out,
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t weight_offset,
+ uint32_t in_dim,
+ uint32_t out_dim,
+ const ds4_gpu_tensor *x,
+ float eps);
+
+int ds4_gpu_hc_rms_norm_f16_mix_storage(
+ ds4_gpu_tensor *out,
+ void *weight_buf,
+ uint64_t weight_offset,
+ uint32_t in_dim,
+ uint32_t out_dim,
+ const ds4_gpu_tensor *x,
+ float eps);
+
+int ds4_gpu_hc_rms_norm_f16_mix_canary(uint32_t out_dim, uint32_t in_dim);
+
 int ds4_gpu_rms_norm_weight_tensor(
  ds4_gpu_tensor *out,
  const ds4_gpu_tensor *x,

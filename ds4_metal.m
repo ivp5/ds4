@@ -71,6 +71,7 @@ static id<MTLComputePipelineState> g_moe_sum6_pipeline;
 static id<MTLComputePipelineState> g_mul_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_plain_pipeline;
+static id<MTLComputePipelineState> g_hc_rms_f16_mix_pipeline;
 static id<MTLComputePipelineState> g_dsv4_qkv_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_hc_split_sinkhorn_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_pipeline;
@@ -3297,6 +3298,15 @@ typedef struct {
 } ds4_gpu_rms_norm_args;
 
 typedef struct {
+ int32_t n_in;
+ int32_t out_dim;
+ uint64_t weight_stride;
+ uint64_t x_stride;
+ uint64_t out_stride;
+ float eps;
+} ds4_gpu_hc_rms_f16_mix_args;
+
+typedef struct {
  int32_t q_n;
  int32_t q_n4;
  int32_t kv_n;
@@ -4544,6 +4554,22 @@ int ds4_gpu_init(void) {
  return 0;
  }
 
+ fn = [library newFunctionWithName:@"kernel_dsv4_hc_rms_norm_f16_mix"];
+ if (!fn) {
+ fprintf(stderr, "ds4: Metal kernel_dsv4_hc_rms_norm_f16_mix function not found\n");
+ g_queue = nil;
+ g_device = nil;
+ return 0;
+ }
+ g_hc_rms_f16_mix_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+ if (!g_hc_rms_f16_mix_pipeline) {
+ fprintf(stderr, "ds4: Metal kernel_dsv4_hc_rms_norm_f16_mix pipeline failed: %s\n",
+ [[error localizedDescription] UTF8String]);
+ g_queue = nil;
+ g_device = nil;
+ return 0;
+ }
+
  fn = [library newFunctionWithName:@"kernel_dsv4_qkv_rms_norm_f32_4"];
  if (!fn) {
  fprintf(stderr, "ds4: Metal kernel_dsv4_qkv_rms_norm_f32_4 function not found\n");
@@ -5713,6 +5739,7 @@ fprintf(stderr,
  g_unary_fill_f16_pipeline = nil;
  g_rms_norm_pipeline = nil;
  g_rms_norm_plain_pipeline = nil;
+ g_hc_rms_f16_mix_pipeline = nil;
  g_dsv4_qkv_rms_norm_pipeline = nil;
  g_hc_split_sinkhorn_pipeline = nil;
  g_hc_split_weighted_sum_pipeline = nil;
@@ -8302,6 +8329,181 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
  }
 
  return 1;
+}
+
+int ds4_gpu_hc_rms_norm_f16_mix_storage(
+ ds4_gpu_tensor *out,
+ void *weight_buf,
+ uint64_t weight_offset,
+ uint32_t in_dim,
+ uint32_t out_dim,
+ const ds4_gpu_tensor *x,
+ float eps) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (!out || !weight_buf || !x ||
+ in_dim == 0 || out_dim == 0 || out_dim > 24u || (in_dim & 3u) != 0) {
+ return 0;
+ }
+
+ @autoreleasepool {
+ id<MTLBuffer> wbuf = (__bridge id<MTLBuffer>)weight_buf;
+ id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+ id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+ const uint64_t x_bytes = (uint64_t)in_dim * sizeof(float);
+ const uint64_t out_bytes = (uint64_t)out_dim * sizeof(float);
+ const uint64_t weight_bytes = (uint64_t)in_dim * out_dim * sizeof(uint16_t);
+ if (!wbuf || !xbuf || !outbuf ||
+ weight_offset > (uint64_t)wbuf.length ||
+ weight_bytes > (uint64_t)wbuf.length - weight_offset ||
+ ds4_gpu_tensor_bytes(x) < x_bytes ||
+ ds4_gpu_tensor_bytes(out) < out_bytes) {
+ fprintf(stderr, "ds4: Metal HC RMS/F16-mix received undersized buffers\n");
+ return 0;
+ }
+
+ id<MTLComputePipelineState> pipeline =
+ ds4_gpu_hot_pipeline(g_hc_rms_f16_mix_pipeline,
+ "kernel_dsv4_hc_rms_norm_f16_mix");
+ if (!pipeline) return 0;
+
+ ds4_gpu_hc_rms_f16_mix_args args = {
+ .n_in = (int32_t)in_dim,
+ .out_dim = (int32_t)out_dim,
+ .weight_stride = in_dim,
+ .x_stride = in_dim,
+ .out_stride = out_dim,
+ .eps = eps,
+ };
+
+ const NSUInteger nth = 256u;
+ if (nth > pipeline.maxTotalThreadsPerThreadgroup) return 0;
+
+ int owned = 0;
+ id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+ if (!cb) return 0;
+
+ id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+ [enc setComputePipelineState:pipeline];
+ [enc setBytes:&args length:sizeof(args) atIndex:0];
+ [enc setBuffer:wbuf offset:(NSUInteger)weight_offset atIndex:1];
+ [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+ [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+ [enc setThreadgroupMemoryLength:25u * 32u * sizeof(float) atIndex:0];
+ [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+ threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+ ds4_gpu_end_compute_encoder(cb, enc);
+
+ if (!ds4_gpu_finish_command_buffer(cb, owned, "HC RMS/F16-mix fused")) return 0;
+ }
+
+ return 1;
+}
+
+int ds4_gpu_hc_rms_norm_f16_mix_tensor(
+ ds4_gpu_tensor *out,
+ const void *model_map,
+ uint64_t model_size,
+ uint64_t weight_offset,
+ uint32_t in_dim,
+ uint32_t out_dim,
+ const ds4_gpu_tensor *x,
+ float eps) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (!model_map) return 0;
+ const uint64_t weight_bytes = (uint64_t)in_dim * out_dim * sizeof(uint16_t);
+ if (!ds4_gpu_range_resolvable(model_map, model_size, weight_offset, weight_bytes)) {
+ fprintf(stderr, "ds4: Metal HC RMS/F16-mix range is outside the mapped model\n");
+ return 0;
+ }
+ uint64_t inner_offset = 0;
+ id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size,
+ weight_offset, weight_bytes, &inner_offset);
+ if (!wbuf) return 0;
+ return ds4_gpu_hc_rms_norm_f16_mix_storage(out,
+ (__bridge void *)wbuf,
+ inner_offset,
+ in_dim,
+ out_dim,
+ x,
+ eps);
+}
+
+int ds4_gpu_hc_rms_norm_f16_mix_canary(uint32_t out_dim, uint32_t in_dim) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ if (out_dim == 0 || out_dim > 24u || in_dim == 0 || (in_dim & 31u) != 0) {
+ fprintf(stderr, "ds4: HC RMS/F16-mix canary needs 1<=out_dim<=24 and in_dim%%32==0 (got out=%u in=%u)\n",
+ out_dim, in_dim);
+ return 0;
+ }
+
+ const size_t page = (size_t)getpagesize();
+ const uint64_t weight_bytes = (uint64_t)out_dim * in_dim * sizeof(uint16_t);
+ const size_t padded = (size_t)((weight_bytes + page - 1u) & ~(uint64_t)(page - 1u));
+ void *host_weight = NULL;
+ if (posix_memalign(&host_weight, page, padded) != 0 || !host_weight) return 0;
+ memset(host_weight, 0, padded);
+ float *host_x = (float *)calloc(in_dim, sizeof(float));
+ float *ref = (float *)calloc(out_dim, sizeof(float));
+ float *fused = (float *)calloc(out_dim, sizeof(float));
+ if (!host_x || !ref || !fused) {
+ free(host_weight); free(host_x); free(ref); free(fused);
+ return 0;
+ }
+
+ uint16_t *w16 = (uint16_t *)host_weight;
+ for (uint32_t r = 0; r < out_dim; r++) {
+ for (uint32_t c = 0; c < in_dim; c++) {
+ const float v = 0.001f * (float)((int)(r * 17u + c * 5u) % 29 - 14);
+ _Float16 h = (_Float16)v;
+ memcpy(&w16[(uint64_t)r * in_dim + c], &h, sizeof(h));
+ }
+ }
+ for (uint32_t i = 0; i < in_dim; i++) {
+ host_x[i] = 0.01f * (float)((int)(i * 13u) % 37 - 18);
+ }
+
+ void *wbuf = ds4_gpu_wrap_heap_bytes(host_weight, (uint64_t)padded);
+ ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
+ ds4_gpu_tensor *flat = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
+ ds4_gpu_tensor *ref_t = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+ ds4_gpu_tensor *fused_t = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+ int ok = wbuf && x && flat && ref_t && fused_t;
+ if (ok) ok = ds4_gpu_tensor_write(x, 0, host_x, (uint64_t)in_dim * sizeof(float)) != 0;
+ if (ok) ok = ds4_gpu_rms_norm_plain_tensor(flat, x, in_dim, 1.0e-6f) != 0;
+ if (ok) ok = ds4_gpu_matmul_f16_storage(ref_t, wbuf, in_dim, out_dim, flat, 1) != 0;
+ if (ok) ok = ds4_gpu_hc_rms_norm_f16_mix_storage(fused_t, wbuf, 0, in_dim, out_dim, x, 1.0e-6f) != 0;
+ if (ok) ok = ds4_gpu_tensor_read(ref_t, 0, ref, (uint64_t)out_dim * sizeof(float)) != 0;
+ if (ok) ok = ds4_gpu_tensor_read(fused_t, 0, fused, (uint64_t)out_dim * sizeof(float)) != 0;
+
+ double max_abs = 0.0;
+ double max_rel = 0.0;
+ int mismatch = 0;
+ if (ok) {
+ for (uint32_t i = 0; i < out_dim; i++) {
+ const double diff = fabs((double)fused[i] - (double)ref[i]);
+ const double rel = diff / (fabs((double)ref[i]) + 1.0e-7);
+ if (diff > max_abs) max_abs = diff;
+ if (rel > max_rel) max_rel = rel;
+ if (diff > 2.0e-4 && rel > 2.0e-4) mismatch++;
+ }
+ fprintf(stderr,
+ "ds4: HC RMS/F16-mix fused canary out=%u in=%u mismatch=%d max_abs=%.6e max_rel=%.6e ref0=%.6e fused0=%.6e\n",
+ out_dim, in_dim, mismatch, max_abs, max_rel,
+ (double)ref[0], (double)fused[0]);
+ } else {
+ fprintf(stderr, "ds4: HC RMS/F16-mix fused canary dispatch FAILED\n");
+ }
+
+ ds4_gpu_tensor_free(x);
+ ds4_gpu_tensor_free(flat);
+ ds4_gpu_tensor_free(ref_t);
+ ds4_gpu_tensor_free(fused_t);
+ if (wbuf) ds4_gpu_release_heap_buffer(wbuf);
+ free(host_weight);
+ free(host_x);
+ free(ref);
+ free(fused);
+ return ok && mismatch == 0;
 }
 
 int ds4_gpu_rms_norm_weight_tensor(

@@ -2304,6 +2304,12 @@ int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--router-select-fused-canary")) {
         return ds4_gpu_router_select_fused_canary() ? 0 : 1;
     }
+    /* --hc-rms-f16-mix-canary [out_dim [in_dim]] : fuses HC RMSNorm + tiny F16 matvec */
+    if (argc >= 2 && !strcmp(argv[1], "--hc-rms-f16-mix-canary")) {
+        const uint32_t out_dim = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 24;
+        const uint32_t in_dim = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 16384;
+        return ds4_gpu_hc_rms_norm_f16_mix_canary(out_dim, in_dim) ? 0 : 1;
+    }
     /* --qkv-rms-norm-canary [q_n [kv_n]] : task #685 per-layer Q+KV RMSNorm */
     if (argc >= 2 && !strcmp(argv[1], "--qkv-rms-norm-canary")) {
         const uint32_t q_n = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 1024;

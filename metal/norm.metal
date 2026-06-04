@@ -84,6 +84,78 @@ typedef decltype(kernel_rms_norm_fuse_impl<float4, 1>) kernel_rms_norm_fuse_t;
 template [[host_name("kernel_rms_norm_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1>;
 template [[host_name("kernel_rms_norm_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 
+struct ds4_metal_args_hc_rms_f16_mix {
+    int32_t n_in;
+    int32_t out_dim;
+    uint64_t weight_stride;
+    uint64_t x_stride;
+    uint64_t out_stride;
+    float eps;
+};
+
+kernel void kernel_dsv4_hc_rms_norm_f16_mix(
+        constant ds4_metal_args_hc_rms_f16_mix & args,
+        device const half  * weights,
+        device const float * x,
+        device       float * out,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    constexpr int MAX_OUT = 24;
+    const int row = (int)tgpig.x;
+    const int nsg = (int)ntg.x / N_SIMDWIDTH;
+    device const float * xr = x + (uint64_t)row * args.x_stride;
+    device float * yr = out + (uint64_t)row * args.out_stride;
+
+    float sumsq = 0.0f;
+    float dots[MAX_OUT];
+    for (int j = 0; j < MAX_OUT; ++j) dots[j] = 0.0f;
+
+    for (int i = tpitg.x; i < args.n_in; i += ntg.x) {
+        const float xv = xr[i];
+        sumsq += xv * xv;
+        for (int j = 0; j < args.out_dim && j < MAX_OUT; ++j) {
+            dots[j] += (float)weights[(uint64_t)j * args.weight_stride + (uint64_t)i] * xv;
+        }
+    }
+
+    sumsq = simd_sum(sumsq);
+    for (int j = 0; j < args.out_dim && j < MAX_OUT; ++j) {
+        dots[j] = simd_sum(dots[j]);
+    }
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumsq;
+        for (int j = 0; j < args.out_dim && j < MAX_OUT; ++j) {
+            shmem_f32[(j + 1) * N_SIMDWIDTH + sgitg] = dots[j];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        if (tiisg == 0) {
+            float total = 0.0f;
+            for (int sg = 0; sg < nsg; ++sg) total += shmem_f32[sg];
+            shmem_f32[0] = 1.0f / sqrt(total / (float)args.n_in + args.eps);
+        } else if (tiisg <= args.out_dim && tiisg <= MAX_OUT) {
+            const int j = (int)tiisg - 1;
+            float total = 0.0f;
+            for (int sg = 0; sg < nsg; ++sg) {
+                total += shmem_f32[(j + 1) * N_SIMDWIDTH + sg];
+            }
+            shmem_f32[tiisg] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg > 0 && tiisg <= args.out_dim && tiisg <= MAX_OUT) {
+        yr[tiisg - 1] = shmem_f32[tiisg] * shmem_f32[0];
+    }
+}
+
 struct ds4_metal_args_qkv_rms_norm {
     int32_t  q_n;
     int32_t  q_n4;
