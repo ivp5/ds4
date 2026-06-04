@@ -84,15 +84,30 @@ def parse_canary_output(text):
 
 def mode_env(mode):
     env = {}
-    if mode == "direct-buffer":
-        env["DS4_D8F_CLASSIC_PACKET_ICB"] = "0"
-    elif mode == "direct-texture":
-        env["DS4_D8F_CLASSIC_PACKET_ICB"] = "0"
-        env["DS4_D8F_RUNTIME_NATIVE_DOWN"] = "1"
-    elif mode == "icb-buffer":
+    if mode == "primary":
         pass
-    elif mode == "texture":
+    elif mode in ("direct-buffer", "buffer-no-icb"):
+        env["DS4_D8F_CLASSIC_PACKET_ICB"] = "0"
+        env["DS4_D8F_RUNTIME_NATIVE_DOWN_DISABLE"] = "1"
+    elif mode in ("icb-buffer", "buffer"):
+        env["DS4_D8F_RUNTIME_NATIVE_DOWN_DISABLE"] = "1"
+    elif mode in ("direct-texture", "compact-texture-no-icb"):
+        env["DS4_D8F_CLASSIC_PACKET_ICB"] = "0"
         env["DS4_D8F_RUNTIME_NATIVE_DOWN"] = "1"
+        env["DS4_D8F_RUNTIME_NATIVE_DOWN_COMPACT_TEX"] = "1"
+        env["DS4_D8F_RUNTIME_NATIVE_DOWN_PACK2D_DISABLE"] = "1"
+    elif mode in ("texture", "compact-texture"):
+        env["DS4_D8F_RUNTIME_NATIVE_DOWN"] = "1"
+        env["DS4_D8F_RUNTIME_NATIVE_DOWN_COMPACT_TEX"] = "1"
+        env["DS4_D8F_RUNTIME_NATIVE_DOWN_PACK2D_DISABLE"] = "1"
+    elif mode == "pack2d":
+        env["DS4_D8F_RUNTIME_NATIVE_DOWN"] = "1"
+        env["DS4_D8F_RUNTIME_NATIVE_DOWN_PACK2D"] = "1"
+        env["DS4_D8F_RUNTIME_NATIVE_DOWN_COMPACT_TEX_DISABLE"] = "1"
+    elif mode == "native-buffer":
+        env["DS4_D8F_RUNTIME_NATIVE_DOWN"] = "1"
+        env["DS4_D8F_RUNTIME_NATIVE_DOWN_PACK2D_DISABLE"] = "1"
+        env["DS4_D8F_RUNTIME_NATIVE_DOWN_COMPACT_TEX_DISABLE"] = "1"
     else:
         raise ValueError(f"unknown mode {mode}")
     return env
@@ -115,6 +130,13 @@ def summarize_pairs(results):
         for left_mode, right_mode, prefix in (
             ("direct-buffer", "direct-texture", "direct"),
             ("icb-buffer", "texture", "production"),
+            ("buffer", "primary", "primary_over_buffer"),
+            ("buffer", "compact-texture", "compact_over_buffer"),
+            ("buffer", "pack2d", "pack2d_over_buffer"),
+            ("buffer", "native-buffer", "native_over_buffer"),
+            ("primary", "compact-texture", "compact_over_primary"),
+            ("primary", "pack2d", "pack2d_over_primary"),
+            ("primary", "native-buffer", "native_over_primary"),
         ):
             left = modes.get(left_mode)
             right = modes.get(right_mode)
@@ -142,8 +164,8 @@ def main():
     parser.add_argument("--layers", default="")
     parser.add_argument(
         "--modes",
-        default="direct-buffer,direct-texture,icb-buffer,texture",
-        help="comma list: direct-buffer,direct-texture,icb-buffer,texture",
+        default="primary,buffer,compact-texture,pack2d,native-buffer",
+        help="comma list: primary,buffer,compact-texture,pack2d,native-buffer",
     )
     args = parser.parse_args()
 
