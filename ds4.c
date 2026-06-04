@@ -12060,6 +12060,14 @@ static bool metal_graph_use_fp8_shared_down_hc(void) {
  return !metal_graph_env_flag("DS4_METAL_DISABLE_SHARED_DOWN_FP8_HC_FUSION", &disable_cache);
 }
 
+static bool metal_graph_use_top_only_argmax_decode(void) {
+ static int enable_cache = -1;
+ static int disable_cache = -1;
+ return (ds4_metal_graph_max_fusion_enabled() ||
+         metal_graph_env_flag("DS4_METAL_ENABLE_TOP_ONLY_ARGMAX", &enable_cache)) &&
+        !metal_graph_env_flag("DS4_METAL_DISABLE_TOP_ONLY_ARGMAX", &disable_cache);
+}
+
 static bool metal_graph_decode_hc_pre(
  ds4_gpu_tensor *out,
  ds4_gpu_tensor *split,
@@ -21656,6 +21664,17 @@ static int generate_metal_graph_raw_swa(
  float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
  const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
  const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
+ const bool top_only_argmax =
+ metal_graph_use_top_only_argmax_decode() &&
+ !trace_top &&
+ !ds4_skip_confidence_gate_enabled() &&
+ !ds4_head_demote_active();
+ bool top_only_valid = false;
+ int top_only_token = -1;
+ if (top_only_argmax) {
+ fprintf(stderr,
+ "ds4: Metal top-only argmax decode active — full logits read back lazily only when requested\n");
+ }
 
  const double t_prefill0 = now_sec();
  if (prefill_cap < (uint32_t)prompt->len) {
@@ -21726,7 +21745,9 @@ static int generate_metal_graph_raw_swa(
  }
 
  int token;
- if (confidence_gate) {
+ if (top_only_valid) {
+ token = top_only_token;
+ } else if (confidence_gate) {
  logits_top2(logits, DS4_N_VOCAB, &top0, &top0_v, &top1, &top1_v);
  token = top0;
  } else {
@@ -21753,6 +21774,10 @@ static int generate_metal_graph_raw_swa(
  if (pred >= 0 && pred < (int32_t)DS4_N_VOCAB) {
  memset(logits, 0, (size_t)DS4_N_VOCAB * sizeof(float));
  logits[pred] = 1.0f;
+ if (top_only_argmax) {
+ top_only_token = (int)pred;
+ top_only_valid = true;
+ }
  skip_this_step = 1;
  cache_lock_skip_budget--;
  cache_lock_skipped_total++;
@@ -21778,15 +21803,31 @@ static int generate_metal_graph_raw_swa(
  ds4_skip_clear_decode_confidence();
  }
  const double t_eval0 = token_timing ? now_sec() : 0.0;
+ if (top_only_argmax) {
+ int next_top = -1;
+ ok = metal_graph_eval_token_raw_swa_top(&g,
+ model,
+ weights,
+ (uint32_t)token,
+ (uint32_t)pos,
+ &next_top,
+ NULL);
+ if (ok) {
+ top_only_token = next_top;
+ top_only_valid = true;
+ }
+ } else {
  ok = metal_graph_eval_token_raw_swa(&g,
  model,
  weights,
  (uint32_t)token,
  (uint32_t)pos,
  logits);
+ top_only_valid = false;
+ }
  ds4_skip_clear_decode_confidence();
  if (!ok) break;
- ds4_apply_head_demote(logits);
+ if (!top_only_argmax) ds4_apply_head_demote(logits);
  if (token_timing) {
  const double t_eval1 = now_sec();
  fprintf(stderr, "ds4: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
@@ -26198,10 +26239,27 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
  } else {
  ds4_skip_clear_decode_confidence();
  }
- if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
+ const bool top_only_argmax =
+ metal_graph_use_top_only_argmax_decode() &&
+ !ds4_skip_confidence_gate_enabled() &&
+ !ds4_head_demote_active();
+ int top_only_token = -1;
+ bool eval_ok = false;
+ if (top_only_argmax) {
+ eval_ok = metal_graph_eval_token_raw_swa_top(&s->graph,
+ &e->model,
+ &e->weights,
+ token,
+ (uint32_t)s->checkpoint.len,
+ &top_only_token,
+ NULL);
+ } else {
+ eval_ok = metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
  (uint32_t)token,
  (uint32_t)s->checkpoint.len,
- s->logits))
+ s->logits);
+ }
+ if (!eval_ok)
  {
  ds4_skip_clear_decode_confidence();
  snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
@@ -26209,7 +26267,17 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
  return 1;
  }
  ds4_skip_clear_decode_confidence();
+ if (top_only_argmax) {
+ static int top_only_session_logged = 0;
+ if (!top_only_session_logged) {
+ top_only_session_logged = 1;
+ fprintf(stderr,
+ "ds4: Metal session top-only argmax decode active — full logits stay device-resident until requested\n");
+ }
+ ds4_session_note_gpu_argmax(s, top_only_token);
+ } else {
  ds4_session_note_host_logits(s);
+ }
  token_vec_push(&s->checkpoint, token);
  if (mtp_should_draft) {
  int mtp_top = -1;
