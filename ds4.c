@@ -14864,7 +14864,26 @@ static bool metal_graph_encode_output_head_batch(
  (uint64_t)n_tokens * vocab_dim * sizeof(float));
  ok = output_pre && output_weights && output_embd && output_norm && logits;
 
- if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
+ int output_hc_full_fused = 0;
+ if (ok) {
+ output_hc_full_fused = ds4_output_hc_full_f16_via_tensor(output_pre,
+ output_weights,
+ output_embd,
+ output_norm,
+ model,
+ weights->output_hc_fn,
+ g->batch_cur_hc,
+ weights->output_hc_scale->abs_offset,
+ weights->output_hc_base->abs_offset,
+ weights->output_norm->abs_offset,
+ DS4_N_EMBD,
+ DS4_N_HC,
+ DS4_RMS_EPS,
+ DS4_HC_EPS,
+ DS4_RMS_EPS);
+ }
+ if (ok && !output_hc_full_fused) {
+ ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
  g->batch_cur_hc,
  (uint32_t)hc_dim,
  n_tokens,
@@ -14894,6 +14913,7 @@ static bool metal_graph_encode_output_head_batch(
  DS4_N_EMBD,
  n_tokens,
  DS4_RMS_EPS) != 0;
+ }
  if (ok) ok = ds4_matmul_q8_0_via_tensor(logits, model,
   weights->output,
   DS4_N_EMBD, vocab_dim,
@@ -14937,7 +14957,24 @@ static bool metal_graph_encode_output_head_mtp(
  const ds4_mtp_weights *mtp,
  uint64_t vocab_dim) {
  const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
- bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+ bool ok = true;
+ int output_hc_full_fused = ds4_output_hc_full_f16_via_tensor(g->output_pre,
+ g->output_weights,
+ g->output_embd,
+ g->output_norm,
+ mtp_model,
+ mtp->hc_head_fn,
+ g->cur_hc,
+ mtp->hc_head_scale->abs_offset,
+ mtp->hc_head_base->abs_offset,
+ mtp->norm->abs_offset,
+ DS4_N_EMBD,
+ DS4_N_HC,
+ DS4_RMS_EPS,
+ DS4_HC_EPS,
+ DS4_RMS_EPS);
+ if (!output_hc_full_fused) {
+ ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
  if (ok) ok = metal_graph_matmul_plain_tensor(g->output_pre, mtp_model, mtp->hc_head_fn,
  hc_dim, DS4_N_HC, g->flat_hc, 1);
  if (ok) ok = ds4_gpu_output_hc_weights_tensor(g->output_weights,
@@ -14960,6 +14997,7 @@ static bool metal_graph_encode_output_head_mtp(
  mtp->norm->abs_offset,
  DS4_N_EMBD,
  DS4_RMS_EPS) != 0;
+ }
  if (ok) ok = ds4_matmul_q8_0_via_tensor(g->logits, base_model,
   base_weights->output,
   DS4_N_EMBD, vocab_dim,
