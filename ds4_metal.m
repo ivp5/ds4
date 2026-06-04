@@ -449,6 +449,31 @@ static id<MTLBuffer> g_topk_mask_icb_args_buffers[DS4_TOPK_MASK_ICB_SLOTS];
  * subsumed by 2 commands inside the generic ds4_icb_slot_t. */
 #define DS4_SOFTPLUS_SQRT_ICB_SLOTS 2
 
+/* Dense Q8_0 single-token matvec ICB. This is deliberately separate from
+ * D8F packet ICB: it covers the repeated dense projections still present in
+ * the 43-layer decode tape (q/kv/output/shared paths). */
+#ifndef DS4_DENSE_ICB_SLOTS
+#define DS4_DENSE_ICB_SLOTS 320
+#endif
+
+typedef struct {
+ void *wbuf;
+ void *xbuf;
+ void *outbuf;
+ uint64_t inner_offset;
+ uint64_t x_offset;
+ uint64_t out_offset;
+ uint64_t in_dim;
+ uint64_t out_dim;
+} ds4_dense_matvec_icb_cache_entry;
+
+static ds4_icb_slot_t g_dense_matvec_slot;
+static id<MTLBuffer> g_dense_matvec_uniforms = nil;
+static ds4_dense_matvec_icb_cache_entry g_dense_matvec_cache[DS4_DENSE_ICB_SLOTS];
+static uint32_t g_dense_matvec_cache_count;
+static int g_dense_matvec_icb_env_checked;
+static int g_dense_matvec_icb_env_active;
+
 /* silv 2026-05-28 ICB Phase 8: VQB2 GPU decoder ICB.
  *
  * Captures the new VQB2 GPU decoder kernel (#751) into a classic-MTL ICB.
@@ -499,6 +524,8 @@ static _Atomic uint64_t g_ds4_d8f_packet_icb_hit_count = 0;
 static _Atomic uint64_t g_ds4_d8f_packet_icb_miss_count = 0;
 static _Atomic uint64_t g_ds4_d8f_mtl4_batch_append_count = 0;
 static _Atomic uint64_t g_ds4_d8f_mtl4_batch_commit_count = 0;
+static _Atomic uint64_t g_ds4_dense_matvec_icb_replay_count = 0;
+static _Atomic uint64_t g_ds4_dense_matvec_icb_fallback_count = 0;
 static _Atomic uint64_t g_ds4_dispatch_count = 0;
 
 typedef void (*ds4_dispatch_imp_t)(id, SEL, MTLSize, MTLSize);
@@ -5944,6 +5971,19 @@ void ds4_gpu_cleanup(void) {
  (unsigned long long)dispatches);
  }
 
+ if (getenv("DS4_DENSE_ICB_COUNT")) {
+ const uint64_t dense_replays = atomic_load_explicit(&g_ds4_dense_matvec_icb_replay_count,
+ memory_order_relaxed);
+ const uint64_t dense_fallbacks = atomic_load_explicit(&g_ds4_dense_matvec_icb_fallback_count,
+ memory_order_relaxed);
+ fprintf(stderr,
+ "ds4: dense_icb_count: q8_matvec_replay %llu fallback %llu slots %u/%u\n",
+ (unsigned long long)dense_replays,
+ (unsigned long long)dense_fallbacks,
+ g_dense_matvec_cache_count,
+ (uint32_t)DS4_DENSE_ICB_SLOTS);
+ }
+
  if (getenv("DS4_D8F_COUNT")) {
  const uint64_t inline_count = atomic_load_explicit(&g_ds4_d8f_inline_count,
  memory_order_relaxed);
@@ -6075,6 +6115,12 @@ fprintf(stderr,
  /* Cycle 9d: reset Phase 6 (route_weights_one) ICB slot to discard
  * stale MTLICB after device reset. */
  ds4_icb_slot_reset(&g_route_weights_one_slot);
+ ds4_icb_slot_reset(&g_dense_matvec_slot);
+ g_dense_matvec_uniforms = nil;
+ memset(g_dense_matvec_cache, 0, sizeof(g_dense_matvec_cache));
+ g_dense_matvec_cache_count = 0;
+ g_dense_matvec_icb_env_checked = 0;
+ g_dense_matvec_icb_env_active = 0;
  ds4_d8f_packet_icb_reset();
  g_dsv4_hc_expand4_pipeline = nil;
  g_flash_attn_mask_buffer = nil;
@@ -7210,6 +7256,23 @@ int ds4_gpu_dsv4_topk_mask_tensor(
  return 1;
 }
 
+static int ds4_gpu_dense_matvec_icb_enabled(void);
+static int ds4_gpu_dense_matvec_icb_slot_for(id<MTLBuffer> wbuf,
+                                             uint64_t inner_offset,
+                                             uint64_t in_dim,
+                                             uint64_t out_dim,
+                                             const ds4_gpu_tensor *x,
+                                             const ds4_gpu_tensor *out,
+                                             uint32_t *slot_idx_out);
+static int ds4_gpu_matmul_q8_0_matvec_icb(id<MTLCommandBuffer> cb,
+                                          uint32_t slot_idx,
+                                          id<MTLBuffer> wbuf,
+                                          uint64_t inner_offset,
+                                          uint64_t in_dim,
+                                          uint64_t out_dim,
+                                          const ds4_gpu_tensor *x,
+                                          ds4_gpu_tensor *out);
+
 /* silv 2026-05-28 #796 Increment 3 — unified Q8_0 matmul kernel dispatch.
  *
  * Same shape as F16's kernel_dispatch helper (#796 Increment 2d): one
@@ -7244,6 +7307,20 @@ static int ds4_gpu_matmul_q8_0_kernel_dispatch(
  const uint64_t row_bytes = blocks * 34;
 
  if (n_tok == 1) {
+  uint32_t dense_icb_slot = 0;
+  if (ds4_gpu_dense_matvec_icb_enabled() &&
+      ds4_gpu_dense_matvec_icb_slot_for(wbuf, inner_offset, in_dim, out_dim, x, out,
+                                        &dense_icb_slot)) {
+   if (ds4_gpu_matmul_q8_0_matvec_icb(cb, dense_icb_slot, wbuf, inner_offset,
+                                      in_dim, out_dim, x, out)) {
+    atomic_fetch_add_explicit(&g_ds4_dense_matvec_icb_replay_count, 1,
+                              memory_order_relaxed);
+    if (!ds4_gpu_finish_command_buffer(cb, owned, label ? label : "Q8_0 matvec ICB")) return 0;
+    return 1;
+   }
+   atomic_fetch_add_explicit(&g_ds4_dense_matvec_icb_fallback_count, 1,
+                             memory_order_relaxed);
+  }
   ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
   ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
   if (out_dim > 65536u) mv_dispatch.nsg = 8;
@@ -7474,11 +7551,74 @@ int ds4_gpu_matmul_q8_0_storage(
  * at binding 0 (the mul_mv kernel reads [[buffer(0)]] identically whether fed by setBytes or a
  * buffer, so NO kernel change). Signature is token-stable (fixed weight buf, reused scratch
  * x/out, fixed grid/tg/smem/args per (layer,role)) ⇒ replay hits every token after the first. */
-#ifndef DS4_DENSE_ICB_SLOTS
-#define DS4_DENSE_ICB_SLOTS 320  /* 43 layers × ~6 dense GEMVs + headroom; >128 ⇒ its own ICB */
-#endif
-static ds4_icb_slot_t g_dense_matvec_slot;
-static id<MTLBuffer>  g_dense_matvec_uniforms = nil;  /* 256B/slot, holds mv_args (binding 0) */
+static int ds4_gpu_dense_matvec_icb_enabled(void) {
+ if (!g_dense_matvec_icb_env_checked) {
+  const int disabled = ds4_gpu_env_bool("DS4_DENSE_MATVEC_ICB_DISABLE") > 0 ||
+                       ds4_gpu_env_bool("DS4_ICB_DENSE_MATVEC_DISABLE") > 0;
+  const int explicit_dense = ds4_gpu_env_bool("DS4_DENSE_MATVEC_ICB");
+  const int explicit_legacy = ds4_gpu_env_bool("DS4_ICB_DENSE_MATVEC");
+  if (disabled) {
+   g_dense_matvec_icb_env_active = 0;
+  } else if (explicit_dense >= 0) {
+   g_dense_matvec_icb_env_active = explicit_dense > 0;
+  } else if (explicit_legacy >= 0) {
+   g_dense_matvec_icb_env_active = explicit_legacy > 0;
+  } else {
+   g_dense_matvec_icb_env_active =
+    ds4_gpu_env_bool("DS4_MAX_FUSION_DENSE_MATVEC_ICB") > 0;
+  }
+  g_dense_matvec_icb_env_checked = 1;
+  if (g_dense_matvec_icb_env_active) {
+   fprintf(stderr,
+           "ds4: dense Q8_0 matvec ICB replay active "
+           "(explicit experiment; set DS4_DENSE_MATVEC_ICB_DISABLE=1 to disable)\n");
+  }
+ }
+ return g_dense_matvec_icb_env_active;
+}
+
+static int ds4_gpu_dense_matvec_icb_slot_for(id<MTLBuffer> wbuf,
+                                             uint64_t inner_offset,
+                                             uint64_t in_dim,
+                                             uint64_t out_dim,
+                                             const ds4_gpu_tensor *x,
+                                             const ds4_gpu_tensor *out,
+                                             uint32_t *slot_idx_out) {
+ if (!wbuf || !x || !out || !slot_idx_out) return 0;
+ id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+ id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+ if (!xbuf || !outbuf) return 0;
+ const ds4_dense_matvec_icb_cache_entry want = {
+  .wbuf = (__bridge void *)wbuf,
+  .xbuf = (__bridge void *)xbuf,
+  .outbuf = (__bridge void *)outbuf,
+  .inner_offset = inner_offset,
+  .x_offset = (uint64_t)ds4_gpu_tensor_offset(x),
+  .out_offset = (uint64_t)ds4_gpu_tensor_offset(out),
+  .in_dim = in_dim,
+  .out_dim = out_dim,
+ };
+ for (uint32_t i = 0; i < g_dense_matvec_cache_count; i++) {
+  if (memcmp(&g_dense_matvec_cache[i], &want, sizeof(want)) == 0) {
+   *slot_idx_out = i;
+   return 1;
+  }
+ }
+ if (g_dense_matvec_cache_count >= (uint32_t)DS4_DENSE_ICB_SLOTS) {
+  static int s_dense_icb_overflow_logged = 0;
+  if (!s_dense_icb_overflow_logged) {
+   s_dense_icb_overflow_logged = 1;
+   fprintf(stderr,
+           "ds4: dense Q8_0 matvec ICB slot cache full (%u); falling back to direct dispatch\n",
+           (uint32_t)DS4_DENSE_ICB_SLOTS);
+  }
+  return 0;
+ }
+ const uint32_t slot = g_dense_matvec_cache_count++;
+ g_dense_matvec_cache[slot] = want;
+ *slot_idx_out = slot;
+ return 1;
+}
 
 /* Record→replay one dense Q8_0 matvec at slot_idx. caller supplies the decode cb. Returns 1 ok. */
 static int ds4_gpu_matmul_q8_0_matvec_icb(
@@ -19460,15 +19600,18 @@ static int ds4_route_weights_one_dispatch(id<MTLCommandBuffer> cb,
      * DS4_ICB_ACTIVE keeps the winning route_remap ICB (43 layers × per-token
      * × 256-thread kernel) without dragging this losing one in by default.
      * Set DS4_ICB_WEIGHTS_ONE=1 to opt in (e.g. for batched/prefill paths). */
-    static int s_env_checked = 0;
-    static int s_env_active = 0;
-    if (!s_env_checked) {
-        s_env_active = getenv("DS4_ICB_WEIGHTS_ONE") != NULL ? 1 : 0;
-        s_env_checked = 1;
-        if (s_env_active) {
-            fprintf(stderr, "ds4: DS4_ICB_WEIGHTS_ONE=1 — route_weights_one ICB engaged (opt-in: caller pays useResource cost)\n");
-        }
-    }
+	    static int s_env_checked = 0;
+	    static int s_env_active = 0;
+	    if (!s_env_checked) {
+	        s_env_active =
+	            ds4_gpu_env_bool("DS4_ICB_WEIGHTS_ONE_DISABLE") > 0 ? 0 :
+	            (getenv("DS4_ICB_WEIGHTS_ONE") != NULL ||
+	             ds4_gpu_env_bool("DS4_MAX_FUSION_ROUTE_WEIGHTS_ICB") > 0) ? 1 : 0;
+	        s_env_checked = 1;
+	        if (s_env_active) {
+	            fprintf(stderr, "ds4: route_weights_one ICB engaged (explicit experiment; set DS4_ICB_WEIGHTS_ONE_DISABLE=1 to disable)\n");
+	        }
+	    }
     if (!s_env_active) return 0; /* caller does direct encoding */
     if (slot_idx >= 2) return 0;
 
