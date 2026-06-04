@@ -66,6 +66,8 @@ typedef struct {
     char *flat_pack_model_owned;
     char *flat_pack_nonrouted_owned;
     bool inspect;
+    bool backend_explicit;
+    bool model_or_pack_explicit;
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
@@ -107,13 +109,13 @@ static void usage(FILE *fp) {
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
-        "      Use the Metal graph backend. This is the normal fast path on macOS.\n"
+        "      Use the Metal graph backend. This is the default fast path on macOS.\n"
         "  --cuda\n"
-        "      Use the CUDA graph backend. This is the normal fast path on CUDA builds.\n"
+        "      Use the CUDA graph backend. This is the default fast path on CUDA builds.\n"
         "  --cpu\n"
         "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
         "  --backend NAME\n"
-        "      Select backend explicitly: metal, cuda, or cpu.\n"
+        "      Select backend explicitly: metal, cuda, or cpu. Default is GPU when built.\n"
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
@@ -161,9 +163,10 @@ static void usage(FILE *fp) {
         "      Open the M1R fixed-plane routed-FFN pack.\n"
         "  --d8m-down-template TEMPLATE\n"
         "      Use per-layer D8M down packs with printf-style layer substitution.\n"
-        "  DS4_PRIME_PATH=1\n"
-        "      Runtime profile: single-submit max-fusion decode by default;\n"
-        "      prefer D8F classic in-graph packet ICB range replay and keep\n"
+        "  DS4_PRIME_PATH=0\n"
+        "      Disable the default PRIME GPU-resident runtime profile. PRIME normally\n"
+        "      uses measured split-2 decode overlap, D8F classic in-graph packet\n"
+        "      ICB range replay, and keeps\n"
         "      external MTL4 packet dispatch force-only.\n"
         "      Embedded MTP stays available when policy permits. D8F spec-decode is\n"
         "      disabled by default after H2758/H2759 measured verifier slower than baseline;\n"
@@ -333,6 +336,35 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
             m.prefill_cap,
             m.raw_cap,
             m.comp_cap);
+}
+
+static int verify_cli_engine_backend(ds4_engine *engine, const cli_config *cfg) {
+    const ds4_backend requested = cfg->engine.backend;
+    const ds4_backend actual = ds4_engine_backend(engine);
+    if (actual != requested) {
+        fprintf(stderr,
+                "ds4: backend mismatch: requested %s but engine reports %s; refusing silent fallback\n",
+                ds4_backend_name(requested),
+                ds4_backend_name(actual));
+        return 1;
+    }
+    if (ds4_backend_is_gpu(requested)) {
+        if (!ds4_engine_uses_gpu(engine)) {
+            fprintf(stderr,
+                    "ds4: %s selected but GPU graph is not active; refusing CPU fallback\n",
+                    ds4_backend_name(requested));
+            return 1;
+        }
+        fprintf(stderr,
+                "ds4: backend verified: %s GPU graph (%s selection, PRIME default-fast path)\n",
+                ds4_backend_name(requested),
+                cfg->backend_explicit ? "explicit" : "default");
+    } else {
+        fprintf(stderr,
+                "ds4: backend verified: cpu reference path (%s selection)\n",
+                cfg->backend_explicit ? "explicit" : "default");
+    }
+    return 0;
 }
 
 static ds4_think_mode cli_effective_think_mode(const cli_generation_options *gen) {
@@ -1737,6 +1769,31 @@ static void apply_flat_pack_dir(cli_config *cfg, const char *dir, const char *op
             dir);
 }
 
+static bool flat_pack_dir_usable(const char *dir) {
+    char *model = flat_pack_join_path(
+        dir,
+        "DeepSeek-V4-Flash.metadata-only.full-tensor-manifest.zero-tensor-data.pack-direct.gguf",
+        "default flat-pack");
+    char *nonrouted = flat_pack_join_path(
+        dir,
+        "ds4v4_nonrouted.i32_normf32_bf16matf16.pack",
+        "default flat-pack");
+    const bool ok = access(model, R_OK) == 0 && access(nonrouted, R_OK) == 0;
+    free(model);
+    free(nonrouted);
+    return ok;
+}
+
+static void apply_default_sota_flat_pack(cli_config *cfg) {
+    if (cfg->model_or_pack_explicit) return;
+    static const char default_pack[] =
+        "/Users/silv/cl/tlp/montyneg/ds4/"
+        "DeepSeek-V4-Flash_H3384_H3382_all43_route_hotblock_sidecar_top6_down_native_codes_D8F_800kctx_probe_20260604";
+    if (!flat_pack_dir_usable(default_pack)) return;
+    apply_flat_pack_dir(cfg, default_pack, "default flat-pack");
+    fprintf(stderr, "ds4: default SOTA pack selected: H3384 hotblock/native-down D8F\n");
+}
+
 static void cli_config_free(cli_config *cfg) {
     if (!cfg) return;
     free(cfg->prompt_owned);
@@ -1795,6 +1852,7 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+            c.model_or_pack_explicit = true;
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -1840,12 +1898,16 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
+            c.backend_explicit = true;
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
+            c.backend_explicit = true;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
+            c.backend_explicit = true;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+            c.backend_explicit = true;
         } else if (!strcmp(arg, "--cpu-moe")) {
             c.engine.cpu_moe = true;
         } else if (!strcmp(arg, "--n-cpu-moe")) {
@@ -1867,8 +1929,10 @@ static cli_config parse_options(int argc, char **argv) {
             fprintf(stderr, "ds4: --mtl4-moe enabled (DS4_MTL4_MOE_ENABLE=1)\n");
         } else if (!strcmp(arg, "--nonrouted-pack")) {
             c.engine.nonrouted_pack_path = need_arg(&i, argc, argv, arg);
+            c.model_or_pack_explicit = true;
             fprintf(stderr, "ds4: --nonrouted-pack %s\n", c.engine.nonrouted_pack_path);
         } else if (!strcmp(arg, "--flat-pack")) {
+            c.model_or_pack_explicit = true;
             apply_flat_pack_dir(&c, need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--m1r-pack")) {
             c.engine.m1r_pack_path = need_arg(&i, argc, argv, arg);
@@ -1908,12 +1972,15 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--metal-graph-test")) {
             c.gen.metal_graph_test = true;
             c.engine.backend = DS4_BACKEND_METAL;
+            c.backend_explicit = true;
         } else if (!strcmp(arg, "--metal-graph-full-test")) {
             c.gen.metal_graph_full_test = true;
             c.engine.backend = DS4_BACKEND_METAL;
+            c.backend_explicit = true;
         } else if (!strcmp(arg, "--metal-graph-prompt-test")) {
             c.gen.metal_graph_prompt_test = true;
             c.engine.backend = DS4_BACKEND_METAL;
+            c.backend_explicit = true;
         } else if (!strcmp(arg, "--metal-graph-generate")) {
             fprintf(stderr, "ds4: --metal-graph-generate was removed; --metal is the graph path\n");
             exit(2);
@@ -1947,6 +2014,7 @@ static cli_config parse_options(int argc, char **argv) {
         exit(2);
     }
 
+    apply_default_sota_flat_pack(&c);
     return c;
 }
 
@@ -3680,6 +3748,11 @@ int main(int argc, char **argv) {
     cfg.engine.inspect_only = cfg.inspect;
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+        cli_config_free(&cfg);
+        return 1;
+    }
+    if (verify_cli_engine_backend(engine, &cfg) != 0) {
+        ds4_engine_close(engine);
         cli_config_free(&cfg);
         return 1;
     }

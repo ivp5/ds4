@@ -198,6 +198,11 @@ const char *ds4_mpp_mode_name(ds4_mpp_mode m);
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
+bool ds4_backend_is_gpu(ds4_backend backend);
+ds4_backend ds4_engine_backend(const ds4_engine *e);
+bool ds4_engine_uses_gpu(const ds4_engine *e);
+ds4_backend ds4_session_backend(const ds4_session *s);
+bool ds4_session_uses_gpu(const ds4_session *s);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);

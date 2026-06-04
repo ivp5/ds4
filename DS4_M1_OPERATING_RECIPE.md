@@ -162,6 +162,8 @@ they pass real selected-layer D8F, overlap, and fidelity gates.
 | File | Size | Status | Capability |
 |------|------|--------|------------|
 | `ds4flash.gguf` (IQ2_XXS w2 imatrix) | 86.7 GB | Production | Full AIME P01-P10 reachable |
+| `DeepSeek-V4-Flash_H3384_H3382_all43_route_hotblock_sidecar_top6_down_native_codes_D8F_800kctx_probe_20260604` | 41 GB physical / 48.9 GiB logical | Current default SOTA pack | H3384 hot-block D8F + top6 native down-code sidecars; no-flag CLI selects it when present |
+| `DeepSeek-V4-Flash_H3385_H3384_sparse_groupcode_sidecars_D8F_800kctx_probe_20260604` | 487 MB overlay | Experimental next-gen sidecar | Exact sparse group-code sidecars with C reader; not primary until Metal sparse path passes full decode/AIME gates |
 | `DS4-trim50-asym-with-metadata.gguf` | 26 GB | Path A trim | **4× gen speedup BUT arithmetic carry breaks** (shifts cite v_P+5 vs v_P+9 collapse) |
 | Q4_K_M-XL 153 GB | 153 GB | doesn't fit | — |
 | `MLX-Qwen3.5-9B-DS-V4-Flash-4bit` | 5 GB | distill, MLX | side-by-side proposer |
@@ -335,13 +337,14 @@ Deferred:
 ## Operating doctrine summary
 
 1. **Always launch with `--prefill-metal-phases auto`** (M1 STICKY HAZARD)
-2. **For chat/agentic: add `--kv-disk-dir`** (9× speedup on repeat)
-3. **For forensics: build JOURNAL=1** (append-only SQLite trace)
-4. **For benchmarking: streaming progress is on by default** (set
+2. **No flags/env default to H3384 + Metal + PRIME** when the H3384 flat-pack is present
+3. **For chat/agentic: add `--kv-disk-dir`** (9× speedup on repeat)
+4. **For forensics: build JOURNAL=1** (append-only SQLite trace)
+5. **For benchmarking: streaming progress is on by default** (set
    DS4_BENCH_QUIET=1 to disable for piped CSV-only output)
-5. **MTP is retired** — don't enable speculative decoding on M1
-6. **trim50 file**: use for non-math; arithmetic carry breaks
-7. **Pillars env-gated** — none auto-active; enable when you have a
+6. **MTP is retired** — don't enable speculative decoding on M1
+7. **trim50 file**: use for non-math; arithmetic carry breaks
+8. **Pillars env-gated** — none auto-active; enable when you have a
    measurement target
 
 ## Files

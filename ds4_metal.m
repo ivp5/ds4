@@ -1583,14 +1583,25 @@ static int ds4_gpu_env_default_on(const char *name, const char *disable_name) {
  return 1;
 }
 
+static int ds4_gpu_prime_path_enabled(void) {
+ const int prime = ds4_gpu_env_bool("DS4_PRIME_PATH");
+ if (ds4_gpu_env_bool("DS4_PRIME_PATH_DISABLE") > 0 ||
+     ds4_gpu_env_bool("DS4_DISABLE_PRIME_PATH") > 0 ||
+     prime == 0) {
+  return 0;
+ }
+ return 1;
+}
+
 static int ds4_gpu_max_fusion_enabled(void) {
  static int initialized = 0;
  static int enabled = 0;
  if (!initialized) {
   enabled =
-   ds4_gpu_env_bool("DS4_PRIME_PATH") > 0 ||
-   ds4_gpu_env_bool("DS4_METAL_GRAPH_MAX_FUSION") > 0 ||
-   ds4_gpu_env_bool("DS4_MAX_FUSION") > 0;
+   ds4_gpu_env_bool("DS4_METAL_GRAPH_MAX_FUSION_DISABLE") <= 0 &&
+   ds4_gpu_env_bool("DS4_MAX_FUSION_DISABLE") <= 0 &&
+   (ds4_gpu_env_bool("DS4_METAL_GRAPH_MAX_FUSION") > 0 ||
+    ds4_gpu_env_bool("DS4_MAX_FUSION") > 0);
   initialized = 1;
  }
  return enabled;
@@ -1646,7 +1657,7 @@ static void ds4_gpu_d8f_env_init(void) {
  g_ds4_d8f_env.half_mid_decode = ds4_gpu_env_bool("DS4_D8F_HALF_MID_DECODE");
  g_ds4_d8f_env.classic_packet_icb = ds4_gpu_env_bool("DS4_D8F_CLASSIC_PACKET_ICB");
  g_ds4_d8f_env.mtl4_packet_icb = ds4_gpu_env_bool("DS4_D8F_MTL4_PACKET_ICB");
- if (ds4_gpu_env_bool("DS4_PRIME_PATH") > 0 || ds4_gpu_max_fusion_enabled()) {
+ if (ds4_gpu_prime_path_enabled() || ds4_gpu_max_fusion_enabled()) {
   if (g_ds4_d8f_env.classic_packet_icb < 0) g_ds4_d8f_env.classic_packet_icb = 1;
   if (g_ds4_d8f_env.mtl4_packet_icb < 0) g_ds4_d8f_env.mtl4_packet_icb = 0;
  }
@@ -1814,7 +1825,7 @@ static int ds4_gpu_d8f_packet_icb_range_enabled(void) {
  if (ds4_gpu_env_bool("DS4_D8F_PACKET_ICB_RANGE_DISABLE") > 0) return 0;
  const int explicit_range = ds4_gpu_env_bool("DS4_D8F_PACKET_ICB_RANGE");
  if (explicit_range >= 0) return explicit_range > 0;
- return ds4_gpu_max_fusion_enabled();
+ return ds4_gpu_prime_path_enabled() || ds4_gpu_max_fusion_enabled();
 }
 
 static int ds4_gpu_d8f_mtl4_packet_icb_enabled(void) {

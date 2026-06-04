@@ -10906,20 +10906,35 @@ static bool ds4_env_enabled(const char *name) {
  return true;
 }
 
+static bool ds4_env_disabled(const char *name) {
+ const char *v = getenv(name);
+ if (!v) return false;
+ while (isspace((unsigned char)*v)) v++;
+ if (!*v) return false;
+ if (!strcmp(v, "0") || !strcmp(v, "false") || !strcmp(v, "FALSE") ||
+     !strcmp(v, "off") || !strcmp(v, "OFF") ||
+     !strcmp(v, "no") || !strcmp(v, "NO")) return true;
+ return false;
+}
+
 static bool ds4_prime_path_enabled(void) {
- return ds4_env_enabled("DS4_PRIME_PATH");
+ if (ds4_env_enabled("DS4_PRIME_PATH_DISABLE") ||
+     ds4_env_enabled("DS4_DISABLE_PRIME_PATH") ||
+     ds4_env_disabled("DS4_PRIME_PATH")) return false;
+ return true;
 }
 
 static bool ds4_metal_graph_max_fusion_enabled(void) {
  static int cache = -1;
  if (cache < 0) {
-  cache = (ds4_prime_path_enabled() ||
-           ds4_env_enabled("DS4_METAL_GRAPH_MAX_FUSION") ||
-           ds4_env_enabled("DS4_MAX_FUSION")) ? 1 : 0;
+  cache = (!ds4_env_enabled("DS4_METAL_GRAPH_MAX_FUSION_DISABLE") &&
+           !ds4_env_enabled("DS4_MAX_FUSION_DISABLE") &&
+           (ds4_env_enabled("DS4_METAL_GRAPH_MAX_FUSION") ||
+            ds4_env_enabled("DS4_MAX_FUSION"))) ? 1 : 0;
   if (cache) {
    fprintf(stderr,
-    "ds4: Metal graph max-fusion policy active — single decode submit by default; "
-    "PRIME/D8F stays in-graph; router/indexer dispatch fusions eligible\n");
+    "ds4: Metal graph max-fusion policy active — single decode submit requested; "
+    "router/indexer dispatch fusions eligible\n");
   }
  }
  return cache != 0;
@@ -15948,10 +15963,10 @@ static bool metal_graph_encode_token_raw_swa(
  * point is layer-based because this executor is a fixed DS4 tape, not a
  * dynamic node graph; four layers is the measured point where the prefix is
  * large enough to hide useful work without starving the second command buffer.
- * Legacy D8F/PRIME reused the same overlap mechanism with split=2 because
+ * D8F/PRIME reuses the same overlap mechanism with split=2 because
  * H3355 decode A/B on 2026-06-03 measured split=2 ahead of split=4, split=8,
- * and split=0. The max-fusion policy now treats PRIME as the stronger
- * objective: minimum submit/ping-pong overhead and one device-resident tape.
+ * and split=0. Explicit max-fusion still selects one device-resident tape for
+ * dispatch-wall experiments, but it is not the no-env default.
  */
  uint32_t split_after_layers = ds4_metal_graph_max_fusion_enabled() ? 0u :
   (ds4_prime_path_enabled() ? 2u : 4u);
@@ -21919,6 +21934,23 @@ const char *ds4_backend_name(ds4_backend backend) {
  return "unknown";
 }
 
+bool ds4_backend_is_gpu(ds4_backend backend) {
+ return ds4_backend_uses_graph(backend);
+}
+
+ds4_backend ds4_engine_backend(const ds4_engine *e) {
+ return e ? e->backend : DS4_BACKEND_CPU;
+}
+
+bool ds4_engine_uses_gpu(const ds4_engine *e) {
+ if (!e || !ds4_backend_uses_graph(e->backend)) return false;
+#ifdef DS4_NO_GPU
+ return false;
+#else
+ return e->metal_ready;
+#endif
+}
+
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
  return mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX;
 }
@@ -22317,6 +22349,14 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
 
 static bool ds4_session_is_cpu(const ds4_session *s) {
  return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
+}
+
+ds4_backend ds4_session_backend(const ds4_session *s) {
+ return (s && s->engine) ? s->engine->backend : DS4_BACKEND_CPU;
+}
+
+bool ds4_session_uses_gpu(const ds4_session *s) {
+ return s && !ds4_session_is_cpu(s) && ds4_engine_uses_gpu(s->engine);
 }
 
 static void ds4_session_note_host_logits(ds4_session *s) {
@@ -24564,11 +24604,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  return 1;
  }
  ds4_gpu_set_quality(e->quality);
- if (ds4_prime_path_enabled()) {
-  fprintf(stderr,
-         "ds4: PRIME path active — D8F classic in-graph packet ICB is primary; "
-          "external MTL4 packet dispatch remains force-only to avoid graph exit\n");
- }
+ fprintf(stderr,
+         "ds4: PRIME GPU-resident path %s — D8F classic in-graph packet ICB is primary; "
+         "external MTL4 packet dispatch remains force-only to avoid graph exit\n",
+         ds4_prime_path_enabled() ? "active by default" : "disabled by env");
  (void)ds4_gpu_set_model_fd(e->model.fd);
  bool mapped_ok = false;
  if (e->model.no_tensor_data) {
@@ -24619,7 +24658,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  *out = NULL;
  return 1;
  }
- fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
+ fprintf(stderr, "ds4: %s GPU graph backend initialized; CPU fallback disabled\n",
  ds4_backend_name(e->backend));
  }
 #else
@@ -25636,6 +25675,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
  cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
  s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
  *out = s;
+ fprintf(stderr, "ds4: verified cpu session path (--cpu/reference backend)\n");
  return 0;
  }
 #ifdef DS4_NO_GPU
@@ -25672,7 +25712,25 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
  s->mtp_verify_tops = xmalloc(16u * sizeof(s->mtp_verify_tops[0]));
  s->mtp_draft_token = -1;
  }
+ if (!ds4_session_uses_gpu(s) || ds4_session_backend(s) != e->backend) {
+ fprintf(stderr, "ds4: internal error: %s session creation did not produce a GPU graph session\n",
+ ds4_backend_name(e->backend));
+ metal_graph_free(&s->graph);
+ free(s->logits);
+ free(s->mtp_logits);
+ free(s->mtp_verify_logits);
+ free(s->mtp_verify_logits0);
+ free(s->mtp_verify_tops);
+ free(s);
+ return 1;
+ }
  *out = s;
+ fprintf(stderr,
+ "ds4: verified %s GPU graph session (ctx=%d, prefill_cap=%u, raw_cap=%u)\n",
+ ds4_backend_name(e->backend),
+ ctx_size,
+ s->prefill_cap,
+ raw_cap);
  return 0;
 #endif
 }
