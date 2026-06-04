@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import struct
 import time
@@ -73,6 +74,17 @@ def existing_sidecars(pack_dir: Path, layer: int) -> list[int]:
     return selected
 
 
+def lognormal_fit(values: list[float]) -> dict[str, float]:
+    logs = [math.log(max(float(value), 1.0e-12)) for value in values]
+    mean = sum(logs) / float(len(logs)) if logs else 0.0
+    var = sum((value - mean) ** 2 for value in logs) / float(len(logs)) if logs else 0.0
+    return {"mean": mean, "sigma": math.sqrt(var) or 1.0}
+
+
+def lognormal_z(value: float, fit: dict[str, float]) -> float:
+    return (math.log(max(float(value), 1.0e-12)) - fit["mean"]) / fit["sigma"]
+
+
 def valid_direction(data_dir: Path, layer: int, expert: int) -> bool:
     targeting_path = data_dir / f"targeting_L{layer}.json"
     dirs_path = data_dir / f"dirs_L{layer}.npz"
@@ -85,7 +97,7 @@ def valid_direction(data_dir: Path, layer: int, expert: int) -> bool:
     return f"L{layer}_e{expert}_u" in dirs.files
 
 
-def priority_rows(payload: dict[str, Any], layers: set[int]) -> list[dict[str, Any]]:
+def priority_rows(payload: dict[str, Any], layers: set[int], score_mode: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows = []
     for row in payload.get("top40", []):
         layer = int(row["L"])
@@ -108,8 +120,20 @@ def priority_rows(payload: dict[str, Any], layers: set[int]) -> list[dict[str, A
                 "source": "agent1_priority",
             }
         )
-    rows.sort(key=lambda item: (-float(item["priority"]), int(item["layer"]), int(item["expert"])))
-    return rows
+    score_meta: dict[str, Any] = {"mode": score_mode, "fields": []}
+    for row in rows:
+        row["selection_score"] = float(row["priority"])
+    if score_mode == "lognormal":
+        score_fields = ["route_mass", "rank1_energy", "rank1_relerr"]
+        fits = {field: lognormal_fit([float(row[field]) for row in rows]) for field in score_fields}
+        score_meta["fields"] = [{**{"name": field}, **fits[field]} for field in score_fields]
+        for row in rows:
+            row["lognormal_score"] = sum(lognormal_z(float(row[field]), fits[field]) for field in score_fields)
+            row["selection_score"] = float(row["lognormal_score"])
+    elif score_mode != "raw":
+        raise ValueError(f"unknown score mode {score_mode}")
+    rows.sort(key=lambda item: (-float(item["selection_score"]), int(item["layer"]), int(item["expert"])))
+    return rows, score_meta
 
 
 def main() -> int:
@@ -121,6 +145,7 @@ def main() -> int:
     parser.add_argument("--top-total", type=int, default=30)
     parser.add_argument("--max-per-layer", type=int, default=0)
     parser.add_argument("--include-existing-pack-dir", type=Path, default=None)
+    parser.add_argument("--score-mode", choices=("lognormal", "raw"), default="lognormal")
     args = parser.parse_args()
 
     if args.out_dir.exists() and any(args.out_dir.iterdir()):
@@ -128,7 +153,7 @@ def main() -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     layers = set(parse_layers(args.layers))
     payload = json.loads(args.priority_json.read_text(encoding="utf-8"))
-    rows = priority_rows(payload, layers)
+    rows, score_meta = priority_rows(payload, layers, args.score_mode)
     chosen: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     per_layer_counts: dict[int, int] = {}
@@ -183,7 +208,7 @@ def main() -> int:
     for row in chosen:
         grouped.setdefault(int(row["layer"]), []).append(row)
     for layer, layer_rows in grouped.items():
-        layer_rows.sort(key=lambda item: (-float(item["priority"]), int(item["expert"])))
+        layer_rows.sort(key=lambda item: (-float(item["selection_score"]), int(item["expert"])))
         selected = [int(row["expert"]) for row in layer_rows]
         priority_sum = sum(float(row["priority"]) for row in layer_rows if float(row["priority"]) > 0.0)
         gains = {
@@ -198,6 +223,7 @@ def main() -> int:
                 for row in layer_rows
             },
             "down_aa_frac": {str(row["expert"]): float(row["rank1_energy"]) for row in layer_rows},
+            "score_meta": score_meta,
             "rank1_harm_rows": layer_rows,
         }
         (args.out_dir / f"gains_L{layer}.json").write_text(json.dumps(gains, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -209,6 +235,7 @@ def main() -> int:
         "layers": sorted(layers),
         "top_total": args.top_total,
         "max_per_layer": args.max_per_layer,
+        "score_meta": score_meta,
         "include_existing_pack_dir": str(args.include_existing_pack_dir) if args.include_existing_pack_dir else None,
         "link_modes": sorted(link_modes),
         "chosen": chosen,
