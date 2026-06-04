@@ -12005,6 +12005,16 @@ static bool metal_graph_use_reference_attn_out_hc(void) {
  return metal_graph_env_flag("DS4_METAL_DISABLE_ATTN_OUT_HC_FUSION", &cache);
 }
 
+static bool metal_graph_use_fp8_attn_out_onecb_hc(void) {
+ static int disable_cache = -1;
+ return !metal_graph_env_flag("DS4_DISABLE_FP8_ATTN_OUT_ONECB_HC", &disable_cache);
+}
+
+static bool metal_graph_use_fp8_shared_down_hc(void) {
+ static int disable_cache = -1;
+ return !metal_graph_env_flag("DS4_METAL_DISABLE_SHARED_DOWN_FP8_HC_FUSION", &disable_cache);
+}
+
 static bool metal_graph_decode_hc_pre(
  ds4_gpu_tensor *out,
  ds4_gpu_tensor *split,
@@ -14201,9 +14211,7 @@ static bool metal_graph_encode_decode_layer(
   s_n_storage_dispatch_fp8_direct++;
   ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8_DIRECT, layer->attn_output_b);
   bool fp8_attn_out_onecb_hc_done = false;
-  if (fuse_fp8_attn_out_hc &&
-  getenv("DS4_ENABLE_FP8_ATTN_OUT_ONECB_HC") != NULL &&
-  getenv("DS4_DISABLE_FP8_ATTN_OUT_ONECB_HC") == NULL) {
+  if (fuse_fp8_attn_out_hc && metal_graph_use_fp8_attn_out_onecb_hc()) {
   const bool store_fp8_attn_out =
   getenv("DS4_FP8_ATTN_OUT_HC_STORE_BLOCK") != NULL ||
   metal_graph_debug_wants("attn_out", il, pos);
@@ -14596,9 +14604,8 @@ static bool metal_graph_encode_decode_layer(
  !keep_ffn_out && shared_down_q8_native && !metal_graph_use_reference_shared_down_hc();
  const bool fuse_shared_down_fp8_hc =
  !keep_ffn_out &&
- getenv("DS4_METAL_ENABLE_SHARED_DOWN_FP8_HC_FUSION") != NULL &&
+ metal_graph_use_fp8_shared_down_hc() &&
  shared_down_fp8_storage &&
- getenv("DS4_METAL_DISABLE_SHARED_DOWN_FP8_HC_FUSION") == NULL &&
  !metal_graph_directional_steering_ffn_enabled(g) &&
  !metal_graph_use_reference_shared_down_hc();
  bool fp8_shared_down_hc_fused = false;
