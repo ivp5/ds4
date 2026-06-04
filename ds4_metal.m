@@ -52240,6 +52240,7 @@ static id<MTLComputePipelineState> g_d8f_down_lut_gather_codes_selected_batch_ti
 static id<MTLComputePipelineState> g_d8f_down_lut_direct_codes_selected_batch_tile8_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_direct_codes_selected_batch_tile16_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_direct_codes_selected_batch_tile16_cbsram1024_pipeline;
+static id<MTLComputePipelineState> g_d8f_down_lut_direct_codes_i8_selected_batch_tile16_cbsram2048_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_direct_codes_selected_batch_tile32_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_scoreh_selected_batch_pipeline;
 static id<MTLComputePipelineState> g_d8f_down_lut_gatherh_selected_batch_pipeline;
@@ -52273,12 +52274,14 @@ static int ds4_d8f_down_lut_classic_pipeline_init(void) {
     id<MTLFunction> direct_codes_tile8_fn = [lib newFunctionWithName:@"d8f_down_lut_direct_codes_selected_batch_tile8"];
     id<MTLFunction> direct_codes_tile16_fn = [lib newFunctionWithName:@"d8f_down_lut_direct_codes_selected_batch_tile16"];
     id<MTLFunction> direct_codes_tile16_cbsram1024_fn = [lib newFunctionWithName:@"d8f_down_lut_direct_codes_selected_batch_tile16_cbsram1024"];
+    id<MTLFunction> direct_codes_i8_tile16_cbsram2048_fn = [lib newFunctionWithName:@"d8f_down_lut_direct_codes_i8_selected_batch_tile16_cbsram2048"];
     id<MTLFunction> direct_codes_tile32_fn = [lib newFunctionWithName:@"d8f_down_lut_direct_codes_selected_batch_tile32"];
     id<MTLFunction> scoreh_fn = [lib newFunctionWithName:@"d8f_down_lut_scoreh_selected_batch"];
     id<MTLFunction> gatherh_fn = [lib newFunctionWithName:@"d8f_down_lut_gatherh_selected_batch"];
     if (!score_fn || !score_vec_fn || !score_i8_fn || !gather_fn || !gather_tile8_fn || !gather_tile16_fn ||
         !gather_codes_fn || !gather_codes_tile8_fn || !gather_codes_tile16_fn || !gather_codes_tile24_fn || !gather_codes_tile32_fn ||
-        !direct_codes_tile8_fn || !direct_codes_tile16_fn || !direct_codes_tile16_cbsram1024_fn || !direct_codes_tile32_fn ||
+        !direct_codes_tile8_fn || !direct_codes_tile16_fn || !direct_codes_tile16_cbsram1024_fn ||
+        !direct_codes_i8_tile16_cbsram2048_fn || !direct_codes_tile32_fn ||
         !scoreh_fn || !gatherh_fn) {
         fprintf(stderr, "ds4_d8f: down LUT Metal function lookup failed\n");
         return 0;
@@ -52378,6 +52381,13 @@ static int ds4_d8f_down_lut_classic_pipeline_init(void) {
         [g_device newComputePipelineStateWithFunction:direct_codes_tile16_cbsram1024_fn error:&err];
     if (!g_d8f_down_lut_direct_codes_selected_batch_tile16_cbsram1024_pipeline) {
         fprintf(stderr, "ds4_d8f: down LUT direct codes tile16 cbsram1024 pipeline failed: %s\n",
+                err.localizedDescription.UTF8String);
+        return 0;
+    }
+    g_d8f_down_lut_direct_codes_i8_selected_batch_tile16_cbsram2048_pipeline =
+        [g_device newComputePipelineStateWithFunction:direct_codes_i8_tile16_cbsram2048_fn error:&err];
+    if (!g_d8f_down_lut_direct_codes_i8_selected_batch_tile16_cbsram2048_pipeline) {
+        fprintf(stderr, "ds4_d8f: down LUT direct codes i8 tile16 cbsram2048 pipeline failed: %s\n",
                 err.localizedDescription.UTF8String);
         return 0;
     }
@@ -52616,7 +52626,6 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     const int direct_fused_mode = !half_score && !i8_score_mode && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_DIRECT_FUSED") > 0;
     const int vec_score_mode = !half_score && !i8_score_mode && !direct_fused_mode &&
         ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_VEC") > 0;
-    const int i8_act_scale = i8_score_mode && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_I8_ACTSCALE") > 0;
     const int phase_profile = ds4_gpu_env_bool("DS4_D8F_METAL_LUT_PROFILE_PHASES") > 0;
     const char *i8_max_rel_env = getenv("DS4_D8F_METAL_LUT_SCORE_I8_MAX_REL");
     const double i8_max_rel = (i8_max_rel_env && i8_max_rel_env[0]) ? strtod(i8_max_rel_env, NULL) : 1.0;
@@ -52639,10 +52648,13 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     if (direct_fused_mode && gather_tile_rows > 32u) gather_tile_rows = 32u;
     if (direct_fused_mode && gather_tile_rows < 8u) gather_tile_rows = 8u;
     uint32_t direct_cbsram_k_cap = 0;
-    const int direct_cbsram_requested =
+    const int direct_i8_cbsram_requested =
         direct_fused_mode && gather_tile_rows == 16u &&
+        ds4_gpu_env_bool("DS4_D8F_METAL_LUT_DIRECT_I8_CBSRAM") > 0;
+    const int direct_cbsram_requested =
+        !direct_i8_cbsram_requested && direct_fused_mode && gather_tile_rows == 16u &&
         ds4_gpu_env_bool("DS4_D8F_METAL_LUT_DIRECT_CBSRAM") > 0;
-    if (direct_cbsram_requested) {
+    if (direct_cbsram_requested || direct_i8_cbsram_requested) {
         direct_cbsram_k_cap = ds4_gpu_env_u32("DS4_D8F_METAL_LUT_DIRECT_CBSRAM_MAXK", 2048u);
         if (direct_cbsram_k_cap > 2048u) direct_cbsram_k_cap = 2048u;
     }
@@ -52650,6 +52662,12 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         direct_cbsram_requested &&
         direct_cbsram_k_cap > 0u &&
         g_d8f_down_lut_direct_codes_selected_batch_tile16_cbsram1024_pipeline;
+    const int direct_i8_cbsram_mode =
+        direct_i8_cbsram_requested &&
+        direct_cbsram_k_cap > 0u &&
+        g_d8f_down_lut_direct_codes_i8_selected_batch_tile16_cbsram2048_pipeline;
+    const int i8_codebook_mode = i8_score_mode || direct_i8_cbsram_mode;
+    const int i8_act_scale = i8_codebook_mode && ds4_gpu_env_bool("DS4_D8F_METAL_LUT_SCORE_I8_ACTSCALE") > 0;
     int ok = 0, mismatch = 0, gpu_zero = 0, gpu_sentinel = 0;
     double max_abs = 0.0, max_rel = 0.0, timed_ms = 0.0;
     double phase_score_ms = -1.0, phase_gather_ms = -1.0;
@@ -52700,7 +52718,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
             }
         }
     }
-    if (i8_score_mode) {
+    if (i8_codebook_mode) {
         i8_recs = (d8f_lut_i8_codebook_lite *)calloc(n_experts, sizeof(*i8_recs));
         uint64_t total_i8_bytes = 0;
         for (uint32_t slot = 0; slot < n_experts; slot++) {
@@ -52825,12 +52843,12 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         id<MTLBuffer> scoreBuf = direct_fused_mode ? nil :
             [g_device newBufferWithLength:(NSUInteger)score_count * score_bytes_per_value
                                   options:MTLResourceStorageModeShared];
-        id<MTLBuffer> i8RecBuf = i8_score_mode ? [g_device newBufferWithBytes:i8_recs
-                                                                        length:(NSUInteger)n_experts * sizeof(*i8_recs)
-                                                                       options:MTLResourceStorageModeShared] : nil;
-        id<MTLBuffer> i8CodebookBuf = i8_score_mode ? [g_device newBufferWithBytes:i8_codebooks
-                                                                             length:(NSUInteger)i8_codebook_bytes
-                                                                            options:MTLResourceStorageModeShared] : nil;
+        id<MTLBuffer> i8RecBuf = i8_codebook_mode ? [g_device newBufferWithBytes:i8_recs
+                                                                           length:(NSUInteger)n_experts * sizeof(*i8_recs)
+                                                                          options:MTLResourceStorageModeShared] : nil;
+        id<MTLBuffer> i8CodebookBuf = i8_codebook_mode ? [g_device newBufferWithBytes:i8_codebooks
+                                                                                length:(NSUInteger)i8_codebook_bytes
+                                                                               options:MTLResourceStorageModeShared] : nil;
         id<MTLBuffer> codeBuf = native_code_mode ? [g_device newBufferWithBytes:native_codes
                                                                          length:(NSUInteger)native_code_count * sizeof(uint16_t)
                                                                         options:MTLResourceStorageModeShared] : nil;
@@ -52856,7 +52874,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         };
         id<MTLBuffer> argsBuf = [g_device newBufferWithBytes:&args length:sizeof(args) options:MTLResourceStorageModeShared];
         if (packBuf && midBuf && selBuf && recBuf && (direct_fused_mode || scoreBuf) && outBuf && argsBuf &&
-            (!i8_score_mode || (i8RecBuf && i8CodebookBuf)) &&
+            (!i8_codebook_mode || (i8RecBuf && i8CodebookBuf)) &&
             (!native_code_mode || (codeBuf && sidecarBuf && sidecarDotBuf))) {
             void (^dispatch_once)(void) = ^{
                 id<MTLCommandBuffer> cb = [g_queue commandBuffer];
@@ -52864,13 +52882,16 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                 if (direct_fused_mode) {
                     const uint32_t direct_tile_rows = gather_tile_rows >= 32u ? 32u : (gather_tile_rows >= 16u ? 16u : 8u);
                     const int use_direct_cbsram = direct_cbsram_mode && direct_tile_rows == 16u;
-                    [enc setComputePipelineState:use_direct_cbsram
+                    const int use_direct_i8_cbsram = direct_i8_cbsram_mode && direct_tile_rows == 16u;
+                    [enc setComputePipelineState:use_direct_i8_cbsram
+                        ? g_d8f_down_lut_direct_codes_i8_selected_batch_tile16_cbsram2048_pipeline
+                        : (use_direct_cbsram
                         ? g_d8f_down_lut_direct_codes_selected_batch_tile16_cbsram1024_pipeline
                         : (direct_tile_rows == 32u
                         ? g_d8f_down_lut_direct_codes_selected_batch_tile32_pipeline
                         : (direct_tile_rows == 16u
                         ? g_d8f_down_lut_direct_codes_selected_batch_tile16_pipeline
-                        : g_d8f_down_lut_direct_codes_selected_batch_tile8_pipeline))];
+                        : g_d8f_down_lut_direct_codes_selected_batch_tile8_pipeline)))];
                     [enc setBuffer:codeBuf offset:0 atIndex:0];
                     [enc setBuffer:packBuf offset:0 atIndex:1];
                     [enc setBuffer:midBuf offset:0 atIndex:2];
@@ -52880,8 +52901,16 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                     [enc setBuffer:recBuf offset:0 atIndex:6];
                     [enc setBuffer:sidecarBuf offset:0 atIndex:7];
                     [enc setBuffer:sidecarDotBuf offset:0 atIndex:8];
+                    if (use_direct_i8_cbsram) {
+                        [enc setBuffer:i8RecBuf offset:0 atIndex:9];
+                        [enc setBuffer:i8CodebookBuf offset:0 atIndex:10];
+                    }
                     [enc setThreadgroupMemoryLength:direct_tile_rows * 8u * sizeof(float) atIndex:0];
-                    if (use_direct_cbsram) {
+                    if (use_direct_i8_cbsram) {
+                        [enc setThreadgroupMemoryLength:2048u * 8u * sizeof(int8_t) atIndex:1];
+                        [enc setThreadgroupMemoryLength:2048u * sizeof(float) atIndex:2];
+                        [enc setThreadgroupMemoryLength:2048u * sizeof(uint8_t) atIndex:3];
+                    } else if (use_direct_cbsram) {
                         [enc setThreadgroupMemoryLength:1024u * 8u * sizeof(uint16_t) atIndex:1];
                     }
                     [enc dispatchThreadgroups:MTLSizeMake((rows + direct_tile_rows - 1u) / direct_tile_rows, n_tokens, 1)
@@ -53017,13 +53046,16 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                     if (direct_fused_mode) {
                         const uint32_t direct_tile_rows = gather_tile_rows >= 32u ? 32u : (gather_tile_rows >= 16u ? 16u : 8u);
                         const int use_direct_cbsram = direct_cbsram_mode && direct_tile_rows == 16u;
-                        [enc setComputePipelineState:use_direct_cbsram
+                        const int use_direct_i8_cbsram = direct_i8_cbsram_mode && direct_tile_rows == 16u;
+                        [enc setComputePipelineState:use_direct_i8_cbsram
+                            ? g_d8f_down_lut_direct_codes_i8_selected_batch_tile16_cbsram2048_pipeline
+                            : (use_direct_cbsram
                             ? g_d8f_down_lut_direct_codes_selected_batch_tile16_cbsram1024_pipeline
                             : (direct_tile_rows == 32u
                             ? g_d8f_down_lut_direct_codes_selected_batch_tile32_pipeline
                             : (direct_tile_rows == 16u
                             ? g_d8f_down_lut_direct_codes_selected_batch_tile16_pipeline
-                            : g_d8f_down_lut_direct_codes_selected_batch_tile8_pipeline))];
+                            : g_d8f_down_lut_direct_codes_selected_batch_tile8_pipeline)))];
                         [enc setBuffer:codeBuf offset:0 atIndex:0];
                         [enc setBuffer:packBuf offset:0 atIndex:1];
                         [enc setBuffer:midBuf offset:0 atIndex:2];
@@ -53033,8 +53065,16 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
                         [enc setBuffer:recBuf offset:0 atIndex:6];
                         [enc setBuffer:sidecarBuf offset:0 atIndex:7];
                         [enc setBuffer:sidecarDotBuf offset:0 atIndex:8];
+                        if (use_direct_i8_cbsram) {
+                            [enc setBuffer:i8RecBuf offset:0 atIndex:9];
+                            [enc setBuffer:i8CodebookBuf offset:0 atIndex:10];
+                        }
                         [enc setThreadgroupMemoryLength:direct_tile_rows * 8u * sizeof(float) atIndex:0];
-                        if (use_direct_cbsram) {
+                        if (use_direct_i8_cbsram) {
+                            [enc setThreadgroupMemoryLength:2048u * 8u * sizeof(int8_t) atIndex:1];
+                            [enc setThreadgroupMemoryLength:2048u * sizeof(float) atIndex:2];
+                            [enc setThreadgroupMemoryLength:2048u * sizeof(uint8_t) atIndex:3];
+                        } else if (use_direct_cbsram) {
                             [enc setThreadgroupMemoryLength:1024u * 8u * sizeof(uint16_t) atIndex:1];
                         }
                         [enc dispatchThreadgroups:MTLSizeMake((rows + direct_tile_rows - 1u) / direct_tile_rows, n_tokens, 1)
@@ -53162,7 +53202,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
     fprintf(stderr,
             "ds4: d8f_metal_lut_down_canary nsel=%u rows=%u tokens=%u rounds=%u max_k=%u score_mode=%s code_mode=%s code_source=%s sidecar_hits=%d rank1_sidecars=%u gather_tile=%u score=%.2f MiB code=%.2f MiB i8_keep=%u/%u pack=%.2f MiB gpu %.3f ms total (%.3f ms/op %.3f us/token-row-round) mismatch=%d gpu_zero=%d gpu_sentinel=%d max_abs=%.6e max_rel=%.6e rc=%d",
             n_experts, rows, n_tokens, rounds, max_k,
-            direct_fused_mode ? (direct_cbsram_mode ? "f32direct16_cbsram1024" : (gather_tile_rows >= 32u ? "f32direct32" : (gather_tile_rows >= 16u ? "f32direct16" : "f32direct8"))) :
+            direct_fused_mode ? (direct_i8_cbsram_mode ? "f32direct16_i8_cbsram2048" : (direct_cbsram_mode ? "f32direct16_cbsram1024" : (gather_tile_rows >= 32u ? "f32direct32" : (gather_tile_rows >= 16u ? "f32direct16" : "f32direct8")))) :
                 (i8_score_mode ? (i8_act_scale ? "f32_i8cb_act" : "f32_i8cb") : (half_score ? "f16" : (vec_score_mode ? "f32vec" : "f32"))),
             native_code_mode ? "native_u16" : "bitpack",
             native_code_mode ? (native_code_sidecar_hits == (int)n_experts ? "sidecar" : "predecode") : "bitpack",
@@ -53217,7 +53257,7 @@ int ds4_gpu_metal_d8f_down_lut_selected_canary(const char *d8f_path,
         fprintf(stderr, "ds4: d8f_metal_lut_down_native_codes code=%.2f MiB\n",
                 (double)(native_code_count * sizeof(uint16_t)) / 1048576.0);
     }
-    if (i8_score_mode) {
+    if (i8_codebook_mode) {
         fprintf(stderr, "ds4: d8f_metal_lut_down_i8_codebook codebook=%.2f MiB\n",
                 (double)i8_codebook_bytes / 1048576.0);
     }

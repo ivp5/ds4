@@ -1840,6 +1840,149 @@ kernel void d8f_down_lut_direct_codes_selected_batch_tile16_cbsram1024(
   }
 }
 
+kernel void d8f_down_lut_direct_codes_i8_selected_batch_tile16_cbsram2048(
+  device const ushort *codes        [[buffer(0)]],
+  device const uchar  *pack         [[buffer(1)]],
+  device const float  *mid          [[buffer(2)]],
+  device const uint   *selected     [[buffer(3)]],
+  device float        *out          [[buffer(4)]],
+  constant D8FDownLutArgs &args     [[buffer(5)]],
+  device const D8FRecordLite *recs  [[buffer(6)]],
+  device const D8FDownLutSidecarLite *sidecars [[buffer(7)]],
+  device const float *sidecar_dot   [[buffer(8)]],
+  device const D8FDownLutI8CodebookLite *i8_recs [[buffer(9)]],
+  device const char *i8_codebook    [[buffer(10)]],
+  threadgroup float *partial        [[threadgroup(0)]],
+  threadgroup char *cb_cache        [[threadgroup(1)]],
+  threadgroup float *scale_cache    [[threadgroup(2)]],
+  threadgroup uchar *keep_cache     [[threadgroup(3)]],
+  uint tid [[thread_index_in_threadgroup]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]],
+  uint2 pos [[threadgroup_position_in_grid]]) {
+  const uint row_base = pos.x << 4;
+  const uint token = pos.y;
+  if (token >= args.n_tokens) return;
+  const uint groups = args.in_dim >> 3;
+  const uint cache_k_cap = min(args.reserved1, 2048u);
+  float acc[16];
+  for (uint rr = 0u; rr < 16u; rr++) acc[rr] = 0.0f;
+  for (uint slot = 0u; slot < args.n_selected; slot++) {
+    const uint expert = selected[ulong(token) * ulong(args.selected_token_stride) + ulong(slot)];
+    const D8FRecordLite rec = recs[8192u + expert];
+    const D8FDownLutI8CodebookLite i8 = i8_recs[slot];
+    const device float *slot_mid =
+        mid + ulong(token) * ulong(args.mid_token_stride) +
+        ulong(slot) * ulong(args.mid_slot_stride);
+    const bool use_i8_cache = i8.k == rec.k && i8.k > 0u && i8.k <= cache_k_cap;
+    if (use_i8_cache) {
+      const device char *i8_cb = i8_codebook + ulong(i8.offset);
+      const device float *i8_scales = (const device float *)(i8_codebook + ulong(i8.scale_offset));
+      const device uchar *i8_keep = (const device uchar *)(i8_codebook + ulong(i8.keep_offset));
+      const uint cb_vals = i8.k << 3;
+      for (uint ci = tid; ci < cb_vals; ci += 256u) cb_cache[ci] = i8_cb[ci];
+      for (uint ci = tid; ci < i8.k; ci += 256u) {
+        scale_cache[ci] = i8_scales[ci];
+        keep_cache[ci] = i8_keep[ci];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint group = tid; group < groups; group += 256u) {
+        const uint x_base = group << 3;
+        const float m0 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 0u);
+        const float m1 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 1u);
+        const float m2 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 2u);
+        const float m3 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 3u);
+        const float m4 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 4u);
+        const float m5 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 5u);
+        const float m6 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 6u);
+        const float m7 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 7u);
+        for (uint rr = 0u; rr < 16u; rr++) {
+          const uint row = row_base + rr;
+          if (row >= args.rows) continue;
+          const uint code = uint(codes[(ulong(slot) * ulong(args.rows) + ulong(row)) * ulong(groups) + ulong(group)]);
+          if (code >= rec.k) continue;
+          if (code < i8.k && keep_cache[code] != 0u) {
+            threadgroup const char *cb = cb_cache + ulong(code) * 8ul;
+            const float scale = scale_cache[code];
+            acc[rr] += scale * (
+                float(cb[0]) * m0 +
+                float(cb[1]) * m1 +
+                float(cb[2]) * m2 +
+                float(cb[3]) * m3 +
+                float(cb[4]) * m4 +
+                float(cb[5]) * m5 +
+                float(cb[6]) * m6 +
+                float(cb[7]) * m7);
+          } else {
+            const device half *cb = (const device half *)(pack + rec.codebook_offset + ulong(code) * 16ul);
+            acc[rr] +=
+                float(cb[0]) * m0 +
+                float(cb[1]) * m1 +
+                float(cb[2]) * m2 +
+                float(cb[3]) * m3 +
+                float(cb[4]) * m4 +
+                float(cb[5]) * m5 +
+                float(cb[6]) * m6 +
+                float(cb[7]) * m7;
+          }
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+      for (uint group = tid; group < groups; group += 256u) {
+        const uint x_base = group << 3;
+        const float m0 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 0u);
+        const float m1 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 1u);
+        const float m2 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 2u);
+        const float m3 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 3u);
+        const float m4 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 4u);
+        const float m5 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 5u);
+        const float m6 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 6u);
+        const float m7 = d8f_mid_value(pack, rec.scale_offset, slot_mid, x_base + 7u);
+        for (uint rr = 0u; rr < 16u; rr++) {
+          const uint row = row_base + rr;
+          if (row >= args.rows) continue;
+          const uint code = uint(codes[(ulong(slot) * ulong(args.rows) + ulong(row)) * ulong(groups) + ulong(group)]);
+          if (code >= rec.k) continue;
+          const device half *cb = (const device half *)(pack + rec.codebook_offset + ulong(code) * 16ul);
+          acc[rr] +=
+              float(cb[0]) * m0 +
+              float(cb[1]) * m1 +
+              float(cb[2]) * m2 +
+              float(cb[3]) * m3 +
+              float(cb[4]) * m4 +
+              float(cb[5]) * m5 +
+              float(cb[6]) * m6 +
+              float(cb[7]) * m7;
+        }
+      }
+    }
+    if (tid == 0u) {
+      for (uint rr = 0u; rr < 16u; rr++) {
+        const uint row = row_base + rr;
+        if (row < args.rows) {
+          acc[rr] += d8f_down_lut_rank1_delta(pack, sidecars, sidecar_dot, args, token, slot, row);
+        }
+      }
+    }
+  }
+  for (uint rr = 0u; rr < 16u; rr++) {
+    acc[rr] = simd_sum(acc[rr]);
+    if (tiisg == 0u) partial[rr * 8u + sgitg] = acc[rr];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    for (uint rr = 0u; rr < 16u; rr++) {
+      const uint row = row_base + rr;
+      if (row < args.rows) {
+        float total = 0.0f;
+        for (uint sg = 0u; sg < 8u; sg++) total += partial[rr * 8u + sg];
+        out[ulong(token) * ulong(args.out_token_stride) + ulong(row)] = total;
+      }
+    }
+  }
+}
+
 kernel void d8f_down_lut_direct_codes_selected_batch_tile32(
   device const ushort *codes        [[buffer(0)]],
   device const uchar  *pack         [[buffer(1)]],
