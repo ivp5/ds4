@@ -10909,6 +10909,20 @@ static bool ds4_prime_path_enabled(void) {
  return ds4_env_enabled("DS4_PRIME_PATH");
 }
 
+static bool ds4_metal_graph_max_fusion_enabled(void) {
+ static int cache = -1;
+ if (cache < 0) {
+  cache = (ds4_env_enabled("DS4_METAL_GRAPH_MAX_FUSION") ||
+           ds4_env_enabled("DS4_MAX_FUSION")) ? 1 : 0;
+  if (cache) {
+   fprintf(stderr,
+    "ds4: Metal graph max-fusion policy active — single decode submit by default; "
+    "router/indexer dispatch fusions eligible\n");
+  }
+ }
+ return cache != 0;
+}
+
 static bool ds4_d8f_mtl4_packet_requested(uint32_t n_tokens) {
   (void)n_tokens;
   const bool requested = ds4_env_enabled("DS4_D8F_FORCE_MTL4_PACKET");
@@ -11992,7 +12006,10 @@ static bool metal_graph_use_q_head_norm_rope(void) {
 
 static bool metal_graph_use_indexer_q_rope_fusion(void) {
  static int enable_cache = -1;
- return metal_graph_env_flag("DS4_METAL_ENABLE_INDEXER_Q_ROPE_FUSION", &enable_cache);
+ static int disable_cache = -1;
+ return (ds4_metal_graph_max_fusion_enabled() ||
+         metal_graph_env_flag("DS4_METAL_ENABLE_INDEXER_Q_ROPE_FUSION", &enable_cache)) &&
+        !metal_graph_env_flag("DS4_METAL_DISABLE_INDEXER_Q_ROPE_FUSION", &disable_cache);
 }
 
 static bool metal_graph_use_indexed_attn_rope_fusion(void) {
@@ -12008,7 +12025,8 @@ static bool metal_graph_use_decode_attn_rope_fusion(void) {
 static bool metal_graph_use_router_matmul_select_fusion(void) {
  static int enable_cache = -1;
  static int disable_cache = -1;
- return metal_graph_env_flag("DS4_METAL_ENABLE_ROUTER_MATMUL_SELECT_FUSION", &enable_cache) &&
+ return (ds4_metal_graph_max_fusion_enabled() ||
+         metal_graph_env_flag("DS4_METAL_ENABLE_ROUTER_MATMUL_SELECT_FUSION", &enable_cache)) &&
         !metal_graph_env_flag("DS4_METAL_DISABLE_ROUTER_MATMUL_SELECT_FUSION", &disable_cache);
 }
 
@@ -14685,7 +14703,7 @@ static bool metal_graph_encode_decode_layer(
   if (router_matmul_select_fused && !router_matmul_select_logged) {
    router_matmul_select_logged = 1;
    fprintf(stderr,
-           "ds4: router F16 matvec+select fusion enabled by DS4_METAL_ENABLE_ROUTER_MATMUL_SELECT_FUSION=1\n");
+           "ds4: router F16 matvec+select fusion enabled\n");
   }
   static int router_matmul_select_fallback_logged = 0;
   if (!router_matmul_select_fused && !router_matmul_select_fallback_logged) {
@@ -15911,14 +15929,17 @@ static bool metal_graph_encode_token_raw_swa(
 
  /*
  * Start executing the prefix of the decode graph while the CPU is still
- * encoding the rest. The split point is layer-based because this executor is
- * a fixed DS4 tape, not a dynamic node graph; four layers is the measured
- * point where the prefix is large enough to hide useful work without
- * starving the second command buffer. D8F/PRIME reuses the same overlap
- * mechanism but defaults to an earlier split; H3355 decode A/B on 2026-06-03
- * measured split=2 ahead of split=4, split=8, and split=0.
+ * encoding the rest unless max-fusion mode asks for one submit. The split
+ * point is layer-based because this executor is a fixed DS4 tape, not a
+ * dynamic node graph; four layers is the measured point where the prefix is
+ * large enough to hide useful work without starving the second command buffer.
+ * D8F/PRIME reuses the same overlap mechanism but defaults to an earlier split;
+ * H3355 decode A/B on 2026-06-03 measured split=2 ahead of split=4, split=8,
+ * and split=0. DS4_METAL_GRAPH_MAX_FUSION=1 deliberately trades that overlap
+ * for minimum submit/ping-pong overhead and a single device-resident tape.
  */
- uint32_t split_after_layers = ds4_prime_path_enabled() ? 2u : 4u;
+ uint32_t split_after_layers = ds4_metal_graph_max_fusion_enabled() ? 0u :
+  (ds4_prime_path_enabled() ? 2u : 4u);
  const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
  if (split_env && split_env[0]) {
  char *end = NULL;
