@@ -4,6 +4,7 @@
 #include "ds4_nonrouted_pack.h"
 #include "ds4_d8m_reader.h"
 #include "ds4_d8f_reader.h"
+#include "ds4_d8fs_reader.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -3101,6 +3102,38 @@ int main(int argc, char **argv) {
             }
         }
         ds4_d8f_close(&p);
+        return 0;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--d8fs-inspect")) {
+        ds4_d8fs_file p;
+        if (!ds4_d8fs_open(argv[2], &p)) {
+            fprintf(stderr, "ds4: --d8fs-inspect failed to open %s\n", argv[2]);
+            return 1;
+        }
+        ds4_d8fs_print_summary(&p);
+        const uint32_t requested_expert = (argc >= 4) ? (uint32_t)atoi(argv[3]) : UINT32_MAX;
+        uint32_t printed = 0;
+        for (uint32_t expert = 0; expert < 256u && printed < 16u; expert++) {
+            if (requested_expert != UINT32_MAX && expert != requested_expert) continue;
+            ds4_d8fs_record rec;
+            if (!ds4_d8fs_get_record(&p, expert, &rec)) continue;
+            uint16_t c00 = 0, c01 = 0, c10 = 0;
+            (void)ds4_d8fs_code_at(&p, &rec, 0u, 0u, &c00);
+            (void)ds4_d8fs_code_at(&p, &rec, 0u, 1u, &c01);
+            (void)ds4_d8fs_code_at(&p, &rec, 1u, 0u, &c10);
+            fprintf(stderr,
+                    "  sparse down expert=%3u K=%4u unique=%u max_group_unique=%u sparse=%.3f MiB first_codes=%u,%u,%u\n",
+                    expert,
+                    rec.k,
+                    rec.unique_count,
+                    rec.max_group_unique,
+                    (double)(rec.group_prefix_bytes + rec.inverse_offset_table_bytes +
+                             rec.unique_code_bytes + rec.inverse_bits_bytes) / 1048576.0,
+                    c00, c01, c10);
+            printed++;
+            if (requested_expert != UINT32_MAX) break;
+        }
+        ds4_d8fs_close(&p);
         return 0;
     }
     if (argc >= 3 && !strcmp(argv[1], "--d8m-down-selected-canary")) {
