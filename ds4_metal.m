@@ -7427,7 +7427,7 @@ static int ds4_gpu_matmul_q8_0_matvec_icb(id<MTLCommandBuffer> cb,
  *   - default mul_mm uses kernel_mul_mm_q8_0_f32 with bc_inp/bc_out
  *
  * Returns 1 on success, 0 on failure. Caller owns wbuf retention. */
-static int ds4_gpu_matmul_q8_0_kernel_dispatch(
+static int ds4_gpu_matmul_q8_0_kernel_dispatch_ex(
  ds4_gpu_tensor *out,
  id<MTLBuffer> wbuf,
  uint64_t inner_offset,
@@ -7435,7 +7435,8 @@ static int ds4_gpu_matmul_q8_0_kernel_dispatch(
  uint64_t out_dim,
  const ds4_gpu_tensor *x,
  uint64_t n_tok,
- const char *label) {
+ const char *label,
+ int allow_dense_icb) {
  id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
  id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
  if (!xbuf || !outbuf) return 0;
@@ -7449,7 +7450,8 @@ static int ds4_gpu_matmul_q8_0_kernel_dispatch(
 
  if (n_tok == 1) {
   uint32_t dense_icb_slot = 0;
-  if (ds4_gpu_dense_matvec_icb_enabled() &&
+  if (allow_dense_icb &&
+      ds4_gpu_dense_matvec_icb_enabled() &&
       ds4_gpu_dense_matvec_icb_slot_for(wbuf, inner_offset, in_dim, out_dim, x, out,
                                         &dense_icb_slot)) {
    if (ds4_gpu_matmul_q8_0_matvec_icb(cb, dense_icb_slot, wbuf, inner_offset,
@@ -7586,6 +7588,20 @@ static int ds4_gpu_matmul_q8_0_kernel_dispatch(
  return 1;
 }
 
+static int ds4_gpu_matmul_q8_0_kernel_dispatch(
+ ds4_gpu_tensor *out,
+ id<MTLBuffer> wbuf,
+ uint64_t inner_offset,
+ uint64_t in_dim,
+ uint64_t out_dim,
+ const ds4_gpu_tensor *x,
+ uint64_t n_tok,
+ const char *label) {
+ return ds4_gpu_matmul_q8_0_kernel_dispatch_ex(out, wbuf, inner_offset,
+                                               in_dim, out_dim, x, n_tok,
+                                               label, 1);
+}
+
 static int ds4_gpu_matmul_q8_0_legacy_tensor(
  ds4_gpu_tensor *out,
  const void *model_map,
@@ -7706,6 +7722,7 @@ static int ds4_gpu_dense_matvec_icb_enabled(void) {
    g_dense_matvec_icb_env_active = explicit_legacy > 0;
   } else {
    g_dense_matvec_icb_env_active =
+    ds4_gpu_prime_path_enabled() ||
     ds4_gpu_max_fusion_enabled() ||
     ds4_gpu_env_bool("DS4_MAX_FUSION_DENSE_MATVEC_ICB") > 0;
   }
@@ -7713,7 +7730,7 @@ static int ds4_gpu_dense_matvec_icb_enabled(void) {
   if (g_dense_matvec_icb_env_active) {
    fprintf(stderr,
            "ds4: dense Q8_0 matvec ICB replay active "
-           "(max-fusion default; set DS4_DENSE_MATVEC_ICB_DISABLE=1 to disable)\n");
+           "(PRIME/default; set DS4_DENSE_MATVEC_ICB_DISABLE=1 to disable)\n");
   }
  }
  return g_dense_matvec_icb_env_active;
@@ -7847,7 +7864,8 @@ int ds4_gpu_dense_matvec_icb_canary(uint32_t M, uint32_t N) {
   if (x && od && oi && hx && hd && hi) {
    for (uint32_t c = 0; c < N; c++) hx[c] = (float)((int)(c % 13u)) * 0.07f - 0.3f;
    if (ds4_gpu_tensor_write(x, 0, hx, (size_t)N * sizeof(float)) > 0) {
-    int ok1 = ds4_gpu_matmul_q8_0_kernel_dispatch(od, wbuf, 0, N, M, x, 1, "icb canary direct");
+    int ok1 = ds4_gpu_matmul_q8_0_kernel_dispatch_ex(od, wbuf, 0, N, M, x, 1,
+                                                     "icb canary direct", 0);
     int owned = 0;
     id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
     int ok2 = (cb != nil) && ds4_gpu_matmul_q8_0_matvec_icb(cb, 0, wbuf, 0, N, M, x, oi);
@@ -7910,7 +7928,8 @@ int ds4_gpu_dense_matvec_icb_bench(uint32_t M, uint32_t N, uint32_t n_gemv, uint
     ds4_gpu_begin_commands();
     int owned = 0; id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
     for (uint32_t g = 0; g < n_gemv; g++) {
-     if (w2 == 0) ds4_gpu_matmul_q8_0_kernel_dispatch(od, wbuf, 0, N, M, x, 1, "bench-warm");
+     if (w2 == 0) ds4_gpu_matmul_q8_0_kernel_dispatch_ex(od, wbuf, 0, N, M, x, 1,
+                                                         "bench-warm", 0);
      else         ds4_gpu_matmul_q8_0_matvec_icb(cb, g, wbuf, 0, N, M, x, od);
     }
     ds4_gpu_end_commands();
@@ -7920,7 +7939,8 @@ int ds4_gpu_dense_matvec_icb_bench(uint32_t M, uint32_t N, uint32_t n_gemv, uint
    for (uint32_t it = 0; it < n_iter; it++) {
     ds4_gpu_begin_commands();
     for (uint32_t g = 0; g < n_gemv; g++)
-     ds4_gpu_matmul_q8_0_kernel_dispatch(od, wbuf, 0, N, M, x, 1, "bench-direct");
+     ds4_gpu_matmul_q8_0_kernel_dispatch_ex(od, wbuf, 0, N, M, x, 1,
+                                            "bench-direct", 0);
     ds4_gpu_end_commands();
    }
    const double t_direct = ds4_gpu_now_ms() - t0;

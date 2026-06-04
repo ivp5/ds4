@@ -136,7 +136,7 @@ DS4_JOURNAL_DB=/tmp/ds4.db ./ds4-bench --prefill-metal-phases auto ...
 **Deployment doctrine update**:
 - Retire only the old **sequential-verifier** MTP path. MTP remains the target speed path when verifier work is block/parallel.
 - Promote KV-disk-dir to default-on for repeated-prefix agentic workloads.
-- Max-performance target: MTL4/compute + ICB/stable buffers + compressed routed-expert replay + block verifier + MTP/specdecode.
+- Max-performance target: MTL4/compute + dense Q8_0 ICB replay + compressed routed-expert replay + block verifier + MTP/specdecode.
 
 ## MPSGraph / ANE runtime status
 
@@ -219,20 +219,23 @@ takes up build time + 8244 lines of declarations).
 
 **Operating recipe** for the ACTUAL ICB pipelines:
 ```bash
-# Baseline (no ICB)
-./ds4-bench --prefill-metal-phases auto --model ds4flash.gguf ...
+# PRIME default: route_remap, softplus_sqrt, topk_mask, dense Q8_0 matvec,
+# and D8F packet ICB are automatic where their measured policy says yes.
+./ds4 --metal --flat-pack /path/to/H3384 ...
 
-# Enable route_remap ICB (43 layers × per-token replay)
-DS4_ICB_ACTIVE=1 ./ds4-bench --prefill-metal-phases auto ...
+# Comparison baseline: turn PRIME-only replay off explicitly.
+DS4_PRIME_PATH=0 DS4_DENSE_MATVEC_ICB_DISABLE=1 \
+  ./ds4 --metal --flat-pack /path/to/H3384 ...
 
-# Enable all four ICB pipelines (caller pays useResource cost on some)
-DS4_ICB_ACTIVE=1 DS4_ICB_TOPK_MASK=1 DS4_ICB_SOFTPLUS=1 \
-DS4_ICB_WEIGHTS_ONE=1 ./ds4-bench --prefill-metal-phases auto ...
+# Known loser on decode remains opt-in: caller pays useResource cost on a
+# 6-thread one-shot kernel, so do not include it in PRIME without new A/B data.
+DS4_ICB_WEIGHTS_ONE=1 ./ds4 --metal --flat-pack /path/to/H3384 ...
 ```
 
-**Measurement pending across all four** — no shipped numbers showing
-they net-improve gen rate over the 1.83 t/s baseline. Would need
-A/B comparison: same prompt, same flags except ICB env vars.
+Dense Q8_0 matvec ICB promotion gate: `--icb-dense-canary 4096 4096`
+must be bit-exact, then `--icb-dense-bench 4096 4096 258 30` must show
+a forward-level speedup. 2026-06-04 M1 Max corrected-bypass result:
+bit-exact, 54.408 → 52.421 ms/fwd, 1.04×.
 
 **MTL4 status** (per ds4_pillars.h doc):
 - COMPUTE path productive on M1 Max (polar_dot canary: 83 ns/packet
