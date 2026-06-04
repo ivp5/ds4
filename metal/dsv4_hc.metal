@@ -90,6 +90,23 @@ struct ds4_metal_args_dsv4_output_hc_sum_norm {
     float    norm_eps;
 };
 
+struct ds4_metal_args_dsv4_output_hc_rms_mix_sum_norm {
+    int64_t  n_embd;
+    int32_t  n_hc;
+    int64_t  n_rows;
+    int64_t  in_dim;
+    uint64_t weight_stride;
+    uint64_t nb_pre1;
+    uint64_t nb_w1;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb1;
+    uint64_t nb_norm1;
+    float    rms_eps;
+    float    eps;
+    float    norm_eps;
+};
+
 struct ds4_metal_args_dsv4_hc_expand {
     int64_t  n_embd;
     int64_t  n_hc;
@@ -851,6 +868,142 @@ kernel void kernel_dsv4_output_hc_sum_norm4(
     device const float4 *w4 = (device const float4 *)norm_weight;
     device float4 *norm4 = (device float4 *)(norm_dst + (uint64_t)row * args.nb_norm1);
     for (uint i = tid; i < n4; i += ntg) {
+        const float4 v = row_shmem[i];
+        dst4[i] = v;
+        norm4[i] = (v * norm_scale) * w4[i];
+    }
+}
+
+kernel void kernel_dsv4_output_hc_rms_f16_mix_sum_norm4(
+        constant ds4_metal_args_dsv4_output_hc_rms_mix_sum_norm & args,
+        device  const half  * pre_weight,
+        device  const float * scale,
+        device  const float * base,
+        device  const char  * x,
+        device        char  * pre_dst,
+        device        char  * weights,
+        device        char  * dst,
+        device  const char  * norm_weight,
+        device        char  * norm_dst,
+        threadgroup   float * shared [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        ushort tid [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort ntg [[threads_per_threadgroup]]) {
+    if ((int64_t)row >= args.n_rows ||
+        args.n_hc != 4 ||
+        args.n_embd != 4096 ||
+        args.in_dim != 16384) {
+        return;
+    }
+
+    constexpr int HC = 4;
+    constexpr uint N4 = 1024u;
+    constexpr uint SIMD_WIDTH = 32u;
+    const uint nsg = (uint)ntg / SIMD_WIDTH;
+
+    threadgroup float4 *row_shmem = (threadgroup float4 *)shared;
+    threadgroup float *pre_shmem = shared + 4096;
+    threadgroup float *w_shmem = pre_shmem + HC;
+    threadgroup float *sum_shmem = w_shmem + HC;
+    threadgroup float *red_shmem = sum_shmem + SIMD_WIDTH;
+
+    device const float *xr = (device const float *)(x + (uint64_t)row * args.nb_x2);
+    device float *pre_out = (device float *)(pre_dst + (uint64_t)row * args.nb_pre1);
+    device float *w_out = (device float *)(weights + (uint64_t)row * args.nb_w1);
+
+    float sumsq = 0.0f;
+    float dots[HC];
+    for (int j = 0; j < HC; ++j) dots[j] = 0.0f;
+
+    for (uint i = tid; i < 16384u; i += ntg) {
+        const float xv = xr[i];
+        sumsq += xv * xv;
+        for (int j = 0; j < HC; ++j) {
+            dots[j] += (float)pre_weight[(uint64_t)j * args.weight_stride + (uint64_t)i] * xv;
+        }
+    }
+
+    sumsq = simd_sum(sumsq);
+    for (int j = 0; j < HC; ++j) dots[j] = simd_sum(dots[j]);
+
+    if (tiisg == 0) {
+        red_shmem[sgitg] = sumsq;
+        for (int j = 0; j < HC; ++j) {
+            red_shmem[(j + 1) * SIMD_WIDTH + sgitg] = dots[j];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        if (tiisg == 0) {
+            float total = 0.0f;
+            for (uint sg = 0; sg < nsg; ++sg) total += red_shmem[sg];
+            red_shmem[0] = rsqrt(total / 16384.0f + args.rms_eps);
+        } else if (tiisg <= HC) {
+            const int j = (int)tiisg - 1;
+            float total = 0.0f;
+            for (uint sg = 0; sg < nsg; ++sg) {
+                total += red_shmem[(j + 1) * SIMD_WIDTH + sg];
+            }
+            red_shmem[tiisg] = total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg < HC) {
+        const float pre = red_shmem[tiisg + 1] * red_shmem[0];
+        pre_shmem[tiisg] = pre;
+        pre_out[tiisg] = pre;
+    }
+    if (sgitg == 0) {
+        sum_shmem[tiisg] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        const float4 z = *((threadgroup float4 *)pre_shmem) * scale[0] +
+                         *((device const float4 *)base);
+        const float4 w = 1.0f / (1.0f + exp(-z)) + args.eps;
+        *((device float4 *)w_out) = w;
+        w_shmem[0] = w.x;
+        w_shmem[1] = w.y;
+        w_shmem[2] = w.z;
+        w_shmem[3] = w.w;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sumf = 0.0f;
+    for (uint i = tid; i < N4; i += ntg) {
+        device const float4 *x0 = (device const float4 *)(x + 0 * args.nb_x1 + (uint64_t)row * args.nb_x2);
+        device const float4 *x1 = (device const float4 *)(x + 1 * args.nb_x1 + (uint64_t)row * args.nb_x2);
+        device const float4 *x2 = (device const float4 *)(x + 2 * args.nb_x1 + (uint64_t)row * args.nb_x2);
+        device const float4 *x3 = (device const float4 *)(x + 3 * args.nb_x1 + (uint64_t)row * args.nb_x2);
+        const float4 v = x0[i] * w_shmem[0] +
+                         x1[i] * w_shmem[1] +
+                         x2[i] * w_shmem[2] +
+                         x3[i] * w_shmem[3];
+        row_shmem[i] = v;
+        sumf += dot(v, v);
+    }
+
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        sum_shmem[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = (tiisg < nsg) ? sum_shmem[tiisg] : 0.0f;
+    sumf = simd_sum(sumf);
+    const float norm_scale = rsqrt(sumf / 4096.0f + args.norm_eps);
+
+    device float4 *dst4 = (device float4 *)(dst + (uint64_t)row * args.nb1);
+    device const float4 *w4 = (device const float4 *)norm_weight;
+    device float4 *norm4 = (device float4 *)(norm_dst + (uint64_t)row * args.nb_norm1);
+    for (uint i = tid; i < N4; i += ntg) {
         const float4 v = row_shmem[i];
         dst4[i] = v;
         norm4[i] = (v * norm_scale) * w4[i];
