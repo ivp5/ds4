@@ -1,7 +1,6 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_nonrouted_pack.h"
-#include "ds4_d8m_reader.h"
 #include "ds4_d8f_reader.h"
 #include "ds4_d8fs_reader.h"
 #include "linenoise.h"
@@ -2839,28 +2838,6 @@ int main(int argc, char **argv) {
         ds4_nrpk_close(&p);
         return 0;
     }
-    if (argc >= 3 && !strcmp(argv[1], "--d8m-inspect")) {
-        ds4_d8m_file p;
-        if (!ds4_d8m_open(argv[2], &p)) {
-            fprintf(stderr, "ds4: --d8m-inspect failed to open %s\n", argv[2]);
-            return 1;
-        }
-        ds4_d8m_print_summary(&p);
-        for (uint32_t expert = 0; expert < 256u; expert++) {
-            ds4_d8m_record rec;
-            if (!ds4_d8m_get_record(&p, expert, &rec)) continue;
-            const uint32_t c0 = ds4_d8m_code_at(&p, &rec, 0);
-            const uint32_t c1 = ds4_d8m_code_at(&p, &rec, 1);
-            fprintf(stderr,
-                    "  expert=%3u K=%4u bits=%2u cb_off=%llu idx_off=%llu idx_bytes=%u first_codes=%u,%u\n",
-                    expert, rec.k, rec.bits,
-                    (unsigned long long)rec.codebook_offset,
-                    (unsigned long long)rec.index_offset,
-                    rec.index_bytes, c0, c1);
-        }
-        ds4_d8m_close(&p);
-        return 0;
-    }
     if (argc >= 3 && !strcmp(argv[1], "--d8f-inspect")) {
         ds4_d8f_file p;
         if (!ds4_d8f_open(argv[2], &p)) {
@@ -2932,27 +2909,6 @@ int main(int argc, char **argv) {
         }
         ds4_d8fs_close(&p);
         return 0;
-    }
-    if (argc >= 3 && !strcmp(argv[1], "--d8m-down-selected-canary")) {
-        const char *d8m_path = argv[2];
-        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 26, 27, 1, 2, 3};
-        uint32_t n_experts = 3;
-        if (!cli_parse_selected_experts(argc, argv, 3, experts, &n_experts, "--d8m-down-selected-canary")) return 1;
-        const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
-        const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
-        return ds4_gpu_mtl4_d8m_down_selected_canary(
-            d8m_path, experts, n_experts, rows, rounds) ? 0 : 1;
-    }
-    if (argc >= 3 && !strcmp(argv[1], "--d8m-down-selected-batch-canary")) {
-        const char *d8m_path = argv[2];
-        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 26, 27, 1, 2, 3};
-        uint32_t n_experts = 3;
-        if (!cli_parse_selected_experts(argc, argv, 3, experts, &n_experts, "--d8m-down-selected-batch-canary")) return 1;
-        const uint32_t rows = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 128u;
-        const uint32_t tokens = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 8u;
-        const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20u;
-        return ds4_gpu_mtl4_d8m_down_selected_batch_canary(
-            d8m_path, experts, n_experts, rows, tokens, rounds) ? 0 : 1;
     }
     if (argc >= 3 && !strcmp(argv[1], "--d8f-gateup-selected-canary")) {
         const char *d8f_path = argv[2];
@@ -3033,91 +2989,6 @@ int main(int argc, char **argv) {
         const float clamp = (argc >= 9) ? strtof(argv[8], NULL) : 10.0f;
         return ds4_gpu_d8f_prefix_graph_canary(
             d8f_dir, experts, n_experts, first_layer, n_layers, tokens, rounds, clamp) ? 0 : 1;
-    }
-    /* --m1r-d8m-routed-organ-canary M1R_PACK D8M_PACK [LAYER [EXPERTS_CSV [ROWS [ROUNDS [CLAMP]]]]]
-     * Runs hybrid routed organ: M1R gate/up -> D8M down in one MTL4 command buffer. */
-    if (argc >= 4 && !strcmp(argv[1], "--m1r-d8m-routed-organ-canary")) {
-        const char *m1r_path = argv[2];
-        const char *d8m_path = argv[3];
-        const uint32_t layer = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 42u;
-        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 1, 2, 3, 4, 5};
-        uint32_t n_experts = DS4_CLI_SELECTED_EXPERT_CAP;
-        if (!cli_parse_selected_experts(argc, argv, 5, experts, &n_experts, "--m1r-d8m-routed-organ-canary")) return 1;
-        const uint32_t rows = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 128u;
-        const uint32_t rounds = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 20u;
-        const float clamp = (argc >= 9) ? strtof(argv[8], NULL) : 10.0f;
-        return ds4_gpu_mtl4_m1r_d8m_routed_organ_canary(
-            m1r_path, d8m_path, layer, experts, n_experts, rows, rounds, clamp) ? 0 : 1;
-    }
-    /* --m1r-d8m-routed-organ-batch-canary M1R_PACK D8M_PACK [LAYER [EXPERTS_CSV [ROWS [TOKENS [ROUNDS [CLAMP]]]]]]
-     * Runs token-batched hybrid routed organ: M1R gate/up -> D8M down in one MTL4 command buffer. */
-    if (argc >= 4 && !strcmp(argv[1], "--m1r-d8m-routed-organ-batch-canary")) {
-        const char *m1r_path = argv[2];
-        const char *d8m_path = argv[3];
-        const uint32_t layer = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 42u;
-        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 1, 2, 3, 4, 5};
-        uint32_t n_experts = DS4_CLI_SELECTED_EXPERT_CAP;
-        if (!cli_parse_selected_experts(argc, argv, 5, experts, &n_experts, "--m1r-d8m-routed-organ-batch-canary")) return 1;
-        const uint32_t rows = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 4096u;
-        const uint32_t n_tokens = (argc >= 8) ? (uint32_t)atoi(argv[7]) : 8u;
-        const uint32_t rounds = (argc >= 9) ? (uint32_t)atoi(argv[8]) : 5u;
-        const float clamp = (argc >= 10) ? strtof(argv[9], NULL) : 10.0f;
-        return ds4_gpu_mtl4_m1r_d8m_routed_organ_batch_canary(
-            m1r_path, d8m_path, layer, experts, n_experts, rows, n_tokens, rounds, clamp) ? 0 : 1;
-    }
-    /* --m1r-gateup-swiglu-selected-canary PACK [LAYER [EXPERTS_CSV [ROWS [ROUNDS [CLAMP]]]]]
-     * Runs selected experts directly from an M1R fixed-plane pack. */
-    if (argc >= 3 && !strcmp(argv[1], "--m1r-gateup-swiglu-selected-canary")) {
-        const char *m1r_path = argv[2];
-        const uint32_t layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 25u;
-        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 1, 2, 3, 4, 5};
-        uint32_t n_experts = DS4_CLI_SELECTED_EXPERT_CAP;
-        if (!cli_parse_selected_experts(argc, argv, 4, experts, &n_experts, "--m1r-gateup-swiglu-selected-canary")) return 1;
-        const uint32_t rows = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128u;
-        const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20u;
-        const float clamp = (argc >= 8) ? strtof(argv[7], NULL) : 10.0f;
-        return ds4_gpu_mtl4_m1r_gateup_swiglu_selected_canary(
-            m1r_path, layer, experts, n_experts, rows, rounds, clamp) ? 0 : 1;
-    }
-    /* --m1r-down-selected-canary PACK [LAYER [EXPERTS_CSV [ROWS [ROUNDS]]]]
-     * Runs selected experts through direct M1R down-projection sum. */
-    if (argc >= 3 && !strcmp(argv[1], "--m1r-down-selected-canary")) {
-        const char *m1r_path = argv[2];
-        const uint32_t layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 25u;
-        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 1, 2, 3, 4, 5};
-        uint32_t n_experts = DS4_CLI_SELECTED_EXPERT_CAP;
-        if (!cli_parse_selected_experts(argc, argv, 4, experts, &n_experts, "--m1r-down-selected-canary")) return 1;
-        const uint32_t rows = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 128u;
-        const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 20u;
-        return ds4_gpu_mtl4_m1r_down_selected_canary(
-            m1r_path, layer, experts, n_experts, rows, rounds) ? 0 : 1;
-    }
-    /* --m1r-routed-organ-canary PACK [LAYER [EXPERTS_CSV [ROUNDS [CLAMP]]]]
-     * Runs direct M1R gate+up+SwiGLU then down-sum in one command buffer. */
-    if (argc >= 3 && !strcmp(argv[1], "--m1r-routed-organ-canary")) {
-        const char *m1r_path = argv[2];
-        const uint32_t layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 25u;
-        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 1, 2, 3, 4, 5};
-        uint32_t n_experts = DS4_CLI_SELECTED_EXPERT_CAP;
-        if (!cli_parse_selected_experts(argc, argv, 4, experts, &n_experts, "--m1r-routed-organ-canary")) return 1;
-        const uint32_t rounds = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 20u;
-        const float clamp = (argc >= 7) ? strtof(argv[6], NULL) : 10.0f;
-        return ds4_gpu_mtl4_m1r_routed_organ_canary(
-            m1r_path, layer, experts, n_experts, rounds, clamp) ? 0 : 1;
-    }
-    /* --m1r-routed-organ-batch-canary PACK [LAYER [EXPERTS_CSV [TOKENS [ROUNDS [CLAMP]]]]]
-     * Compares true token-batch dispatch against per-token tensor dispatch. */
-    if (argc >= 3 && !strcmp(argv[1], "--m1r-routed-organ-batch-canary")) {
-        const char *m1r_path = argv[2];
-        const uint32_t layer = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 25u;
-        uint32_t experts[DS4_CLI_SELECTED_EXPERT_CAP] = {0, 1, 2, 3, 4, 5};
-        uint32_t n_experts = DS4_CLI_SELECTED_EXPERT_CAP;
-        if (!cli_parse_selected_experts(argc, argv, 4, experts, &n_experts, "--m1r-routed-organ-batch-canary")) return 1;
-        const uint32_t n_tokens = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 8u;
-        const uint32_t rounds = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 5u;
-        const float clamp = (argc >= 8) ? strtof(argv[7], NULL) : 10.0f;
-        return ds4_gpu_mtl4_m1r_routed_organ_batch_canary(
-            m1r_path, layer, experts, n_experts, n_tokens, rounds, clamp) ? 0 : 1;
     }
     /* --prefix-cache-test : silv 2026-05-27 Phase 1 self-test (cached prefix activations) */
     if (argc >= 2 && !strcmp(argv[1], "--prefix-cache-test")) {

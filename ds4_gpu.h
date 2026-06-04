@@ -2020,35 +2020,6 @@ int ds4_gpu_mtl4_routed_mm_dispatch_probe(void);
  * computed as out[p][s][r] = sum_pair X[pair*2:(pair+1)*2] · decode(p,e,r,pair).
  * Canary cross-checks each output against a CPU scalar reference. */
 
-/* Direct M1R fixed-plane selected-expert canary. This reads the runtime-native
- * pack directly: no CDX3 framed records and no host-side expert staging. */
-int ds4_gpu_mtl4_m1r_gateup_swiglu_selected_canary(const char *m1r_path,
-                                                   uint32_t layer,
-                                                   const uint32_t *experts,
-                                                   uint32_t n_experts,
-                                                   uint32_t rows,
-                                                   uint32_t rounds,
-                                                   float swiglu_limit);
-
-/* Direct M1R selected down-projection canary. Takes synthetic per-slot mid
- * activations and writes the routed out vector in one selected-expert sum. */
-int ds4_gpu_mtl4_m1r_down_selected_canary(const char *m1r_path,
-                                          uint32_t layer,
-                                          const uint32_t *experts,
-                                          uint32_t n_experts,
-                                          uint32_t rows,
-                                          uint32_t rounds);
-int ds4_gpu_mtl4_d8m_down_selected_canary(const char *d8m_path,
-                                          const uint32_t *experts,
-                                          uint32_t n_experts,
-                                          uint32_t rows,
-                                          uint32_t rounds);
-int ds4_gpu_mtl4_d8m_down_selected_batch_canary(const char *d8m_path,
-                                                const uint32_t *experts,
-                                                uint32_t n_experts,
-                                                uint32_t rows,
-                                                uint32_t n_tokens,
-                                                uint32_t rounds);
 int ds4_gpu_mtl4_d8f_gateup_selected_canary(const char *d8f_path,
                                             const uint32_t *experts,
                                             uint32_t n_experts,
@@ -2148,39 +2119,6 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
                                                           uint32_t n_tokens,
                                                           uint32_t n_experts,
                                                           float swiglu_limit);
-int ds4_gpu_mtl4_m1r_d8m_routed_organ_canary(const char *m1r_path,
-                                             const char *d8m_path,
-                                             uint32_t layer,
-                                             const uint32_t *experts,
-                                             uint32_t n_experts,
-                                             uint32_t rows,
-                                             uint32_t rounds,
-                                             float swiglu_limit);
-int ds4_gpu_mtl4_m1r_d8m_routed_organ_batch_canary(const char *m1r_path,
-                                                   const char *d8m_path,
-                                                   uint32_t layer,
-                                                   const uint32_t *experts,
-                                                   uint32_t n_experts,
-                                                   uint32_t rows,
-                                                   uint32_t n_tokens,
-                                                   uint32_t rounds,
-                                                   float swiglu_limit);
-
-/* Direct M1R full routed-FFN organ canary: gate+up+SwiGLU then down sum.
- * This is the closest current canary to the production decode organ. */
-int ds4_gpu_mtl4_m1r_routed_organ_canary(const char *m1r_path,
-                                          uint32_t layer,
-                                          const uint32_t *experts,
-                                          uint32_t n_experts,
-                                          uint32_t rounds,
-                                          float swiglu_limit);
-int ds4_gpu_mtl4_m1r_routed_organ_batch_canary(const char *m1r_path,
-                                               uint32_t layer,
-                                               const uint32_t *experts,
-                                               uint32_t n_experts,
-                                               uint32_t n_tokens,
-                                               uint32_t rounds,
-                                               float swiglu_limit);
 int ds4_gpu_mtl4_m1r_routed_organ_dispatch_cpu(const char *m1r_path,
                                                 uint32_t layer,
                                                 const int32_t *selected_experts,

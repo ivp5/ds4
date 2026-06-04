@@ -25,7 +25,6 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_expert_table.h"  /* ds4_hot_store_get_active, ds4_hot_expert_store */
-#include "ds4_d8m_reader.h"
 #include "ds4_d8f_reader.h"
 #include "ds4_d8fs_reader.h"
 
@@ -54004,7 +54003,6 @@ int ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor(const char *d8f_path,
         1u, n_experts, swiglu_limit);
 }
 
-static uint32_t g_d8m_runtime_layer = UINT32_MAX;
 
 
 
@@ -54033,15 +54031,5 @@ static uint32_t g_d8m_runtime_layer = UINT32_MAX;
 
 
 
-/* ===== cdx3/d8m/m1r REMOVED — ABI stubs for codex-hot callers (ds4.c/ds4_cli.c).
-   Dead paths (M1R unset / d8m canaries diagnostic): honest-fail returns. ===== */
-int ds4_gpu_mtl4_d8m_down_selected_batch_canary(const char *d8m_path, const uint32_t *experts, uint32_t n_experts, uint32_t rows, uint32_t n_tokens, uint32_t rounds) { (void)d8m_path; (void)experts; (void)n_experts; (void)rows; (void)n_tokens; (void)rounds; return 0; }
-int ds4_gpu_mtl4_d8m_down_selected_canary(const char *d8m_path, const uint32_t *experts, uint32_t n_experts, uint32_t rows, uint32_t rounds) { (void)d8m_path; (void)experts; (void)n_experts; (void)rows; (void)rounds; return 0; }
-int ds4_gpu_mtl4_m1r_d8m_routed_organ_batch_canary(const char *m1r_path, const char *d8m_path, uint32_t layer, const uint32_t *experts, uint32_t n_experts, uint32_t rows, uint32_t n_tokens, uint32_t rounds, float swiglu_limit) { (void)m1r_path; (void)d8m_path; (void)layer; (void)experts; (void)n_experts; (void)rows; (void)n_tokens; (void)rounds; (void)swiglu_limit; return 0; }
-int ds4_gpu_mtl4_m1r_d8m_routed_organ_canary(const char *m1r_path, const char *d8m_path, uint32_t layer, const uint32_t *experts, uint32_t n_experts, uint32_t rows, uint32_t rounds, float swiglu_limit) { (void)m1r_path; (void)d8m_path; (void)layer; (void)experts; (void)n_experts; (void)rows; (void)rounds; (void)swiglu_limit; return 0; }
-int ds4_gpu_mtl4_m1r_down_selected_canary(const char *m1r_path, uint32_t layer, const uint32_t *experts, uint32_t n_experts, uint32_t rows, uint32_t rounds) { (void)m1r_path; (void)layer; (void)experts; (void)n_experts; (void)rows; (void)rounds; return 0; }
-int ds4_gpu_mtl4_m1r_gateup_swiglu_selected_canary(const char *m1r_path, uint32_t layer, const uint32_t *experts, uint32_t n_experts, uint32_t rows, uint32_t rounds, float swiglu_limit) { (void)m1r_path; (void)layer; (void)experts; (void)n_experts; (void)rows; (void)rounds; (void)swiglu_limit; return 0; }
-int ds4_gpu_mtl4_m1r_routed_organ_batch_canary(const char *m1r_path, uint32_t layer, const uint32_t *experts, uint32_t n_experts, uint32_t n_tokens, uint32_t rounds, float swiglu_limit) { (void)m1r_path; (void)layer; (void)experts; (void)n_experts; (void)n_tokens; (void)rounds; (void)swiglu_limit; return 0; }
-int ds4_gpu_mtl4_m1r_routed_organ_canary(const char *m1r_path, uint32_t layer, const uint32_t *experts, uint32_t n_experts, uint32_t rounds, float swiglu_limit) { (void)m1r_path; (void)layer; (void)experts; (void)n_experts; (void)rounds; (void)swiglu_limit; return 0; }
 int ds4_gpu_mtl4_m1r_routed_organ_dispatch_tensor(const char *m1r_path, uint32_t layer, ds4_gpu_tensor *selected_experts, ds4_gpu_tensor *route_weights, ds4_gpu_tensor *input, ds4_gpu_tensor *output, uint32_t n_experts, float swiglu_limit) { (void)m1r_path; (void)layer; (void)selected_experts; (void)route_weights; (void)input; (void)output; (void)n_experts; (void)swiglu_limit; return -1; }
 int ds4_gpu_mtl4_m1r_routed_organ_dispatch_tensor_batch(const char *m1r_path, uint32_t layer, ds4_gpu_tensor *selected_experts, ds4_gpu_tensor *route_weights, ds4_gpu_tensor *input, ds4_gpu_tensor *output, uint32_t n_tokens, uint32_t n_experts, float swiglu_limit) { (void)m1r_path; (void)layer; (void)selected_experts; (void)route_weights; (void)input; (void)output; (void)n_tokens; (void)n_experts; (void)swiglu_limit; return -1; }
