@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Regenerate the H3371 general-fidelity allocation from H3216.
+
+H3371 is the non-AIME-derived repair target recorded in the codec registry:
+drop the H3230 overlay, demote L40-L42 down records above K512 to K512, then
+demote the 186 weakest L40 down records from K512 to K256.  This tool makes
+that rule executable and emits a byte-budget manifest for pack rebuilds.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+EXPERTS = 256
+LAYERS = 43
+HEADER_BYTES = 4096
+FUSED_RECORD_BYTES = 64
+PROJECTIONS = 3
+GROUP = 8
+ROUTED_ROWS = 2048
+ROUTED_COLS = 4096
+DOWN_SCALE_BYTES = 4096
+WEIGHTS_PER_PROJECTION = ROUTED_ROWS * ROUTED_COLS
+GROUPS_PER_PROJECTION = WEIGHTS_PER_PROJECTION // GROUP
+DEFAULT_INPUT = Path("tmp/20260602_codec_general/ds4_52gb_allocation_h3216_l39_downprotected_l40_42_gateup_floor.npy")
+DEFAULT_TEMPLATE_PACK = Path(
+    "/Users/silv/cl/tlp/montyneg/ds4/"
+    "DeepSeek-V4-Flash_H3384_H3382_all43_route_hotblock_sidecar_top6_down_native_codes_D8F_800kctx_probe_20260604"
+)
+
+
+def projection_bpw(k: int) -> float:
+    bits = int(math.ceil(math.log2(k)))
+    codebook_bits = k * GROUP * 16
+    return float(bits + codebook_bits / WEIGHTS_PER_PROJECTION)
+
+
+def record_payload_bytes(k: int, *, down: bool) -> int:
+    bits = int(math.ceil(math.log2(k)))
+    codebook_bytes = k * GROUP * 2
+    index_bytes = (GROUPS_PER_PROJECTION * bits + 7) // 8
+    return codebook_bytes + index_bytes + (DOWN_SCALE_BYTES if down else 0)
+
+
+def routed_payload_bytes(allocation: np.ndarray) -> int:
+    total = LAYERS * (HEADER_BYTES + PROJECTIONS * EXPERTS * FUSED_RECORD_BYTES)
+    for row in allocation:
+        total += record_payload_bytes(int(row["K_gate"]), down=False)
+        total += record_payload_bytes(int(row["K_up"]), down=False)
+        total += record_payload_bytes(int(row["K_down"]), down=True)
+    return total
+
+
+def k_hist(allocation: np.ndarray, field: str) -> dict[str, int]:
+    values, counts = np.unique(allocation[field], return_counts=True)
+    return {str(int(value)): int(count) for value, count in zip(values, counts, strict=True)}
+
+
+def template_bytes(template_pack: Path | None) -> dict[str, int]:
+    if template_pack is None:
+        return {}
+    metadata = template_pack / "DeepSeek-V4-Flash.metadata-only.full-tensor-manifest.zero-tensor-data.pack-direct.gguf"
+    nonrouted = template_pack / "ds4v4_nonrouted.i32_normf32_bf16matf16.pack"
+    out: dict[str, int] = {}
+    if metadata.exists():
+        out["metadata_bytes"] = metadata.stat().st_size
+    if nonrouted.exists():
+        out["nonrouted_bytes"] = nonrouted.stat().st_size
+    return out
+
+
+def update_down_fields(allocation: np.ndarray) -> None:
+    if "bpw_down" in allocation.dtype.names:
+        for k in np.unique(allocation["K_down"]):
+            allocation["bpw_down"][allocation["K_down"] == k] = projection_bpw(int(k))
+    if "codec_down" in allocation.dtype.names:
+        allocation["codec_down"][:] = "VQ-D8"
+    if "cbtrain_down" in allocation.dtype.names:
+        allocation["cbtrain_down"][:] = "act-aware"
+
+
+def weakest_l40_down_rows(allocation: np.ndarray, count: int) -> np.ndarray:
+    indices = np.where((allocation["layer"] == 40) & (allocation["K_down"] == 512))[0]
+    if len(indices) < count:
+        raise ValueError(f"only {len(indices)} L40 K512 down rows remain; cannot demote {count}")
+    priority = allocation["combo_priority"][indices] if "combo_priority" in allocation.dtype.names else np.zeros(len(indices))
+    route_mass = allocation["route_mass"][indices] if "route_mass" in allocation.dtype.names else np.zeros(len(indices))
+    up_priority = allocation["up_priority"][indices] if "up_priority" in allocation.dtype.names else np.zeros(len(indices))
+    rank = allocation["rank"][indices] if "rank" in allocation.dtype.names else np.arange(len(indices))
+    order = np.lexsort((-rank, up_priority, route_mass, priority))
+    return indices[order[:count]]
+
+
+def build_h3371(source: np.ndarray, l40_k256_count: int) -> tuple[np.ndarray, dict[str, Any]]:
+    allocation = source.copy()
+    late_mask = (allocation["layer"] >= 40) & (allocation["layer"] <= 42) & (allocation["K_down"] > 512)
+    late_before = allocation["K_down"][late_mask].copy()
+    allocation["K_down"][late_mask] = 512
+    weak = weakest_l40_down_rows(allocation, l40_k256_count)
+    weak_rows = [
+        {
+            "layer": int(allocation["layer"][index]),
+            "expert": int(allocation["expert"][index]),
+            "rank": int(allocation["rank"][index]) if "rank" in allocation.dtype.names else int(index),
+            "route_mass": float(allocation["route_mass"][index]) if "route_mass" in allocation.dtype.names else 0.0,
+            "up_priority": float(allocation["up_priority"][index]) if "up_priority" in allocation.dtype.names else 0.0,
+        }
+        for index in weak
+    ]
+    allocation["K_down"][weak] = 256
+    update_down_fields(allocation)
+    manifest = {
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": "H3216 allocation",
+        "target": "H3371_H3216_budget_repair_no_overlay",
+        "rule": [
+            "drop H3230 overlay",
+            "demote L40-L42 down K>512 records to K512",
+            f"demote {l40_k256_count} weakest L40 down K512 records to K256",
+        ],
+        "late_down_demotions": {
+            "count": int(late_mask.sum()),
+            "from_hist": {str(int(k)): int(v) for k, v in zip(*np.unique(late_before, return_counts=True), strict=True)},
+        },
+        "l40_k256_demotions": {
+            "count": int(len(weak)),
+            "tie_break": "combo_priority asc, route_mass asc, up_priority asc, rank desc",
+            "first_rows": weak_rows[:24],
+        },
+        "k_hist": {
+            "gate": k_hist(allocation, "K_gate"),
+            "up": k_hist(allocation, "K_up"),
+            "down": k_hist(allocation, "K_down"),
+        },
+    }
+    return allocation, manifest
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--template-pack", type=Path, default=DEFAULT_TEMPLATE_PACK)
+    parser.add_argument("--l40-k256-count", type=int, default=186)
+    args = parser.parse_args()
+
+    source = np.load(args.input, allow_pickle=False)
+    if source.shape != (LAYERS * EXPERTS,):
+        raise SystemExit(f"unexpected allocation shape {source.shape}; expected {(LAYERS * EXPERTS,)}")
+    required = {"layer", "expert", "K_gate", "K_up", "K_down"}
+    missing = required.difference(source.dtype.names or ())
+    if missing:
+        raise SystemExit(f"allocation missing required fields: {sorted(missing)}")
+
+    allocation, manifest = build_h3371(source, args.l40_k256_count)
+    before_routed = routed_payload_bytes(source)
+    after_routed = routed_payload_bytes(allocation)
+    extras = template_bytes(args.template_pack)
+    total = after_routed + sum(extras.values())
+    manifest["byte_model"] = {
+        "record_model": "bitpacked indices + fp16 Kx8 codebook + 4096-byte down act-scale",
+        "source_routed_bytes": before_routed,
+        "target_routed_bytes": after_routed,
+        "routed_saved_bytes": before_routed - after_routed,
+        **extras,
+        "target_total_bytes_with_template_extras": total,
+        "target_total_decimal_gb_with_template_extras": total / 1e9,
+        "target_total_gib_with_template_extras": total / (1024**3),
+        "margin_to_52gb_decimal": 52_000_000_000 - total,
+    }
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    npy_path = args.out_dir / "ds4_52gb_allocation_h3371_general_fit_no_overlay.npy"
+    json_path = args.out_dir / "h3371_general_fit_no_overlay_manifest.json"
+    if npy_path.exists() or json_path.exists():
+        raise SystemExit(f"refusing to overwrite existing outputs in {args.out_dir}")
+    np.save(npy_path, allocation)
+    json_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(json.dumps({"allocation": os.fspath(npy_path), "manifest": os.fspath(json_path), **manifest["byte_model"]}, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
