@@ -280,6 +280,82 @@ kernel void kernel_dsv4_router_weights_one(
  w[tid] = p[s[tid]] / sum * 1.5f;
 }
 
+// Decode router one-shot. This is the dispatch-fusion version of:
+//   kernel_dsv4_softplus_sqrt_f32_4 -> kernel_dsv4_router_finalize_one ->
+//   kernel_dsv4_router_weights_one.
+// It intentionally still materializes the 256-wide unbiased probs row so
+// diagnostics and downstream exactness probes retain the old observation
+// surface. Bias affects selection only; weights use the unbiased probabilities,
+// matching kernel_dsv4_router_weights_one.
+kernel void kernel_dsv4_router_select_one_fused(
+ constant ds4_metal_args_dsv4_router_select_one & args,
+ device const float *logits,
+ device float *probs,
+ device int32_t *selected,
+ device float *weights,
+ device const float *bias,
+ device const int32_t *hash,
+ device const int32_t *tokens,
+ threadgroup float *scratch [[threadgroup(0)]],
+ uint tid [[thread_index_in_threadgroup]]) {
+ if (tid >= 256) return;
+
+ threadgroup float *prob_values = scratch;
+ threadgroup float *sel_scores = scratch + 256;
+ threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 512);
+
+ const float x = logits[tid];
+ const float sp = x > 20.0f ? x : log(1.0f + exp(x));
+ const float p = sqrt(sp);
+ probs[tid] = p;
+ prob_values[tid] = p;
+ sel_scores[tid] = args.has_bias ? p + bias[tid] : p;
+ idx[tid] = (int32_t)tid;
+ threadgroup_barrier(mem_flags::mem_threadgroup);
+
+ if (args.hash_mode) {
+ if (tid < 6) {
+ const uint token = args.use_token_buffer ? (uint)tokens[0] : args.token;
+ const uint row = min(token, args.hash_rows - 1u);
+ idx[tid] = hash[row * 6u + tid];
+ }
+ } else {
+ for (uint k = 2; k <= 256; k <<= 1) {
+ for (uint j = k >> 1; j > 0; j >>= 1) {
+ const uint other = tid ^ j;
+ if (other > tid) {
+ if ((tid & k) == 0) {
+ if (sel_scores[(uint)idx[tid]] < sel_scores[(uint)idx[other]]) {
+ const int32_t tmp = idx[tid];
+ idx[tid] = idx[other];
+ idx[other] = tmp;
+ }
+ } else {
+ if (sel_scores[(uint)idx[tid]] > sel_scores[(uint)idx[other]]) {
+ const int32_t tmp = idx[tid];
+ idx[tid] = idx[other];
+ idx[other] = tmp;
+ }
+ }
+ }
+ threadgroup_barrier(mem_flags::mem_threadgroup);
+ }
+ }
+ }
+ threadgroup_barrier(mem_flags::mem_threadgroup);
+
+ if (tid < 6) {
+ const int32_t expert = idx[tid];
+ selected[tid] = expert;
+ float sum = 0.0f;
+ for (uint i = 0; i < 6; i++) {
+ sum += prob_values[(uint)idx[i]];
+ }
+ sum = max(sum, 6.103515625e-5f);
+ weights[tid] = prob_values[(uint)expert] / sum * 1.5f;
+ }
+}
+
 // Decode router selection for one token after the existing
 // sqrt(softplus(logit)) probability kernel has run. Bias affects only top-k
 // selection. Route-weight normalization deliberately stays in the old one-token

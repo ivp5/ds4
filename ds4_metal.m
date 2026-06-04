@@ -122,6 +122,7 @@ static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_rb16_pipeline;
 static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
+static id<MTLComputePipelineState> g_dsv4_router_select_one_fused_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_with_remap_pipeline;
 static id<MTLBuffer> g_dsv4_expert_inverse_table_buffer; /* 43*256 int32, flat */
@@ -5260,6 +5261,8 @@ int ds4_gpu_init(void) {
  ds4_gpu_get_pipeline("kernel_dsv4_softplus_sqrt_f32_4");
  g_dsv4_router_finalize_one_pipeline =
  ds4_gpu_get_pipeline("kernel_dsv4_router_finalize_one");
+ g_dsv4_router_select_one_fused_pipeline =
+ ds4_gpu_get_pipeline("kernel_dsv4_router_select_one_fused");
  g_dsv4_router_weights_one_pipeline =
  ds4_gpu_get_pipeline("kernel_dsv4_router_weights_one");
  g_dsv4_router_weights_with_remap_pipeline =
@@ -5297,6 +5300,7 @@ int ds4_gpu_init(void) {
  !g_dsv4_indexed_attention_heads8_rb16_pipeline ||
  !g_dsv4_softplus_sqrt_pipeline ||
  !g_dsv4_router_finalize_one_pipeline ||
+ !g_dsv4_router_select_one_fused_pipeline ||
  !g_dsv4_router_weights_one_pipeline ||
  !g_dsv4_router_weights_with_remap_pipeline ||
  !g_dsv4_hc_expand4_pipeline) {
@@ -5745,6 +5749,7 @@ fprintf(stderr,
  g_dsv4_indexed_attention_heads8_rb16_pipeline = nil;
  g_dsv4_softplus_sqrt_pipeline = nil;
  g_dsv4_router_finalize_one_pipeline = nil;
+ g_dsv4_router_select_one_fused_pipeline = nil;
  g_dsv4_router_weights_one_pipeline = nil;
  g_dsv4_router_weights_with_remap_pipeline = nil;
  g_dsv4_expert_inverse_table_buffer = nil;
@@ -16259,6 +16264,59 @@ static int ds4_gpu_encode_router_select(
  int ok = 0;
  if (!g_quality_mode && n_tokens == 1 &&
  getenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSION") == NULL) {
+ const bool use_token_buffer = single_token == NULL;
+ ds4_gpu_dsv4_router_select_one_args args = {
+ .has_bias = has_bias ? 1u : 0u,
+ .hash_mode = hash_mode ? 1u : 0u,
+ .use_token_buffer = use_token_buffer ? 1u : 0u,
+ .token = single_token ? (uint32_t)*single_token : 0u,
+ .hash_rows = hash_rows,
+ };
+ const float zero_f32 = 0.0f;
+ const int32_t zero_i32 = 0;
+ if ((has_bias && !biasbuf) ||
+ (hash_mode && !hashbuf) ||
+ (use_token_buffer && !tokensbuf)) {
+ return 0;
+ }
+
+ if (getenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSED_ONE") == NULL &&
+ g_dsv4_router_select_one_fused_pipeline) {
+ id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+ [enc setComputePipelineState:g_dsv4_router_select_one_fused_pipeline];
+ [enc setBytes:&args length:sizeof(args) atIndex:0];
+ [enc setBuffer:logitsbuf offset:logits_off atIndex:1];
+ [enc setBuffer:probsbuf offset:probs_off atIndex:2];
+ [enc setBuffer:selectedbuf offset:selected_off atIndex:3];
+ [enc setBuffer:weightsbuf offset:weights_off atIndex:4];
+ if (has_bias) {
+ [enc setBuffer:biasbuf offset:bias_off atIndex:5];
+ } else {
+ [enc setBytes:&zero_f32 length:sizeof(zero_f32) atIndex:5];
+ }
+ if (hash_mode) {
+ [enc setBuffer:hashbuf offset:hash_off atIndex:6];
+ } else {
+ [enc setBytes:&zero_i32 length:sizeof(zero_i32) atIndex:6];
+ }
+ if (use_token_buffer) {
+ [enc setBuffer:tokensbuf offset:tokens_off atIndex:7];
+ } else {
+ [enc setBytes:&zero_i32 length:sizeof(zero_i32) atIndex:7];
+ }
+ [enc setThreadgroupMemoryLength:512u * sizeof(float) + 256u * sizeof(int32_t) atIndex:0];
+ [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+ threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+ ds4_gpu_end_compute_encoder(cb, enc);
+ static int s_router_fused_notice = 0;
+ if (!s_router_fused_notice) {
+ s_router_fused_notice = 1;
+ fprintf(stderr,
+ "ds4: fused decode router active — softplus/sqrt + top6 + weights in one dispatch\n");
+ }
+ return 1;
+ }
+
  id<MTLComputePipelineState> softplus_sqrt_pipeline =
  ds4_gpu_hot_pipeline(g_dsv4_softplus_sqrt_pipeline,
  "kernel_dsv4_softplus_sqrt_f32_4");
@@ -16285,23 +16343,6 @@ static int ds4_gpu_encode_router_select(
  0.0f,
  0.0f);
  if (!ok) return 0;
- }
-
- const bool use_token_buffer = single_token == NULL;
- ds4_gpu_dsv4_router_select_one_args args = {
- .has_bias = has_bias ? 1u : 0u,
- .hash_mode = hash_mode ? 1u : 0u,
- .use_token_buffer = use_token_buffer ? 1u : 0u,
- .token = single_token ? (uint32_t)*single_token : 0u,
- .hash_rows = hash_rows,
- };
-
- const float zero_f32 = 0.0f;
- const int32_t zero_i32 = 0;
- if ((has_bias && !biasbuf) ||
- (hash_mode && !hashbuf) ||
- (use_token_buffer && !tokensbuf)) {
- return 0;
  }
 
  /* #559 ICB Phase 5 + #566 multi-command finalize-sequence ICB —
@@ -16650,6 +16691,123 @@ int ds4_gpu_router_select_tensor(
  }
 
  return 1;
+}
+
+int ds4_gpu_router_select_fused_canary(void) {
+ if (!g_initialized && !ds4_gpu_init()) return 0;
+ float logits[256];
+ for (uint32_t i = 0; i < 256u; i++) {
+ const float wave = sinf((float)i * 0.071f) * 0.25f + cosf((float)i * 0.013f) * 0.17f;
+ logits[i] = wave - (float)(i % 19u) * 0.003f;
+ }
+ logits[17] = 5.50f;
+ logits[91] = 5.43f;
+ logits[6] = 5.37f;
+ logits[203] = 5.31f;
+ logits[44] = 5.25f;
+ logits[250] = 5.19f;
+ logits[73] = 5.02f;
+
+ ds4_gpu_tensor *logits_t = ds4_gpu_tensor_alloc(256u * sizeof(float));
+ ds4_gpu_tensor *probs_ref = ds4_gpu_tensor_alloc(256u * sizeof(float));
+ ds4_gpu_tensor *probs_fused = ds4_gpu_tensor_alloc(256u * sizeof(float));
+ ds4_gpu_tensor *selected_ref = ds4_gpu_tensor_alloc(6u * sizeof(int32_t));
+ ds4_gpu_tensor *selected_fused = ds4_gpu_tensor_alloc(6u * sizeof(int32_t));
+ ds4_gpu_tensor *weights_ref = ds4_gpu_tensor_alloc(6u * sizeof(float));
+ ds4_gpu_tensor *weights_fused = ds4_gpu_tensor_alloc(6u * sizeof(float));
+ if (!logits_t || !probs_ref || !probs_fused || !selected_ref || !selected_fused ||
+ !weights_ref || !weights_fused) {
+ ds4_gpu_tensor_free(logits_t);
+ ds4_gpu_tensor_free(probs_ref);
+ ds4_gpu_tensor_free(probs_fused);
+ ds4_gpu_tensor_free(selected_ref);
+ ds4_gpu_tensor_free(selected_fused);
+ ds4_gpu_tensor_free(weights_ref);
+ ds4_gpu_tensor_free(weights_fused);
+ return 0;
+ }
+
+ int ok = ds4_gpu_tensor_write(logits_t, 0, logits, sizeof(logits)) != 0;
+ char dummy_model = 0;
+ const char *saved_disable_all = getenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSION");
+ const char *saved_disable = getenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSED_ONE");
+ char saved_disable_all_buf[64];
+ char saved_disable_buf[64];
+ if (saved_disable_all) {
+ snprintf(saved_disable_all_buf, sizeof(saved_disable_all_buf), "%s", saved_disable_all);
+ } else {
+ saved_disable_all_buf[0] = '\0';
+ }
+ if (saved_disable) {
+ snprintf(saved_disable_buf, sizeof(saved_disable_buf), "%s", saved_disable);
+ } else {
+ saved_disable_buf[0] = '\0';
+ }
+ unsetenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSION");
+ setenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSED_ONE", "1", 1);
+ if (ok) {
+ ok = ds4_gpu_router_select_tensor(selected_ref, weights_ref, probs_ref,
+ &dummy_model, 1, 0, 0, 0, 0,
+ 256, 6, 1.5f, 0, 0, false, false, logits_t) != 0;
+ }
+ if (saved_disable) {
+ setenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSED_ONE", saved_disable_buf, 1);
+ } else {
+ unsetenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSED_ONE");
+ }
+ if (ok) {
+ ok = ds4_gpu_router_select_tensor(selected_fused, weights_fused, probs_fused,
+ &dummy_model, 1, 0, 0, 0, 0,
+ 256, 6, 1.5f, 0, 0, false, false, logits_t) != 0;
+ }
+ if (saved_disable_all) {
+ setenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSION", saved_disable_all_buf, 1);
+ } else {
+ unsetenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSION");
+ }
+
+ float probs_ref_h[256] = {0}, probs_fused_h[256] = {0};
+ float weights_ref_h[6] = {0}, weights_fused_h[6] = {0};
+ int32_t selected_ref_h[6] = {0}, selected_fused_h[6] = {0};
+ if (ok) {
+ ok = ds4_gpu_tensor_read(probs_ref, 0, probs_ref_h, sizeof(probs_ref_h)) != 0 &&
+ ds4_gpu_tensor_read(probs_fused, 0, probs_fused_h, sizeof(probs_fused_h)) != 0 &&
+ ds4_gpu_tensor_read(weights_ref, 0, weights_ref_h, sizeof(weights_ref_h)) != 0 &&
+ ds4_gpu_tensor_read(weights_fused, 0, weights_fused_h, sizeof(weights_fused_h)) != 0 &&
+ ds4_gpu_tensor_read(selected_ref, 0, selected_ref_h, sizeof(selected_ref_h)) != 0 &&
+ ds4_gpu_tensor_read(selected_fused, 0, selected_fused_h, sizeof(selected_fused_h)) != 0;
+ }
+ double max_prob_abs = 0.0;
+ double max_weight_abs = 0.0;
+ int selected_mismatch = 0;
+ if (ok) {
+ for (uint32_t i = 0; i < 256u; i++) {
+ const double d = fabs((double)probs_ref_h[i] - (double)probs_fused_h[i]);
+ if (d > max_prob_abs) max_prob_abs = d;
+ }
+ for (uint32_t i = 0; i < 6u; i++) {
+ if (selected_ref_h[i] != selected_fused_h[i]) selected_mismatch++;
+ const double d = fabs((double)weights_ref_h[i] - (double)weights_fused_h[i]);
+ if (d > max_weight_abs) max_weight_abs = d;
+ }
+ }
+ fprintf(stderr,
+ "ds4: router_select_fused_canary selected_mismatch=%d max_prob_abs=%.6e max_weight_abs=%.6e "
+ "ref={%d,%d,%d,%d,%d,%d} fused={%d,%d,%d,%d,%d,%d}\n",
+ selected_mismatch, max_prob_abs, max_weight_abs,
+ selected_ref_h[0], selected_ref_h[1], selected_ref_h[2],
+ selected_ref_h[3], selected_ref_h[4], selected_ref_h[5],
+ selected_fused_h[0], selected_fused_h[1], selected_fused_h[2],
+ selected_fused_h[3], selected_fused_h[4], selected_fused_h[5]);
+
+ ds4_gpu_tensor_free(logits_t);
+ ds4_gpu_tensor_free(probs_ref);
+ ds4_gpu_tensor_free(probs_fused);
+ ds4_gpu_tensor_free(selected_ref);
+ ds4_gpu_tensor_free(selected_fused);
+ ds4_gpu_tensor_free(weights_ref);
+ ds4_gpu_tensor_free(weights_fused);
+ return ok && selected_mismatch == 0 && max_prob_abs <= 1.0e-6 && max_weight_abs <= 1.0e-6;
 }
 
 int ds4_gpu_router_select_batch_tensor(
