@@ -55858,6 +55858,81 @@ static int ds4_d8f_runtime_down_i8_codebook_build(ds4_d8f_file *file,
     return 1;
 }
 
+static int ds4_d8f_runtime_down_i8_codebook_load_sidecars(ds4_d8f_file *file,
+                                                          id<MTLBuffer> *out_rec_buf,
+                                                          id<MTLBuffer> *out_codebook_buf,
+                                                          uint32_t *out_bytes,
+                                                          uint32_t *out_kept,
+                                                          uint32_t *out_total,
+                                                          uint32_t layer) {
+    if (out_rec_buf) *out_rec_buf = nil;
+    if (out_codebook_buf) *out_codebook_buf = nil;
+    if (out_bytes) *out_bytes = 0;
+    if (out_kept) *out_kept = 0;
+    if (out_total) *out_total = 0;
+    if (!file || ds4_d8f_down_i8_codebook_sidecar_count(file) == 0u) return 0;
+    uint64_t total_bytes64 = 0;
+    uint32_t total_codes = 0;
+    uint32_t kept = 0;
+    for (uint32_t expert = 0; expert < 256u; expert++) {
+        ds4_d8f_i8_codebook_record i8;
+        if (!ds4_d8f_get_down_i8_codebook(file, expert, &i8)) continue;
+        ds4_d8f_record down;
+        if (!ds4_d8f_get_record(file, DS4_D8F_DOWN, expert, &down) ||
+            i8.k != down.k ||
+            i8.k == 0u ||
+            i8.k > 2048u ||
+            i8.bytes != i8.k * (8u + 2u) ||
+            i8.offset + (uint64_t)i8.bytes < i8.offset ||
+            i8.offset + (uint64_t)i8.bytes > (uint64_t)file->size) {
+            fprintf(stderr,
+                    "ds4_d8f: persistent i8 down codebook rejected L%u expert=%u k=%u bytes=%u\n",
+                    layer, expert, i8.k, i8.bytes);
+            return 0;
+        }
+        total_bytes64 += i8.bytes;
+        total_codes += i8.k;
+        kept += i8.kept;
+    }
+    if (total_bytes64 == 0u || total_bytes64 > UINT32_MAX) return 0;
+    ds4_d8f_runtime_i8_codebook_lite recs[256];
+    memset(recs, 0, sizeof(recs));
+    uint8_t *bytes = (uint8_t *)malloc((size_t)total_bytes64);
+    if (!bytes) return 0;
+    uint32_t offset = 0;
+    for (uint32_t expert = 0; expert < 256u; expert++) {
+        ds4_d8f_i8_codebook_record i8;
+        if (!ds4_d8f_get_down_i8_codebook(file, expert, &i8)) continue;
+        memcpy(bytes + offset, file->map + i8.offset, i8.bytes);
+        recs[expert].k = i8.k;
+        recs[expert].offset = offset;
+        recs[expert].scale_offset = offset + i8.k * 8u;
+        recs[expert].reserved = 0u;
+        offset += i8.bytes;
+    }
+    id<MTLBuffer> rec_buf = [g_device newBufferWithBytes:recs
+                                                  length:sizeof(recs)
+                                                 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> codebook_buf = [g_device newBufferWithBytes:bytes
+                                                       length:(NSUInteger)total_bytes64
+                                                      options:MTLResourceStorageModeShared];
+    free(bytes);
+    if (!rec_buf || !codebook_buf) return 0;
+    if (out_rec_buf) *out_rec_buf = rec_buf;
+    if (out_codebook_buf) *out_codebook_buf = codebook_buf;
+    if (out_bytes) *out_bytes = (uint32_t)total_bytes64;
+    if (out_kept) *out_kept = kept;
+    if (out_total) *out_total = total_codes;
+    fprintf(stderr,
+            "ds4_d8f: persistent i8 down codebook sidecar L%u kept=%u/%u bytes=%.3f MiB records=%u\n",
+            layer,
+            kept,
+            total_codes,
+            (double)total_bytes64 / 1048576.0,
+            ds4_d8f_down_i8_codebook_sidecar_count(file));
+    return 1;
+}
+
 static int ds4_d8f_runtime_pack2d_warm_buffer_ensure(NSUInteger bytes) {
     if (bytes == 0u) return 0;
     if (g_d8f_runtime_pack2d_warm_buf &&
@@ -55971,7 +56046,14 @@ static int ds4_d8f_runtime_cache_prepare(uint32_t layer, const char *path) {
         uint32_t i8_bytes = 0;
         uint32_t i8_kept = 0;
         uint32_t i8_total = 0;
-        if (ds4_d8f_runtime_down_i8_codebook_build(file,
+        if (ds4_d8f_runtime_down_i8_codebook_load_sidecars(file,
+                                                           &i8_rec_buf,
+                                                           &i8_codebook_buf,
+                                                           &i8_bytes,
+                                                           &i8_kept,
+                                                           &i8_total,
+                                                           layer) ||
+            ds4_d8f_runtime_down_i8_codebook_build(file,
                                                    &i8_rec_buf,
                                                    &i8_codebook_buf,
                                                    &i8_bytes,

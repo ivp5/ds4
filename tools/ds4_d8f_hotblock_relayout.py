@@ -57,6 +57,9 @@ DOWN_GROUPS = DOWN_IN_DIM // 8
 DOWN_NATIVE_CODE_RECORD_BYTES = 32
 DOWN_NATIVE_CODE_RECORD = struct.Struct("<IIIIQII")
 DOWN_NATIVE_CODE_DTYPE_U16 = 1
+DOWN_I8_CODEBOOK_RECORD_BYTES = 32
+DOWN_I8_CODEBOOK_RECORD = struct.Struct("<IIIIQII")
+DOWN_I8_CODEBOOK_DTYPE_I8X8_F16_SCALE = 1
 
 
 def parse_int_set(text: str, *, limit: int, name: str) -> list[int]:
@@ -523,6 +526,123 @@ def finish_down_native_code_sidecars(state: dict[str, Any] | None, handle) -> di
     }
 
 
+def _f16_bits_and_value(value: float) -> tuple[bytes, float]:
+    bits = struct.pack("<e", float(value))
+    return bits, float(struct.unpack("<e", bits)[0])
+
+
+def encode_down_i8_codebook(source_path: Path,
+                            source_record: tuple[Any, ...],
+                            max_rel: float) -> tuple[int, bytes, int, int]:
+    projection, expert, k, _, block, _, codebook_offset, _, _, codebook_bytes, _, _, _ = [
+        int(x) for x in source_record
+    ]
+    if projection != 2 or k == 0 or k > 2048 or block != 8:
+        raise RuntimeError(f"invalid down i8-codebook source p={projection} e={expert} k={k} block={block}")
+    needed = k * 16
+    if codebook_bytes < needed:
+        raise RuntimeError(f"down i8-codebook source too short e={expert} bytes={codebook_bytes} need={needed}")
+    codebook = read_payload(source_path, codebook_offset, needed)
+    payload = bytearray(k * 8 + k * 2)
+    scale_base = k * 8
+    kept = 0
+    for code in range(k):
+        values = [float(v) for v in struct.unpack_from("<8e", codebook, code * 16)]
+        max_abs = max(abs(v) for v in values)
+        scale = max_abs / 127.0 if max_abs > 0.0 else 0.0
+        scale_bits, scale_q = _f16_bits_and_value(scale)
+        use_i8 = scale_q > 0.0
+        for dim, value in enumerate(values):
+            q = int(round(value / scale_q)) if scale_q > 0.0 else 0
+            if q < -127:
+                q = -127
+            elif q > 127:
+                q = 127
+            struct.pack_into("<b", payload, code * 8 + dim, q)
+            recon = float(q) * scale_q
+            denom = max(abs(value), 1.0e-6)
+            if abs(recon - value) > max_rel * denom:
+                use_i8 = False
+        if use_i8:
+            kept += 1
+            payload[scale_base + code * 2:scale_base + (code + 1) * 2] = scale_bits
+        else:
+            payload[scale_base + code * 2:scale_base + (code + 1) * 2] = b"\0\0"
+    return k, bytes(payload), kept, k
+
+
+def begin_down_i8_codebook_sidecars(source_path: Path,
+                                    records: list[tuple[Any, ...]],
+                                    hot_experts: list[int],
+                                    handle,
+                                    max_rel: float) -> dict[str, Any] | None:
+    table_offset = handle.tell()
+    padding = (-table_offset) % 16
+    if padding:
+        handle.write(b"\0" * padding)
+        table_offset += padding
+    table = bytearray(DOWN_I8_CODEBOOK_RECORD_BYTES * EXPERTS)
+    handle.write(table)
+    payload_hash = hashlib.sha256()
+    count = 0
+    total_codes = 0
+    total_kept = 0
+    for expert in ordered_experts(hot_experts):
+        record = records[2 * EXPERTS + expert]
+        projection = int(record[0])
+        k = int(record[2])
+        block = int(record[4])
+        if projection != 2 or k == 0 or k > 2048 or block != 8:
+            continue
+        k, payload, kept, total = encode_down_i8_codebook(source_path, record, max_rel)
+        payload_offset = append_aligned(handle, payload)
+        payload_hash.update(payload)
+        table[expert * DOWN_I8_CODEBOOK_RECORD_BYTES:(expert + 1) * DOWN_I8_CODEBOOK_RECORD_BYTES] = DOWN_I8_CODEBOOK_RECORD.pack(
+            expert,
+            k,
+            DOWN_I8_CODEBOOK_DTYPE_I8X8_F16_SCALE,
+            0,
+            payload_offset,
+            len(payload),
+            kept,
+        )
+        count += 1
+        total_codes += total
+        total_kept += kept
+    return {
+        "table_offset": table_offset,
+        "table": table,
+        "count": count,
+        "total_codes": total_codes,
+        "total_kept": total_kept,
+        "max_rel": max_rel,
+        "payload_hash": payload_hash,
+    }
+
+
+def finish_down_i8_codebook_sidecars(state: dict[str, Any] | None, handle) -> dict[str, Any]:
+    if not state:
+        return {}
+    here = handle.tell()
+    handle.seek(int(state["table_offset"]))
+    handle.write(state["table"])
+    handle.seek(here)
+    return {
+        "down_i8_codebook_sidecar_format": "DS4D8F_DOWN_I8_CODEBOOK_F16SCALE_V1",
+        "down_i8_codebook_sidecar_table_offset": int(state["table_offset"]),
+        "down_i8_codebook_sidecar_record_bytes": DOWN_I8_CODEBOOK_RECORD_BYTES,
+        "down_i8_codebook_sidecar_records": EXPERTS,
+        "down_i8_codebook_sidecar_count": int(state["count"]),
+        "down_i8_codebook_sidecar_record_struct": "<IIIIQII",
+        "down_i8_codebook_sidecar_dtype": "i8x8_f16scale_le",
+        "down_i8_codebook_sidecar_layout": "per_expert_i8_plane_then_f16_scale_plane",
+        "down_i8_codebook_sidecar_max_rel": float(state["max_rel"]),
+        "down_i8_codebook_sidecar_total_codes": int(state["total_codes"]),
+        "down_i8_codebook_sidecar_kept_codes": int(state["total_kept"]),
+        "down_i8_codebook_sidecar_payload_sha256": state["payload_hash"].hexdigest(),
+    }
+
+
 def begin_hotblock_sidecars(source_path: Path,
                             sidecars: dict[int, tuple[Any, ...]],
                             hot_experts: list[int],
@@ -637,6 +757,18 @@ def strip_rebuilt_header_keys(header: dict[str, Any]) -> None:
         "down_native_code_sidecar_layout",
         "down_native_code_sidecar_groups",
         "down_native_code_sidecar_payload_sha256",
+        "down_i8_codebook_sidecar_format",
+        "down_i8_codebook_sidecar_table_offset",
+        "down_i8_codebook_sidecar_record_bytes",
+        "down_i8_codebook_sidecar_records",
+        "down_i8_codebook_sidecar_count",
+        "down_i8_codebook_sidecar_record_struct",
+        "down_i8_codebook_sidecar_dtype",
+        "down_i8_codebook_sidecar_layout",
+        "down_i8_codebook_sidecar_max_rel",
+        "down_i8_codebook_sidecar_total_codes",
+        "down_i8_codebook_sidecar_kept_codes",
+        "down_i8_codebook_sidecar_payload_sha256",
     ]:
         header.pop(key, None)
 
@@ -648,7 +780,9 @@ def relayout_layer(source_pack: Path,
                    execute: bool,
                    status_every: int,
                    gateup_rowblock_overlays: bool,
-                   down_native_code_sidecars: bool) -> dict[str, Any]:
+                   down_native_code_sidecars: bool,
+                   down_i8_codebook_sidecars: bool,
+                   down_i8_codebook_max_rel: float) -> dict[str, Any]:
     source_path = d8f_path(source_pack, layer)
     info = read_d8f(source_path)
     report: dict[str, Any] = {
@@ -696,6 +830,7 @@ def relayout_layer(source_pack: Path,
         "d8f_hotblock_payload_order": "hot_expert_major_gate_up_down_then_remaining_expert_major",
         "d8f_hotblock_gateup_rowblock_overlays": bool(gateup_rowblock_overlays),
         "d8f_hotblock_down_native_code_sidecars": bool(down_native_code_sidecars),
+        "d8f_hotblock_down_i8_codebook_sidecars": bool(down_i8_codebook_sidecars),
     })
     payload_hashers = {projection: hashlib.sha256() for projection in PROJECTIONS}
     overlay_hashers = {projection: hashlib.sha256() for projection in PROJECTIONS[:2]}
@@ -708,6 +843,7 @@ def relayout_layer(source_pack: Path,
         expert_order = ordered_experts(hot_experts)
         sidecar_state = begin_hotblock_sidecars(source_path, info["sidecars"], hot_experts, handle)
         down_native_state = begin_down_native_code_sidecars(source_path, old_records, hot_experts, handle) if down_native_code_sidecars else None
+        down_i8_state = begin_down_i8_codebook_sidecars(source_path, old_records, hot_experts, handle, down_i8_codebook_max_rel) if down_i8_codebook_sidecars else None
         overlay_state = begin_gateup_overlay(handle, hot_experts) if gateup_rowblock_overlays else None
         if overlay_state:
             for row_block in range(GATEUP_ROW_BLOCKS):
@@ -766,9 +902,11 @@ def relayout_layer(source_pack: Path,
         overlay_header = finish_gateup_overlay(overlay_state, handle)
         sidecar_header = finish_hotblock_sidecars(sidecar_state, handle)
         down_native_header = finish_down_native_code_sidecars(down_native_state, handle)
+        down_i8_header = finish_down_i8_codebook_sidecars(down_i8_state, handle)
         header.update(overlay_header)
         header.update(sidecar_header)
         header.update(down_native_header)
+        header.update(down_i8_header)
         if overlay_state:
             header["gateup_overlay_payload_sha256"] = {
                 projection: overlay_hashers[projection].hexdigest()
@@ -826,6 +964,10 @@ def main() -> int:
                         help="materialize hot gate/up experts as 128-row overlay records for deeper locality")
     parser.add_argument("--down-native-code-sidecars", action="store_true",
                         help="materialize hot down expert codes as row-major uint16 gather-native sidecars")
+    parser.add_argument("--down-i8-codebook-sidecars", action="store_true",
+                        help="materialize supported down codebooks as int8+f16-scale sidecars matching runtime CBSRAM layout")
+    parser.add_argument("--down-i8-codebook-max-rel", type=float, default=0.02,
+                        help="per-code per-lane relative error threshold for int8 codebook sidecars")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--status-every", type=int, default=32)
@@ -856,6 +998,8 @@ def main() -> int:
     if args.hot_json:
         per_layer_hot.update(parse_layer_hot_json(args.hot_json))
     common_hot = parse_int_set(args.hot_experts, limit=EXPERTS, name="expert") if args.hot_experts else []
+    if not (args.down_i8_codebook_max_rel > 0.0 and args.down_i8_codebook_max_rel <= 1.0):
+        raise SystemExit("--down-i8-codebook-max-rel must be in (0, 1]")
     reports: list[dict[str, Any]] = []
     for layer in layers:
         hot_experts = per_layer_hot.get(layer, common_hot)
@@ -868,11 +1012,14 @@ def main() -> int:
             "execute": args.execute,
             "gateup_rowblock_overlays": args.gateup_rowblock_overlays,
             "down_native_code_sidecars": args.down_native_code_sidecars,
+            "down_i8_codebook_sidecars": args.down_i8_codebook_sidecars,
         }, sort_keys=True), flush=True)
         report = relayout_layer(
             args.pack, args.out_dir, layer, hot_experts, args.execute,
             args.status_every, args.gateup_rowblock_overlays,
             args.down_native_code_sidecars,
+            args.down_i8_codebook_sidecars,
+            args.down_i8_codebook_max_rel,
         )
         reports.append(report)
         print(json.dumps({
@@ -907,6 +1054,8 @@ def main() -> int:
         "common_hot_experts": common_hot,
         "gateup_rowblock_overlays": args.gateup_rowblock_overlays,
         "down_native_code_sidecars": args.down_native_code_sidecars,
+        "down_i8_codebook_sidecars": args.down_i8_codebook_sidecars,
+        "down_i8_codebook_max_rel": args.down_i8_codebook_max_rel,
         "route_trace_csv": None if args.route_trace_csv is None else str(args.route_trace_csv),
         "route_top": args.route_top,
         "route_stages": args.route_stages,

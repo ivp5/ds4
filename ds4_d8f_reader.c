@@ -15,6 +15,8 @@ enum {
     DS4_D8F_SIDECAR_RECORD_BYTES = 64,
     DS4_D8F_NATIVE_CODE_RECORD_BYTES = 32,
     DS4_D8F_NATIVE_CODE_DTYPE_U16 = 1,
+    DS4_D8F_I8_CODEBOOK_RECORD_BYTES = 32,
+    DS4_D8F_I8_CODEBOOK_DTYPE_I8X8_F16_SCALE = 1,
     DS4_D8F_FLAG_ACT_SCALE = 1u,
     DS4_D8F_GATEUP_OVERLAY_PROJECTIONS = 2,
     DS4_D8F_GATEUP_ROW_BLOCKS = 16,
@@ -194,6 +196,16 @@ static void d8f_native_code_read(const uint8_t *p, ds4_d8f_native_code_record *o
     out->flags = d8f_u32(p + 28);
 }
 
+static void d8f_i8_codebook_read(const uint8_t *p, ds4_d8f_i8_codebook_record *out) {
+    out->expert = d8f_u32(p + 0);
+    out->k = d8f_u32(p + 4);
+    out->dtype = d8f_u32(p + 8);
+    out->flags = d8f_u32(p + 12);
+    out->offset = d8f_u64(p + 16);
+    out->bytes = d8f_u32(p + 24);
+    out->kept = d8f_u32(p + 28);
+}
+
 static bool d8f_span_ok(const ds4_d8f_file *file, uint64_t offset, uint64_t bytes) {
     if (bytes == 0u) return false;
     if (offset < DS4_D8F_HEADER_BYTES + (uint64_t)DS4_D8F_PROJECTION_COUNT * DS4_D8F_EXPERTS * DS4_D8F_RECORD_BYTES) return false;
@@ -351,6 +363,30 @@ bool ds4_d8f_open(const char *path, ds4_d8f_file *file) {
             return false;
         }
     }
+    uint64_t i8_codebook_offset = 0;
+    if (d8f_header_u64(header_json, file->header_json_bytes, "down_i8_codebook_sidecar_table_offset", &i8_codebook_offset)) {
+        file->down_i8_codebook_sidecar_table_offset = i8_codebook_offset;
+        file->down_i8_codebook_sidecar_record_bytes =
+            d8f_header_u32_or(header_json, file->header_json_bytes,
+                              "down_i8_codebook_sidecar_record_bytes", DS4_D8F_I8_CODEBOOK_RECORD_BYTES);
+        file->down_i8_codebook_sidecar_records =
+            d8f_header_u32_or(header_json, file->header_json_bytes,
+                              "down_i8_codebook_sidecar_records", DS4_D8F_EXPERTS);
+        if (file->down_i8_codebook_sidecar_record_bytes != DS4_D8F_I8_CODEBOOK_RECORD_BYTES ||
+            file->down_i8_codebook_sidecar_records > DS4_D8F_EXPERTS ||
+            file->down_i8_codebook_sidecar_table_offset <
+                DS4_D8F_HEADER_BYTES + (uint64_t)DS4_D8F_PROJECTION_COUNT * DS4_D8F_EXPERTS * DS4_D8F_RECORD_BYTES ||
+            file->down_i8_codebook_sidecar_table_offset +
+                (uint64_t)file->down_i8_codebook_sidecar_records * file->down_i8_codebook_sidecar_record_bytes >
+                (uint64_t)file->size) {
+            fprintf(stderr, "ds4_d8f: invalid down i8-codebook sidecar table off=%llu records=%u record_bytes=%u\n",
+                    (unsigned long long)file->down_i8_codebook_sidecar_table_offset,
+                    file->down_i8_codebook_sidecar_records,
+                    file->down_i8_codebook_sidecar_record_bytes);
+            ds4_d8f_close(file);
+            return false;
+        }
+    }
     const uint8_t *table = base + DS4_D8F_HEADER_BYTES;
     for (uint32_t projection = 0; projection < DS4_D8F_PROJECTION_COUNT; projection++) {
         for (uint32_t expert = 0; expert < DS4_D8F_EXPERTS; expert++) {
@@ -486,6 +522,30 @@ bool ds4_d8f_open(const char *path, ds4_d8f_file *file) {
             file->down_native_code_sidecar_count++;
         }
     }
+    if (file->down_i8_codebook_sidecar_table_offset) {
+        const uint8_t *i8_table = base + file->down_i8_codebook_sidecar_table_offset;
+        for (uint32_t i = 0; i < file->down_i8_codebook_sidecar_records; i++) {
+            ds4_d8f_i8_codebook_record rec;
+            d8f_i8_codebook_read(i8_table + (size_t)i * DS4_D8F_I8_CODEBOOK_RECORD_BYTES, &rec);
+            if (rec.bytes == 0u) continue;
+            if (rec.expert >= DS4_D8F_EXPERTS ||
+                rec.k == 0u ||
+                rec.k > 2048u ||
+                !d8f_supported_k(rec.k) ||
+                rec.dtype != DS4_D8F_I8_CODEBOOK_DTYPE_I8X8_F16_SCALE ||
+                rec.flags != 0u ||
+                rec.kept > rec.k ||
+                rec.bytes != rec.k * (8u + 2u) ||
+                !d8f_payload_span_ok(file, rec.offset, rec.bytes)) {
+                fprintf(stderr, "ds4_d8f: invalid down i8-codebook sidecar row=%u expert=%u k=%u dtype=%u bytes=%u kept=%u\n",
+                        i, rec.expert, rec.k, rec.dtype, rec.bytes, rec.kept);
+                ds4_d8f_close(file);
+                return false;
+            }
+            file->down_i8_codebooks[rec.expert] = rec;
+            file->down_i8_codebook_sidecar_count++;
+        }
+    }
     if (file->sidecar_count > 0u && !file->rank1_residual_sidecars) {
         fprintf(stderr,
                 "ds4_d8f: sidecar table present without rank1-residual codec contract "
@@ -567,12 +627,24 @@ bool ds4_d8f_get_down_native_codes(const ds4_d8f_file *file, uint32_t expert, ds
     return true;
 }
 
+bool ds4_d8f_get_down_i8_codebook(const ds4_d8f_file *file, uint32_t expert, ds4_d8f_i8_codebook_record *out) {
+    if (!file || !out || expert >= DS4_D8F_EXPERTS) return false;
+    ds4_d8f_i8_codebook_record rec = file->down_i8_codebooks[expert];
+    if (rec.bytes == 0u) return false;
+    *out = rec;
+    return true;
+}
+
 uint32_t ds4_d8f_down_sidecar_count(const ds4_d8f_file *file) {
     return file ? file->sidecar_count : 0u;
 }
 
 uint32_t ds4_d8f_down_native_code_sidecar_count(const ds4_d8f_file *file) {
     return file ? file->down_native_code_sidecar_count : 0u;
+}
+
+uint32_t ds4_d8f_down_i8_codebook_sidecar_count(const ds4_d8f_file *file) {
+    return file ? file->down_i8_codebook_sidecar_count : 0u;
 }
 
 uint32_t ds4_d8f_gateup_overlay_count(const ds4_d8f_file *file) {
@@ -595,7 +667,7 @@ void ds4_d8f_print_summary(const ds4_d8f_file *file) {
     if (!file) return;
     uint32_t live[DS4_D8F_PROJECTION_COUNT] = {0};
     uint32_t act_scaled = 0;
-    uint64_t codebook_bytes = 0, index_bytes = 0, scale_bytes = 0, sidecar_bytes = 0;
+    uint64_t codebook_bytes = 0, index_bytes = 0, scale_bytes = 0, sidecar_bytes = 0, i8_codebook_bytes = 0;
     uint64_t overlay_codebook_bytes = 0, overlay_index_bytes = 0;
     for (uint32_t projection = 0; projection < DS4_D8F_PROJECTION_COUNT; projection++) {
         for (uint32_t expert = 0; expert < DS4_D8F_EXPERTS; expert++) {
@@ -613,6 +685,11 @@ void ds4_d8f_print_summary(const ds4_d8f_file *file) {
         if (rec->rank == 0u) continue;
         sidecar_bytes += rec->u_bytes + rec->a_bytes;
     }
+    for (uint32_t expert = 0; expert < DS4_D8F_EXPERTS; expert++) {
+        const ds4_d8f_i8_codebook_record *rec = &file->down_i8_codebooks[expert];
+        if (rec->bytes == 0u) continue;
+        i8_codebook_bytes += rec->bytes;
+    }
     if (file->gateup_rowblock_overlay) {
         const uint8_t *record_base = file->map + file->gateup_overlay_record_offset;
         for (uint32_t slot = 0; slot < file->gateup_overlay_records; slot++) {
@@ -624,15 +701,18 @@ void ds4_d8f_print_summary(const ds4_d8f_file *file) {
         }
     }
     fprintf(stderr,
-            "ds4_d8f: version=%u record_bytes=%u size=%.3f MiB live_gate=%u live_up=%u live_down=%u act_scaled=%u sidecars=%u gateup_overlay=%u rank1_residual=%u codebook=%.3f MiB index=%.3f MiB scale=%.3f MiB sidecar=%.3f MiB overlay_codebook=%.3f MiB overlay_index=%.3f MiB\n",
+            "ds4_d8f: version=%u record_bytes=%u size=%.3f MiB live_gate=%u live_up=%u live_down=%u act_scaled=%u sidecars=%u native_codes=%u i8_codebooks=%u gateup_overlay=%u rank1_residual=%u codebook=%.3f MiB index=%.3f MiB scale=%.3f MiB sidecar=%.3f MiB i8_codebook=%.3f MiB overlay_codebook=%.3f MiB overlay_index=%.3f MiB\n",
             file->version, file->record_bytes, (double)file->size / 1048576.0,
             live[DS4_D8F_GATE], live[DS4_D8F_UP], live[DS4_D8F_DOWN], act_scaled, file->sidecar_count,
+            file->down_native_code_sidecar_count,
+            file->down_i8_codebook_sidecar_count,
             file->gateup_overlay_live_slots,
             file->rank1_residual_sidecars ? 1u : 0u,
             (double)codebook_bytes / 1048576.0,
             (double)index_bytes / 1048576.0,
             (double)scale_bytes / 1048576.0,
             (double)sidecar_bytes / 1048576.0,
+            (double)i8_codebook_bytes / 1048576.0,
             (double)overlay_codebook_bytes / 1048576.0,
             (double)overlay_index_bytes / 1048576.0);
 }
