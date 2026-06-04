@@ -145,6 +145,89 @@ enum {
 #include "ds4_cache_lock_detector.h"
 
 static int g_ds4_lock_fd = -1;
+static int g_metal_graph_max_fusion_enabled_cache = -1;
+static int g_d8f_mtl4_packet_warning_printed;
+static int g_storage_dispatch_site_profile_checked;
+static int g_storage_dispatch_site_profile_enabled;
+static int g_bf16_storage_disabled = -1;
+static int g_iq2_tbl_kernel_enabled_cache = -1;
+static int g_k_reduce_effective_k_cache = -1;
+static int g_int8_indexer_enabled_cache = -1;
+static int g_q8_dispatch_substitute_warning_printed;
+static int g_qa_kv_fp8_pair_disable_checked;
+static int g_qa_kv_fp8_pair_disabled;
+static int g_qa_kv_fp8_pair_logged;
+static int g_kv_rope_store_fused_logged;
+static int g_indexer_q_rope_fused_logged;
+static int g_indexed_attn_rope_fused_logged;
+static int g_decode_attn_rope_fused_logged;
+static int g_fp8_attn_out_onecb_logged;
+static int g_fp8_attn_out_onecb_fail_logged;
+static int g_router_matmul_select_logged;
+static int g_router_matmul_select_fallback_logged;
+static int g_shared_gate_up_fp8_logged;
+static int g_shared_gate_up_fp8_fail_logged;
+static int g_shared_down_fp8_logged;
+static int g_shared_down_fp8_fail_logged;
+static bool g_metal_prefill_kernel_warmup_done;
+static uint64_t g_residency_initial_wired_bytes;
+static int g_residency_auto_reserve_logged;
+static int g_residency_hard_limit_logged;
+static int g_top_only_session_logged;
+static bool g_decode_policy_has_been_read_from_environment;
+static FILE *g_dump_expert_mid_fp;
+static int g_dump_expert_mid_env_checked;
+static int g_polar_layer_notice_printed[DS4_POLAR_MAX_LAYERS];
+static int g_hash_router_probe_printed[DS4_N_LAYER];
+static int g_d8f_prefill_notice_printed;
+static int g_m1r_prefill_batch_notice_printed;
+static int g_m1r_prefill_fallback_notice_printed;
+static const float g_e4m3fn_exp_scale[16] = {
+ 0.0f, 0.015625f, 0.03125f, 0.0625f,
+ 0.125f, 0.25f, 0.5f, 1.0f,
+ 2.0f, 4.0f, 8.0f, 16.0f,
+ 32.0f, 64.0f, 128.0f, 256.0f,
+};
+static const uint32_t g_q4_k_mask1 = 0x3f3f3f3f;
+static const uint32_t g_q4_k_mask2 = 0x0f0f0f0f;
+static const uint8_t g_iq2_tbl_idx_lo[16] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+static const uint8_t g_iq2_tbl_idx_hi[16] = {16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31};
+static _Thread_local float g_hc_pre_flat_scratch[(size_t)DS4_N_EMBD * DS4_N_HC];
+static _Thread_local float g_hc_pre_norm_batch_flat_scratch[(size_t)DS4_N_EMBD * DS4_N_HC];
+static _Thread_local block_q8_K g_routed_moe_xq_scratch[DS4_N_EMBD / QK_K];
+static _Thread_local float g_routed_moe_mid_all_scratch[DS4_N_EXPERT_USED * DS4_N_FF_EXP];
+static _Thread_local block_q8_K g_routed_moe_midq_scratch[DS4_N_EXPERT_USED * DS4_N_FF_EXP / QK_K];
+static _Thread_local float g_ffn_cur_scratch[DS4_N_EMBD];
+static _Thread_local float g_ffn_norm_scratch[DS4_N_EMBD];
+static _Thread_local float g_ffn_moe_scratch[DS4_N_EMBD];
+static _Thread_local float g_ffn_shared_scratch[DS4_N_EMBD];
+static _Thread_local float g_ffn_out_scratch[DS4_N_EMBD];
+
+static struct {
+ bool uses_reference_hc;
+ bool uses_reference_kv;
+ bool uses_reference_qkv_norm;
+ bool uses_reference_compressor_pair_proj;
+ bool uses_reference_hc_norm;
+ bool uses_reference_shared_down_hc;
+ bool uses_reference_attn_out_hc;
+ bool uses_kv_rope_store_fusion;
+ bool uses_q_head_norm_rope_fusion;
+ bool uses_indexer_q_rope_fusion;
+ bool uses_indexed_attn_rope_fusion;
+ bool uses_decode_attn_rope_fusion;
+ bool uses_router_matmul_select_fusion;
+ bool uses_fp8_attn_out_onecb_hc;
+ bool uses_fp8_shared_down_hc;
+ bool disables_fp8_attn_out;
+ bool disables_fp8_attn_out_hc_fuse;
+ bool uses_top_only_argmax;
+ bool uses_hc_rms_mix_fusion;
+ bool uses_hc_full_prelude_fusion;
+ bool uses_output_hc_sum_norm_fusion;
+ bool uses_output_hc_full_fusion;
+ uint32_t indexer_top_k;
+} g_decode_policy;
 
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_MAYBE_UNUSED __attribute__((unused))
@@ -2081,18 +2164,11 @@ static void f16_round_inplace_cpu(float *x, uint32_t n) {
 }
 
 static float dsv4_e4m3fn_value_cpu(int i) {
- static const float exp_scale[16] = {
- 0.0f, 0.015625f, 0.03125f, 0.0625f,
- 0.125f, 0.25f, 0.5f, 1.0f,
- 2.0f, 4.0f, 8.0f, 16.0f,
- 32.0f, 64.0f, 128.0f, 256.0f,
- };
-
  const int exp = (i >> 3) & 0x0f;
  const int mant = i & 0x07;
  return exp == 0
  ? (float)mant * 0.001953125f
- : (1.0f + (float)mant * 0.125f) * exp_scale[exp];
+ : (1.0f + (float)mant * 0.125f) * g_e4m3fn_exp_scale[exp];
 }
 
 static float dsv4_e4m3fn_dequant_cpu(float x) {
@@ -2311,9 +2387,6 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_
  const int nb = n / QK_K;
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
- static const uint32_t kmask1 = 0x3f3f3f3f;
- static const uint32_t kmask2 = 0x0f0f0f0f;
-
  const uint8x16_t m4b = vdupq_n_u8(0x0f);
  const int32x4_t zero = vdupq_n_s32(0);
 
@@ -2327,11 +2400,11 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_
  const int16x8_t q8sums = vpaddq_s16(vld1q_s16(y[i].bsums), vld1q_s16(y[i].bsums + 8));
 
  memcpy(utmp, x[i].scales, 12);
- utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & 0x03030303) << 4);
- const uint32_t uaux = utmp[1] & kmask1;
- utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & 0x03030303) << 4);
+ utmp[3] = ((utmp[2] >> 4) & g_q4_k_mask2) | (((utmp[1] >> 6) & 0x03030303) << 4);
+ const uint32_t uaux = utmp[1] & g_q4_k_mask1;
+ utmp[1] = (utmp[2] & g_q4_k_mask2) | (((utmp[0] >> 6) & 0x03030303) << 4);
  utmp[2] = uaux;
- utmp[0] &= kmask1;
+ utmp[0] &= g_q4_k_mask1;
 
  const uint8x8_t mins8 = vld1_u8((const uint8_t *)&utmp[2]);
  const int16x8_t mins = vreinterpretq_s16_u16(vmovl_u8(mins8));
@@ -2641,10 +2714,8 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K_tbl(
  vreinterpretq_u8_s8(vcombine_s8(vld1_s8(iq2xxs_signs[((aux)[3] >> 14) & 127]), \
  vld1_s8(iq2xxs_signs[((aux)[3] >> 21) & 127]))) \
  }}; \
- static const uint8_t idx_lo_data[16] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}; \
- static const uint8_t idx_hi_data[16] = {16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31}; \
- const uint8x16_t idx_lo = vld1q_u8(idx_lo_data); \
- const uint8x16_t idx_hi = vld1q_u8(idx_hi_data); \
+ const uint8x16_t idx_lo = vld1q_u8(g_iq2_tbl_idx_lo); \
+ const uint8x16_t idx_hi = vld1q_u8(g_iq2_tbl_idx_hi); \
  int8x16_t s0v = vreinterpretq_s8_u8(vqtbl2q_u8(sgn01, idx_lo)); \
  int8x16_t s1v = vreinterpretq_s8_u8(vqtbl2q_u8(sgn01, idx_hi)); \
  int8x16_t s2v = vreinterpretq_s8_u8(vqtbl2q_u8(sgn23, idx_lo)); \
@@ -2683,12 +2754,11 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
  /* Optional TBL-kernel route, switchable via DS4_USE_TBL_KERNEL env var */
  {
- static int cached = -1;
- if (cached < 0) {
+ if (g_iq2_tbl_kernel_enabled_cache < 0) {
  const char *e = getenv("DS4_USE_TBL_KERNEL");
- cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+ g_iq2_tbl_kernel_enabled_cache = (e && e[0] && e[0] != '0') ? 1 : 0;
  }
- if (cached) {
+ if (g_iq2_tbl_kernel_enabled_cache) {
  ds4_vec_dot_iq2_xxs_pair_q8_K_tbl(n, s0, s1, x0, x1, y);
  return;
  }
@@ -6332,15 +6402,10 @@ static void hc_pre_from_state_one(
  float * out,
  float * post,
  float * comb) {
- /* H1 lift: 64KB scratch was per-call xmalloc+free, now thread-local static.
- * Purely scratch (overwritten by rms_norm_no_weight inside _scratch), size
- * is compile-time constant, concurrent callers handled by _Thread_local. */
- static _Thread_local float flat[(size_t)DS4_N_EMBD * DS4_N_HC];
-
  hc_pre_from_state_one_scratch(model,
  fn, scale_tensor, base_tensor,
  residual_hc, out, post, comb,
- flat, false);
+ g_hc_pre_flat_scratch, false);
 }
 
 static void layer_attn_pre_one(
@@ -6519,12 +6584,6 @@ typedef struct {
 static void hc_pre_norm_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
  hc_pre_norm_batch_ctx *ctx = vctx;
  const float *norm_w = tensor_data(ctx->model, ctx->norm_w);
- /* H2 lift: per-worker xmalloc replaced by thread-local static. Each parallel-for
- * thread keeps its own 64KB scratch across all hc_pre_norm_batch invocations
- * for its lifetime. Buffer is overwritten by rms_norm_no_weight inside the
- * scratch fn before any read. */
- static _Thread_local float flat[(size_t)DS4_N_EMBD * DS4_N_HC];
-
  for (uint64_t t = t0; t < t1; t++) {
  const float *residual = ctx->inp_hc + t * ctx->hc_dim;
  if (ctx->residual_hc) {
@@ -6541,7 +6600,7 @@ static void hc_pre_norm_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
  ctx->cur + t * DS4_N_EMBD,
  ctx->post + t * ctx->n_hc,
  ctx->comb + t * ctx->n_hc * ctx->n_hc,
- flat,
+ g_hc_pre_norm_batch_flat_scratch,
  true);
  rms_norm_weight(ctx->norm + t * DS4_N_EMBD,
  ctx->cur + t * DS4_N_EMBD,
@@ -7350,17 +7409,9 @@ static void layer_routed_moe_one(
  if (expert_in_dim % QK_K != 0) ds4_die("IQ2_XXS expert input is not QK_K aligned");
  if (expert_in_dim > DS4_N_EMBD) ds4_die("expert_in_dim exceeds DS4_N_EMBD static-scratch ceiling");
  if (down_in_dim != DS4_N_FF_EXP || down_in_dim % QK_K != 0) ds4_die("Q2_K expert input has an unexpected layout");
- /* H4 lift: xq sized to maximum expert_in_dim/QK_K = DS4_N_EMBD/QK_K = 16 blocks.
- * Asserted ≤ at runtime; tensor_expect_routed_expert pins to DS4_N_EMBD at model load. */
- static _Thread_local block_q8_K xq[DS4_N_EMBD / QK_K];
-
  if (!trace) {
- /* Fast path: H4 lift — mid_all + midq lifted to thread-local statics.
- * Sizes are compile-time constants (DS4_N_EXPERT_USED=6, DS4_N_FF_EXP=2048,
- * down_in_dim==DS4_N_FF_EXP asserted above). */
- static _Thread_local float mid_all[DS4_N_EXPERT_USED * DS4_N_FF_EXP];
- static _Thread_local block_q8_K midq[DS4_N_EXPERT_USED * DS4_N_FF_EXP / QK_K];
- layer_routed_moe_one_prealloc(out, model, layer, x, il, token, clamp, mid_all, xq, midq);
+ layer_routed_moe_one_prealloc(out, model, layer, x, il, token, clamp,
+ g_routed_moe_mid_all_scratch, g_routed_moe_xq_scratch, g_routed_moe_midq_scratch);
  return;
  }
 
@@ -7373,7 +7424,7 @@ static void layer_routed_moe_one(
  float *down = xmalloc((size_t)DS4_N_EMBD * sizeof(down[0]));
 
  memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
- ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
+ ds4_quantize_row_q8_K(x, g_routed_moe_xq_scratch, (int64_t)expert_in_dim);
 
  if (layer->ffn_gate_tid2eid) {
  layer_hash_selected_experts(selected, model, layer, token);
@@ -7385,7 +7436,7 @@ static void layer_routed_moe_one(
 
  for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
  const uint32_t expert = (uint32_t)selected[i];
- matvec_iq2_xxs_expert_pair_prequant(gate, up, model, layer->ffn_gate_exps, layer->ffn_up_exps, xq, expert);
+ matvec_iq2_xxs_expert_pair_prequant(gate, up, model, layer->ffn_gate_exps, layer->ffn_up_exps, g_routed_moe_xq_scratch, expert);
  char name[64];
  snprintf(name, sizeof(name), "blk.%u expert %u gate", il, expert); print_vec_stats(name, gate, DS4_N_FF_EXP);
  snprintf(name, sizeof(name), "blk.%u expert %u up", il, expert); print_vec_stats(name, up, DS4_N_FF_EXP);
@@ -7403,7 +7454,7 @@ static void layer_routed_moe_one(
  for (int j = 0; j < DS4_N_EMBD; j++) out[j] += down[j];
  }
 
- free(down); free(mid); free(up); free(gate); /* H4: xq is thread-local-static, no free */
+ free(down); free(mid); free(up); free(gate);
 }
 
 /* Decode version of routed MoE: same math as layer_routed_moe_one(), but all
@@ -7443,17 +7494,16 @@ static void layer_routed_moe_one_prealloc(
  * Quality degradation is the cost; speed gain is the diagnostic signal. */
  int effective_k = DS4_N_EXPERT_USED;
  {
- static int cached_k = -1;
- if (cached_k < 0) {
+ if (g_k_reduce_effective_k_cache < 0) {
  const char *e = getenv("DS4_K_REDUCE");
  if (e && e[0]) {
  int v = atoi(e);
- cached_k = (v >= 1 && v <= DS4_N_EXPERT_USED) ? v : DS4_N_EXPERT_USED;
+ g_k_reduce_effective_k_cache = (v >= 1 && v <= DS4_N_EXPERT_USED) ? v : DS4_N_EXPERT_USED;
  } else {
- cached_k = DS4_N_EXPERT_USED;
+ g_k_reduce_effective_k_cache = DS4_N_EXPERT_USED;
  }
  }
- effective_k = cached_k;
+ effective_k = g_k_reduce_effective_k_cache;
  }
  if (effective_k < DS4_N_EXPERT_USED) {
  /* Renormalize top-effective_k weights to sum to DS4_EXPERT_WEIGHT_SCALE */
@@ -7487,22 +7537,20 @@ static void layer_routed_moe_one_prealloc(
   * @ lm_head to see what tokens THAT expert pushes on THIS specific input.
   * Disambiguates weight-level mean-direction probe ambiguity. */
  {
-  static FILE *fp = NULL;
-  static int env_checked = 0;
-  if (!env_checked) {
-   env_checked = 1;
+  if (!g_dump_expert_mid_env_checked) {
+   g_dump_expert_mid_env_checked = 1;
    const char *p = getenv("DS4_DUMP_EXPERT_MID");
    if (p && p[0]) {
-    fp = fopen(p, "wb");
-    if (fp) fprintf(stderr, "DS4_DUMP_EXPERT_MID: capturing expert intermediates to %s\n", p);
+    g_dump_expert_mid_fp = fopen(p, "wb");
+    if (g_dump_expert_mid_fp) fprintf(stderr, "DS4_DUMP_EXPERT_MID: capturing expert intermediates to %s\n", p);
    }
   }
-  if (fp) {
+  if (g_dump_expert_mid_fp) {
    uint32_t hdr[4] = { (uint32_t)token, (uint32_t)il, (uint32_t)effective_k, (uint32_t)down_in_dim };
-   fwrite(hdr, sizeof(uint32_t), 4, fp);
-   fwrite(selected, sizeof(int32_t), (size_t)effective_k, fp);
-   fwrite(expert_weight, sizeof(float), (size_t)effective_k, fp);
-   fwrite(mid_all, sizeof(float), (size_t)effective_k * down_in_dim, fp);
+   fwrite(hdr, sizeof(uint32_t), 4, g_dump_expert_mid_fp);
+   fwrite(selected, sizeof(int32_t), (size_t)effective_k, g_dump_expert_mid_fp);
+   fwrite(expert_weight, sizeof(float), (size_t)effective_k, g_dump_expert_mid_fp);
+   fwrite(mid_all, sizeof(float), (size_t)effective_k * down_in_dim, g_dump_expert_mid_fp);
   }
  }
 
@@ -7825,16 +7873,11 @@ static void layer_ffn_one(
  double t_routed = 0.0;
  double t_shared = 0.0;
  double t_post = 0.0;
- /* H3 lift: five per-call xmallocs (5 × 16KB = 80KB) replaced by thread-local
- * statics. Each parallel-for worker keeps its own scratch across all FFN calls
- * for its lifetime. All five buffers are fully overwritten by the layer
- * subcalls below (hc_pre_from_state_one, rms_norm_weight, layer_routed_moe_one,
- * layer_shared_ffn_one, the moe+shared sum loop) before any read. */
- static _Thread_local float ffn_cur[DS4_N_EMBD];
- static _Thread_local float norm[DS4_N_EMBD];
- static _Thread_local float moe[DS4_N_EMBD];
- static _Thread_local float shared[DS4_N_EMBD];
- static _Thread_local float ffn_out[DS4_N_EMBD];
+ float *ffn_cur = g_ffn_cur_scratch;
+ float *norm = g_ffn_norm_scratch;
+ float *moe = g_ffn_moe_scratch;
+ float *shared = g_ffn_shared_scratch;
+ float *ffn_out = g_ffn_out_scratch;
  float post[4];
  float comb[16];
 
@@ -8611,9 +8654,8 @@ static void kv_cache_push_raw(ds4_layer_cache *cache, const float *kv) {
  * GPU edit. NB the keys are already FP16-precision here (kv_cache_push_comp f16-round-trips), so a FREE
  * lossless 2x is also available by storing FP16 instead of FP32 -- see the patch doc. */
 static int ds4_int8_indexer_enabled(void) {
- static int v = -1;
- if (v < 0) v = (getenv("DS4_INT8_INDEXER") != NULL) ? 1 : 0;
- return v;
+ if (g_int8_indexer_enabled_cache < 0) g_int8_indexer_enabled_cache = (getenv("DS4_INT8_INDEXER") != NULL) ? 1 : 0;
+ return g_int8_indexer_enabled_cache;
 }
 /* DS4_INT8_INDEXER: push one 128-dim index key. int8 mode => symmetric-quantize into the int8 buffer +
  * per-entry scale (4x smaller, no f32 store); else the legacy f16-precision-in-f32 store. */
@@ -10928,9 +10970,6 @@ static bool ds4_prime_path_enabled(void) {
  return true;
 }
 
-static int g_metal_graph_max_fusion_enabled_cache = -1;
-static int g_d8f_mtl4_packet_warning_printed;
-
 static bool ds4_metal_graph_max_fusion_enabled(void) {
  if (g_metal_graph_max_fusion_enabled_cache < 0) {
   g_metal_graph_max_fusion_enabled_cache =
@@ -11985,34 +12024,6 @@ static bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t i
  * DS4_METAL_DISABLE_*_FUSION environment switches.
  */
 
-static struct {
- bool uses_reference_hc;
- bool uses_reference_kv;
- bool uses_reference_qkv_norm;
- bool uses_reference_compressor_pair_proj;
- bool uses_reference_hc_norm;
- bool uses_reference_shared_down_hc;
- bool uses_reference_attn_out_hc;
- bool uses_kv_rope_store_fusion;
- bool uses_q_head_norm_rope_fusion;
- bool uses_indexer_q_rope_fusion;
- bool uses_indexed_attn_rope_fusion;
- bool uses_decode_attn_rope_fusion;
- bool uses_router_matmul_select_fusion;
- bool uses_fp8_attn_out_onecb_hc;
- bool uses_fp8_shared_down_hc;
- bool disables_fp8_attn_out;
- bool disables_fp8_attn_out_hc_fuse;
- bool uses_top_only_argmax;
- bool uses_hc_rms_mix_fusion;
- bool uses_hc_full_prelude_fusion;
- bool uses_output_hc_sum_norm_fusion;
- bool uses_output_hc_full_fusion;
- uint32_t indexer_top_k;
-} g_decode_policy;
-
-static bool g_decode_policy_has_been_read_from_environment;
-
 static void metal_graph_read_decode_policy_from_environment_once(void) {
  if (g_decode_policy_has_been_read_from_environment) return;
  const bool max_fusion = ds4_metal_graph_max_fusion_enabled();
@@ -12470,10 +12481,6 @@ static uint64_t s_n_storage_dispatch_fp8_direct = 0;
  * doing real work. If identical → Increment 5 is dormant (kernel-level
  * canary fires but no observable model-level effect). */
 static uint64_t s_n_storage_dispatch_bf16_suppressed = 0;
-static int g_storage_dispatch_site_profile_checked;
-static int g_storage_dispatch_site_profile_enabled;
-static int g_bf16_storage_disabled = -1;
-
 typedef enum {
  DS4_DISPATCH_DTYPE_F16 = 0,
  DS4_DISPATCH_DTYPE_Q8_0,
@@ -12701,9 +12708,8 @@ static int ds4_matmul_q8_0_via_tensor(ds4_gpu_tensor *dst,
 	    return ds4_gpu_matmul_bf16_storage(dst, t->storage.metal_buffer,
 	                                       in_dim, out_dim, src, n_tok);
 	   }
-	   static int once = 0;
-	   if (!once) {
-	    once = 1;
+	   if (!g_q8_dispatch_substitute_warning_printed) {
+	    g_q8_dispatch_substitute_warning_printed = 1;
 	    if (t->storage.dtype == DS4_TENSOR_FP8_E4M3) {
 	     fprintf(stderr,
 	      "ds4: Q8_0 dispatcher — storage.dtype=FP8_E4M3 with scale=%s "
@@ -12753,16 +12759,14 @@ static int ds4_matmul_q8_0_pair_fp8_via_tensor(ds4_gpu_tensor *dst0,
                                                uint64_t out1_dim,
                                                const ds4_gpu_tensor *src,
                                                uint64_t n_tok) {
- static int disable_checked = 0;
- static int disable = 0;
- if (!disable_checked) {
-  disable = getenv("DS4_METAL_DISABLE_QA_KV_FP8_PAIR") != NULL ? 1 : 0;
-  disable_checked = 1;
-  if (disable) {
+ if (!g_qa_kv_fp8_pair_disable_checked) {
+  g_qa_kv_fp8_pair_disabled = getenv("DS4_METAL_DISABLE_QA_KV_FP8_PAIR") != NULL ? 1 : 0;
+  g_qa_kv_fp8_pair_disable_checked = 1;
+  if (g_qa_kv_fp8_pair_disabled) {
    fprintf(stderr, "ds4: DS4_METAL_DISABLE_QA_KV_FP8_PAIR=1 — q_a/kv FP8 pair fusion disabled\n");
   }
  }
- if (disable) return 0;
+ if (g_qa_kv_fp8_pair_disabled) return 0;
  if (!ds4_tensor_storage_is_fp8_e8m0(t0) ||
      !ds4_tensor_storage_is_fp8_e8m0(t1)) {
   return 0;
@@ -12783,9 +12787,8 @@ static int ds4_matmul_q8_0_pair_fp8_via_tensor(ds4_gpu_tensor *dst0,
   s_n_storage_dispatch_fp8 += 2;
   ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8, t0);
   ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8, t1);
-  static int logged = 0;
-  if (!logged) {
-   logged = 1;
+  if (!g_qa_kv_fp8_pair_logged) {
+   g_qa_kv_fp8_pair_logged = 1;
    fprintf(stderr,
            "ds4: q_a/kv FP8 pair fusion active (in=%llu out=%llu/%llu n_tok=%llu)\n",
            (unsigned long long)in_dim,
@@ -13935,9 +13938,8 @@ static bool metal_graph_encode_decode_layer(
  attn_factor,
  DS4_ROPE_YARN_BETA_FAST,
  DS4_ROPE_YARN_BETA_SLOW);
- static int kv_rope_store_fused_logged = 0;
- if (kv_rope_store_fused && !kv_rope_store_fused_logged) {
- kv_rope_store_fused_logged = 1;
+ if (kv_rope_store_fused && !g_kv_rope_store_fused_logged) {
+ g_kv_rope_store_fused_logged = 1;
  fprintf(stderr, "ds4: KV RoPE + FP8/raw-store fused path active\n");
  }
  }
@@ -14148,9 +14150,8 @@ static bool metal_graph_encode_decode_layer(
  attn_factor,
  DS4_ROPE_YARN_BETA_FAST,
  DS4_ROPE_YARN_BETA_SLOW);
- static int indexer_q_rope_logged = 0;
- if (indexer_q_rope_fused && !indexer_q_rope_logged) {
- indexer_q_rope_logged = 1;
+ if (indexer_q_rope_fused && !g_indexer_q_rope_fused_logged) {
+ g_indexer_q_rope_fused_logged = 1;
  fprintf(stderr, "ds4: indexer Q F16 matvec + RoPE fused path active\n");
  }
  }
@@ -14273,9 +14274,8 @@ static bool metal_graph_encode_decode_layer(
  attn_factor,
  DS4_ROPE_YARN_BETA_FAST,
  DS4_ROPE_YARN_BETA_SLOW);
- static int indexed_attn_rope_logged = 0;
- if (indexed_attn_rope_fused && !indexed_attn_rope_logged) {
- indexed_attn_rope_logged = 1;
+ if (indexed_attn_rope_fused && !g_indexed_attn_rope_fused_logged) {
+ g_indexed_attn_rope_fused_logged = 1;
  fprintf(stderr, "ds4: indexed attention + inverse RoPE fused path active\n");
  }
  }
@@ -14333,9 +14333,8 @@ static bool metal_graph_encode_decode_layer(
  attn_factor,
  DS4_ROPE_YARN_BETA_FAST,
  DS4_ROPE_YARN_BETA_SLOW);
- static int decode_attn_rope_logged = 0;
- if (decode_attn_rope_fused && !decode_attn_rope_logged) {
- decode_attn_rope_logged = 1;
+ if (decode_attn_rope_fused && !g_decode_attn_rope_fused_logged) {
+ g_decode_attn_rope_fused_logged = 1;
  fprintf(stderr, "ds4: decode attention + inverse RoPE fused path active\n");
  }
  }
@@ -14433,15 +14432,13 @@ static bool metal_graph_encode_decode_layer(
   store_fp8_attn_out ? 1 : 0);
   if (onecb_ok) {
   fp8_attn_out_onecb_hc_done = true;
-  static int s_fp8_attn_out_onecb_logged = 0;
-  if (!s_fp8_attn_out_onecb_logged) {
-  s_fp8_attn_out_onecb_logged = 1;
+  if (!g_fp8_attn_out_onecb_logged) {
+  g_fp8_attn_out_onecb_logged = 1;
   fprintf(stderr, "ds4: FP8 attn output one-CB HC fused path active\n");
   }
   } else {
-  static int s_fp8_attn_out_onecb_fail_logged = 0;
-  if (!s_fp8_attn_out_onecb_fail_logged) {
-  s_fp8_attn_out_onecb_fail_logged = 1;
+  if (!g_fp8_attn_out_onecb_fail_logged) {
+  g_fp8_attn_out_onecb_fail_logged = 1;
   fprintf(stderr, "ds4: FP8 attn output one-CB HC fused path failed; falling back\n");
   }
   }
@@ -14663,15 +14660,13 @@ static bool metal_graph_encode_decode_layer(
   layer->ffn_exp_probs_b != NULL,
   layer->ffn_gate_tid2eid != NULL,
   g->ffn_norm);
-  static int router_matmul_select_logged = 0;
-  if (router_matmul_select_fused && !router_matmul_select_logged) {
-   router_matmul_select_logged = 1;
+  if (router_matmul_select_fused && !g_router_matmul_select_logged) {
+   g_router_matmul_select_logged = 1;
    fprintf(stderr,
            "ds4: router F16 matvec+select fusion enabled\n");
   }
-  static int router_matmul_select_fallback_logged = 0;
-  if (!router_matmul_select_fused && !router_matmul_select_fallback_logged) {
-   router_matmul_select_fallback_logged = 1;
+  if (!router_matmul_select_fused && !g_router_matmul_select_fallback_logged) {
+   g_router_matmul_select_fallback_logged = 1;
    fprintf(stderr,
            "ds4: router F16 matvec+select fusion was eligible but failed; falling back to matvec + router_select\n");
   }
@@ -14791,15 +14786,13 @@ static bool metal_graph_encode_decode_layer(
   s_n_storage_dispatch_fp8 += 2;
   ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8, layer->ffn_gate_shexp);
   ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8, layer->ffn_up_shexp);
-  static int shared_fp8_logged = 0;
-  if (!shared_fp8_logged) {
-   shared_fp8_logged = 1;
+  if (!g_shared_gate_up_fp8_logged) {
+   g_shared_gate_up_fp8_logged = 1;
    fprintf(stderr, "ds4: shared gate/up FP8 fused SwiGLU active\n");
   }
  } else {
-  static int shared_fp8_fail_logged = 0;
-  if (!shared_fp8_fail_logged) {
-   shared_fp8_fail_logged = 1;
+  if (!g_shared_gate_up_fp8_fail_logged) {
+   g_shared_gate_up_fp8_fail_logged = 1;
    fprintf(stderr, "ds4: shared gate/up FP8 fused SwiGLU failed; falling back to separate FP8 matmuls\n");
   }
  }
@@ -14866,15 +14859,13 @@ static bool metal_graph_encode_decode_layer(
  fp8_shared_down_hc_fused = true;
  s_n_storage_dispatch_fp8++;
  ds4_storage_dispatch_note(DS4_DISPATCH_DTYPE_FP8, layer->ffn_down_shexp);
- static int shared_down_fp8_logged = 0;
- if (!shared_down_fp8_logged) {
- shared_down_fp8_logged = 1;
+ if (!g_shared_down_fp8_logged) {
+ g_shared_down_fp8_logged = 1;
  fprintf(stderr, "ds4: shared-down FP8 HC fused path active\n");
  }
  } else {
- static int shared_down_fp8_fail_logged = 0;
- if (!shared_down_fp8_fail_logged) {
- shared_down_fp8_fail_logged = 1;
+ if (!g_shared_down_fp8_fail_logged) {
+ g_shared_down_fp8_fail_logged = 1;
  fprintf(stderr, "ds4: shared-down FP8 HC fused path failed; falling back to separate FP8 matmul + HC expand\n");
  }
  }
@@ -16168,8 +16159,7 @@ static bool metal_graph_warmup_prefill_kernels(
  const ds4_model *model,
  const ds4_weights *weights,
  uint32_t n_tokens) {
- static bool warmed = false;
- if (warmed || getenv("DS4_METAL_NO_PREFILL_KERNEL_WARMUP") != NULL) return true;
+ if (g_metal_prefill_kernel_warmup_done || getenv("DS4_METAL_NO_PREFILL_KERNEL_WARMUP") != NULL) return true;
 
  /*
  * The first batched F16 matmul can pay Metal's one-time pipeline execution
@@ -16194,7 +16184,7 @@ static bool metal_graph_warmup_prefill_kernels(
  return false;
  }
 
- warmed = true;
+ g_metal_prefill_kernel_warmup_done = true;
  return true;
 }
 
@@ -17696,9 +17686,8 @@ static bool metal_graph_encode_layer_ffn_batch(
      const ds4_polar_file *gate = ds4_polar_pool_get(g->polar_pool_ref, il, DS4_POLAR_KIND_GATE);
      const ds4_polar_file *up   = ds4_polar_pool_get(g->polar_pool_ref, il, DS4_POLAR_KIND_UP);
      const ds4_polar_file *down = ds4_polar_pool_get(g->polar_pool_ref, il, DS4_POLAR_KIND_DOWN);
-     static int s_warned[DS4_POLAR_MAX_LAYERS] = {0};
-     if (!s_warned[il]) {
-         s_warned[il] = 1;
+     if (!g_polar_layer_notice_printed[il]) {
+         g_polar_layer_notice_printed[il] = 1;
          if (gate && up && down) {
              fprintf(stderr,
                      "ds4: polar layer %u armed (gate=%u×%u up=%u×%u down=%u×%u) — Phase B-2.2 dispatch pending\n",
@@ -17814,9 +17803,8 @@ static bool metal_graph_encode_layer_ffn_batch(
   * the storage.metal_buffer is NULL (override-fill didn't wire I32 tensors)
   * the kernel ends up reading past-EOF garbage. Env-gated print. */
  if (ok && layer->ffn_gate_tid2eid && getenv("DS4_HASH_ROUTER_PROBE") != NULL) {
-     static int s_t_printed[DS4_N_LAYER] = {0};
-     if (il < DS4_N_LAYER && !s_t_printed[il]) {
-         s_t_printed[il] = 1;
+     if (il < DS4_N_LAYER && !g_hash_router_probe_printed[il]) {
+         g_hash_router_probe_printed[il] = 1;
          fprintf(stderr,
                  "ds4: TID2EID_PROBE L%u abs_offset=%llu storage.metal_buffer=%s storage.dtype=%u storage.length=%llu t->type=%u dim=[%llu,%llu]\n",
                  il,
@@ -17880,9 +17868,8 @@ static bool metal_graph_encode_layer_ffn_batch(
 	 const char *m1r_path = getenv("DS4_M1R_PACK_PATH");
 	 const bool has_m1r_pack = m1r_path && m1r_path[0];
 	 if (ok && has_d8f_pack) {
-	 static int s_d8f_prefill_notice = 0;
-	 if (!s_d8f_prefill_notice) {
-	  s_d8f_prefill_notice = 1;
+		 if (!g_d8f_prefill_notice_printed) {
+		  g_d8f_prefill_notice_printed = 1;
 	  fprintf(stderr, "ds4: D8F prefill using fused routed organ n_tokens=%u\n", n_tokens);
 	 }
 	 int dr = -1;
@@ -17915,13 +17902,11 @@ static bool metal_graph_encode_layer_ffn_batch(
 	   DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP);
 	  ok = (dr == 0);
 	 } else if (ok) {
-	  static int s_m1r_prefill_batch_notice = 0;
-	  static int s_m1r_prefill_fallback_notice = 0;
-	  const bool m1r_batch_enabled = getenv("DS4_M1R_BATCH_ENABLE") != NULL;
-	  int batch_dr = -1;
-	  if (m1r_batch_enabled) {
-	   if (!s_m1r_prefill_batch_notice) {
-	    s_m1r_prefill_batch_notice = 1;
+		  const bool m1r_batch_enabled = getenv("DS4_M1R_BATCH_ENABLE") != NULL;
+		  int batch_dr = -1;
+		  if (m1r_batch_enabled) {
+		   if (!g_m1r_prefill_batch_notice_printed) {
+		    g_m1r_prefill_batch_notice_printed = 1;
 	    fprintf(stderr,
 	            "ds4: M1R prefill using true batched dispatch n_tokens=%u\n",
 	            n_tokens);
@@ -17931,10 +17916,10 @@ static bool metal_graph_encode_layer_ffn_batch(
 	    g->batch_router_selected, g->batch_router_weights,
 	    g->batch_ffn_norm, g->batch_routed_out,
 	    (uint32_t)n_tokens, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP);
-	  }
-	  if (batch_dr != 0) {
-	   if (!s_m1r_prefill_fallback_notice) {
-	    s_m1r_prefill_fallback_notice = 1;
+		  }
+		  if (batch_dr != 0) {
+		   if (!g_m1r_prefill_fallback_notice_printed) {
+		    g_m1r_prefill_fallback_notice_printed = 1;
 	    fprintf(stderr,
 	            "ds4: M1R prefill falling back to token-loop bridge n_tokens=%u "
 	            "disabled=%d last_rc=%d\n",
@@ -23722,15 +23707,12 @@ int ds4_mem_would_overcommit(uint64_t add_bytes) {
  const uint64_t phys = ds4_physical_ram_bytes();
  if (phys == 0) return 0;
  const uint64_t wired = ds4_current_wired_bytes();
- static uint64_t s_initial_wired = 0;
- static int s_auto_reserve_logged = 0;
- static int s_hard_limit_logged = 0;
- if (s_initial_wired == 0) s_initial_wired = wired;
+ if (g_residency_initial_wired_bytes == 0) g_residency_initial_wired_bytes = wired;
  uint64_t hard_limit = 56ull * 1000ull * 1000ull * 1000ull;
  (void)ds4_env_mib_to_bytes("DS4_WIRE_HARD_LIMIT_MIB", &hard_limit);
  if (hard_limit > 0 && add_bytes > 0 && wired + add_bytes > hard_limit) {
-  if (!s_hard_limit_logged || getenv("DS4_RESIDENCY_VERBOSE")) {
-   s_hard_limit_logged = 1;
+  if (!g_residency_hard_limit_logged || getenv("DS4_RESIDENCY_VERBOSE")) {
+   g_residency_hard_limit_logged = 1;
    fprintf(stderr,
            "ds4: residency hard-limit guard: wired %.2f GB + request %.2f GB "
            "would exceed %.2f GB (DS4_WIRE_HARD_LIMIT_MIB overrides). "
@@ -23745,13 +23727,13 @@ int ds4_mem_would_overcommit(uint64_t add_bytes) {
  const char *r = getenv("DS4_WIRE_RESERVE_MIB");
  if (r && r[0]) {
   reserve = (uint64_t)strtoull(r, NULL, 10) << 20;
- } else if (s_initial_wired >= ((uint64_t)8 << 30)) {
+ } else if (g_residency_initial_wired_bytes >= ((uint64_t)8 << 30)) {
   reserve = (uint64_t)24 << 30;
-  if (!s_auto_reserve_logged) {
-   s_auto_reserve_logged = 1;
+  if (!g_residency_auto_reserve_logged) {
+   g_residency_auto_reserve_logged = 1;
    fprintf(stderr,
            "ds4: auto wire reserve raised to 24576 MiB because initial wired memory is %.2f GB\n",
-           (double)s_initial_wired / 1e9);
+           (double)g_residency_initial_wired_bytes / 1e9);
   }
  }
  const uint64_t avail = (phys > wired + reserve) ? (phys - wired - reserve) : 0;
@@ -26470,9 +26452,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
  }
  ds4_skip_clear_decode_confidence();
  if (top_only_argmax) {
- static int top_only_session_logged = 0;
- if (!top_only_session_logged) {
- top_only_session_logged = 1;
+ if (!g_top_only_session_logged) {
+ g_top_only_session_logged = 1;
  fprintf(stderr,
  "ds4: Metal session top-only argmax decode active — full logits stay device-resident until requested\n");
  }
