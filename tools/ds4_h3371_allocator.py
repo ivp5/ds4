@@ -159,6 +159,25 @@ def build_h3371(source: np.ndarray, l40_k256_count: int) -> tuple[np.ndarray, di
     return allocation, manifest
 
 
+def build_source_base(source: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    allocation = source.copy()
+    manifest = {
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": "H3216 allocation",
+        "target": "H3373_H3216_late_route_hot_gateup_repair",
+        "rule": [
+            "start from H3216 without H3371 late-down demotion",
+            "preserve H3216 down allocation to avoid over-demoting route-hot late experts",
+        ],
+        "k_hist": {
+            "gate": k_hist(allocation, "K_gate"),
+            "up": k_hist(allocation, "K_up"),
+            "down": k_hist(allocation, "K_down"),
+        },
+    }
+    return allocation, manifest
+
+
 def promote_late_hot_gateup(allocation: np.ndarray,
                             manifest: dict[str, Any],
                             route_threshold: float,
@@ -189,7 +208,10 @@ def promote_late_hot_gateup(allocation: np.ndarray,
             "new_K_up": int(current["K_up"]),
             "K_down": int(current["K_down"]),
         })
-    manifest["target"] = "H3372_H3371_late_route_hot_gateup_repair"
+    if manifest.get("target") == "H3373_H3216_late_route_hot_gateup_repair":
+        pass
+    else:
+        manifest["target"] = "H3372_H3371_late_route_hot_gateup_repair"
     manifest["rule"].append(
         f"promote L40-L42 route_mass>={route_threshold:g} gate/up to at least K{gate_k}/K{up_k}"
     )
@@ -212,6 +234,7 @@ def main() -> int:
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--template-pack", type=Path, default=DEFAULT_TEMPLATE_PACK)
+    parser.add_argument("--base-policy", choices=("h3371", "source"), default="h3371")
     parser.add_argument("--l40-k256-count", type=int, default=186)
     parser.add_argument("--late-hot-gateup-threshold", type=float, default=0.0)
     parser.add_argument("--late-hot-gate-k", type=int, default=2048)
@@ -226,7 +249,10 @@ def main() -> int:
     if missing:
         raise SystemExit(f"allocation missing required fields: {sorted(missing)}")
 
-    allocation, manifest = build_h3371(source, args.l40_k256_count)
+    if args.base_policy == "source":
+        allocation, manifest = build_source_base(source)
+    else:
+        allocation, manifest = build_h3371(source, args.l40_k256_count)
     promote_late_hot_gateup(allocation,
                             manifest,
                             args.late_hot_gateup_threshold,
@@ -249,7 +275,12 @@ def main() -> int:
     }
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    tag = "h3372_late_route_hot_gateup_repair" if args.late_hot_gateup_threshold > 0.0 else "h3371_general_fit_no_overlay"
+    if args.base_policy == "source" and args.late_hot_gateup_threshold > 0.0:
+        tag = "h3373_source_down_late_route_hot_gateup_repair"
+    elif args.late_hot_gateup_threshold > 0.0:
+        tag = "h3372_late_route_hot_gateup_repair"
+    else:
+        tag = "h3371_general_fit_no_overlay"
     npy_path = args.out_dir / f"ds4_52gb_allocation_{tag}.npy"
     json_path = args.out_dir / f"{tag}_manifest.json"
     if npy_path.exists() or json_path.exists():
