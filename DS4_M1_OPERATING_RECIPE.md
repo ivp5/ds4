@@ -336,8 +336,8 @@ Deferred:
 
 ## Operating doctrine summary
 
-1. **Always launch with `--prefill-metal-phases auto`** (M1 STICKY HAZARD)
-2. **No flags/env default to H3384 + Metal + PRIME** when the H3384 flat-pack is present
+1. **No flags/env default to H3384 + Metal + PRIME + prefill auto** when the H3384 flat-pack is present
+2. **Use `--prefill-metal-phases 0` only for A/B**; Metal default is `auto`, and external D8F normalizes to phase-free GPU runtime when no GGUF routed residency needs swapping
 3. **For chat/agentic: add `--kv-disk-dir`** (9× speedup on repeat)
 4. **For forensics: build JOURNAL=1** (append-only SQLite trace)
 5. **For benchmarking: streaming progress is on by default** (set
@@ -346,6 +346,22 @@ Deferred:
 7. **trim50 file**: use for non-math; arithmetic carry breaks
 8. **Pillars env-gated** — none auto-active; enable when you have a
    measurement target
+
+## Anemll ds4-ssd fork notes — measured borrowing only
+
+Checked `github.com/Anemll/ds4-ssd` `main-alpha` (pushed 2026-06-04). Its
+headline SSD path is a sidecar package with routed expert slot banks, async
+pread/readahead, prefill slot prefetch, optional disk KV, and machine profiles
+whose environment defaults never override user exports. That is a different
+artifact class from H3384: H3384 is already a <=52GB resident flat D8F pack, so
+SSD slot banking is not automatically faster and should not replace the default
+without a local selected-layer/end-to-end win.
+
+Borrowed now: make the measured resident default explicit — H3384 + Metal +
+PRIME + `prefill-metal-phases auto`. Fork lesson kept for future sidecar work:
+M1-class profiles keep ANE routed prefill off unless measured; 16K prefill
+chunks require raw-cap headroom (`128 + chunk`, aligned), and SSD/I/O knobs
+should be profile defaults with user env winning, not hidden cargo-cult flags.
 
 ## Files
 

@@ -147,6 +147,7 @@ static void usage(FILE *fp) {
         "      Run prefill on Metal in N evenly-split phases, swapping the routed\n"
         "      expert residency between phases. Generation falls back to cpu-moe\n"
         "      for GGUF-routed weights; external D8F auto/N=1 becomes phase-free GPU runtime.\n"
+        "      Default on Metal: auto. Use --prefill-metal-phases 0 to disable.\n"
         "      \"auto\" sizes N from sysctl iogpu.wired_limit_mb (bounded by\n"
         "      hw.memsize) so each phase fits the Metal wired-memory cap.\n"
         "      Mutually exclusive with --cpu-moe / --n-cpu-moe. Metal backend only.\n"
@@ -1805,13 +1806,15 @@ static void cli_config_free(cli_config *cfg) {
 }
 
 static cli_config parse_options(int argc, char **argv) {
+    const ds4_backend backend_default = default_backend();
     cli_config c = {
         .engine = {
             .model_path = "ds4flash.gguf",
-            .backend = default_backend(),
+            .backend = backend_default,
             .mtp_draft_tokens = 2,
             .mtp_draft_tree_width = 1,  /* silv 2026-05-27: spec-tree default linear */
             .mtp_margin = 3.0f,
+            .prefill_metal_phases = backend_default == DS4_BACKEND_METAL ? -1 : 0,
         },
         .gen = {
             .prompt = NULL,
@@ -1828,6 +1831,7 @@ static cli_config parse_options(int argc, char **argv) {
     };
 
     bool directional_steering_scale_set = false;
+    bool prefill_metal_phases_explicit = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -1899,20 +1903,28 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
             c.backend_explicit = true;
+            if (!prefill_metal_phases_explicit) {
+                c.engine.prefill_metal_phases =
+                    c.engine.backend == DS4_BACKEND_METAL ? -1 : 0;
+            }
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
             c.backend_explicit = true;
+            if (!prefill_metal_phases_explicit) c.engine.prefill_metal_phases = 0;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
             c.backend_explicit = true;
+            if (!prefill_metal_phases_explicit) c.engine.prefill_metal_phases = -1;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
             c.backend_explicit = true;
+            if (!prefill_metal_phases_explicit) c.engine.prefill_metal_phases = 0;
         } else if (!strcmp(arg, "--cpu-moe")) {
             c.engine.cpu_moe = true;
         } else if (!strcmp(arg, "--n-cpu-moe")) {
             c.engine.n_cpu_moe_layers = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--prefill-metal-phases")) {
+            prefill_metal_phases_explicit = true;
             const char *s = need_arg(&i, argc, argv, arg);
             if (!strcmp(s, "auto")) {
                 c.engine.prefill_metal_phases = -1;
