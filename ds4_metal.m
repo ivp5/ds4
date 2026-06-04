@@ -180,6 +180,9 @@ static uint32_t g_dsv4_route_remap_args_n_tokens; /* last n_tokens loaded */
 #ifndef DS4_ICB_MAX_EXTRAS
 #define DS4_ICB_MAX_EXTRAS 8
 #endif
+#ifndef DS4_ICB_MAX_TGMEMS
+#define DS4_ICB_MAX_TGMEMS 4
+#endif
 
 typedef struct {
     /* Per-binding identity: (buffer pointer, offset). Pointer comparison
@@ -192,7 +195,8 @@ typedef struct {
     void     *pipeline_ptr;        /* id<MTLComputePipelineState> as bare pointer */
     uint64_t  grid[3];
     uint64_t  tg[3];
-    uint32_t  threadgroup_mem_bytes;
+    uint32_t  threadgroup_mem_bytes[DS4_ICB_MAX_TGMEMS];
+    uint32_t  n_threadgroup_mems;
     /* Caller-defined extras (e.g. n_tokens, layer, kind). Compared bytewise. */
     uint64_t  extras[DS4_ICB_MAX_EXTRAS];
     uint32_t  n_extras;
@@ -222,7 +226,15 @@ static int ds4_icb_slot_acquire(ds4_icb_slot_t *slot,
                                 NSUInteger max_commands,
                                 NSUInteger max_buffer_bind_count) {
     if (!slot) return 0;
-    if (slot->icb) return 1;
+    if (slot->icb) {
+        if (slot->max_commands == max_commands &&
+            slot->max_buffer_bind_count >= max_buffer_bind_count) return 1;
+        slot->icb = nil;
+        slot->max_commands = 0;
+        slot->max_buffer_bind_count = 0;
+        memset(slot->recorded, 0, sizeof(slot->recorded));
+        memset(slot->sig,      0, sizeof(slot->sig));
+    }
     if (max_commands == 0 || max_commands > DS4_ICB_SLOT_MAX_COMMANDS) return 0;
     if (max_buffer_bind_count == 0 || max_buffer_bind_count > DS4_ICB_MAX_BINDINGS) return 0;
     MTLIndirectCommandBufferDescriptor *desc = [MTLIndirectCommandBufferDescriptor new];
@@ -246,20 +258,22 @@ static int ds4_icb_slot_acquire(ds4_icb_slot_t *slot,
  *
  * Returns 1 if the slot is ready (either already-cached or just recorded),
  * 0 on failure. */
-static int ds4_icb_slot_record_command(ds4_icb_slot_t *slot,
-                                       NSUInteger cmd_idx,
-                                       id<MTLComputePipelineState> pso,
-                                       __unsafe_unretained id<MTLBuffer> *bufs,
-                                       NSUInteger *offsets,
-                                       NSUInteger n_bindings,
-                                       MTLSize grid,
-                                       MTLSize tg,
-                                       uint32_t threadgroup_mem_bytes,
-                                       const uint64_t *extras,
-                                       uint32_t n_extras) {
+static int ds4_icb_slot_record_command_tgmems(ds4_icb_slot_t *slot,
+                                              NSUInteger cmd_idx,
+                                              id<MTLComputePipelineState> pso,
+                                              __unsafe_unretained id<MTLBuffer> *bufs,
+                                              NSUInteger *offsets,
+                                              NSUInteger n_bindings,
+                                              MTLSize grid,
+                                              MTLSize tg,
+                                              const uint32_t *threadgroup_mem_bytes,
+                                              uint32_t n_threadgroup_mems,
+                                              const uint64_t *extras,
+                                              uint32_t n_extras) {
     if (!slot || !slot->icb || cmd_idx >= slot->max_commands) return 0;
     if (!pso || !bufs || !offsets) return 0;
     if (n_bindings > slot->max_buffer_bind_count) return 0;
+    if (n_threadgroup_mems > DS4_ICB_MAX_TGMEMS) return 0;
     if (n_extras > DS4_ICB_MAX_EXTRAS) return 0;
     ds4_icb_slot_signature_t want;
     memset(&want, 0, sizeof(want));
@@ -271,7 +285,12 @@ static int ds4_icb_slot_record_command(ds4_icb_slot_t *slot,
     want.pipeline_ptr = (__bridge void *)pso;
     want.grid[0] = grid.width;  want.grid[1] = grid.height;  want.grid[2] = grid.depth;
     want.tg[0]   = tg.width;    want.tg[1]   = tg.height;    want.tg[2]   = tg.depth;
-    want.threadgroup_mem_bytes = threadgroup_mem_bytes;
+    if (threadgroup_mem_bytes && n_threadgroup_mems > 0) {
+        memcpy(want.threadgroup_mem_bytes,
+               threadgroup_mem_bytes,
+               n_threadgroup_mems * sizeof(uint32_t));
+    }
+    want.n_threadgroup_mems = n_threadgroup_mems;
     if (extras && n_extras > 0) {
         memcpy(want.extras, extras, n_extras * sizeof(uint64_t));
     }
@@ -286,13 +305,41 @@ static int ds4_icb_slot_record_command(ds4_icb_slot_t *slot,
     for (NSUInteger i = 0; i < n_bindings; i++) {
         [cmd setKernelBuffer:bufs[i] offset:offsets[i] atIndex:i];
     }
-    if (threadgroup_mem_bytes > 0) {
-        [cmd setThreadgroupMemoryLength:threadgroup_mem_bytes atIndex:0];
+    for (uint32_t i = 0; i < n_threadgroup_mems; i++) {
+        if (want.threadgroup_mem_bytes[i] > 0) {
+            [cmd setThreadgroupMemoryLength:want.threadgroup_mem_bytes[i] atIndex:i];
+        }
     }
     [cmd concurrentDispatchThreadgroups:grid threadsPerThreadgroup:tg];
     slot->sig[cmd_idx] = want;
     slot->recorded[cmd_idx] = 1;
     return 1;
+}
+
+static int ds4_icb_slot_record_command(ds4_icb_slot_t *slot,
+                                       NSUInteger cmd_idx,
+                                       id<MTLComputePipelineState> pso,
+                                       __unsafe_unretained id<MTLBuffer> *bufs,
+                                       NSUInteger *offsets,
+                                       NSUInteger n_bindings,
+                                       MTLSize grid,
+                                       MTLSize tg,
+                                       uint32_t threadgroup_mem_bytes,
+                                       const uint64_t *extras,
+                                       uint32_t n_extras) {
+    const uint32_t tgmems[1] = { threadgroup_mem_bytes };
+    return ds4_icb_slot_record_command_tgmems(slot,
+                                              cmd_idx,
+                                              pso,
+                                              bufs,
+                                              offsets,
+                                              n_bindings,
+                                              grid,
+                                              tg,
+                                              tgmems,
+                                              threadgroup_mem_bytes > 0 ? 1u : 0u,
+                                              extras,
+                                              n_extras);
 }
 
 /* Execute a range of recorded commands on the given encoder. The caller
@@ -56322,16 +56369,16 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
         const int rank1_packet_icb_requested =
             rank1_sidecar_active && rank1_packet_icb_policy != 0;
         const int packet_icb_gate_only_requested =
-            (down_native_recbuf || down_native_i8_cbsram) && !rank1_split_sidecar;
+            down_native_recbuf && !rank1_split_sidecar;
         if (n_tokens == 1u &&
-            (packet_icb_gate_only_requested || (!down_native_recbuf && !down_native_i8_cbsram)) &&
+            (packet_icb_gate_only_requested || down_native_i8_cbsram || !down_native_recbuf) &&
             (rank1_split_packet_icb ||
              (!rank1_split_sidecar && (!rank1_sidecar_active || rank1_packet_icb_requested))) &&
             (rank1_packet_icb_requested || ds4_gpu_d8f_classic_packet_icb_enabled()) && gate_pso && down_pso &&
             (!rank1_split_packet_icb || (g_d8f_down_rank1_dot_batch_classic_pipeline &&
                                          g_d8f_down_rank1_axpy_batch_classic_pipeline)) &&
             packet_last_cmd < (NSUInteger)ds4_d8f_packet_icb_cmds &&
-            ds4_icb_slot_acquire(&g_d8f_packet_icb_slot, (NSUInteger)ds4_d8f_packet_icb_cmds, 8)) {
+            ds4_icb_slot_acquire(&g_d8f_packet_icb_slot, (NSUInteger)ds4_d8f_packet_icb_cmds, 10)) {
             __unsafe_unretained id<MTLBuffer> gate_bufs[8] = { nil };
             NSUInteger gate_offs[8] = { 0 };
             NSUInteger gate_n = 0;
@@ -56345,8 +56392,8 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             } else if (preweight_mid) {
                 gate_bufs[gate_n] = weightBuf; gate_offs[gate_n++] = weight_off;
             }
-            __unsafe_unretained id<MTLBuffer> down_bufs[8] = { nil };
-            NSUInteger down_offs[8] = { 0 };
+            __unsafe_unretained id<MTLBuffer> down_bufs[10] = { nil };
+            NSUInteger down_offs[10] = { 0 };
             NSUInteger down_n = 0;
             down_bufs[down_n] = g_d8f_runtime_buf; down_offs[down_n++] = 0;
             down_bufs[down_n] = g_d8f_runtime_mid_buf; down_offs[down_n++] = 0;
@@ -56359,6 +56406,10 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             if (down_any_recbuf) {
                 down_bufs[down_n] = g_d8f_runtime_rec_buf; down_offs[down_n++] = 0;
                 down_bufs[down_n] = g_d8f_runtime_mid_buf; down_offs[down_n++] = 0;
+            }
+            if (down_native_i8_cbsram) {
+                down_bufs[down_n] = g_d8f_runtime_i8_rec_buf; down_offs[down_n++] = 0;
+                down_bufs[down_n] = g_d8f_runtime_i8_codebook_buf; down_offs[down_n++] = 0;
             }
             uint64_t gate_extra[8] = { layer, n_tokens, n_experts, gateup_recbuf, gateup_tile4, preweight_mid, ds4_mid_dim, ds4_gateup_in_dim };
             uint64_t down_extra[8] = { layer, n_tokens, n_experts, down_tile16_recbuf || down_native_recbuf || down_native_i8_cbsram, down_tile8_recbuf || down_tile8, down_tile16, preweight_mid, down_tile16_recbuf_cbsram || down_native_recbuf || down_native_i8_cbsram };
@@ -56408,11 +56459,26 @@ int ds4_gpu_d8f_routed_organ_dispatch_tensor_batch_inline(const char *d8f_path,
             } else if (packet_icb_ready && packet_icb_gate_only_requested) {
                 packet_icb_gate_only = 1;
             } else if (packet_icb_ready) {
-                packet_icb_ready =
-                    ds4_icb_slot_record_command(&g_d8f_packet_icb_slot, packet_down_cmd, down_pso,
-                                                down_bufs, down_offs, down_n,
-                                                down_grid, packet_tg, down_tg_mem,
-                                                down_extra, 8);
+                if (down_native_i8_cbsram) {
+                    const uint32_t i8_tg_mems[4] = {
+                        down_tg_mem,
+                        2048u * 8u * (uint32_t)sizeof(int8_t),
+                        2048u * (uint32_t)sizeof(float),
+                        2048u * (uint32_t)sizeof(uint8_t),
+                    };
+                    packet_icb_ready =
+                        ds4_icb_slot_record_command_tgmems(&g_d8f_packet_icb_slot, packet_down_cmd, down_pso,
+                                                           down_bufs, down_offs, down_n,
+                                                           down_grid, packet_tg,
+                                                           i8_tg_mems, 4,
+                                                           down_extra, 8);
+                } else {
+                    packet_icb_ready =
+                        ds4_icb_slot_record_command(&g_d8f_packet_icb_slot, packet_down_cmd, down_pso,
+                                                    down_bufs, down_offs, down_n,
+                                                    down_grid, packet_tg, down_tg_mem,
+                                                    down_extra, 8);
+                }
             }
         }
 
@@ -56738,7 +56804,7 @@ int ds4_gpu_mtl4_d8f_routed_organ_dispatch_tensor_batch(const char *d8f_path,
         }
         if (packet_icb_requested && gate_pso && down_pso &&
             packet_down_cmd < (NSUInteger)ds4_d8f_packet_icb_cmds &&
-            ds4_icb_slot_acquire(&g_d8f_packet_icb_slot, (NSUInteger)ds4_d8f_packet_icb_cmds, 8)) {
+            ds4_icb_slot_acquire(&g_d8f_packet_icb_slot, (NSUInteger)ds4_d8f_packet_icb_cmds, 10)) {
             __unsafe_unretained id<MTLBuffer> gate_bufs[7] = { nil };
             NSUInteger gate_offs[7] = { 0 };
             NSUInteger gate_n = 0;
