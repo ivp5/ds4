@@ -133,6 +133,8 @@ enum {
  DS4_N_HC_SINKHORN_ITER = 20,
 };
 
+#define DS4_WARM_MAX_SKIP_RANGES (DS4_N_LAYER * 3u)
+
 /* silv 2026-05-26: HOT-dispatch counter wiring. Included AFTER the enum
  * so DS4_N_LAYER / DS4_N_EXPERT are integer constants, not macros. */
 #include "ds4_expert_table.h"
@@ -20184,6 +20186,19 @@ struct ds4_engine {
  bool ssd_stream_iq2xxs;
  bool cpu_model_ready;
  bool cpu_moe_layer[DS4_N_LAYER];
+ bool warm_weights_active;
+ bool warm_weights_touch_pages;
+ size_t warm_weights_n_skip;
+ size_t warm_weights_skip_idx;
+ uint64_t warm_weights_cursor;
+ uint64_t warm_weights_end;
+ uint64_t warm_weights_total_bytes;
+ uint64_t warm_weights_skipped_bytes;
+ uint64_t warm_weights_advised_bytes;
+ uint64_t warm_weights_checksum;
+ uint64_t warm_weights_slice_bytes;
+ double warm_weights_t0;
+ ds4_byte_range warm_weights_skip[DS4_WARM_MAX_SKIP_RANGES];
  /* Prefill-only Metal phase split. 0 = disabled. When >0, prefill
  * loops over N phases, swapping the routed-expert Metal residency
  * between them; generation always uses the cpu_moe path (cpu_model
@@ -23984,6 +23999,110 @@ static size_t engine_collect_cpu_moe_routed_ranges(const ds4_engine *e,
  return aligned_n;
 }
 
+static uint64_t ds4_env_mib_u64(const char *name, uint64_t fallback_mib) {
+ const char *env = getenv(name);
+ if (!env || !env[0]) return fallback_mib * 1024ull * 1024ull;
+ char *end = NULL;
+ unsigned long long v = strtoull(env, &end, 10);
+ if (end == env) return fallback_mib * 1024ull * 1024ull;
+ return (uint64_t)v * 1024ull * 1024ull;
+}
+
+static void engine_warm_weights_begin(ds4_engine *e,
+ const ds4_byte_range *skip,
+ size_t n_skip) {
+ if (!e) return;
+ const uint64_t start = e->model.tensor_data_pos;
+ const uint64_t end = e->model.size;
+ if (start >= end) return;
+
+ if (n_skip > DS4_WARM_MAX_SKIP_RANGES) n_skip = DS4_WARM_MAX_SKIP_RANGES;
+ e->warm_weights_n_skip = n_skip;
+ for (size_t i = 0; i < n_skip; i++) e->warm_weights_skip[i] = skip[i];
+ e->warm_weights_skip_idx = 0;
+ e->warm_weights_cursor = start;
+ e->warm_weights_end = end;
+ e->warm_weights_skipped_bytes = 0;
+ for (size_t i = 0; i < n_skip; i++) {
+  uint64_t s = skip[i].start < start ? start : skip[i].start;
+  uint64_t r = skip[i].end > end ? end : skip[i].end;
+  if (r > s) e->warm_weights_skipped_bytes += r - s;
+ }
+ e->warm_weights_total_bytes = (end - start) - e->warm_weights_skipped_bytes;
+ e->warm_weights_advised_bytes = 0;
+ e->warm_weights_checksum = 0;
+ e->warm_weights_slice_bytes = ds4_env_mib_u64("DS4_WARM_SLICE_MIB", 64);
+ e->warm_weights_touch_pages = ds4_env_enabled("DS4_WARM_SLICE_TOUCH");
+ e->warm_weights_t0 = now_sec();
+ e->warm_weights_active = e->warm_weights_slice_bytes > 0;
+ if (!e->warm_weights_active) return;
+
+ fprintf(stderr,
+ "ds4: amortized weight warm active: %.2f GiB over %.0f MiB slices%s%s\n",
+ (double)e->warm_weights_total_bytes / (1024.0 * 1024.0 * 1024.0),
+ (double)e->warm_weights_slice_bytes / (1024.0 * 1024.0),
+ e->warm_weights_skipped_bytes ? " (CPU-MoE routed ranges skipped)" : "",
+ e->warm_weights_touch_pages ? " touch=1" : " advise-only");
+}
+
+static void engine_warm_weights_advance(ds4_engine *e) {
+ if (!e || !e->warm_weights_active) return;
+ const uint8_t *p = e->model.map;
+ if (!p) {
+  e->warm_weights_active = false;
+  return;
+ }
+
+ const uint64_t page = (uint64_t)getpagesize();
+ uint64_t budget = e->warm_weights_slice_bytes;
+ while (budget > 0 && e->warm_weights_cursor < e->warm_weights_end) {
+  while (e->warm_weights_skip_idx < e->warm_weights_n_skip &&
+         e->warm_weights_skip[e->warm_weights_skip_idx].end <= e->warm_weights_cursor) {
+   e->warm_weights_skip_idx++;
+  }
+  if (e->warm_weights_skip_idx < e->warm_weights_n_skip &&
+      e->warm_weights_skip[e->warm_weights_skip_idx].start <= e->warm_weights_cursor) {
+   e->warm_weights_cursor = e->warm_weights_skip[e->warm_weights_skip_idx].end;
+   continue;
+  }
+
+  uint64_t seg_end = e->warm_weights_end;
+  if (e->warm_weights_skip_idx < e->warm_weights_n_skip &&
+      e->warm_weights_skip[e->warm_weights_skip_idx].start < seg_end) {
+   seg_end = e->warm_weights_skip[e->warm_weights_skip_idx].start;
+  }
+  uint64_t slice_end = e->warm_weights_cursor + budget;
+  if (slice_end < e->warm_weights_cursor || slice_end > seg_end) slice_end = seg_end;
+  if (slice_end <= e->warm_weights_cursor) break;
+
+#if defined(POSIX_MADV_WILLNEED)
+  (void)posix_madvise((void *)(p + e->warm_weights_cursor),
+                      (size_t)(slice_end - e->warm_weights_cursor),
+                      POSIX_MADV_WILLNEED);
+#endif
+  if (e->warm_weights_touch_pages) {
+   for (uint64_t off = e->warm_weights_cursor; off < slice_end; off += page) {
+    e->warm_weights_checksum += p[off];
+   }
+   e->warm_weights_checksum += p[slice_end - 1];
+  }
+  const uint64_t advanced = slice_end - e->warm_weights_cursor;
+  e->warm_weights_advised_bytes += advanced;
+  e->warm_weights_cursor = slice_end;
+  budget -= advanced;
+ }
+
+ if (e->warm_weights_cursor >= e->warm_weights_end) {
+  e->warm_weights_active = false;
+  fprintf(stderr,
+  "ds4: amortized weight warm complete in %.3fs (%.2f GiB%s checksum=%llu)\n",
+  now_sec() - e->warm_weights_t0,
+  (double)e->warm_weights_advised_bytes / (1024.0 * 1024.0 * 1024.0),
+  e->warm_weights_touch_pages ? " touched" : " advised",
+  (unsigned long long)e->warm_weights_checksum);
+ }
+}
+
 #ifndef DS4_NO_GPU
 static bool engine_tensor_is_cpu_routed(const ds4_engine *e,
  const ds4_tensor *t) {
@@ -24654,15 +24773,19 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
  fprintf(stderr,
  "ds4: --warm-weights ignored under --ssd-stream-iq2xxs; dense prefetching "
  "the 80GB GGUF defeats SSD/page-cache streaming\n");
- } else if (opt->warm_weights) {
+ } else if (opt->warm_weights && ds4_env_enabled("DS4_WARM_BLOCKING")) {
  ds4_byte_range *skip = NULL;
  size_t n_skip = 0;
  if (e->cpu_moe) {
- skip = xmalloc((size_t)DS4_N_LAYER * 3 * sizeof(*skip));
- n_skip = engine_collect_cpu_moe_routed_ranges(e, skip);
+  skip = xmalloc((size_t)DS4_N_LAYER * 3 * sizeof(*skip));
+  n_skip = engine_collect_cpu_moe_routed_ranges(e, skip);
  }
  model_warm_weights(&e->model, skip, n_skip);
  free(skip);
+ } else if (opt->warm_weights) {
+ ds4_byte_range skip[DS4_WARM_MAX_SKIP_RANGES];
+ size_t n_skip = e->cpu_moe ? engine_collect_cpu_moe_routed_ranges(e, skip) : 0;
+ engine_warm_weights_begin(e, skip, n_skip);
  }
 
  if (opt->mtp_path && opt->mtp_path[0]) {
@@ -25905,6 +26028,7 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  for (int i = 0; i < current; i++) token_vec_push(&p->session->checkpoint, p->prompt->v[i]);
  p->session->checkpoint_valid = true;
  p->session->mtp_draft_valid = false;
+ engine_warm_weights_advance(p->session->engine);
  }
  if (p->user) p->user(p->user_ud, event, current, total);
 }
@@ -25950,6 +26074,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
  &s->cpu_scratch);
  ds4_session_note_host_logits(s);
  token_vec_push(&s->checkpoint, prompt->v[i]);
+ engine_warm_weights_advance(e);
  if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
  }
  s->checkpoint_valid = true;
@@ -25969,6 +26094,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
  ds4_tokens_copy(&s->checkpoint, prompt);
  s->checkpoint_valid = true;
  s->mtp_draft_valid = false;
+ engine_warm_weights_advance(e);
  if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
  return 0;
  }
@@ -26016,6 +26142,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
  ds4_session_note_host_logits(s);
  ds4_tokens_copy(&s->checkpoint, prompt);
  s->checkpoint_valid = true;
+ engine_warm_weights_advance(e);
  /* Match the full-prefill branch below: release the Metal residency
  * that engine_activate_prefill_phase() built inside the chunked
  * range so gen falls back to the all-routed-on-CPU layout and the
@@ -26038,6 +26165,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
  }
  ds4_session_note_host_logits(s);
  token_vec_push(&s->checkpoint, prompt->v[i]);
+ engine_warm_weights_advance(e);
  }
  return 0;
  }
@@ -26118,6 +26246,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
  s->checkpoint_valid = true;
  s->mtp_draft_valid = false;
  s->graph.mtp_n_raw = 0;
+ engine_warm_weights_advance(e);
  return 0;
 #endif
 }
@@ -26381,6 +26510,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
  &s->cpu_scratch);
  ds4_session_note_host_logits(s);
  token_vec_push(&s->checkpoint, token);
+ engine_warm_weights_advance(e);
  s->checkpoint_valid = true;
  s->mtp_draft_valid = false;
  (void)probe_mtp;
@@ -26462,6 +26592,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
  ds4_session_note_host_logits(s);
  }
  token_vec_push(&s->checkpoint, token);
+ engine_warm_weights_advance(e);
  if (mtp_should_draft) {
  int mtp_top = -1;
  if (metal_graph_eval_mtp_draft(&s->graph,
