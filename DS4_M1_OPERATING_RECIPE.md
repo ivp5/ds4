@@ -246,12 +246,14 @@ takes up build time + 8244 lines of declarations).
 
 **Operating recipe** for the ACTUAL ICB pipelines:
 ```bash
-# PRIME default: H3384 GPU-resident pack, split-2 overlap, measured decode
-# fusions, D8F native-down texture/cache gates, dense Q8_0 matvec ICB,
-# D8F packet ICB replay/range where eligible, and top-only greedy argmax.
+# Speed-only H3384 canary: GPU-resident pack, split-2 overlap, measured
+# decode fusions, D8F native-down texture/cache gates, dense Q8_0 matvec ICB,
+# D8F packet ICB replay/range where eligible, and top-only argmax.
+# Do not treat this as the primary fidelity path: greedy and temp=0.6 sampled
+# gates both collapse, so the failure is not a greedy-only attractor.
 ./ds4 --metal --flat-pack /path/to/H3384 ...
 
-# Comparison baseline: turn PRIME-only replay off explicitly.
+# Comparison baseline for speed-only canaries: turn PRIME-only replay off explicitly.
 DS4_PRIME_PATH=0 DS4_DENSE_MATVEC_ICB_DISABLE=1 DS4_METAL_DISABLE_TOP_ONLY_ARGMAX=1 \
   ./ds4 --metal --flat-pack /path/to/H3384 ...
 
@@ -373,7 +375,7 @@ Deferred:
 
 ## Operating doctrine summary
 
-1. **No flags/env discover H3384 + Metal + PRIME + prefill auto** when the H3384 flat-pack is present, but auto-selected H3384 now refuses normal generation until greedy and sampled `--coherence-gate` passes; use explicit `--flat-pack` or `DS4_ALLOW_UNCERTIFIED_H3384=1` only for speed-only experiments
+1. **No flags/env discover H3384 + Metal + PRIME + prefill auto** when the H3384 flat-pack is present, but auto-selected H3384 now refuses normal generation until greedy and sampled `--coherence-gate` passes; temp=0.6 sampled echo makes this a codec/allocation failure signal, not a greedy decode workaround; use explicit `--flat-pack` or `DS4_ALLOW_UNCERTIFIED_H3384=1` only for speed-only experiments
 2. **Use `--prefill-metal-phases 0` only for A/B**; Metal default is `auto`, and external D8F normalizes to phase-free GPU runtime when no GGUF routed residency needs swapping
 3. **For chat/agentic: add `--kv-disk-dir`** (9× speedup on repeat)
 4. **For forensics: build JOURNAL=1** (append-only SQLite trace)
@@ -396,8 +398,10 @@ Metal wired memory grows during prefill, so "fits" must be reported as live RSS
 is not automatically faster and should not replace the default without a local
 selected-layer/end-to-end win and coherence gate pass.
 
-Borrowed now: make the measured runnable default explicit — H3384 + Metal +
-PRIME + `prefill-metal-phases auto`, with dynamic coherence still uncertified.
+Borrowed now: make the measured speed-only recipe explicit — H3384 + Metal +
+PRIME + `prefill-metal-phases auto`, with dynamic coherence refuted by greedy
+and sampled gates. The primary fidelity direction is the H3371 general-fit
+rebuild, not another sampler setting on H3384.
 Fork lesson kept for future sidecar work:
 M1-class profiles keep ANE routed prefill off unless measured; 16K prefill
 chunks require raw-cap headroom (`128 + chunk`, aligned), and SSD/I/O knobs
