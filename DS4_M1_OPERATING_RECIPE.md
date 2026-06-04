@@ -174,6 +174,13 @@ they pass real selected-layer D8F, overlap, and fidelity gates.
 | Q4_K_M-XL 153 GB | 153 GB | doesn't fit | — |
 | `MLX-Qwen3.5-9B-DS-V4-Flash-4bit` | 5 GB | distill, MLX | side-by-side proposer |
 
+H3384 root-cause triage: `tools/ds4_d8f_weight_compare.py` decodes a D8F
+record exactly as Metal sees it and compares it to the source safetensors
+expert. The first L40 canaries refute the easy "missing codebook scalar" bug:
+optimal decoded→source scalars are ~0.91-0.99 for E0/E192/E236 gate/up/down,
+while rel-L2 remains ~0.46-0.60. So the sampled echo is not fixed by a global
+scale multiplier; the current evidence points at allocation/codec fidelity.
+
 Int8 codebook-cache remains opt-in. On H3384 L26 selected-six,
 `DS4_D8F_RUNTIME_NATIVE_DOWN_I8_CBSRAM=1` kept 52,911/219,136 entries at
 `max_rel=0.02` and preserved selected mismatch=0, but slowed selected organ
